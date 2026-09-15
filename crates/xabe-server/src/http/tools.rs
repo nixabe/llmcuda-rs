@@ -422,7 +422,7 @@ enum ParserState {
     Text,
     /// Between an opener and `</tool_call>`; `raw` holds everything consumed
     /// since the opener so an unparseable block can be returned verbatim.
-    InCall { raw: String },
+    InCall { raw: String, wrapped: bool },
 }
 
 /// Incremental scanner over the answer span's text.
@@ -478,12 +478,9 @@ impl ToolCallParser {
                             self.pending.drain(..opener.len());
                             // A bare `<function=...>` opener is part of the
                             // call body; the `<tool_call>` line is markup.
-                            let raw = if opener == CALL_OPEN {
-                                String::new()
-                            } else {
-                                opener
-                            };
-                            self.state = ParserState::InCall { raw };
+                            let wrapped = opener == CALL_OPEN;
+                            let raw = if wrapped { String::new() } else { opener };
+                            self.state = ParserState::InCall { raw, wrapped };
                         }
                         None => {
                             let held = held_back_len(&self.pending, &self.openers);
@@ -496,7 +493,8 @@ impl ToolCallParser {
                         }
                     }
                 }
-                ParserState::InCall { raw } => {
+                ParserState::InCall { raw, wrapped } => {
+                    let prefix = if *wrapped { CALL_OPEN } else { "" };
                     match self.pending.find(CALL_CLOSE) {
                         Some(at) => {
                             raw.push_str(&self.pending[..at]);
@@ -511,7 +509,7 @@ impl ToolCallParser {
                                 None => {
                                     // Reassemble what was consumed so the
                                     // caller sees the model's actual output.
-                                    self.emit_text(format!("{CALL_OPEN}{raw}{CALL_CLOSE}"), events);
+                                    self.emit_text(format!("{prefix}{raw}{CALL_CLOSE}"), events);
                                 }
                             }
                         }
@@ -525,7 +523,7 @@ impl ToolCallParser {
                             if raw.len() > MAX_CALL_BYTES {
                                 let raw = std::mem::take(raw);
                                 self.state = ParserState::Text;
-                                self.emit_text(format!("{CALL_OPEN}{raw}"), events);
+                                self.emit_text(format!("{prefix}{raw}"), events);
                             }
                             return;
                         }
@@ -539,8 +537,9 @@ impl ToolCallParser {
     pub(crate) fn finish(&mut self, events: &mut Vec<ToolEvent>) {
         let tail = match std::mem::replace(&mut self.state, ParserState::Text) {
             ParserState::Text => std::mem::take(&mut self.pending),
-            ParserState::InCall { raw } => {
-                format!("{CALL_OPEN}{raw}{}", std::mem::take(&mut self.pending))
+            ParserState::InCall { raw, wrapped } => {
+                let prefix = if wrapped { CALL_OPEN } else { "" };
+                format!("{prefix}{raw}{}", std::mem::take(&mut self.pending))
             }
         };
         self.emit_text(tail, events);
@@ -599,7 +598,7 @@ fn parse_call(
         return None;
     }
     rest = &rest[name_end + 1..];
-    let string_params = schemas.get(name);
+    let string_params = schemas.get(name)?;
 
     let mut arguments = Map::new();
     loop {
@@ -633,21 +632,73 @@ fn parse_call(
         // `common_chat_params_init_qwen3_coder`): a schema that says
         // `string` takes the text verbatim; anything else is JSON, with the
         // raw text kept when it does not parse.
-        let is_string = string_params
-            .and_then(|params| params.get(&key).copied())
-            .unwrap_or(false);
+        let is_string = string_params.get(&key).copied().unwrap_or(false);
         let parsed = if is_string {
             Value::String(value.to_owned())
         } else {
             serde_json::from_str(value.trim()).unwrap_or_else(|_| Value::String(value.to_owned()))
         };
-        arguments.insert(key, parsed);
+        if arguments.insert(key, parsed).is_some() {
+            return None;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_arguments_survive_every_stream_split() {
+        let tool = ToolDefinition::from_anthropic(&json!({
+            "name": "sandbox.run", "input_schema": {"type":"object", "properties": {
+                "command": {"type":"string"}, "options": {"type":"object"}
+            }}
+        }))
+        .unwrap();
+        let raw = "<tool_call>\n<function=sandbox.run>\n<parameter=command>\nprintf '你好'\ncat <<'EOF'\n  keep spaces\nEOF\n</parameter>\n<parameter=options>\n{\"timeout\":30,\"env\":{\"X\":\"y\"}}\n</parameter>\n</function>\n</tool_call>";
+        let expected = vec![call(
+            "sandbox.run",
+            json!({
+                "command":"printf '你好'\ncat <<'EOF'\n  keep spaces\nEOF",
+                "options":{"timeout":30,"env":{"X":"y"}}
+            }),
+        )];
+        for split in (0..=raw.len()).filter(|&at| raw.is_char_boundary(at)) {
+            let mut parser = ToolCallParser::new(std::slice::from_ref(&tool));
+            assert_eq!(
+                events(&mut parser, &[&raw[..split], &raw[split..]]),
+                expected,
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_calls_and_duplicate_arguments_remain_text() {
+        for raw in [
+            "<tool_call><function=unknown></function></tool_call>",
+            "<tool_call><function=get_weather><parameter=city>A</parameter><parameter=city>B</parameter></function></tool_call>",
+        ] {
+            assert_eq!(
+                events(&mut ToolCallParser::new(&[weather_tool()]), &[raw]),
+                vec![ToolEvent::Text(raw.to_owned())]
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_bare_function_is_preserved_without_an_invented_opener() {
+        for raw in [
+            "<function=get_weather>unfinished",
+            "<function=get_weather>invalid</tool_call>",
+        ] {
+            assert_eq!(
+                events(&mut ToolCallParser::new(&[weather_tool()]), &[raw]),
+                vec![ToolEvent::Text(raw.to_owned())]
+            );
+        }
+    }
 
     #[test]
     fn anthropic_server_tools_are_dropped_and_client_tools_beside_them_serve() {

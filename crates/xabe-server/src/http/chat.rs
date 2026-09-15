@@ -68,11 +68,7 @@ pub(crate) enum KnownPart {
     #[serde(rename = "summary_text")]
     SummaryText { text: String },
     #[serde(rename = "tool_use")]
-    ToolUse {
-        name: String,
-        #[serde(default)]
-        input: Value,
-    },
+    ToolUse { name: String, input: Value },
     #[serde(rename = "tool_result")]
     ToolResult {
         #[serde(default)]
@@ -271,11 +267,11 @@ impl Content {
                 | KnownPart::SummaryText { text: value },
             ) => (&mut folded.thinking, value.as_str()),
             Part::Known(KnownPart::ToolUse { name, input }) => {
-                let arguments = match input {
-                    Value::Object(map) => map.clone(),
-                    Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
-                    _ => serde_json::Map::new(),
-                };
+                if name.is_empty() || name.contains(['<', '>', '\n']) {
+                    return Err("tool_use needs a non-empty, renderable `name`".to_owned());
+                }
+                let arguments = xabe_server::sandbox::parse_arguments(input)
+                    .map_err(|failure| format!("tool_use `{name}`: {failure}"))?;
                 folded.tool_calls.push(ParsedToolCall {
                     name: name.clone(),
                     arguments,
@@ -308,6 +304,9 @@ impl Content {
                     .get("type")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("(untyped)");
+                if matches!(kind, "tool_use" | "tool_result") {
+                    return Err(format!("malformed `{kind}` content block"));
+                }
                 if CONTENT_THIS_SERVER_CANNOT_READ.contains(&kind) {
                     return Err(format!(
                         "content parts of type `{kind}` are not supported; this server \
@@ -935,6 +934,32 @@ mod tests {
             conversation.render(true).contains("let me check"),
             "reasoning before a tool response must be replayed"
         );
+    }
+
+    #[test]
+    fn malformed_tool_use_cannot_silently_lose_arguments() {
+        for input in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!("broken"),
+            serde_json::json!("[]"),
+            serde_json::json!(42),
+        ] {
+            assert!(
+                parts(serde_json::json!([{"type":"tool_use", "name":"run", "input":input}]))
+                    .fold()
+                    .is_err()
+            );
+        }
+        for block in [
+            serde_json::json!({"type":"tool_use", "input":{}}),
+            serde_json::json!({"type":"tool_use", "name":"run"}),
+            serde_json::json!({"type":"tool_use", "name":"", "input":{}}),
+        ] {
+            assert!(parts(serde_json::json!([block])).fold().is_err());
+        }
+        let folded = parts(serde_json::json!([{"type":"tool_use", "name":"run", "input":"{\"command\":\"echo ok\"}"}])).fold().unwrap();
+        assert_eq!(folded.tool_calls[0].arguments["command"], "echo ok");
     }
 
     #[test]

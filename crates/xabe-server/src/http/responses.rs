@@ -46,6 +46,8 @@ struct InputItem {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
     arguments: Option<String>,
     #[serde(default)]
     output: Option<Value>,
@@ -175,6 +177,16 @@ impl ResponsesRequest {
                                         "a `function_call` item needs a `name`",
                                     )
                                 })?;
+                            let name = match item.namespace.as_deref() {
+                                Some("") => {
+                                    return Err(ApiError::bad_request(
+                                        DIALECT,
+                                        "a tool namespace must not be empty",
+                                    ));
+                                }
+                                Some(namespace) => format!("{namespace}.{name}"),
+                                None => name,
+                            };
                             let arguments = match item.arguments.as_deref() {
                                 None | Some("") => serde_json::Map::new(),
                                 Some(text) => serde_json::from_str::<Value>(text)
@@ -934,6 +946,25 @@ mod tests {
             name: name.to_owned(),
             arguments: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn namespaced_calls_round_trip_through_sandbox_and_replay() {
+        use xabe_server::sandbox::{ToolDialect, ToolInvocation};
+        let wire = namespaced_envelope().function_call_item(0, &parsed("crm.search"), "completed");
+        let invocation = ToolInvocation::parse(&wire, ToolDialect::Responses).unwrap();
+        assert_eq!(invocation.call.name, "crm.search");
+        let result = invocation.result(json!({"found":true}));
+        assert_eq!(result["call_id"], wire["call_id"]);
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"input":[wire, result]})).unwrap();
+        let conversation = request.conversation().unwrap();
+        assert!(
+            matches!(&conversation.turns[0], Turn::Assistant { tool_calls, .. } if tool_calls[0].name == "crm.search")
+        );
+        assert!(
+            matches!(&conversation.turns[1], Turn::ToolResults(results) if results == &[r#"{"found":true}"#])
+        );
     }
 
     #[test]

@@ -722,6 +722,23 @@ mod tests {
     }
 
     #[test]
+    fn generated_calls_round_trip_through_sandbox_and_replay() {
+        use xabe_server::sandbox::{ToolDialect, ToolInvocation};
+        let call = ParsedToolCall {
+            name: "run".to_owned(),
+            arguments: json!({"command":"echo ok"}).as_object().unwrap().clone(),
+        };
+        let wire = tool_call_value(7, 0, &call);
+        let invocation = ToolInvocation::parse(&wire, ToolDialect::ChatCompletions).unwrap();
+        assert_eq!(invocation.call, call);
+        let result = invocation.result(json!("ok\n"));
+        assert_eq!(result["role"], "tool");
+        assert_eq!(result["tool_call_id"], wire["id"]);
+        assert_eq!(result["content"], "ok\n");
+        assert_eq!(replayed_tool_calls(Some(vec![wire])).unwrap(), vec![call]);
+    }
+
+    #[test]
     fn replayed_tool_calls_parse_string_and_object_arguments() {
         let calls = replayed_tool_calls(Some(vec![
             json!({ "id": "call_1", "type": "function",

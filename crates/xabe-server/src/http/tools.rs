@@ -401,19 +401,7 @@ pub(crate) fn grammar(tools: &[ToolDefinition], vocab: &Arc<Vocab>) -> Option<Ar
     ToolGrammar::new(&specs, true, Arc::clone(vocab)).map(Arc::new)
 }
 
-/// One call parsed out of the model's output.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ParsedToolCall {
-    pub(crate) name: String,
-    pub(crate) arguments: Map<String, Value>,
-}
-
-impl ParsedToolCall {
-    /// The arguments as the JSON string OpenAI's wire format carries.
-    pub(crate) fn arguments_json(&self) -> String {
-        serde_json::to_string(&self.arguments).expect("JSON maps serialize")
-    }
-}
+pub(crate) use xabe_server::sandbox::ToolCall as ParsedToolCall;
 
 /// What the parser hands back for a piece of decoded output.
 #[derive(Debug, PartialEq)]

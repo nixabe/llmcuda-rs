@@ -693,6 +693,31 @@ mod tests {
     }
 
     #[test]
+    fn generated_tool_use_round_trips_through_sandbox_and_replay() {
+        use xabe_server::sandbox::{ToolDialect, ToolInvocation};
+        let call = ParsedToolCall {
+            name: "run".to_owned(),
+            arguments: json!({"command":"echo ok"}).as_object().unwrap().clone(),
+        };
+        let blocks = content_blocks(&collected("", "", vec![call.clone()]), 7);
+        let invocation = ToolInvocation::parse(&blocks[0], ToolDialect::Anthropic).unwrap();
+        assert_eq!(invocation.call, call);
+        let result = invocation.result(json!("ok\n"));
+        assert_eq!(result["tool_use_id"], blocks[0]["id"]);
+        let request: MessagesRequest = serde_json::from_value(json!({"max_tokens":16,"messages":[
+            {"role":"assistant","content":blocks}, {"role":"user","content":[result]}
+        ]}))
+        .unwrap();
+        let conversation = request.conversation().unwrap();
+        assert!(
+            matches!(&conversation.turns[0], Turn::Assistant { tool_calls, .. } if tool_calls == &[call])
+        );
+        assert!(
+            matches!(&conversation.turns[1], Turn::ToolResults(results) if results == &["ok\n"])
+        );
+    }
+
+    #[test]
     fn tool_use_and_tool_result_blocks_fold_into_the_conversation() {
         let request = request(
             r#"{"max_tokens":16,"messages":[

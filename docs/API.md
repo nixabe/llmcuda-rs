@@ -189,6 +189,9 @@ penalties do not currently suppress repetition here.
 
 ## Tool calling
 
+For harness-owned sandbox execution, including AgentENV, see
+[Sandbox tool calls](SANDBOX.md) and the `xabe_server::sandbox::Sandbox` trait.
+
 All three chat dialects take tool definitions and return structured calls:
 
 | Dialect | Definitions | Calls come back as |

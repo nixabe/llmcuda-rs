@@ -21,6 +21,7 @@ mod chat;
 mod error;
 mod generate;
 mod jinja;
+mod mcp;
 mod openai;
 mod responses;
 mod tools;
@@ -58,6 +59,7 @@ pub struct ServerConfig {
     /// `None` leaves the server open, which is what it was before an API key
     /// could be configured.
     pub api_key: Option<String>,
+    pub mcp_config: Option<std::path::PathBuf>,
     /// The model name reported by `/v1/models` and echoed in responses.
     pub model: String,
     /// The output token limit for a request that does not set one.
@@ -87,6 +89,7 @@ pub struct ServerConfig {
 
 #[derive(Clone)]
 struct AppState {
+    mcp: Option<Arc<xabe_mcp::Registry>>,
     engine: Arc<Engine>,
     tokenizer: Arc<Tokenizer>,
     clients: ClientMap,
@@ -400,7 +403,19 @@ pub async fn serve(
             None
         }
     };
+    let mcp = config
+        .mcp_config
+        .map(|path| {
+            if config.api_key.as_ref().is_none_or(|key| key.is_empty()) {
+                return Err("MCP execution requires --api-key".to_owned());
+            }
+            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            let config = serde_json::from_slice(&bytes).map_err(|e| format!("MCP config: {e}"))?;
+            xabe_mcp::Registry::new(config).map_err(|e| e.to_string())
+        })
+        .transpose()?;
     let state = AppState {
+        mcp,
         engine: Arc::new(engine),
         tokenizer: Arc::new(tokenizer),
         clients: Arc::new(Mutex::new(HashMap::new())),
@@ -431,6 +446,12 @@ pub async fn serve(
     // `/health` stays outside the authenticated routes so a load balancer can
     // probe the server without holding a key.
     let api = Router::new()
+        .route("/tools", get(mcp::list_tools).post(mcp::call_tool))
+        .route("/mcp/sessions", post(mcp::create_session))
+        .route(
+            "/mcp/sessions/{id}",
+            axum::routing::delete(mcp::close_session),
+        )
         .route("/v1/models", get(models))
         .route("/v1/completions", post(openai::completions))
         .route("/v1/chat/completions", post(openai::chat_completions))

@@ -3067,6 +3067,8 @@ dependencies = [
  "serde_json",
  "tokenizers",
  "tokio",
+ "tokio-util",
+ "tower",
  "tracing",
  "xabe-cache",
  "xabe-cuda",
@@ -3075,6 +3077,7 @@ dependencies = [
  "xabe-grammar",
  "xabe-kernels",
  "xabe-log",
+ "xabe-mcp",
  "xabe-model",
  "xabe-sched",
 ]

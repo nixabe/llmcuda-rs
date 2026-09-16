@@ -74,6 +74,8 @@ struct ReasoningOptions {
 
 #[derive(Debug, Deserialize)]
 struct ResponsesRequest {
+    #[serde(default)]
+    mcp: Option<xabe_server::agent::Options>,
     input: Input,
     #[serde(default)]
     instructions: Option<String>,
@@ -513,6 +515,9 @@ pub(crate) async fn create(
              so send the whole conversation in `input`",
         ));
     }
+    if request.mcp.is_some() {
+        return create_agent(state, request).await;
+    }
     let thinking = request.thinking_enabled(state.default_reasoning);
     let mut conversation = request.conversation()?;
     if request.tools_offered()? {
@@ -797,6 +802,253 @@ pub(crate) async fn create(
         .into_response())
 }
 
+/// The model adapter admits one inference request per loop turn. `generation`
+/// is fully consumed and dropped before the loop begins external tool work.
+struct McpModel {
+    state: AppState,
+    conversation: Conversation,
+    applied: usize,
+    thinking: bool,
+    sampling: xabe_engine::SamplingParams,
+}
+impl xabe_server::agent::Model for McpModel {
+    async fn generate(
+        &mut self,
+        history: &[xabe_server::agent::Step],
+        remaining_tokens: u32,
+    ) -> Result<xabe_server::agent::ModelTurn, String> {
+        for step in &history[self.applied..] {
+            self.conversation.turns.push(Turn::Assistant {
+                reasoning: step.turn.reasoning.clone(),
+                content: step.turn.text.clone(),
+                tool_calls: step.turn.calls.clone(),
+            });
+            for result in &step.results {
+                let result = Content::fold_blocks(&result.content_blocks())?;
+                self.conversation.push_tool_result(result);
+            }
+        }
+        self.applied = history.len();
+        let prompt = self
+            .state
+            .render(&self.conversation, self.thinking, DIALECT)
+            .map_err(|e| e.payload().to_string())?;
+        let encoding = self
+            .state
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| e.to_string())?;
+        let (prompt, images) = super::vision::expand_images(
+            self.state.vision.as_deref(),
+            DIALECT,
+            encoding.get_ids().to_vec(),
+            &self.conversation.images,
+        )
+        .map_err(|e| e.payload().to_string())?;
+        let constraint = super::tools::grammar(&self.conversation.tools, &self.state.grammar_vocab)
+            .map(|g| Box::new(xabe_grammar::ToolConstraint::new(g)));
+        let mut generation = Generation::start(
+            &self.state,
+            GenerationSpec {
+                prompt,
+                images,
+                max_tokens: remaining_tokens,
+                stop: Vec::new(),
+                thinking: self.thinking,
+                trim_spans: true,
+                sampling: self.sampling,
+                tool_parser: Some(ToolCallParser::new(&self.conversation.tools)),
+                constraint,
+            },
+            DIALECT,
+        )
+        .map_err(|e| e.payload().to_string())?;
+        let collected = generation
+            .collect()
+            .await
+            .map_err(|e| e.payload().to_string())?;
+        Ok(xabe_server::agent::ModelTurn {
+            reasoning: collected.reasoning,
+            text: collected.text,
+            calls: collected.tool_calls,
+            input_tokens: generation.prompt_tokens(),
+            output_tokens: generation.completion_tokens() as u32,
+            complete: generation.finish() == Finish::EndOfTurn,
+        })
+    }
+}
+
+fn agent_object(envelope: &Envelope, result: &xabe_server::agent::RunResult) -> Value {
+    let mut history = Vec::new();
+    let mut output = Vec::new();
+    let mut call_index = 0;
+    for (iteration, step) in result.steps.iter().enumerate() {
+        if !step.turn.reasoning.is_empty() {
+            history.push(json!({"type":"reasoning", "content":[{"type":"reasoning_text", "text":step.turn.reasoning}]}));
+        }
+        if !step.turn.text.is_empty() {
+            history.push(json!({"role":"assistant", "content":step.turn.text}));
+        }
+        let first_call = call_index;
+        for call in &step.turn.calls {
+            let wire = envelope.function_call_item(call_index, call, "completed");
+            history.push(wire);
+            call_index += 1;
+        }
+        // Preserve a batch as one assistant turn followed by its results.
+        for (index, result) in step.results.iter().enumerate() {
+            history.push(json!({"type":"function_call_output", "call_id":envelope.function_call_id(first_call + index), "output":result.responses_blocks()}));
+        }
+        if iteration + 1 == result.steps.len() {
+            if !step.turn.reasoning.is_empty() {
+                output.push(envelope.reasoning_item(&step.turn.reasoning));
+            }
+            if !step.turn.text.is_empty() || step.turn.calls.is_empty() {
+                output.push(envelope.message_item(&step.turn.text));
+            }
+            // Calls left at a limit are reported but were not executed.
+            for (index, call) in step.turn.calls.iter().enumerate().skip(step.results.len()) {
+                output.push(envelope.function_call_item(
+                    call_index - step.turn.calls.len() + index,
+                    call,
+                    "completed",
+                ));
+            }
+        }
+    }
+    let completed = result.stop_reason == "end_turn";
+    let mut object = envelope.object(if completed { "completed" } else { "incomplete" },
+        if completed { Value::Null } else { json!({"reason":result.stop_reason}) }, output,
+        json!({"input_tokens":result.input_tokens, "output_tokens":result.output_tokens, "total_tokens":result.input_tokens + result.output_tokens as usize}));
+    // Append this entire history to the next `input`, not output as well.
+    object["mcp_history"] = json!(history);
+    object["mcp_stop_reason"] = json!(result.stop_reason);
+    object
+}
+
+async fn create_agent(state: AppState, request: ResponsesRequest) -> Result<Response, ApiError> {
+    let registry = super::mcp::registry(&state)?;
+    let options = request.mcp.as_ref().expect("MCP request");
+    if !request.tools_offered()?
+        || request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(ApiError::bad_request(
+            DIALECT,
+            "MCP mode uses the session catalog; omit tools and use tool_choice auto",
+        ));
+    }
+    let session = registry
+        .get(&options.session_id)
+        .map_err(super::mcp::failure)?;
+    let lease = session.acquire().map_err(super::mcp::failure)?;
+    let config = registry.config();
+    let limits = xabe_server::agent::Limits {
+        max_iterations: options.max_iterations.unwrap_or(config.max_iterations),
+        max_tokens: request.max_output_tokens.unwrap_or(config.max_agent_tokens),
+        timeout_ms: options.timeout_ms.unwrap_or(config.max_agent_ms),
+        max_output_bytes: config.max_result_bytes,
+        max_calls_per_turn: config.max_tools,
+    };
+    if limits.max_iterations == 0
+        || limits.max_iterations > config.max_iterations
+        || limits.max_tokens == 0
+        || limits.max_tokens > config.max_agent_tokens
+        || limits.timeout_ms == 0
+        || limits.timeout_ms > config.max_agent_ms
+    {
+        return Err(ApiError::bad_request(
+            DIALECT,
+            "MCP request limits must be positive and no larger than server limits",
+        ));
+    }
+    let definitions: Vec<_> = session
+        .tools()
+        .iter()
+        .map(|t| t.function_definition())
+        .collect();
+    let mut conversation = request.conversation()?;
+    conversation.tools = OfferedTools::from_responses(&definitions)
+        .map_err(|e| ApiError::bad_request(DIALECT, e))?
+        .definitions;
+    let mut model = McpModel {
+        thinking: request.thinking_enabled(state.default_reasoning),
+        sampling: resolve_sampling(
+            DIALECT,
+            state.sampling_defaults,
+            request.temperature,
+            request.top_p,
+            request.top_k,
+            request.min_p,
+            None,
+        )?,
+        state: state.clone(),
+        conversation,
+        applied: 0,
+    };
+    let envelope = Envelope {
+        id: format!(
+            "resp_{}",
+            state
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+        created: unix_now(),
+        model: state.model_name(request.model),
+        tools: json!(definitions),
+        tool_choice: json!("auto"),
+        parallel_tool_calls: false,
+        namespaces: HashSet::new(),
+    };
+    let cancel = session.cancellation();
+    if !request.stream {
+        let _lease = lease;
+        let result = xabe_server::agent::run(&mut model, &session, limits, &cancel, None)
+            .await
+            .map_err(|e| ApiError::new(axum::http::StatusCode::BAD_GATEWAY, DIALECT, e))?;
+        return Ok(axum::Json(agent_object(&envelope, &result)).into_response());
+    }
+    let stream = async_stream::stream! {
+        let _lease = lease;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let work = xabe_server::agent::run(&mut model, &session, limits, &cancel, Some(tx));
+        tokio::pin!(work);
+        let mut sequence = 0u64;
+        yield Ok::<_, std::convert::Infallible>(sse_named("response.created", &json!({"type":"response.created", "sequence_number":sequence, "response":envelope.object("in_progress", Value::Null, vec![], Value::Null)})));
+        let result = loop {
+            tokio::select! {
+                biased;
+                event = rx.recv() => {
+                    if let Some(event) = event {
+                        sequence += 1;
+                        yield Ok(sse_named("response.mcp_event", &json!({"type":"response.mcp_event", "sequence_number":sequence, "event":event})));
+                    } else { break work.await; }
+                }
+                result = &mut work => break result,
+            }
+        };
+        // A send can enqueue the final turn during the same poll in which
+        // `work` completes. Drain it before emitting the terminal event.
+        while let Ok(event) = rx.try_recv() {
+            sequence += 1;
+            yield Ok(sse_named("response.mcp_event", &json!({"type":"response.mcp_event", "sequence_number":sequence, "event":event})));
+        }
+        sequence += 1;
+        match result {
+            Ok(result) => {
+                let name = if result.stop_reason == "end_turn" { "response.completed" } else { "response.incomplete" };
+                yield Ok(sse_named(name, &json!({"type":name, "sequence_number":sequence, "response":agent_object(&envelope, &result)})));
+            }
+            Err(error) => yield Ok(sse_named("error", &json!({"type":"error", "sequence_number":sequence, "error":{"message":error}}))),
+        }
+    };
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,6 +1198,54 @@ mod tests {
             name: name.to_owned(),
             arguments: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn agent_history_replays_calls_results_and_final_answer() {
+        use xabe_server::{
+            agent::{ModelTurn, RunResult, Step},
+            sandbox::ToolOutput,
+        };
+        let result = RunResult {
+            steps: vec![
+                Step {
+                    turn: ModelTurn {
+                        complete: true,
+                        calls: vec![parsed("mcp_0"), parsed("mcp_1")],
+                        reasoning: "check".into(),
+                        ..Default::default()
+                    },
+                    results: vec![
+                        ToolOutput::text("tool result".into()),
+                        ToolOutput::text("second result".into()),
+                    ],
+                },
+                Step {
+                    turn: ModelTurn {
+                        complete: true,
+                        text: "answer".into(),
+                        ..Default::default()
+                    },
+                    results: vec![],
+                },
+            ],
+            stop_reason: "end_turn",
+            input_tokens: 10,
+            output_tokens: 5,
+        };
+        let object = agent_object(&namespaced_envelope(), &result);
+        assert_eq!(object["usage"]["total_tokens"], 15);
+        assert_eq!(object["output"][0]["content"][0]["text"], "answer");
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"input":object["mcp_history"]})).unwrap();
+        let conversation = request.conversation().unwrap();
+        assert!(
+            matches!(&conversation.turns[0],Turn::Assistant {tool_calls,..} if tool_calls.len()==2 && tool_calls[0].name=="mcp_0" && tool_calls[1].name=="mcp_1")
+        );
+        assert!(
+            matches!(&conversation.turns[1],Turn::ToolResults(results) if results==&["tool result", "second result"])
+        );
+        assert!(matches!(&conversation.turns[2],Turn::Assistant {content,..} if content=="answer"));
     }
 
     #[test]

@@ -251,6 +251,10 @@ struct Args {
     #[arg(long, env = "LLMXABE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
+    /// Administrator MCP server configuration; enables session/tool endpoints
+    #[arg(long)]
+    mcp_servers_config: Option<std::path::PathBuf>,
+
     /// Model name reported by /v1/models and echoed in responses; defaults
     /// to the GGUF's own `general.name`
     #[arg(short, long, env = "LLMXABE_SERVED_MODEL_NAME")]
@@ -1018,6 +1022,7 @@ fn main() -> std::process::ExitCode {
     };
     let server = http::ServerConfig {
         api_key: args.api_key,
+        mcp_config: args.mcp_servers_config,
         model: served_name,
         default_max_tokens: args.max_tokens,
         default_reasoning: !args.no_reasoning,

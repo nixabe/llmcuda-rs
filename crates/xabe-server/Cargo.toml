@@ -16,6 +16,8 @@ default = []
 rust-kernels = ["xabe-engine/rust-kernels"]
 
 [dependencies]
+xabe-mcp.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing.workspace = true
 xabe-log.workspace = true
 xabe-model.workspace = true
@@ -39,3 +41,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync",
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokenizers = "0.22"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -1,6 +1,6 @@
 //! Normalize completed tool calls and dispatch them to a harness-owned sandbox.
 //!
-//! The HTTP server only generates calls. A harness implements [`Sandbox`] using
+//! Ordinary HTTP requests generate calls; opt-in MCP requests can execute them. A harness implements [`Sandbox`] using
 //! its own backend (for example an E2B client connected to AgentENV), registers
 //! allowed tools there, and explicitly dispatches completed calls. Streaming
 //! clients must assemble deltas before parsing a call.
@@ -10,7 +10,7 @@ use std::future::Future;
 use serde_json::{Map, Value, json};
 
 /// A function name and its object-valued arguments.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub name: String,
     pub arguments: Map<String, Value>,
@@ -122,7 +122,23 @@ impl ToolInvocation {
     /// Errors are returned to the harness; this method never retries a call.
     pub async fn dispatch<S: Sandbox>(&self, sandbox: &mut S) -> Result<Value, S::Error> {
         let output = sandbox.execute(&self.call).await?;
-        Ok(self.result(output))
+        Ok(self.result_output(&output))
+    }
+
+    /// Preserve MCP text/images, structured output, and tool-error status.
+    pub fn result_output(&self, output: &ToolOutput) -> Value {
+        let blocks = output.content_blocks();
+        match self.dialect {
+            ToolDialect::Anthropic => {
+                json!({"type":"tool_result", "tool_use_id":self.id, "content":blocks, "is_error":output.is_error})
+            }
+            ToolDialect::ChatCompletions => {
+                json!({"role":"tool", "tool_call_id":self.id, "content":output.openai_blocks()})
+            }
+            ToolDialect::Responses => {
+                json!({"type":"function_call_output", "call_id":self.id, "output":output.responses_blocks()})
+            }
+        }
     }
 
     /// Encode a successful result for the next request in the original dialect.
@@ -146,6 +162,91 @@ impl ToolInvocation {
     }
 }
 
+/// Rich tool output, independent of its MCP transport or HTTP dialect.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolOutput {
+    pub content: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
+    #[serde(default)]
+    pub is_error: bool,
+}
+impl ToolOutput {
+    pub fn text(text: String) -> Self {
+        Self {
+            content: vec![json!({"type":"text", "text":text})],
+            ..Self::default()
+        }
+    }
+    pub fn from_mcp(result: &xabe_mcp::CallToolResult) -> Self {
+        Self {
+            content: result
+                .content
+                .iter()
+                .map(|c| serde_json::to_value(c).expect("MCP content serializes"))
+                .collect(),
+            structured_content: result.structured_content.clone(),
+            is_error: result.is_error.unwrap_or(false),
+        }
+    }
+    /// Anthropic-compatible content blocks, also accepted by our history parser.
+    pub fn content_blocks(&self) -> Vec<Value> {
+        let mut blocks = Vec::new();
+        if self.is_error {
+            blocks.push(json!({"type":"text", "text":"Tool execution reported an error."}));
+        }
+        for content in &self.content {
+            match content["type"].as_str() {
+                Some("text") => blocks.push(json!({"type":"text", "text":content["text"]})),
+                Some("image") => blocks.push(json!({"type":"image", "source":{"type":"base64", "mime_type":content["mimeType"], "data":content["data"]}})),
+                // Resources and other content remain visible as JSON; never
+                // fetch links or quietly discard an unsupported content type.
+                _ => blocks.push(json!({"type":"text", "text":content.to_string()})),
+            }
+        }
+        if let Some(structured) = &self.structured_content {
+            blocks.push(json!({"type":"text", "text":structured.to_string()}));
+        }
+        blocks
+    }
+    pub fn responses_blocks(&self) -> Vec<Value> {
+        self.openai_blocks()
+            .into_iter()
+            .map(|block| {
+                if block["type"] == "image_url" {
+                    json!({"type":"input_image", "image_url":block["image_url"]["url"]})
+                } else {
+                    json!({"type":"input_text", "text":block["text"]})
+                }
+            })
+            .collect()
+    }
+    pub fn openai_blocks(&self) -> Vec<Value> {
+        self.content_blocks().into_iter().map(|block| {
+            if block["type"] == "image" {
+                json!({"type":"image_url", "image_url":{"url":format!("data:{};base64,{}", block["source"]["mime_type"].as_str().unwrap_or(""), block["source"]["data"].as_str().unwrap_or(""))}})
+            } else { block }
+        }).collect()
+    }
+}
+
+/// An MCP session can also be used by an external Rust harness.
+pub struct McpSandbox {
+    pub session: std::sync::Arc<xabe_mcp::Session>,
+    pub cancel: xabe_mcp::CancelToken,
+}
+impl Sandbox for McpSandbox {
+    type Error = xabe_mcp::Error;
+    async fn execute(&mut self, call: &ToolCall) -> Result<ToolOutput, Self::Error> {
+        let _lease = self.session.acquire()?;
+        self.session
+            .call(&call.name, call.arguments.clone(), &self.cancel)
+            .await
+            .map(|result| ToolOutput::from_mcp(&result))
+    }
+}
+
 /// Harness-owned sandbox execution, independent of Docker or a remote provider.
 ///
 /// Implementations should match registered tool names and deserialize each
@@ -157,7 +258,7 @@ pub trait Sandbox {
     fn execute(
         &mut self,
         call: &ToolCall,
-    ) -> impl Future<Output = Result<Value, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<ToolOutput, Self::Error>> + Send;
 }
 
 #[cfg(test)]
@@ -169,12 +270,14 @@ mod tests {
     }
     impl Sandbox for FakeSandbox {
         type Error = &'static str;
-        async fn execute(&mut self, call: &ToolCall) -> Result<Value, Self::Error> {
+        async fn execute(&mut self, call: &ToolCall) -> Result<ToolOutput, Self::Error> {
             if call.name != "sandbox.run" {
                 return Err("unknown tool");
             }
             self.calls.push(call.clone());
-            Ok(json!({"stdout":"ok\n", "exit_code":0}))
+            Ok(ToolOutput::text(
+                json!({"stdout":"ok\n", "exit_code":0}).to_string(),
+            ))
         }
     }
 
@@ -211,6 +314,8 @@ mod tests {
                 .get("output")
                 .or_else(|| result.get("content"))
                 .unwrap()
+                .as_array()
+                .unwrap()[0]["text"]
                 .as_str()
                 .unwrap();
             assert_eq!(
@@ -231,6 +336,35 @@ mod tests {
         let mut sandbox = FakeSandbox { calls: Vec::new() };
         assert_eq!(call.dispatch(&mut sandbox).await, Err("unknown tool"));
         assert!(sandbox.calls.is_empty());
+    }
+
+    #[test]
+    fn rich_results_preserve_images_structured_data_and_error_status() {
+        let output = ToolOutput {
+            content: vec![
+                json!({"type":"text","text":"failed"}),
+                json!({"type":"image","mimeType":"image/png","data":"YWJj"}),
+            ],
+            structured_content: Some(json!({"code":42})),
+            is_error: true,
+        };
+        let invocation = ToolInvocation::parse(
+            &json!({"type":"tool_use","id":"tu","name":"run","input":{}}),
+            ToolDialect::Anthropic,
+        )
+        .unwrap();
+        let result = invocation.result_output(&output);
+        assert_eq!(result["is_error"], true);
+        assert_eq!(result["content"][2]["source"]["data"], "YWJj");
+        assert_eq!(
+            output.responses_blocks()[2]["image_url"],
+            "data:image/png;base64,YWJj"
+        );
+        assert_eq!(output.responses_blocks()[2]["type"], "input_image");
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][3]["text"].as_str().unwrap()).unwrap(),
+            json!({"code":42})
+        );
     }
 
     #[test]

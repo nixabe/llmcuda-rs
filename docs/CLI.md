@@ -48,6 +48,10 @@ the value nor the variable's contents appear in `--help` or in any log line.
 | `--jinja` / `--no-jinja` | `LLMXABE_NO_JINJA` | `--jinja` | Render prompts with the model's own `tokenizer.chat_template`, as llama.cpp does by default. The alternative is the hand-written ChatML in `http::chat`, which is a *copy* of that template and can drift from it silently; a test renders both ways against the served model's own template and requires them byte-identical, but only for the models it is run against. `--no-jinja` (or `LLMXABE_NO_JINJA=1`) picks the hand-written renderer. A model file with no usable template falls back to the hand-written renderer with a warning — unless `--jinja` was passed by name, which turns the same situation into a startup failure. The template evaluation costs about 35 µs a request against the hand-written renderer's 1 µs, both far under the tokenization that follows. |
 | `--api-key <KEY>` | `LLMXABE_API_KEY` | none | Key callers must present, in `Authorization: Bearer <key>` or `x-api-key: <key>`. With none set the server is open. See [API.md](API.md#authentication). |
 
+`--mcp-servers-config <PATH>` enables configured MCP sessions and tool execution.
+It requires an API key; see [Server-side MCP](MCP.md) for the configuration and
+opt-in Responses loop.
+
 ### Capacity and scheduling
 
 | Flag | Env | Default | Meaning |

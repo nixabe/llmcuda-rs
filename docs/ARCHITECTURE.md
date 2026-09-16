@@ -228,3 +228,11 @@ Video stays out of scope, and so does fetching remote image URLs.
 3. [SCHEDULER.md](SCHEDULER.md) — chunked prefill and admission
 4. [KERNELS.md](KERNELS.md) — what has to be written, and in what order
 5. [TESTING.md](TESTING.md) — how any of it is known to be correct
+
+## MCP serving layer
+
+`xabe-mcp` owns session-scoped MCP connections, bounded discovery, tool routing,
+and execution. It depends on neither the engine nor the cache. `xabe-server`
+adds authenticated session/tool endpoints and an opt-in Responses loop above
+normal generation. Each model turn releases its inference request before tool
+execution. See [MCP.md](MCP.md) for lifecycle, limits, and verification.

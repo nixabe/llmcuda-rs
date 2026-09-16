@@ -9,8 +9,9 @@ execution service without changing the inference engine.
 E2B-compatible API. An AgentENV harness can use the E2B SDK pointed at its
 AgentENV server and map registered tool names to that SDK's operations. There
 is no built-in AgentENV network client or sandbox provisioning in llmxabe.
-The HTTP endpoints generate calls; the harness owns execution and sandbox
-credentials.
+Ordinary HTTP requests generate calls for the harness. The opt-in
+[server-side MCP mode](MCP.md) can execute configured MCP tools and run a
+bounded generation loop. An optional AgentENV bridge is documented there.
 
 ## Rust integration
 
@@ -54,8 +55,11 @@ Dispatch each completed call in order, or apply the harness's own concurrency
 policy. The adapter does not retry failed calls or deduplicate repeated IDs;
 the harness decides whether an operation can safely be retried. Backend errors
 propagate to the harness so it can apply its own error reporting policy.
-Successful string outputs remain text; structured outputs become JSON text.
-Image-bearing results should be built with the API's native content blocks.
+`Sandbox::execute` returns `ToolOutput`: text/image content, optional structured
+JSON, and a tool-error flag. `dispatch` preserves content blocks and correlation
+IDs in each dialect; structured data is also rendered as JSON text. Backend
+errors remain separate from tool-error results. `McpSandbox` implements this
+trait for an explicit `xabe-mcp` session.
 
 For streaming, assemble each call's argument deltas before parsing and
 executing it. A block-start event with empty input is not a completed call.
@@ -74,6 +78,7 @@ Malformed or truncated bare function blocks retain their original text.
 Tests cover all three generated wire formats, result IDs, replay (including
 Responses namespaces), fake-backend dispatch, nested arguments, Unicode and
 multiline commands, and every character-boundary split of a streamed call.
-These are CPU protocol tests; they do not establish model tool-selection
-quality or connectivity to a live AgentENV deployment. Existing API limitations,
+These CPU protocol tests are supplemented by the GPU and live AgentENV
+checks described in [MCP validation](MCP.md#validation). They are compatibility
+checks, not a general model tool-selection evaluation. Existing API limitations,
 including forcing `tool_choice`, remain documented in [API.md](API.md).

@@ -189,6 +189,10 @@ penalties do not currently suppress repetition here.
 
 ## Tool calling
 
+For opt-in server-owned MCP discovery, execution, and the bounded Responses
+loop, see [Server-side MCP](MCP.md). Ordinary requests continue returning calls
+for the harness to execute.
+
 For harness-owned sandbox execution, including AgentENV, see
 [Sandbox tool calls](SANDBOX.md) and the `xabe_server::sandbox::Sandbox` trait.
 

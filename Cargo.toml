@@ -11,6 +11,7 @@ members = [
     "crates/xabe-grammar",
     "crates/xabe-engine",
     "crates/xabe-server",
+    "crates/xabe-mcp",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ repository = "https://github.com/nixabe/llmxabe"
 authors = ["llmxabe contributors"]
 
 [workspace.dependencies]
+xabe-mcp = { path = "crates/xabe-mcp" }
 xabe-gguf = { path = "crates/xabe-gguf" }
 xabe-model = { path = "crates/xabe-model" }
 xabe-cache = { path = "crates/xabe-cache" }

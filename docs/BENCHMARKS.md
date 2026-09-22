@@ -104,9 +104,12 @@ The discipline is the reason the standing can be trusted at all; several
 
 ## Current standing
 
-Every cell of the serving target — one card, N=3, llama.cpp at
-`-np 3 -b 4096 -ub 4096` — measured same-hour, same-card, alternating
-processes. Prefill on GPU 2, decode on GPU 1.
+The latest recorded cross-engine measurements cover the serving target:
+one card, N=3, llama.cpp at `-np 3 -b 4096 -ub 4096`. Prefill uses GPU 2,
+decode GPU 1; pairing conditions and exceptions are recorded below.
+The newer [engine-only comparison](OPTIMIZATION_CAMPAIGN.md#final-comparison-with-the-original-implementation)
+has its own original-versus-final pairs. These cross-engine margins have
+not been re-measured for those changes.
 
 | cell | llmxabe tok/s | llama.cpp tok/s | margin |
 | :--- | ---: | ---: | ---: |
@@ -124,18 +127,17 @@ ran a binary predating the per-sequence prefill fork, whose effect at those
 depths is orders of magnitude inside the reported margins; the 65K row was
 measured while gates ran on a neighbouring card and its margin is therefore a
 floor; the 128K rows ran clean and uncontended. The two decode rows are
-three same-hour alternating pairs (middle pair reversed) of the current
-tree against `llama-batched-bench` on GPU 1 with the box quiet, listed
+three same-hour alternating pairs (middle pair reversed) of the measured
+engine revision against `llama-batched-bench` on GPU 1 with the box quiet, listed
 pair by pair; the prefill 2K row is an alternating same-card run of the
-current tree whose llama.cpp column is the standing head-to-head rather
+measured engine revision whose llama.cpp column is the standing head-to-head rather
 than a same-hour re-run, so read that margin with llama.cpp's ~1%/day
 drift in mind.
 
-Single sequence, same tree, for reference: **~87.5 tok/s** decode at 32K
-(not re-measured since the decode folds) and 115 tok/s at 2K
-(`bench_decode_batch` at N=1). Aggregate across three cards, one session each, is a
-deployment figure and **not** the per-instance N=3 target — do not cite it as
-a replacement claim.
+Current single-sequence engine observations are included in the linked
+campaign comparison, separately for single-stream and batch-1 decode.
+Aggregate throughput across three cards with one session each is a deployment
+measurement; the serving target here remains N=3 on one instance.
 
 ### Capability
 

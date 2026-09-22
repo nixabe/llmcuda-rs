@@ -1,19 +1,21 @@
 # Inference optimization campaign
 
-Status: the original baseline, profiling, capture-tool validation, and
-deep-prefill attention phase are complete. The corrected fragment-softmax
-implementation is accepted. The exact-order gate experiments are complete and
-rejected. Consumer-side normalization is accepted after paired model measurements
-and the complete release suite. The query/key normalization grid seam is
-rejected after its deeper model comparison changes sign. The block-persistent
-GDN fragment is also rejected at the isolated gate. A test-only resident
-continuation prototype preserves exact output and reduces follow-up latency;
-production router integration remains future work. Speculation measurements
-are complete, with wide-verification correctness repairs retained and the
-plain-decode serving default unchanged. Final workspace validation passed;
-the original-versus-final comparison remains in progress.
+All eight phases are complete and committed. Fresh comparisons of the final
+implementation with the original show consistent prefill gains from 8K through
+128K, reaching 12.05–12.17% at 128K. N=3 decode improves 0.19–0.84% at 2K;
+the 32K and 120K pairs change direction and do not establish a reliable gain.
+Reported peak VRAM is unchanged. The complete release suite passed with the
+fixture and audit skips documented below; no numerical threshold was relaxed.
 
-| Experiment | Kernel throughput change | Prefill throughput change | Decode throughput change | Correct | Decision |
+The retained production changes are fragment-local prefill softmax with
+original rounding, consumer-side normalization, a partial-copy repair, and
+wide-verification correctness repairs. Resident continuation remains a
+test-only prototype: it preserves exact output and reduces follow-up latency
+in the two measured conversations. Production router integration is future
+work. Rejected experiments are documented, and plain decode remains the
+general serving default.
+
+| Experiment | Kernel throughput change | Prefill result | Decode or serving result | Correct | Decision |
 | --- | ---: | ---: | ---: | --- | --- |
 | Fragment softmax with implicit normalizer FMA | Not timed | Not timed | Not timed | No: forward golden | Reject arithmetic form |
 | Fragment softmax with explicit original rounding | +21.69–22.77% at 128K | +12.09–12.11% at 128K, N=3 | Not separately measured | Yes; full suite and new regression | Keep |
@@ -45,6 +47,19 @@ the original-versus-final comparison remains in progress.
 The documentation cleanup is commit `0e92f0c`. It changes descriptions,
 example messages, test names, and repository hygiene rules; it changes no
 inference arithmetic or correctness threshold.
+
+Each phase has its own commit:
+
+| Phase | Commit | Outcome |
+| --- | --- | --- |
+| 1: baseline and profiling | `957c02b` | Timed capture support and measured attribution |
+| 2: deep-prefill attention | `3366970` | Retain fragment-local softmax with original rounding |
+| 3: exact-order GDN gates | `b87ae7f` | Record rejected loading and grid experiments |
+| 4: consumer normalization | `335e6c3` | Retain RMSNorm plus GDN-gate fusion |
+| 5: further launch fusion | `5570127` | Reject query/key normalization seam |
+| 6: persistent fragment | `acdf717` | Reject block-persistent GDN prototype |
+| 7: resident continuation | `949c4a9` | Retain test-only prototype and partial-copy repair |
+| 8: speculative re-evaluation | `bca1014` | Retain exact verification repairs; measure policy crossover |
 
 The current comparison with llama.cpp remains in
 [BENCHMARKS.md](BENCHMARKS.md#current-standing). This campaign compares
@@ -147,6 +162,90 @@ Peak reported N=3 VRAM is 31.805, 33.555, and 38.711 GiB at those three
 depths. Decode rates are printed to one decimal place by the existing
 harness; the extra digits in the mean and SD describe that recorded data,
 not additional timing precision.
+
+## Final comparison with the original implementation
+
+A is the preserved original implementation, `d398f1940e1a9adc270661201465349fa4857545`.
+B is the validated final implementation, `bca1014c9708218282e361048ee7f265afe60796`.
+These are fresh alternating runs, not a comparison with the immediately
+preceding optimization or with the initial baseline taken hours earlier.
+The order is A1 B1 B2 A2 A3 B3, on GPU 1 with the same model, physical chunk
+sizes, contexts, warmups and timing windows specified above. Prefill and
+decode run serially, with no concurrent builds, tests or other GPU work.
+
+Frozen executable SHA-256 values:
+
+| Executable | A | B |
+| --- | --- | --- |
+| `bench_forward` | `dfa82d7c9a5b20730889cb9448028cf6fbea0ff91c5296cf0580e1eb9041efec` | `b7e064c67b07a95fc43c8ee9b972a7d226f059d1960ae09690eadba4627fe98c` |
+| `bench_decode_batch` | `da16972ba5163c88e1f1cbb4562a4c45960369f9507c3f82d42ba78dd529cc7c` | `3676b3b8508f8675d09f57e191137764dfed38d15ba10b3a7c1c817c7a300034` |
+
+All rates are aggregate tokens/s. Means and sample SD use the three
+observations per arm; the paired changes follow A1/B1, A2/B2 and A3/B3.
+
+### Final prefill, N=3
+
+| Workload / context / shape | A1 | B1 | B2 | A2 | A3 | B3 | A mean ± SD | B mean ± SD | Paired change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| prefill / 512 / batch 3 | 3252.95 | 3180.57 | 3180.37 | 3183.59 | 3180.34 | 3198.21 | 3205.63 ± 41.02 | 3186.38 ± 10.24 | -2.23% / -0.10% / +0.56% |
+| prefill / 2,046 / batch 3 | 3666.56 | 3633.56 | 3633.14 | 3609.94 | 3609.63 | 3632.62 | 3628.71 ± 32.78 | 3633.11 ± 0.47 | -0.90% / +0.64% / +0.64% |
+| prefill / 8,184 / batch 3 | 3405.45 | 3412.48 | 3415.18 | 3358.65 | 3364.24 | 3414.00 | 3376.11 ± 25.56 | 3413.89 ± 1.35 | +0.21% / +1.68% / +1.48% |
+| prefill / 32,736 / batch 3 | 2659.34 | 2779.46 | 2783.07 | 2643.26 | 2641.22 | 2780.43 | 2647.94 ± 9.93 | 2780.99 ± 1.87 | +4.52% / +5.29% / +5.27% |
+| prefill / 65,472 / batch 3 | 2082.88 | 2255.97 | 2257.05 | 2080.31 | 2079.05 | 2254.53 | 2080.75 ± 1.95 | 2255.85 ± 1.26 | +8.31% / +8.50% / +8.44% |
+| prefill / 130,944 / batch 3 | 1460.12 | 1637.85 | 1637.48 | 1460.62 | 1460.27 | 1636.30 | 1460.34 ± 0.26 | 1637.21 ± 0.81 | +12.17% / +12.11% / +12.05% |
+
+Every pair favors the final implementation from 8K through 128K. The
+128K improvement is 12.05–12.17%, with original rates of 1,460.12–1,460.62
+and final rates of 1,636.30–1,637.85 tokens/s. The two shallowest points
+change sign across pairs: 512 tokens and 2K do not establish a consistent
+gain or regression. At 512, the original arm itself spans 2.28%; its
+higher first observation must remain in the table, not be discarded to
+improve the reported result.
+
+Every 512-token process reports 32.229 GiB peak VRAM, and every longer
+ladder reports 42.104 GiB, for both original and final binaries. No increase
+in reported prefill VRAM accompanies the throughput improvement.
+
+### Final decode
+
+| Workload / context / shape | A1 | B1 | B2 | A2 | A3 | B3 | A mean ± SD | B mean ± SD | Paired change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| decode / 2,048 / batch 1 | 114.20 | 115.00 | 115.10 | 114.40 | 114.50 | 115.40 | 114.37 ± 0.15 | 115.17 ± 0.21 | +0.70% / +0.61% / +0.79% |
+| decode / 2,048 / batch 3 | 215.00 | 215.40 | 216.90 | 215.10 | 214.70 | 216.00 | 214.93 ± 0.21 | 216.10 ± 0.75 | +0.19% / +0.84% / +0.61% |
+| decode / 2,048 / single_stream | 113.50 | 114.00 | 114.50 | 113.40 | 113.60 | 114.40 | 113.50 ± 0.10 | 114.30 ± 0.26 | +0.44% / +0.97% / +0.70% |
+| decode / 32,768 / batch 1 | 97.40 | 97.80 | 98.30 | 97.90 | 98.10 | 97.90 | 97.80 ± 0.36 | 98.00 ± 0.26 | +0.41% / +0.41% / -0.20% |
+| decode / 32,768 / batch 3 | 167.10 | 165.70 | 166.90 | 166.50 | 165.20 | 165.50 | 166.27 ± 0.97 | 166.03 ± 0.76 | -0.84% / +0.24% / +0.18% |
+| decode / 32,768 / single_stream | 97.20 | 97.80 | 98.00 | 97.00 | 97.00 | 97.60 | 97.07 ± 0.12 | 97.80 ± 0.20 | +0.62% / +1.03% / +0.62% |
+| decode / 122,880 / batch 3 | 101.70 | 101.20 | 100.50 | 101.30 | 101.10 | 101.40 | 101.37 ± 0.31 | 101.03 ± 0.47 | -0.49% / -0.79% / +0.30% |
+| decode / 122,880 / single_stream | 65.80 | 66.00 | 66.40 | 65.50 | 65.80 | 66.70 | 65.70 ± 0.17 | 66.37 ± 0.35 | +0.30% / +1.37% / +1.37% |
+
+Single-stream decode favors the final implementation in all pairs at all
+three depths. Batch-1 decode gains 0.61–0.79% at 2K, but changes direction
+at 32K. For the primary N=3 target, the 2K pairs gain 0.19–0.84%; the
+32K pairs range from −0.84% to +0.24%, and the 120K pairs from −0.79%
+to +0.30%. The two deeper N=3 means are slightly lower (−0.14% and
+−0.33%). Their changes are smaller than the observed within-arm spread
+and change sign across pairs: this series establishes neither a consistent
+deep-batch gain nor the absence of a subpercent regression. The earlier
+longer, targeted normalization comparisons do not replace these final
+original-versus-final observations.
+
+These are 32-step timing windows, and decode rates are recorded to one
+decimal place. Additional digits in the means, SDs and changes summarize
+those recorded observations; they do not add measurement precision.
+
+Reported peak decode VRAM is identical in every original and final run:
+
+| Context | Single stream | Batch 1 | Batch 3 |
+| ---: | ---: | ---: | ---: |
+| 2,048 | 31.586 GiB | 31.586 GiB | 31.805 GiB |
+| 32,768 | 32.180 GiB | 32.180 GiB | 33.555 GiB |
+| 122,880 | 33.898 GiB | Not measured | 38.711 GiB |
+
+All 30 scheduled final-comparison processes completed successfully: 12
+prefill processes and 18 decode processes, yielding six observations for
+each of the 14 workload shapes. These measurements do not refresh the
+separate llama.cpp head-to-head.
 
 ## Original correctness checks
 
@@ -1158,13 +1257,11 @@ The next experiments justified by these results are:
    covers a complete row and can reproduce the canonical reduction. The
    small GDN-gate win does not establish that duplicating the reduction in
    larger projection grids will help.
+5. Refresh the separate llama.cpp standing with matched, alternating runs
+   at its best settings when that checkout is available. The original-engine
+   comparison here does not provide a new cross-engine ratio.
 
 CUDA graph capture remains a design constraint, not the largest unmeasured
 opportunity: its previously measured contribution does not justify ranking
 it ahead of these costs. Per-group page geometry, independent recurrent
 snapshot retention, and full-sequence admission are unchanged.
-
-## Results still required
-
-Compare the validated final tree with the original implementation across
-the complete prefill and decode ladder.

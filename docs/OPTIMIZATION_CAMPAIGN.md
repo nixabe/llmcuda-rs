@@ -4,7 +4,8 @@ Status: the original baseline, profiling, capture-tool validation, and
 deep-prefill attention phase are complete. The corrected fragment-softmax
 implementation is accepted. The exact-order gate experiments are complete and
 rejected. Consumer-side normalization is accepted after paired model measurements
-and the complete release suite.
+and the complete release suite. The query/key normalization grid seam is
+rejected after its deeper model comparison changes sign.
 
 | Experiment | Kernel throughput change | Prefill throughput change | Decode throughput change | Correct | Decision |
 | --- | ---: | ---: | ---: | --- | --- |
@@ -13,6 +14,7 @@ and the complete release suite.
 | Cooperative gate loading | Cache dependent; N=3 resident loss | Not measured | Not measured | Bit-exact isolated probe | Reject |
 | One head per gate block | Cache dependent | Not measured | −0.09–0.14% at 2K, N=3 | Yes; targeted model checks | Reject |
 | Consumer RMSNorm plus GDN gates | About +21% resident / +39% rotating weights, N=3 | Not separately measured | +0.14–0.32% at 2K; +0.42–0.48% at 32K, N=3 | Yes; full suite and CPU/GPU regression | Keep |
+| Query/key head norm grid seam | +72.9–73.8%, N=3 | Not measured | +0.09–0.28% at 2K; −0.24% to +0.24% at 32K, N=3 | Yes; targeted model and CPU/GPU checks | Reject: depth result changes sign |
 
 ## Scope and provenance
 
@@ -647,10 +649,100 @@ profiling overhead are uncontrolled between them. The unprofiled reversed
 pairs above determine acceptance. Final source formatting produces
 byte-identical NVRTC PTX to the measured implementation.
 
+## Query/key head normalization grid seam
+
+The post-normalization 2K, N=3 trace identifies these sub-10-microsecond
+kernels. Rows are ordered by total duration in the 32-step capture; launch
+counts and averages describe that same capture. These durations include
+instrumentation and select candidates, not performance claims.
+
+| Kernel | Total ms | Calls | Mean us |
+| --- | ---: | ---: | ---: |
+| `moe_route` | 11.496 | 1280 | 8.981 |
+| `moe_block_router_logits_t3` | 11.254 | 1280 | 8.792 |
+| `gdn_norm_alpha_beta_gates` | 6.971 | 960 | 7.261 |
+| `rms_norm_rows` | 6.759 | 2272 | 2.975 |
+| `gdn_conv_silu_split_step_batch` | 5.889 | 960 | 6.135 |
+| `moe_block_gate_and_combine` | 5.156 | 1280 | 4.028 |
+| `rms_norm_swiglu_rows` | 2.772 | 960 | 2.888 |
+| `attn_decode_rope_append_batch` | 2.196 | 320 | 6.861 |
+| `gdn_normalize_qk` | 2.187 | 960 | 2.278 |
+| `sigmoid_gate_mul` | 0.751 | 320 | 2.345 |
+| `tensor_add` | 0.599 | 320 | 1.873 |
+| `attn_split_query_gate` | 0.576 | 320 | 1.800 |
+| `argmax_partial` | 0.443 | 96 | 4.617 |
+| `argmax_final` | 0.200 | 96 | 2.079 |
+| `fwd_embed_q8_0` | 0.150 | 32 | 4.679 |
+
+Query and key per-head norms each use 256 threads and independent 256-float
+rows. Once the key/value projections finish, both inputs are ready; assigning
+the first grid range to query rows and the second to key rows can remove one
+launch at each of ten attention layers. Their weights and outputs are
+disjoint. The query norm moves later, so whole-model measurements must check
+whether the altered order changes cache behavior. The trial only selects
+hidden=2,048, 16 query heads, two KV heads, head width 256, and one through
+three tokens. Other geometries and larger chunks keep the old order.
+
+The isolated source retains the norm's exact tree and multiplication order.
+N=1 and N=3 match all 18,432 output floats in bits. Both original and seam
+use 22 registers, zero local bytes, 256 threads and 32 dynamic shared bytes;
+the resource ceiling remains four blocks / 32 warps per SM. Each graph
+contains 300 fragments, with 200 warmup replays and ten timed replays.
+A has two launches per fragment; B has one. All values are us/fragment:
+
+| N | A1 | B1 | B2 | A2 | A3 | B3 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 3.7091 | 1.7239 | 1.7159 | 3.2031 | 3.2031 | 1.7169 |
+| 3 | 3.4961 | 2.0216 | 2.0215 | 3.5140 | 3.5142 | 2.0232 |
+
+The first N=1 A measurement still exposes startup clock drift; it is
+retained rather than discarded. N=3 improves in all pairs by 72.9–73.8%
+in fragment throughput. The integrated kernel retains 22 registers, no
+stack or spill traffic and no local bytes. Targeted release tests pass:
+27 successful returns across batch decode, batch prefill, forward golden
+and layer-op differential targets; zero failures and one opt-in audit skip.
+The new N=1/2/3 regression compares separate and merged GPU outputs in bits
+and checks both row sets against the existing CPU RMSNorm reference with
+unchanged tolerances. The full-model measurements are below.
+
+### Head-normalization full-model pairs
+
+A is commit `335e6c3`'s measured inference implementation. B adds only the
+query/key norm seam. The protocol uses four discarded warmup steps and
+128 timed decode steps, greedy sampling included, with each process on
+GPU 1 and no concurrent build/test/GPU work. Rates are aggregate tokens/s.
+
+| Context | Shape | A1 | B1 | B2 | A2 | A3 | B3 | Paired change | A mean ± SD | B mean ± SD |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 2048 | single_stream | 114.8 | 114.6 | 114.3 | 114.3 | 114.2 | 114.4 | -0.17% / +0.00% / +0.18% | 114.43 ± 0.32 | 114.43 ± 0.15 |
+| 2048 | batch 1 | 114.9 | 115.1 | 115.2 | 115.0 | 114.9 | 115.0 | +0.17% / +0.17% / +0.09% | 114.93 ± 0.06 | 115.10 ± 0.10 |
+| 2048 | batch 3 | 216.3 | 216.5 | 216.7 | 216.1 | 216.0 | 216.3 | +0.09% / +0.28% / +0.14% | 216.13 ± 0.15 | 216.50 ± 0.20 |
+| 32768 | single_stream | 97.9 | 97.8 | 97.6 | 97.5 | 97.5 | 97.7 | -0.10% / +0.10% / +0.21% | 97.63 ± 0.23 | 97.70 ± 0.10 |
+| 32768 | batch 1 | 98.1 | 98.1 | 98.0 | 98.0 | 97.8 | 97.8 | +0.00% / +0.00% / +0.00% | 97.97 ± 0.15 | 97.97 ± 0.15 |
+| 32768 | batch 3 | 166.7 | 166.5 | 166.6 | 166.2 | 166.6 | 166.2 | -0.12% / +0.24% / -0.24% | 166.50 ± 0.26 | 166.43 ± 0.21 |
+
+At 2K, all three batch-1 and N=3 pairs favor the seam; single-stream N=1
+changes sign and has identical means. At 32K, batch-1 ties in all three pairs
+and N=3 loses two of three pairs. Its −0.12% / +0.24% / −0.24% changes are
+smaller than the observed 0.30% spread between baseline N=3 runs. The deeper
+result is inconclusive, with no stable improvement. These rounded,
+sub-drift rates do not justify a context-specific dispatch. The candidate is
+rejected and its implementation and added test are reverted. No prefill
+benefit or regression is claimed. Peak N=3 VRAM remains 31.805 / 33.555 GiB
+at 2K / 32K.
+
+A separate bounded 32-step Nsight capture verifies 629 → 619 launches per
+step. Standalone RMSNorm calls fall from 71 to 51, with ten paired calls
+added. Thus the launch saving is real, but insufficient to establish the
+required model gain. The restored inference source is byte-identical to
+`335e6c3`, whose GPU 1 release suite completed 87 targets with 976 successful
+returns, zero failures and 12 explicit skips. Formatting and all-target
+workspace Clippy are checked again after restoration. No additional full
+suite is attributed to the rejected trial.
+
 ## Results still required
 
-1. Investigate additional launch fusion and one persistent fragment, in
-   that order unless the profile establishes a different priority.
+1. Investigate one isolated persistent fragment.
 2. Prototype or implement safe same-slot continuation and measure multi-turn
    time to first token, transferred bytes, reuse, and conversation time.
 3. Re-evaluate the available speculative drafters after the kernel work.

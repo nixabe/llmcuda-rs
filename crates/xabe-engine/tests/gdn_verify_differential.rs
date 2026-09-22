@@ -320,3 +320,132 @@ fn committing_a_partial_ring_slot_matches_a_recurrent_prefix() {
          exists for.",
     );
 }
+
+#[test]
+fn wide_repacked_verify_matches_single_token_outputs_and_rollback_bit_for_bit() {
+    use xabe_engine::block::gdn_verify::run_layer_with_snapshots_batch;
+
+    let Some(fx) = setup() else { return };
+    let dir = directory(&fx.file, &fx.config);
+    let mut weights = GdnLayerWeights::upload(&fx.stream, &fx.file, &dir, LAYER).unwrap();
+    let geometry = GdnGeometry {
+        max_tokens: 147,
+        ..fx.geometry
+    };
+    let mut block = GdnBlock::new(&fx.ctx, geometry).unwrap();
+    let repacked = block.repack(&fx.stream, &weights).unwrap();
+    // Match production residency: falling back to the GGUF layout must fail.
+    weights.qkv = None;
+    weights.gate = None;
+    weights.out = None;
+
+    fn identical(label: &str, actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "{label}");
+        if let Some(i) = actual
+            .iter()
+            .zip(expected)
+            .position(|(a, b)| !a.is_finite() || !b.is_finite() || a.to_bits() != b.to_bits())
+        {
+            panic!("{label} differs at {i}: {} vs {}", actual[i], expected[i]);
+        }
+    }
+
+    for (sequences, window) in [(1, 1), (1, 63), (1, 64), (1, 65), (3, 49)] {
+        let tokens = sequences * window;
+        let values = pseudo_random_hidden(tokens * geometry.hidden, 0x1234 + tokens as u64);
+        let hidden = fx.stream.clone_htod(&values).unwrap();
+        let mut states: Vec<_> = (0..sequences)
+            .map(|_| block.state(&fx.stream).unwrap())
+            .collect();
+        let mut rings: Vec<_> = (0..sequences)
+            .map(|_| GdnSnapshotRing::new(&fx.stream, &geometry, window + 1).unwrap())
+            .collect();
+        let mut expected = Vec::with_capacity(values.len());
+        let mut checkpoints = Vec::new();
+        for (seq, state) in states.iter_mut().enumerate() {
+            let conv = pseudo_random_hidden(geometry.conv_state_len(), 100 + seq as u64);
+            let recurrent: Vec<_> =
+                pseudo_random_hidden(geometry.recurrent_state_len(), 200 + seq as u64)
+                    .into_iter()
+                    .map(|v| v * 0.001)
+                    .collect();
+            fx.stream.memcpy_htod(&conv, &mut state.conv).unwrap();
+            fx.stream
+                .memcpy_htod(&recurrent, &mut state.recurrent)
+                .unwrap();
+            let mut reference = block.state(&fx.stream).unwrap();
+            fx.stream.memcpy_htod(&conv, &mut reference.conv).unwrap();
+            fx.stream
+                .memcpy_htod(&recurrent, &mut reference.recurrent)
+                .unwrap();
+            let accepted = (seq + 1) * window / (sequences + 1);
+            let mut partial = (conv.clone(), recurrent.clone());
+            let mut one = fx.stream.alloc_zeros::<f32>(geometry.hidden).unwrap();
+            let mut out = fx.stream.alloc_zeros::<f32>(geometry.hidden).unwrap();
+            for row in 0..window {
+                let start = (seq * window + row) * geometry.hidden;
+                fx.stream
+                    .memcpy_htod(&values[start..start + geometry.hidden], &mut one)
+                    .unwrap();
+                block
+                    .forward(
+                        &fx.stream,
+                        &weights,
+                        Some(&repacked),
+                        &mut reference,
+                        &one,
+                        &mut out,
+                    )
+                    .unwrap();
+                expected.extend(dtoh(&fx.stream, &out));
+                if row + 1 == accepted {
+                    partial = (
+                        dtoh(&fx.stream, &reference.conv),
+                        dtoh(&fx.stream, &reference.recurrent),
+                    );
+                }
+            }
+            checkpoints.push((
+                accepted,
+                (conv, recurrent),
+                partial,
+                (
+                    dtoh(&fx.stream, &reference.conv),
+                    dtoh(&fx.stream, &reference.recurrent),
+                ),
+            ));
+        }
+        let mut out = fx.stream.alloc_zeros::<f32>(values.len()).unwrap();
+        let mut scratch = GdnVerifyScratch::new(&fx.stream, &geometry, tokens).unwrap();
+        run_layer_with_snapshots_batch(
+            &fx.stream,
+            &mut block,
+            &weights,
+            Some(&repacked),
+            &mut states.iter_mut().collect::<Vec<_>>(),
+            &hidden,
+            &mut out,
+            &mut scratch,
+            &mut rings.iter_mut().collect::<Vec<_>>(),
+            window,
+        )
+        .unwrap();
+        identical("output", &dtoh(&fx.stream, &out), &expected);
+        for (seq, ((accepted, initial, partial, full), state)) in
+            checkpoints.iter().zip(&mut states).enumerate()
+        {
+            for (position, reference) in [(0, initial), (*accepted, partial), (window, full)] {
+                rings[seq].commit(&fx.stream, position, state).unwrap();
+                identical("conv", &dtoh(&fx.stream, &state.conv), &reference.0);
+                identical(
+                    "recurrent",
+                    &dtoh(&fx.stream, &state.recurrent),
+                    &reference.1,
+                );
+            }
+        }
+        println!(
+            "{sequences} sequences x {window} rows: output and zero/partial/full rollback bit-identical"
+        );
+    }
+}

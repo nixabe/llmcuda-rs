@@ -26,6 +26,11 @@
 //! `LLMXABE_BATCH_N` the widths. The synthetic prompt only seeds
 //! generation — past the first few tokens the timed window is the model's
 //! own text, which is the workload acceptance rates are about.
+//!
+//! `LLMXABE_TIMED_STEPS` selects a fixed scheduler-step window. Every
+//! sequence must remain active throughout setup and measurement; an early
+//! retirement is an error rather than a silently narrower throughput result.
+//! Per-sequence counts expose differing context growth between drafters.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -210,6 +215,7 @@ fn run_width(
         .ok()
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(quota * (drafts + 1) + 8);
+    info!("N={width} reserved output/sequence={max_output}");
     for sequence in 0..width {
         let request = NewRequest {
             id: RequestId(sequence as u64 + 1),
@@ -239,6 +245,9 @@ fn run_width(
     let prefill_started = Instant::now();
     while emitted.contains(&0) {
         let step = worker.step_device().map_err(|error| error.to_string())?;
+        if !step.completed.is_empty() || !step.stopped.is_empty() {
+            return Err("a sequence retired during prefill; increase LLMXABE_MAX_OUTPUT".into());
+        }
         for (id, _) in &step.generated {
             emitted[(id.0 - 1) as usize] += 1;
         }
@@ -256,6 +265,9 @@ fn run_width(
     // sequence has cleared the warm-up quota.
     while emitted.iter().any(|&count| count < WARMUP_TOKENS) {
         let step = worker.step_device().map_err(|error| error.to_string())?;
+        if !step.completed.is_empty() || !step.stopped.is_empty() {
+            return Err("a sequence retired during warmup; increase LLMXABE_MAX_OUTPUT".into());
+        }
         for (id, _) in &step.generated {
             emitted[(id.0 - 1) as usize] += 1;
         }
@@ -279,6 +291,9 @@ fn run_width(
     let fixed_steps: Option<u64> = std::env::var("LLMXABE_TIMED_STEPS")
         .ok()
         .and_then(|raw| raw.parse().ok());
+    if fixed_steps == Some(0) {
+        return Err("LLMXABE_TIMED_STEPS must be positive".into());
+    }
     let started = Instant::now();
     while match fixed_steps {
         Some(target) => timed_steps < target,
@@ -288,6 +303,20 @@ fn run_width(
             .any(|(&count, &start)| count < start + tokens_per_seq),
     } {
         let step = worker.step_device().map_err(|error| error.to_string())?;
+        if step.decode_items != width
+            || step.prefill_items != 0
+            || !step.completed.is_empty()
+            || !step.stopped.is_empty()
+        {
+            return Err(format!(
+                "timed width changed: expected {width}, got {} decode/{} prefill, \
+                 {} completed/{} stopped; increase LLMXABE_MAX_OUTPUT if a sequence retired",
+                step.decode_items,
+                step.prefill_items,
+                step.completed.len(),
+                step.stopped.len()
+            ));
+        }
         for (id, _) in &step.generated {
             emitted[(id.0 - 1) as usize] += 1;
         }
@@ -307,6 +336,10 @@ fn run_width(
         .sum();
     let tps = f64::from(window_tokens) / elapsed;
     let tokens_per_step = f64::from(window_tokens) / timed_steps as f64;
+    info!(
+        "N={width} emitted before window={window_start:?} after window={emitted:?}, \
+         timed seconds={elapsed:.6} prefill seconds={prefill_elapsed:.6}"
+    );
     Ok(WidthResult {
         prefill_tps,
         tps,

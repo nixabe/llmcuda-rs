@@ -8,7 +8,10 @@ and the complete release suite. The query/key normalization grid seam is
 rejected after its deeper model comparison changes sign. The block-persistent
 GDN fragment is also rejected at the isolated gate. A test-only resident
 continuation prototype preserves exact output and reduces follow-up latency;
-production router integration remains future work.
+production router integration remains future work. Speculation measurements
+are complete, with wide-verification correctness repairs retained and the
+plain-decode serving default unchanged. Final workspace validation passed;
+the original-versus-final comparison remains in progress.
 
 | Experiment | Kernel throughput change | Prefill throughput change | Decode throughput change | Correct | Decision |
 | --- | ---: | ---: | ---: | --- | --- |
@@ -20,6 +23,8 @@ production router integration remains future work.
 | Query/key head norm grid seam | +72.9–73.8%, N=3 | Not measured | +0.09–0.28% at 2K; −0.24% to +0.24% at 32K, N=3 | Yes; targeted model and CPU/GPU checks | Reject: depth result changes sign |
 | Block-persistent GDN normalization and recurrence | −1.20–1.66% N=3 resident; +2.01–2.35% rotating states; N=1 loses | Not measured | Not measured | Bit-exact isolated probe | Reject |
 | Exact-prefix resident continuation | No kernel change | Follow-up TTFT −8.34–18.31% | Conversation wall time −0.27–0.83%; cold tok/s not measured | Bit-exact logits and generated IDs; ownership and copy regressions | Keep test-only prototype |
+| Wide-verification residency and arithmetic | No new CUDA kernel | Ordinary prefill unchanged | No speed claim against broken verification | New bit-exact GDN and full-model acceptance regressions | Keep correctness repair |
+| Existing speculative policies | No kernel change | MTP loses at depth; all observations below | Map: +10.37–10.43% shallow N=1, +1.29–1.49% at 120K N=3 with full acceptance; active policies lose shallow/32K N=3 | Corrected verify path and fixed-width guard | Keep plain serving default; record conditional crossover |
 
 ## Scope and provenance
 
@@ -930,8 +935,236 @@ returns, zero failures, 12 explicit fixture/audit skips, and one ignored
 manual conversation test (executed successfully above). Formatting and
 workspace all-target Clippy are clean. No numerical tolerance was changed.
 
+## Speculative decoding after the kernel changes
+
+Re-evaluation exposed two correctness problems in previously unexercised
+wide verification, before a performance decision could be made. At three
+49-row windows, GDN's prefill threshold discarded its split-layout handle
+at 64 total rows. The fallback requested stored Q8_0 bytes that production
+no longer keeps resident. Removing that threshold preserves the existing
+four-row projection slices and their one-token FMA order; it does not add
+another copy of the weights or switch verification to integer MMA.
+
+A new full-model regression then caught a second failure: attention still
+selected prefill arithmetic for a wide verify shape. The crafted draft
+expected 24 accepted tokens but stopped at 10. Verification now explicitly
+selects ordinary FP32 attention projections and per-query decode attention
+at every window width, just as its MoE already selects an exact decode
+regime. This setting is local to the verify pass. Ordinary prefill and
+plain-decode dispatch remain the same. No CUDA source or numerical tolerance
+changes in this repair; it selects existing kernels for the required
+arithmetic, even where that costs additional launches.
+
+Two regressions passed on GPU 1:
+
+- A real-weight GDN differential removes all stored-format projection
+  copies, then compares every output and zero/partial/full rollback state
+  bit for bit against a single-token chain. Cases cover 1, 63, 64 and 65
+  rows, plus three independent 49-row windows. All pass.
+- A full-model three-sequence verify test crafts zero, 24-token and
+  48-token acceptance, checks each bonus token immediately, and compares
+  64 emitted tokens per sequence with plain greedy decode. It failed with
+  only the residency fix and passed after selecting exact attention.
+
+The benchmark also refuses a request that retires during setup or timing,
+and refuses a changed decode width. A deliberate 40-token output budget at
+N=3 triggers the guard before any throughput result is published. Per-sequence
+emission counts and wall times are logged outside the timed window, exposing
+both acceptance imbalance and context growth.
+
+The frozen corrected benchmark executable has SHA-256
+`d26308a1a1c2be7ffd82cdea91398564cb18e8d0a61be50ea05795bf8ab749a7`.
+Measurements use the same target model and GPU 1 as the earlier phases.
+Every policy in a configuration reserves the same output budget; the
+393,216-token pool and 1% watermark are unchanged. The generated text is the
+model's own greedy continuation of the existing deterministic synthetic
+prompt, after every sequence has emitted at least 32 warmup tokens.
+
+| Configuration | Initial context/sequence | N | Timed window | Reserved output/sequence | Policies and draft caps |
+| --- | ---: | ---: | --- | ---: | --- |
+| Shallow N=1 | 256 | 1 | At least 512 emitted tokens | 8,192 | none, map-k 48, MTP 3 |
+| Sustained shallow N=3 | 256 | 3 | 512 scheduler steps | 32,768 | none, simple 48, map-k4v 8, MTP 3 |
+| 32K N=3 | 32,768 | 3 | 64 scheduler steps | 8,192 | same four policies |
+| 120K N=3 | 122,880 | 3 | 32 scheduler steps | 4,096 | same four policies, subject to allocation |
+
+The N=1 token quota limits differences in generated length; an accepted
+window can overshoot it, so actual counts are retained. N=3 uses fixed
+scheduler steps to keep all three sequences active and avoid the old
+slowest-sequence quota skew. This still permits differing context growth,
+which must remain explicit: sustained shallow results are not rates at a
+single fixed KV depth. Deep windows are short relative to their initial
+context. The policy order is A B C, C B A, A B C, or A B C D, D C B A,
+A B C D when there are three candidate policies. A is always `none`.
+An allocation failure is recorded once rather than repeatedly timed.
+
+Earlier exploratory runs used a 128-step shallow window, where the N=1 map
+policy emitted no extra tokens per step, and then a 512-step window. The
+latter activated wide N=3 verification and exposed the missing-weight error.
+Those runs are retained locally with their original executable and logs;
+wide pre-repair timings are not evidence for a correct implementation.
+The final comparisons use the corrected executable above.
+
+The narrow per-query attention dispatch already existed in the original
+campaign commit. Consequently, a difference from older speculative tables
+cannot be attributed solely to the campaign's prefill attention optimization.
+The corrected verify path deliberately retains decode arithmetic at all
+widths, so the prefill MMA improvement is not itself a verify-kernel win.
+DFlash is unavailable because its model file is absent; it is not measured.
+
+All 42 scheduled successful policy measurements completed. The one failed
+allocation was simple at cap 48, N=3 and 122,880 tokens/sequence; its later
+repetitions were skipped after the first explicit `CUDA_ERROR_OUT_OF_MEMORY`.
+This is a memory rejection, not a zero-throughput observation.
+
+On the matched shallow N=1 quota, map-k gains 10.37–10.43% and MTP gains
+5.61–6.28%. Every measured active speculative policy loses during sustained
+shallow N=3 generation and at 32K. Simple at 32K emits no extra tokens per
+step; its near-plain rate is not an active-drafting win.
+
+The deep result is different: map-k4v at cap 8 gains 1.29–1.49% in every pair,
+with perfect acceptance (27 tokens/step). MTP also has perfect acceptance
+(12 tokens/step), but loses 11.14–11.23%. Map's approximately 265 ms step
+barely repays its ninefold output multiple against plain decode's 30 ms;
+MTP's approximately 134 ms step cannot repay a fourfold multiple. These are
+completed worker-step wall costs, not per-kernel CUDA-event timings. Neither
+the small deep map win nor the shallow single-stream wins justify changing
+the general serving default. The measured text and acceptance distribution
+are part of each result.
+
+Both correctness repairs are retained. No performance gain is claimed
+against the broken wide-verification path, and no new speculation kernel or
+policy is introduced. The default remains plain decode. The following
+observations are tokens/s; repeated emission counts were identical across
+all three runs of each configuration. `quota-shallow-n1` and
+`long-shallow-n3` identify the two shallow windows in the method table above.
+
+### Speculative prefill observations
+
+| Configuration / policy (cap) | Run 1 | Run 2 | Run 3 | Mean ± sample SD |
+| --- | ---: | ---: | ---: | ---: |
+| quota-shallow-n1 / none (0) | 1615.9 | 1583.9 | 1600.8 | 1600.20 ± 16.01 |
+| quota-shallow-n1 / ngram-map-k (48) | 1593.1 | 1581.5 | 1586.4 | 1587.00 ± 5.82 |
+| quota-shallow-n1 / draft-mtp (3) | 1519.1 | 1518.6 | 1546.4 | 1528.03 ± 15.91 |
+| long-shallow-n3 / none (0) | 1697.1 | 1740.3 | 1747.6 | 1728.33 ± 27.29 |
+| long-shallow-n3 / ngram-simple (48) | 1675.3 | 1692.6 | 1738.3 | 1702.07 ± 32.55 |
+| long-shallow-n3 / ngram-map-k4v (8) | 1704.4 | 1740.6 | 1728.8 | 1724.60 ± 18.46 |
+| long-shallow-n3 / draft-mtp (3) | 1610.0 | 1659.2 | 1643.6 | 1637.60 ± 25.14 |
+| 32k-n3 / none (0) | 2409.2 | 2411.0 | 2412.2 | 2410.80 ± 1.51 |
+| 32k-n3 / ngram-simple (48) | 2408.5 | 2411.4 | 2411.9 | 2410.60 ± 1.84 |
+| 32k-n3 / ngram-map-k4v (8) | 2408.9 | 2410.7 | 2410.6 | 2410.07 ± 1.01 |
+| 32k-n3 / draft-mtp (3) | 2259.1 | 2258.7 | 2262.6 | 2260.13 ± 2.15 |
+| 120k-n3 / none (0) | 1526.9 | 1528.3 | 1529.0 | 1528.07 ± 1.07 |
+| 120k-n3 / ngram-map-k4v (8) | 1528.1 | 1527.4 | 1529.5 | 1528.33 ± 1.07 |
+| 120k-n3 / draft-mtp (3) | 1415.7 | 1416.3 | 1417.8 | 1416.60 ± 1.08 |
+
+### Speculative decode observations
+
+| Configuration / policy (cap) | Run 1 | Run 2 | Run 3 | Mean ± sample SD |
+| --- | ---: | ---: | ---: | ---: |
+| quota-shallow-n1 / none (0) | 118.4 | 117.9 | 117.7 | 118.00 ± 0.36 |
+| quota-shallow-n1 / ngram-map-k (48) | 130.7 | 130.2 | 129.9 | 130.27 ± 0.40 |
+| quota-shallow-n1 / draft-mtp (3) | 125.4 | 125.3 | 124.3 | 125.00 ± 0.61 |
+| long-shallow-n3 / none (0) | 219.7 | 219.4 | 219.6 | 219.57 ± 0.15 |
+| long-shallow-n3 / ngram-simple (48) | 149.1 | 148.6 | 149.2 | 148.97 ± 0.32 |
+| long-shallow-n3 / ngram-map-k4v (8) | 101.5 | 101.2 | 101.2 | 101.30 ± 0.17 |
+| long-shallow-n3 / draft-mtp (3) | 168.8 | 168.4 | 168.8 | 168.67 ± 0.23 |
+| 32k-n3 / none (0) | 165.8 | 166.0 | 165.7 | 165.83 ± 0.15 |
+| 32k-n3 / ngram-simple (48) | 165.4 | 165.2 | 165.2 | 165.27 ± 0.12 |
+| 32k-n3 / ngram-map-k4v (8) | 117.6 | 117.8 | 117.8 | 117.73 ± 0.12 |
+| 32k-n3 / draft-mtp (3) | 127.4 | 127.4 | 127.7 | 127.50 ± 0.17 |
+| 120k-n3 / none (0) | 100.5 | 100.6 | 100.7 | 100.60 ± 0.10 |
+| 120k-n3 / ngram-map-k4v (8) | 102.0 | 101.9 | 102.0 | 101.97 ± 0.06 |
+| 120k-n3 / draft-mtp (3) | 89.3 | 89.3 | 89.4 | 89.33 ± 0.06 |
+
+### Generation windows
+
+| Configuration / policy | Emitted before timing, by sequence | Emitted after timing, by sequence | Tokens/step | Paired decode change |
+| --- | --- | --- | ---: | --- |
+| quota-shallow-n1 / none | [32] | [544] | 1.000 | control |
+| quota-shallow-n1 / ngram-map-k | [32] | [569] | 2.114 | +10.39% / +10.43% / +10.37% |
+| quota-shallow-n1 / draft-mtp | [32] | [546] | 2.856 | +5.91% / +6.28% / +5.61% |
+| long-shallow-n3 / none | [32, 32, 32] | [544, 544, 544] | 3.000 | control |
+| long-shallow-n3 / ngram-simple | [32, 32, 32] | [736, 544, 544] | 3.375 | -32.13% / -32.27% / -32.06% |
+| long-shallow-n3 / ngram-map-k4v | [47, 32, 104] | [2486, 544, 3737] | 12.859 | -53.80% / -53.87% / -53.92% |
+| long-shallow-n3 / draft-mtp | [41, 32, 43] | [1885, 1783, 2089] | 11.018 | -23.17% / -23.25% / -23.13% |
+| 32k-n3 / none | [34, 33, 32] | [98, 97, 96] | 3.000 | control |
+| 32k-n3 / ngram-simple | [34, 33, 32] | [98, 97, 96] | 3.000 | -0.24% / -0.48% / -0.30% |
+| 32k-n3 / ngram-map-k4v | [105, 32, 71] | [681, 96, 647] | 19.000 | -29.07% / -29.04% / -28.91% |
+| 32k-n3 / draft-mtp | [64, 34, 50] | [320, 204, 306] | 10.656 | -23.16% / -23.25% / -22.93% |
+| 120k-n3 / none | [34, 33, 32] | [66, 65, 64] | 3.000 | control |
+| 120k-n3 / ngram-map-k4v | [62, 77, 36] | [350, 365, 324] | 27.000 | +1.49% / +1.29% / +1.29% |
+| 120k-n3 / draft-mtp | [45, 51, 32] | [173, 179, 160] | 12.000 | -11.14% / -11.23% / -11.22% |
+
+## Final correctness
+
+The complete release workspace suite passed on GPU 1 after the wide-verify
+repairs: 87 targets, 983 successful test returns, zero failures, 12 explicit
+fixture/audit skips, and one ignored manual conversation benchmark. The
+ignored benchmark was run separately in the resident-continuation phase;
+its implementation and ordinary-forward dispatch are unchanged by the
+verification repairs. Formatting and workspace all-target Clippy are clean.
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets
+CUDA_VISIBLE_DEVICES=1 \
+  LLMXABE_GOLDEN=/home/nixabe/llmxabe/.golden/qwen36-golden.bin \
+  cargo test --workspace --release -- --test-threads=1 --nocapture
+```
+
+The executed GPU checks include the forward golden, batch decode and
+prefill, graph replay, attention, GDN, MoE and LM-head differentials,
+serving speculative identity, and both new wide-verification regressions.
+No threshold was loosened. The 12 explicit skips cover absent dense-model,
+DFlash, vision and live-template fixtures, plus opt-in audit runs; they are
+not numerical passes. Dense-model GPU correctness and DFlash execution are
+therefore not established by this campaign.
+
+## Remaining bottlenecks and next experiments
+
+The original traces identify two different limits. At shallow N=3 decode,
+expert projections occupy about 5.66 ms of the 13.42 ms active GPU interval,
+with GDN projections at 2.70 ms and the LM head at 0.96 ms. At 32K,
+attention rises to 4.66 ms. These are the measured original attributions,
+not a reconstructed profile of the final executable. The accepted decode
+fusion removes 30 launches; it does not change those projection kernels.
+The rejected head-normalization seam and persistent fragment demonstrate
+why a lower launch count alone does not identify the next useful change.
+
+Deep prefill remains an attention problem. The original 128K trace assigns
+59.9% of active kernel time to attention. The fragment rewrite removes
+shared-memory traffic while retaining the two block barriers per key octet,
+the 255-register allocation, and the one-block occupancy ceiling. A further
+experiment needs to shorten synchronization or fragment lifetimes without
+growing that live register set; widening the existing tiles has already
+failed. No post-change attribution percentage is inferred from throughput.
+
+The next experiments justified by these results are:
+
+1. Integrate resident continuation into a bounded production routing
+   experiment, checking actual chat-template token prefixes, multiple
+   sessions, cancellation and eviction pressure. Keep exclusive ownership
+   and the ordinary host-checkpoint fallback. The two measured conversations
+   justify this experiment, not a claim about production p99.
+2. Investigate shared work across verification rows while preserving the
+   one-token projection and attention arithmetic. Wide verification now
+   deliberately pays for per-query decode launches. Reusing prefill MMA
+   without a numerical argument would repeat the regression caught here.
+3. Profile the expert integer-unpacking path and deep decode attention
+   before selecting another kernel change. A memory-traffic reduction is
+   not sufficient evidence when the integer pipe or softmax is the limit.
+   Use a narrow probe, then the same alternating whole-model pairs.
+4. Consider another consumer normalization only where its grid already
+   covers a complete row and can reproduce the canonical reduction. The
+   small GDN-gate win does not establish that duplicating the reduction in
+   larger projection grids will help.
+
+CUDA graph capture remains a design constraint, not the largest unmeasured
+opportunity: its previously measured contribution does not justify ranking
+it ahead of these costs. Per-group page geometry, independent recurrent
+snapshot retention, and full-sequence admission are unchanged.
+
 ## Results still required
 
-1. Re-evaluate the available speculative drafters after the kernel work.
-2. Compare the final tree with the original implementation and report the
-   remaining bottlenecks and justified next experiments.
+Compare the validated final tree with the original implementation across
+the complete prefill and decode ladder.

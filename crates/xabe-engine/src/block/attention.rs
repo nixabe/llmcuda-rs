@@ -517,6 +517,10 @@ pub struct GatedAttentionBlock {
     /// token would pay all of it to fill an eighth of a fragment.
     int8: Option<Arc<AttnInt8>>,
 
+    /// Speculative verification must retain one-token arithmetic even when
+    /// its total rows or per-sequence window reach a prefill threshold.
+    exact_decode_regime: bool,
+
     /// Side streams and events for the batch-prefill per-sequence fan-out.
     ///
     /// The flattened pass runs the shared projections batch-wide, but rope,
@@ -904,6 +908,11 @@ impl GatedAttentionBlock {
         self.int8 = None;
     }
 
+    pub(crate) fn enable_exact_decode(&mut self) {
+        self.disable_tensor_cores();
+        self.exact_decode_regime = true;
+    }
+
     /// Whether this block has any repacked int8 weight resident.
     ///
     /// Per-projection since the `qwen35` file arrived: this is true when at
@@ -1146,6 +1155,7 @@ impl GatedAttentionBlock {
             rope_theta,
             weights,
             int8,
+            exact_decode_regime: false,
             batch_fork: if std::env::var_os("LLMXABE_ATTN_PREFILL_SERIAL").is_some() {
                 None
             } else {
@@ -1407,7 +1417,10 @@ impl GatedAttentionBlock {
         //    + 1` keys, which is the same causal bound the tiled kernels
         //    apply; step 8 has already appended every row's K and V, so the
         //    window each row reads is complete.
-        if t > 1 && t <= ROW_DECODE_MAX_QUERY && k.mixer.decode_split_is_available() {
+        if t > 1
+            && (self.exact_decode_regime
+                || (t <= ROW_DECODE_MAX_QUERY && k.mixer.decode_split_is_available()))
+        {
             k.mixer
                 .row_positions(stream, positions, &mut sc.row_positions, t)?;
             for i in 0..t {
@@ -2147,9 +2160,10 @@ impl GatedAttentionBlock {
             // the scratch (which is capped at the serving maximum) takes the
             // tiled kernel for its tail rather than sharing a slot.
             if chunk_tokens > 1
-                && chunk_tokens <= ROW_DECODE_MAX_QUERY
                 && i < sc.decode.len()
-                && k.mixer.decode_split_is_available()
+                && (self.exact_decode_regime
+                    || (chunk_tokens <= ROW_DECODE_MAX_QUERY
+                        && k.mixer.decode_split_is_available()))
             {
                 let mut rows = unsafe {
                     crate::viewslice::subslice(stream, &sc.row_positions, base, chunk_tokens)

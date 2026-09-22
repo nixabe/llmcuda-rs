@@ -50,8 +50,9 @@
 //! the first FMA; `split_tiled`
 //! is the GEMV's own grouping amortized across the window. Without that,
 //! `tests/speculative_identity.rs` would reject a draft the target's own
-//! one-token argmax would have emitted. The MMA path is never taken: a
-//! verify window does not cross [`GdnBlock::uses_tensor_cores`].
+//! one-token argmax would have emitted. The MMA path is never taken, even
+//! when a wide draft or several sequences cross the ordinary prefill
+//! threshold: verify must retain one-token arithmetic at every width.
 //!
 //! # Cost
 //!
@@ -226,8 +227,8 @@ impl GdnSnapshotRing {
 /// exactly, because this **is** `run`'s sequence — just with steps 3/4 and 7
 /// unrolled to one token at a time. Kept in this file rather than reused
 /// from `gdn.rs` because `Scratch` there is private, and the fields it needs
-/// are a strict subset of what `run` allocates (no tensor-core staging: `1 +
-/// d` tokens never crosses `GdnBlock::uses_tensor_cores`'s threshold). The
+/// are a strict subset of what `run` allocates (no tensor-core staging:
+/// verification always uses the exact-order projection path). The
 /// qkv/gate/out projections take `project_split_tiled` when the split-layout
 /// repack is present, matching one-token decode's GEMV — see the module docs.
 pub struct GdnVerifyScratch {
@@ -402,7 +403,11 @@ pub fn run_layer_with_snapshots_batch(
     //    first FMA matches one-token decode's GEMV. Standard-layout
     //    `project` is the fallback for callers that did not upload a
     //    repack — the differential test against a cold `GdnBlock`.
-    let split = int8.filter(|_| tokens > 1 && !GdnBlock::uses_tensor_cores(tokens));
+    // Total verify rows may exceed the prefill MMA threshold (for example,
+    // three 49-row windows). That threshold selects prefill arithmetic, not
+    // weight residency: Q8_0 can exist only in this split layout. Keep using
+    // the exact-width slices below regardless of the total window size.
+    let split = int8;
     if let Some(i8w) = split {
         // In slices of at most `SPLIT_PROJ_EXACT_TOKENS` rows: the wider
         // split tiles change the per-output accumulation order, and a

@@ -2706,6 +2706,12 @@ impl Forward {
         // Pin this pass's MoE to the flat decode regime for its lifetime —
         // a Forward with verify enabled is only ever used to verify.
         self.moe.set_exact_decode_regime(true);
+        // Wide verify windows also cross attention's projection and query
+        // tile thresholds. Keep decode arithmetic here, independently of
+        // the shape's ordinary prefill dispatch.
+        for block in &mut self.attention {
+            block.enable_exact_decode();
+        }
         let geometry = self.gdn.geometry();
         let mut scratch = Vec::with_capacity(self.gdn_weights.len());
         for _ in &self.gdn_weights {

@@ -315,11 +315,23 @@ fn twin_sequences_stay_identical_through_every_stage() {
 
 #[test]
 fn batched_verify_matches_plain_greedy_decode_for_every_sequence() {
+    check_batched_verify(sequences(), DRAFT_TOKENS, &[0, 1, 2, 3]);
+}
+
+#[test]
+fn wide_verify_matches_plain_decode_across_full_and_partial_acceptance() {
+    // The shipped 48-token n-gram cap makes 147 total rows at N=3,
+    // crossing the prefill MMA threshold. Verify must still use decode's
+    // arithmetic and the actually resident projection representation.
+    check_batched_verify(3, 48, &[0, 24, 48]);
+}
+
+fn check_batched_verify(n_seq: usize, draft_tokens: usize, acceptance_counts: &[usize]) {
+    let window = draft_tokens + 1;
     let _gpu_case = GPU_CASE.lock().expect("GPU test lock poisoned");
     let Some(fx) = setup() else { return };
 
     let vocab = fx.config.vocab_size as i64;
-    let n_seq = sequences();
     let prompts: Vec<Vec<i32>> = [(0x5EED, 16), (0xB0A7, 24), (0xD1CE, 20)][..n_seq]
         .iter()
         .map(|&(seed, len)| xorshift_prompt(seed, len, vocab))
@@ -344,7 +356,7 @@ fn batched_verify_matches_plain_greedy_decode_for_every_sequence() {
     // Plain greedy runs first: they are both the identity baseline and the
     // source of the crafted drafts. Decode a margin past MIN_STEPS so a
     // full-accept step near the end still has known continuations to draft.
-    let slack = MIN_STEPS + WINDOW + 4;
+    let slack = MIN_STEPS + 2 * window + 4;
     let max_seq = prompts.iter().map(Vec::len).max().unwrap() + slack + 8;
     let plain: Vec<Vec<i32>> = prompts
         .iter()
@@ -390,7 +402,7 @@ fn batched_verify_matches_plain_greedy_decode_for_every_sequence() {
             &fx.file,
             &dir,
             &weights,
-            n_seq * WINDOW,
+            n_seq * window,
         )
         .expect("verify pass reshapes");
     verify
@@ -402,24 +414,24 @@ fn batched_verify_matches_plain_greedy_decode_for_every_sequence() {
     let mut rings: Vec<_> = (0..n_seq)
         .map(|_| {
             verify
-                .new_verify_rings(&fx.stream, WINDOW)
+                .new_verify_rings(&fx.stream, window)
                 .expect("snapshot rings allocate")
         })
         .collect();
 
     let mut step = 0usize;
-    let mut window_ids = vec![0i32; n_seq * WINDOW];
-    let mut drafts = vec![[0i32; DRAFT_TOKENS]; n_seq];
+    let mut window_ids = vec![0i32; n_seq * window];
+    let mut drafts = vec![vec![0i32; draft_tokens]; n_seq];
     while emitted.iter().any(|e| e.len() < MIN_STEPS) {
         // Craft each sequence's draft from its own plain continuation:
         // correct for the first k_target positions, deliberately wrong
         // after. Different target counts per sequence in the same step
         // exercise per-sequence rollback within one batched pass.
         for s in 0..n_seq {
-            let k_target = (step + s) % (DRAFT_TOKENS + 1);
+            let k_target = acceptance_counts[(step + s) % acceptance_counts.len()];
             let e = emitted[s].len();
-            window_ids[s * WINDOW] = *emitted[s].last().expect("prefill emitted a token");
-            for j in 0..DRAFT_TOKENS {
+            window_ids[s * window] = *emitted[s].last().expect("prefill emitted a token");
+            for j in 0..draft_tokens {
                 let correct = plain[s][e + j];
                 let tok = if j < k_target {
                     correct
@@ -427,7 +439,7 @@ fn batched_verify_matches_plain_greedy_decode_for_every_sequence() {
                     (correct + 1) % vocab as i32
                 };
                 drafts[s][j] = tok;
-                window_ids[s * WINDOW + 1 + j] = tok;
+                window_ids[s * window + 1 + j] = tok;
             }
         }
 
@@ -436,10 +448,10 @@ fn batched_verify_matches_plain_greedy_decode_for_every_sequence() {
             .expect("batched verify runs");
 
         for s in 0..n_seq {
-            let k_target = (step + s) % (DRAFT_TOKENS + 1);
-            let seq_rows = &rows[s * WINDOW..(s + 1) * WINDOW];
+            let k_target = acceptance_counts[(step + s) % acceptance_counts.len()];
+            let seq_rows = &rows[s * window..(s + 1) * window];
             let mut accepted = 0usize;
-            while accepted < DRAFT_TOKENS && seq_rows[accepted] == drafts[s][accepted] {
+            while accepted < draft_tokens && seq_rows[accepted] == drafts[s][accepted] {
                 accepted += 1;
             }
             assert_eq!(

@@ -35,12 +35,15 @@
 //! Environment: `LLMXABE_MODEL` overrides the model path,
 //! `LLMXABE_BATCH_N` overrides the comma-separated batch widths (default
 //! `1,2,3,4,8`), `LLMXABE_DECODE_CHUNK` overrides the prefill chunk width.
+//! `LLMXABE_PROFILE_TIMED` brackets each timed decode sweep with the CUDA
+//! profiler API. Use `nsys -c cudaProfilerApi --capture-range-end=repeat`
+//! and `--cuda-graph-trace=node` to omit loading, prefill, and warmup.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use cudarc::driver::CudaContext;
+use cudarc::driver::{CudaContext, Profiler};
 use tracing::{error, info, warn};
 
 use xabe_cuda::arena::memory_info;
@@ -131,6 +134,7 @@ fn main() -> ExitCode {
     let context = nums.first().copied().unwrap_or(DEFAULT_CONTEXT);
     let steps = nums.get(1).copied().unwrap_or(DEFAULT_STEPS);
     let batch_widths = env_usize_list("LLMXABE_BATCH_N", DEFAULT_BATCH_WIDTHS);
+    let profile_timed = std::env::var_os("LLMXABE_PROFILE_TIMED").is_some();
 
     if !driver_available() {
         error!("No CUDA driver reachable on this host.");
@@ -250,6 +254,10 @@ fn main() -> ExitCode {
                 .expect("warmup decode step");
         }
 
+        let profiling = profile_timed
+            .then(Profiler::new)
+            .transpose()
+            .expect("start timed decode capture");
         let mut samples = Vec::with_capacity(steps);
         for _ in 0..steps {
             let t = Instant::now();
@@ -258,6 +266,7 @@ fn main() -> ExitCode {
                 .expect("timed decode step");
             samples.push(t.elapsed().as_secs_f64() * 1e3);
         }
+        drop(profiling);
         let (mean, _sd) = stats(&samples);
         let (free_now, _) = memory_info(&ctx).expect("memory info");
         info!(
@@ -328,6 +337,10 @@ fn main() -> ExitCode {
                 .expect("warmup batch decode step");
         }
 
+        let profiling = profile_timed
+            .then(Profiler::new)
+            .transpose()
+            .expect("start timed decode capture");
         let mut samples = Vec::with_capacity(steps);
         for _ in 0..steps {
             let t = Instant::now();
@@ -336,6 +349,7 @@ fn main() -> ExitCode {
                 .expect("timed batch decode step");
             samples.push(t.elapsed().as_secs_f64() * 1e3);
         }
+        drop(profiling);
         let (mean, _sd) = stats(&samples);
         let (free_now, _) = memory_info(&ctx).expect("memory info");
         info!(

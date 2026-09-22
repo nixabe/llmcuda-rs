@@ -33,12 +33,17 @@
 //! overrides the comma-separated batch sizes, `LLMXABE_BENCH_REPS` the
 //! repetition count. `LLMXABE_PREFILL_SEQUENCES` runs that many independent
 //! prompts through the chunked path in one timed serving batch (default 1).
+//! `LLMXABE_PROFILE_TIMED` brackets each timed pass or chunk with the CUDA
+//! profiler API. Use `nsys -c cudaProfilerApi --capture-range-end=repeat`
+//! to collect bounded traces without loading or discarded warmup work.
+//! Capture introduces synchronization between chunks; profiled throughput
+//! is not an uninstrumented benchmark result.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::{CudaContext, CudaStream, Profiler};
 use tracing::{error, info, warn};
 use xabe_cuda::arena::memory_info;
 use xabe_cuda::device::{DeviceInfo, driver_available};
@@ -108,6 +113,7 @@ fn main() {
     }
 
     let batches = env_usize_list("LLMXABE_BENCH_N", &[1, 19, 128, 512]);
+    let profile_timed = std::env::var_os("LLMXABE_PROFILE_TIMED").is_some();
     let reps: usize = std::env::var("LLMXABE_BENCH_REPS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -232,6 +238,10 @@ fn main() {
 
         let mut samples = Vec::with_capacity(reps);
         for _ in 0..reps {
+            let profiling = profile_timed
+                .then(Profiler::new)
+                .transpose()
+                .expect("start timed prefill capture");
             // The reset is inside the timed region because it used to be
             // inside `run`, and moving it out would make these numbers
             // quietly incomparable with every prefill measurement already in
@@ -243,6 +253,7 @@ fn main() {
                 .expect("forward pass");
             stream.synchronize().expect("sync");
             samples.push(t.elapsed().as_secs_f64() * 1e3);
+            drop(profiling);
         }
 
         let (mean, sd) = stats(&samples);
@@ -294,6 +305,7 @@ fn chunked_prefill(
     free_at_start: u64,
     total: u64,
 ) {
+    let profile_timed = std::env::var_os("LLMXABE_PROFILE_TIMED").is_some();
     let sequences = std::env::var("LLMXABE_PREFILL_SEQUENCES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -372,8 +384,12 @@ fn chunked_prefill(
             .collect();
 
         let mut flattened = Vec::with_capacity(chunk);
-        let mut run_once = |states: &mut [_]| -> Result<(), String> {
+        let mut run_once = |states: &mut [_], capture: bool| -> Result<(), String> {
             for c in 0..chunks {
+                let profiling = capture
+                    .then(Profiler::new)
+                    .transpose()
+                    .map_err(|e| format!("start chunk capture: {e}"))?;
                 if sequences == 1 || serial_sequences {
                     for (sequence, state) in states.iter_mut().enumerate() {
                         let slice = &ids[sequence][c * sequence_chunk..(c + 1) * sequence_chunk];
@@ -397,6 +413,12 @@ fn chunked_prefill(
                             format!("batch chunk {c} at position {}: {e}", c * sequence_chunk)
                         })?;
                 }
+                if capture {
+                    stream
+                        .synchronize()
+                        .map_err(|e| format!("finish chunk capture: {e}"))?;
+                }
+                drop(profiling);
             }
             Ok(())
         };
@@ -404,7 +426,7 @@ fn chunked_prefill(
         for state in &mut states {
             state.reset(stream).expect("reset");
         }
-        if let Err(e) = run_once(&mut states) {
+        if let Err(e) = run_once(&mut states, false) {
             error!("{n:>8} | FAILED during warmup: {e}");
             continue;
         }
@@ -419,7 +441,7 @@ fn chunked_prefill(
             for state in &mut states {
                 state.reset(stream).expect("reset");
             }
-            if let Err(e) = run_once(&mut states) {
+            if let Err(e) = run_once(&mut states, profile_timed) {
                 error!("{n:>8} | FAILED: {e}");
                 failed = true;
                 break;

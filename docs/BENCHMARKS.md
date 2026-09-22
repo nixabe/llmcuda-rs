@@ -2054,10 +2054,22 @@ LLMXABE_MODEL="$M" LLMXABE_SPEC=draft-mtp CUDA_VISIBLE_DEVICES=1 \
 # Per-kernel attribution of a decode step. `--cuda-graph-trace=node` is not
 # optional: decode replays a captured graph and without it nsys attributes one
 # pass and drops the rest.
-nsys profile -t cuda --cuda-graph-trace=node -s none -o d \
-  ./target/release/bench_decode 128 20
+LLMXABE_PROFILE_TIMED=1 LLMXABE_SKIP_SINGLE_STREAM=1 LLMXABE_BATCH_N=3 \
+  CUDA_VISIBLE_DEVICES=1 nsys profile -t cuda --cuda-graph-trace=node \
+  -c cudaProfilerApi --capture-range-end=repeat -s none -o d \
+  ./target/release/bench_decode_batch 32768 32
 nsys export --type sqlite -o d.sqlite d.nsys-rep
 ```
+
+`LLMXABE_PROFILE_TIMED` excludes loading, prefill setup, and discarded
+decode warmups from capture. `bench_forward` accepts the same switch and
+captures each timed prefill chunk separately; repeated ranges produce
+numbered reports. Export and sum their kernel intervals individually.
+Capture start/stop can take seconds on this host, so profiled rates are
+not throughput results. Bounded captures also avoid the event-order import
+failure observed when tracing long context setup. The current engine
+baseline and detailed attribution are in
+[OPTIMIZATION_CAMPAIGN.md](OPTIMIZATION_CAMPAIGN.md).
 
 The requantized files, and the two the engine cannot read. These are
 generated artifacts rather than anything shipped, so a checkout will not have

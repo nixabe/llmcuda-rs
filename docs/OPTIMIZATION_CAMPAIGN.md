@@ -5,7 +5,8 @@ deep-prefill attention phase are complete. The corrected fragment-softmax
 implementation is accepted. The exact-order gate experiments are complete and
 rejected. Consumer-side normalization is accepted after paired model measurements
 and the complete release suite. The query/key normalization grid seam is
-rejected after its deeper model comparison changes sign.
+rejected after its deeper model comparison changes sign. The block-persistent
+GDN fragment is also rejected at the isolated gate.
 
 | Experiment | Kernel throughput change | Prefill throughput change | Decode throughput change | Correct | Decision |
 | --- | ---: | ---: | ---: | --- | --- |
@@ -15,6 +16,7 @@ rejected after its deeper model comparison changes sign.
 | One head per gate block | Cache dependent | Not measured | −0.09–0.14% at 2K, N=3 | Yes; targeted model checks | Reject |
 | Consumer RMSNorm plus GDN gates | About +21% resident / +39% rotating weights, N=3 | Not separately measured | +0.14–0.32% at 2K; +0.42–0.48% at 32K, N=3 | Yes; full suite and CPU/GPU regression | Keep |
 | Query/key head norm grid seam | +72.9–73.8%, N=3 | Not measured | +0.09–0.28% at 2K; −0.24% to +0.24% at 32K, N=3 | Yes; targeted model and CPU/GPU checks | Reject: depth result changes sign |
+| Block-persistent GDN normalization and recurrence | −1.20–1.66% N=3 resident; +2.01–2.35% rotating states; N=1 loses | Not measured | Not measured | Bit-exact isolated probe | Reject |
 
 ## Scope and provenance
 
@@ -740,13 +742,83 @@ returns, zero failures and 12 explicit skips. Formatting and all-target
 workspace Clippy are checked again after restoration. No additional full
 suite is attributed to the rejected trial.
 
+## Block-persistent GDN fragment
+
+This prototype assigns one 256-thread block to a (sequence, value head).
+It normalizes that head's Q/K vectors into shared memory, then its eight
+warps each advance 16 recurrent-state rows before leaving the block. It
+combines two operations in one repeated layer fragment; it has no inter-block
+handshake, cooperative-grid requirement, CPU synchronization between layers,
+or whole-transformer persistent loop. Fixed pointers and launch geometry
+remain CUDA-graph compatible. No production dispatch is installed.
+
+The canonical 128-thread normalization uses four warp partials. The
+prototype's other four warps contribute positive zeros after those partials;
+the finite square sum keeps its original bits. State-row float4 loads,
+decay, delta correction, FMA order and warp XOR reductions are copied from
+`xabe-cuda`'s `gdn_recurrent_step`. Q/K remain resident in 1,024 shared bytes,
+with another 32 bytes for reductions. The two value heads sharing one Q/K
+head duplicate its normalization. Only one writes the normalized waypoint.
+Every warp loops over its disjoint rows, with sequence selected by the same
+fixed pointer-slot convention as the original kernel.
+
+At N=1 and N=3, three consecutive updates compare all recurrent state,
+normalized Q/K and output values against the original GPU fragment:
+6,389,760 float comparisons, all bit-identical. Inputs differ by sequence
+and include a zero Q/K head. This is direct GPU equivalence on the probe,
+not a new CPU differential or a full-model test of the prototype. The
+original GPU fragment's CPU differentials passed in the preceding complete
+release suite; no tolerance is changed.
+
+| Kernel | Threads/block | Registers/thread | Dynamic shared bytes | Local/stack/spill bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Original Q/K normalization | 128 | 27 | 16 | 0 |
+| Original recurrent step | 128 | 64 | 0 | 0 |
+| Combined head pipeline | 256 | 62 | 1,056 | 0 |
+
+Runtime JIT attributes and offline ptxas agree. Both the original state
+kernel and pipeline have a 32-warp/SM resource ceiling; the pipeline has
+four possible resident blocks instead of eight. More significantly, N=3
+shrinks the state grid from 3,072 blocks to 96, only 1.33 blocks per SM on
+average over this 72-SM card. At N=1 there are only 32 blocks. These are grid
+and resource limits, not measured occupancy. Lower register use does not
+compensate for the smaller grid in all tested cache states.
+
+The CUDA-event probe captures 300 fragments per graph, discards 200 warmup
+replays, and times ten replays per measurement. A has the separate normalize
+and state launches; B has the combined block pipeline. One bank reuses the
+same state; 30 banks rotate through 60 MiB (N=1) or 180 MiB (N=3) of state
+per arm. Q/K, gates and value inputs are fixed in each case. Values are
+us/complete fragment; every observation is retained, including the first
+N=1 run's startup drift.
+
+| N | State banks | A1 | B1 | B2 | A2 | A3 | B3 | Paired throughput change |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 1 | 6.3072 | 9.7387 | 9.8227 | 6.8122 | 6.6862 | 9.8336 | -35.24% / -30.65% / -32.01% |
+| 1 | 30 | 11.7118 | 14.9606 | 14.9763 | 11.7221 | 11.7382 | 14.9796 | -21.72% / -21.73% / -21.64% |
+| 3 | 1 | 20.2942 | 20.5397 | 20.6938 | 20.3767 | 20.3059 | 20.6479 | -1.20% / -1.53% / -1.66% |
+| 3 | 30 | 28.0072 | 27.4030 | 27.4129 | 28.0583 | 27.9756 | 27.4241 | +2.20% / +2.35% / +2.01% |
+
+Reject at the isolated gate. N=1 loses in every pair under both cache
+conditions, and N=3 loses with one resident state bank. The rotating N=3
+case does improve consistently, but its absolute saving is only
+0.55–0.65 us/fragment and does not establish a robust replacement for the
+independently specialized grids. No full-model integration, prefill or
+decode-rate claim follows from this experiment. A future N=3-only study
+would still need to establish the actual in-model cache condition and win
+whole-model pairs; these timings alone do not justify that dispatch.
+
+No production source changed. Its complete release-suite evidence remains
+`335e6c3` (87 targets, 976 successful returns, zero failures, 12 explicit
+skips); formatting and workspace all-target Clippy are checked for this
+phase's documentation commit.
+
 ## Results still required
 
-1. Investigate one isolated persistent fragment.
-2. Prototype or implement safe same-slot continuation and measure multi-turn
+1. Prototype or implement safe same-slot continuation and measure multi-turn
    time to first token, transferred bytes, reuse, and conversation time.
-3. Re-evaluate the available speculative drafters after the kernel work.
-4. Record each experiment's individual pairs, register/shared-memory changes,
+2. Re-evaluate the available speculative drafters after the kernel work.
+3. Record each experiment's individual pairs, register/shared-memory changes,
    correctness checks, and keep/reject decision.
-5. Compare the final tree with the original implementation and report the
+4. Compare the final tree with the original implementation and report the
    remaining bottlenecks and justified next experiments.

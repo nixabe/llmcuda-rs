@@ -1574,9 +1574,14 @@ than a fixed pool, so it degrades by evicting rather than by declining to
 publish. It also has a tier we do not: a slot keeps its KV in place between
 requests and takes the common prefix against what it already holds
 (`get_common_prefix` → `n_past`), so a continuing conversation that lands on
-its own slot costs nothing at all. Ours always pays a 102.81 MiB host round
-trip for the same continuation. Making same-slot continuation free is the
-obvious next lever and is not built.
+its own slot costs nothing at all. Our production route still restores from
+host snapshots (102.81 MiB in that measurement). A test-only exact-prefix resident-slot prototype now
+checks the mechanism: follow-up TTFT falls 8.34–18.31% across six paired
+file-tool conversations, while whole-conversation time falls only
+0.27–0.83% because file prefill and generation dominate. Both arms still
+write host snapshots. Identity, ownership, eviction and fallback are
+exercised; production routing under multiple sessions remains unimplemented.
+[All pairs, transfer bytes and scope](OPTIMIZATION_CAMPAIGN.md#exact-prefix-resident-continuation).
 
 ## A speculative output ceiling is not a prediction, so it is not a reservation
 

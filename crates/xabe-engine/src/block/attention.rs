@@ -101,7 +101,8 @@
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
-    CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError, PinnedHostSlice,
+    CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError, HostSlice,
+    PinnedHostSlice,
 };
 
 use xabe_cuda::arena::ArenaError;
@@ -367,7 +368,8 @@ pub struct KvCache {
     max_seq: usize,
 }
 
-/// One attention layer's preallocated retention-interval delta.
+/// Capacity for one attention layer's retention-interval delta. A snapshot
+/// can use a shorter prefix; its start and position determine the live length.
 pub(crate) struct HostKvPrefix {
     pub k: PinnedHostSlice<u16>,
     pub v: PinnedHostSlice<u16>,
@@ -451,10 +453,17 @@ impl KvCache {
         assert!(positions <= self.max_seq);
         let first = start * self.kv_dim;
         let elements = (positions - start) * self.kv_dim;
-        assert_eq!(elements, prefix.k.len());
-        assert_eq!(elements, prefix.v.len());
-        stream.memcpy_dtoh(&self.k.slice(first..first + elements), &mut prefix.k)?;
-        stream.memcpy_dtoh(&self.v.slice(first..first + elements), &mut prefix.v)?;
+        for (device, host) in [(&self.k, &mut prefix.k), (&self.v, &mut prefix.v)] {
+            assert!(elements <= host.len());
+            // SAFETY: the bounded view is used only on this stream. Keep the
+            // pinned allocation's event guard until its copy is enqueued;
+            // slicing via as_mut_slice would instead synchronize on the host.
+            let (host, _record) = unsafe { host.stream_synced_mut_slice(stream) };
+            stream.memcpy_dtoh(
+                &device.slice(first..first + elements),
+                &mut host[..elements],
+            )?;
+        }
         Ok(())
     }
 
@@ -469,10 +478,17 @@ impl KvCache {
         assert!(positions <= self.max_seq);
         let first = start * self.kv_dim;
         let elements = (positions - start) * self.kv_dim;
-        assert_eq!(elements, prefix.k.len());
-        assert_eq!(elements, prefix.v.len());
-        stream.memcpy_htod(&prefix.k, &mut self.k.slice_mut(first..first + elements))?;
-        stream.memcpy_htod(&prefix.v, &mut self.v.slice_mut(first..first + elements))?;
+        for (device, host) in [(&mut self.k, &prefix.k), (&mut self.v, &prefix.v)] {
+            assert!(elements <= host.len());
+            // SAFETY: capture initialized exactly this prefix. Its pinned
+            // event orders the read after capture, including across streams;
+            // the guard records completion after the bounded copy is queued.
+            let (host, _record) = unsafe { host.stream_synced_slice(stream) };
+            stream.memcpy_htod(
+                &host[..elements],
+                &mut device.slice_mut(first..first + elements),
+            )?;
+        }
         Ok(())
     }
 }
@@ -2328,6 +2344,72 @@ mod tests {
     use super::*;
     use xabe_model::config::LayerKind;
 
+    #[test]
+    fn partial_snapshot_copies_only_live_kv_and_keeps_cross_stream_ordering() {
+        if !xabe_cuda::device::driver_available() {
+            println!("SKIPPED: no CUDA driver present");
+            return;
+        }
+        let ctx = match CudaContext::new(0) {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                println!("SKIPPED: could not create CUDA context: {error}");
+                return;
+            }
+        };
+        let capture = ctx.new_stream().unwrap();
+        let restore = ctx.new_stream().unwrap();
+        let mut source = KvCache::with_kv_dim(&capture, 8, 8).unwrap();
+        let mut destination = KvCache::with_kv_dim(&restore, 8, 8).unwrap();
+        let keys: Vec<u16> = (0..64).map(|i| i + 10).collect();
+        let values: Vec<u16> = (0..64).map(|i| i + 1000).collect();
+        capture.memcpy_htod(&keys, &mut source.k).unwrap();
+        capture.memcpy_htod(&values, &mut source.v).unwrap();
+        // SAFETY: initialize all host elements before any access or transfer.
+        let mut prefix = unsafe {
+            HostKvPrefix {
+                k: ctx.alloc_pinned::<u16>(64).unwrap(),
+                v: ctx.alloc_pinned::<u16>(64).unwrap(),
+            }
+        };
+        for (start, positions) in [(0, 0), (1, 4), (0, 8)] {
+            prefix.k.as_mut_slice().unwrap().fill(0x5a5a);
+            prefix.v.as_mut_slice().unwrap().fill(0x5a5a);
+            restore
+                .memcpy_htod(&[0xcdabu16; 64], &mut destination.k)
+                .unwrap();
+            restore
+                .memcpy_htod(&[0xcdabu16; 64], &mut destination.v)
+                .unwrap();
+            source
+                .snapshot_range_into(&capture, start, positions, &mut prefix)
+                .unwrap();
+            // No host synchronization between capture and restoration: the
+            // pinned event must carry the dependency to the second stream.
+            destination
+                .restore_prefix(&restore, &prefix, start, positions)
+                .unwrap();
+            restore.synchronize().unwrap();
+            let first = start * 8;
+            let elements = (positions - start) * 8;
+            for (host, device, expected) in [
+                (&prefix.k, &destination.k, &keys),
+                (&prefix.v, &destination.v, &values),
+            ] {
+                let host = host.as_slice().unwrap();
+                assert_eq!(&host[..elements], &expected[first..first + elements]);
+                assert!(host[elements..].iter().all(|&v| v == 0x5a5a));
+                let actual = restore.clone_dtoh(device).unwrap();
+                restore.synchronize().unwrap();
+                assert_eq!(
+                    &actual[first..first + elements],
+                    &expected[first..first + elements]
+                );
+                assert!(actual[..first].iter().all(|&v| v == 0xcdab));
+                assert!(actual[first + elements..].iter().all(|&v| v == 0xcdab));
+            }
+        }
+    }
     #[test]
     fn the_attention_layers_are_the_ten_the_pattern_implies() {
         let config = ModelConfig::qwen3_6_35b_a3b();

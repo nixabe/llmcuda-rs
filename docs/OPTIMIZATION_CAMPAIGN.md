@@ -6,7 +6,9 @@ implementation is accepted. The exact-order gate experiments are complete and
 rejected. Consumer-side normalization is accepted after paired model measurements
 and the complete release suite. The query/key normalization grid seam is
 rejected after its deeper model comparison changes sign. The block-persistent
-GDN fragment is also rejected at the isolated gate.
+GDN fragment is also rejected at the isolated gate. A test-only resident
+continuation prototype preserves exact output and reduces follow-up latency;
+production router integration remains future work.
 
 | Experiment | Kernel throughput change | Prefill throughput change | Decode throughput change | Correct | Decision |
 | --- | ---: | ---: | ---: | --- | --- |
@@ -17,6 +19,7 @@ GDN fragment is also rejected at the isolated gate.
 | Consumer RMSNorm plus GDN gates | About +21% resident / +39% rotating weights, N=3 | Not separately measured | +0.14–0.32% at 2K; +0.42–0.48% at 32K, N=3 | Yes; full suite and CPU/GPU regression | Keep |
 | Query/key head norm grid seam | +72.9–73.8%, N=3 | Not measured | +0.09–0.28% at 2K; −0.24% to +0.24% at 32K, N=3 | Yes; targeted model and CPU/GPU checks | Reject: depth result changes sign |
 | Block-persistent GDN normalization and recurrence | −1.20–1.66% N=3 resident; +2.01–2.35% rotating states; N=1 loses | Not measured | Not measured | Bit-exact isolated probe | Reject |
+| Exact-prefix resident continuation | No kernel change | Follow-up TTFT −8.34–18.31% | Conversation wall time −0.27–0.83%; cold tok/s not measured | Bit-exact logits and generated IDs; ownership and copy regressions | Keep test-only prototype |
 
 ## Scope and provenance
 
@@ -813,12 +816,122 @@ No production source changed. Its complete release-suite evidence remains
 skips); formatting and workspace all-target Clippy are checked for this
 phase's documentation commit.
 
+## Exact-prefix resident continuation
+
+This phase keeps a **test-only prototype**, not a production router change.
+`forward::resident_continuation` owns a fixed set of GPU states and
+preallocated token histories. A mutable lease selects an unowned slot,
+compares every consumed token, and checks model, tokenizer, rotary offset
+and session identity. Those identities are tied to the live immutable model
+and tokenizer instances in this harness. Reuse requires a strictly longer
+prompt: an exact-length hit falls back because pending logits are not cached.
+A miss must restore a verified host checkpoint or reset before exposing
+state. Eviction clears validity; an abandoned pass stays invalid; capacity
+exhaustion refuses the request without resizing. Only a completed pass can
+publish its consumed prefix. The final emitted token has not yet entered
+KV/recurrent state and must be consumed on the next turn.
+
+The experiment exposed a prerequisite bug: the snapshot arena accepted a
+partial retention interval, but attention copies asserted that the valid
+prefix filled the entire pinned allocation. The production fix copies only
+the valid host/device subranges while retaining the pinned allocation's
+stream event guard. It adds no allocation or host barrier. Its GPU regression
+covers empty, partial and full intervals, independent K/V payloads, untouched
+tails, and capture/restore across two streams without an intervening host
+synchronization. Four CPU tests exercise prefix/scope mismatches, capacity,
+ownership, eviction, abandoned passes, and consumed-token bookkeeping.
+
+The manual ignored test runs two model-generated file-tool conversations:
+
+- Contributor task: read `Cargo.toml` and `CONTRIBUTING.md`, explain CUDA
+  kernel validation/commits, then answer a one-sentence follow-up.
+- Architecture task: read `docs/MODEL.md` and `docs/CACHE.md`, explain cache
+  geometry and the dense model difference, then answer the same follow-up.
+
+Both tasks take three turns: generated file calls, the file-informed answer,
+and the follow-up. The tool executes only the two whitelisted local reads.
+Raw token history is append-only, including emitted special tokens; generic
+chat-template rerendering that rewrites earlier thinking is outside this
+prototype. Such a prefix mismatch must fall back, not inherit resident state.
+
+A restores a verified full-prefix checkpoint at each continuation; B retains
+the same slot. **Both arms capture the same host checkpoint after every
+turn**, so D2H snapshot time remains in conversation time. This isolates the
+saved restoration, with the partial-copy fix present in both arms. Inference
+shapes 1–512, one 16,384-token GPU state (401,408,000 bytes), 65,536 bytes of
+slot history, two pinned snapshot slots (802,816,000 bytes together), and a
+pinned argmax buffer are allocated before timing. The shapes share weights;
+there is no per-token sampling allocation. Initial model/shape/pool setup is
+excluded. TTFT starts at slot claim and ends after the first GPU argmax read;
+conversation time also includes subsequent tokenization, file I/O, generation
+and snapshots. These are one-slot measurements, not N=3 serving throughput.
+
+GPU 1, same target model and automatic clocks as the campaign baseline.
+Executable SHA-256:
+`43717411cea77ea9022b60a391215c7b7902f353c249e8c9355b90ddd579066e`.
+A discarded A/B pair validates every generated token and all 248,320
+first-token logits per turn bit for bit, then six timed conversations run
+A1 B1 B2 A2 A3 B3. Every timed generated sequence must also match the
+validation reference. No logits readback is added to timed runs. All 12
+timed conversations and both validation pairs passed.
+
+All latency observations below are milliseconds. The means use the three
+observations per arm; SD is the sample standard deviation.
+
+| Task / turn | A1 | B1 | B2 | A2 | A3 | B3 | A mean ± SD | B mean ± SD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Contributor / file calls | 204.785 | 205.415 | 205.180 | 205.825 | 202.944 | 206.744 | 204.518 ± 1.459 | 205.780 ± 0.844 |
+| Contributor / answer | 1297.024 | 1290.043 | 1296.323 | 1306.767 | 1311.088 | 1305.161 | 1304.960 ± 7.204 | 1297.176 ± 7.595 |
+| Contributor / follow-up | 153.423 | 138.672 | 140.374 | 153.152 | 153.105 | 138.236 | 153.227 ± 0.172 | 139.094 ± 1.130 |
+| Architecture / file calls | 227.894 | 229.121 | 232.280 | 229.851 | 231.727 | 230.198 | 229.824 ± 1.917 | 230.533 ± 1.606 |
+| Architecture / answer | 6674.592 | 6684.214 | 6715.171 | 6728.532 | 6734.715 | 6726.183 | 6712.613 ± 33.072 | 6708.523 ± 21.760 |
+| Architecture / follow-up | 231.922 | 189.455 | 193.096 | 231.172 | 232.858 | 192.620 | 231.984 ± 0.844 | 191.724 ± 1.979 |
+| Contributor / whole conversation | 3319.764 | 3305.409 | 3312.357 | 3339.999 | 3343.862 | 3331.891 | 3334.541 ± 12.943 | 3316.552 ± 13.730 |
+| Architecture / whole conversation | 9701.178 | 9674.907 | 9718.282 | 9767.038 | 9776.315 | 9728.883 | 9748.177 ± 40.966 | 9707.358 ± 28.598 |
+
+Follow-up TTFT falls in every pair: 9.62% / 8.34% / 9.71% on the
+contributor task and 18.31% / 16.47% / 17.28% on architecture. The larger
+file-prefill turn dominates conversation time, so whole-conversation savings
+are much smaller: 0.43% / 0.83% / 0.36% and 0.27% / 0.50% / 0.49%,
+respectively. All six paired conversation changes favor reuse, but their
+small magnitude and these two deterministic tasks do not establish a
+production latency distribution. The cold first turn has no consistent
+change. The architecture file-prefill turn changes sign and is unresolved.
+
+Transfer counts are payload bytes derived from the actual copied tensor
+lengths. `reuse` is the same consumed prefix in A and B; it is restored in A
+and already resident in B. B's state H2D payload is zero on all turns.
+Common input-token and position uploads remain and are listed separately.
+
+| Task / turn | Prompt tokens | Reused tokens | Emitted tokens | A state H2D bytes | D2H snapshot bytes, both | Token/position H2D bytes A / B |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Contributor / file calls | 147 | 0 | 10 | 0 | 69,058,560 | 728 / 728 |
+| Contributor / answer | 2,369 | 156 | 138 | 69,058,560 | 117,186,560 | 10,568 / 10,560 |
+| Contributor / follow-up | 2,534 | 2,506 | 42 | 117,186,560 | 118,599,680 | 636 / 628 |
+| Architecture / file calls | 154 | 0 | 13 | 0 | 69,263,360 | 792 / 792 |
+| Architecture / answer | 11,997 | 166 | 174 | 69,263,360 | 315,105,280 | 49,632 / 49,624 |
+| Architecture / follow-up | 12,198 | 12,170 | 49 | 315,105,280 | 316,661,760 | 720 / 712 |
+
+Reproduce after checking the GPU is idle:
+
+```sh
+CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --lib \
+  resident_continuation::conversations::agent_conversations -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The prototype justifies a future production routing experiment with multiple
+sessions, eviction pressure, cancellation and real chat-template prefix
+identity. It does not justify removing the host fallback or changing snapshot
+retention. No CUDA kernel resources or arithmetic change in this phase.
+
+The complete GPU-1 release workspace suite passed: 87 targets, 981 successful
+returns, zero failures, 12 explicit fixture/audit skips, and one ignored
+manual conversation test (executed successfully above). Formatting and
+workspace all-target Clippy are clean. No numerical tolerance was changed.
+
 ## Results still required
 
-1. Prototype or implement safe same-slot continuation and measure multi-turn
-   time to first token, transferred bytes, reuse, and conversation time.
-2. Re-evaluate the available speculative drafters after the kernel work.
-3. Record each experiment's individual pairs, register/shared-memory changes,
-   correctness checks, and keep/reject decision.
-4. Compare the final tree with the original implementation and report the
+1. Re-evaluate the available speculative drafters after the kernel work.
+2. Compare the final tree with the original implementation and report the
    remaining bottlenecks and justified next experiments.

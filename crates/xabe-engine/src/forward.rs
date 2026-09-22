@@ -4402,3 +4402,7 @@ mod tests {
         assert!(e.to_string().contains("19"));
     }
 }
+
+#[cfg(test)]
+#[path = "resident_continuation/mod.rs"]
+mod resident_continuation;

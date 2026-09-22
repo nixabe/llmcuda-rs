@@ -28,3 +28,4 @@ half.workspace = true
 smallvec = "1"
 
 [dev-dependencies]
+tokenizers = "0.22"

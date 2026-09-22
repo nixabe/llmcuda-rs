@@ -32,10 +32,10 @@
 //! `Tolerance::reduced_precision_gpu()` (5e-2, declared for fp16 accumulation)
 //! would be a formulation error hiding behind a loose threshold.
 //!
-//! Three things here are gated at exact equality instead, because they have no
-//! floating-point freedom at all: the partial-rotary tail, the packed
-//! query/gate deinterleave, and the causal mask (perturbing a future key must
-//! leave earlier rows bit-identical, not merely close).
+//! Exact invariants additionally cover the partial-rotary tail, the packed
+//! query/gate deinterleave, the causal mask (perturbing a future key must
+//! leave earlier rows bit-identical), and equivalent rows across attention
+//! fragments. Moving a row between MMA fragments must not change its rounding.
 //!
 //! ## The 128K claim, stated precisely
 //!
@@ -411,6 +411,91 @@ fn device_attention_matches_the_reference_across_sequence_depths() {
             g.q_heads,
         );
     }
+}
+
+#[test]
+fn equivalent_query_rows_preserve_the_same_softmax_rounding() {
+    let Some(ctx) = setup() else { return };
+    let g = geometry();
+    let stream = ctx.default_stream();
+    let kernels =
+        AttentionKernels::new(&ctx, g.q_heads, g.kv_heads, g.head_dim).expect("kernels compile");
+
+    const N_QUERY: usize = 32;
+    const KEY_OFFSET: usize = 256;
+    const N_KEYS: usize = KEY_OFFSET + N_QUERY;
+    assert!(kernels.uses_tensor_cores(N_QUERY));
+
+    // Within each head, every query sees the same live prefix. Appended keys
+    // score below -1000, so their probabilities underflow to zero regardless of
+    // the causal mask. This makes all query rows numerically equivalent,
+    // including rows owned by different halves of an MMA fragment.
+    let query_scale = |head: usize| 1.0 + head as f32 / g.q_heads as f32;
+    let mut q = vec![0.0; N_QUERY * g.q_heads * g.head_dim];
+    for row in q.chunks_mut(g.q_heads * g.head_dim) {
+        for (head, values) in row.chunks_mut(g.head_dim).enumerate() {
+            values.fill(query_scale(head));
+        }
+    }
+    let mut k = vec![-64.0; N_KEYS * g.kv_heads * g.head_dim];
+    let mut v = vec![0.0; k.len()];
+    let mut rng = Xorshift64Star::new(0x5A17_2026);
+    for key in 0..KEY_OFFSET {
+        let base = key * g.kv_heads * g.head_dim;
+        let width = g.kv_heads * g.head_dim;
+        // A rising score makes the running maximum move repeatedly. A
+        // constant maximum would reduce every normalizer correction to one
+        // and hide the difference between FMA and separate multiply/add.
+        let bias = key as f32 / 512.0;
+        for (dst, noise) in k[base..base + width]
+            .iter_mut()
+            .zip(rng.vec_f32(width, -0.125, 0.125))
+        {
+            *dst = bias + noise;
+        }
+        v[base..base + width].copy_from_slice(&rng.vec_f32(width, -1.0, 1.0));
+    }
+    let k = as_cached(&k);
+    let v = as_cached(&v);
+    let score_scale = (g.head_dim as f32).sqrt();
+    let future_score = -64.0 * score_scale;
+    let prefix_score_lower_bound = -0.125 * score_scale;
+    assert_eq!((future_score - prefix_score_lower_bound).exp(), 0.0);
+
+    let device = run_device(
+        &stream, &kernels, &q, &k, &v, N_QUERY, N_KEYS, KEY_OFFSET, g.q_heads, g.head_dim,
+    );
+
+    // The existing scalar oracle also checks the value of those equivalent
+    // rows, so a kernel returning the same wrong value everywhere cannot pass.
+    let reference: Vec<Vec<f32>> = (0..g.q_heads)
+        .map(|head| {
+            let kv_head =
+                kv_head_for_query_head(head as u32, g.q_heads as u32, g.kv_heads as u32) as usize;
+            causal_attention_streaming(
+                &vec![vec![query_scale(head); g.head_dim]; N_KEYS],
+                &head_rows(&k, N_KEYS, g.kv_heads, g.head_dim, kv_head),
+                &head_rows(&v, N_KEYS, g.kv_heads, g.head_dim, kv_head),
+            )
+            .pop()
+            .expect("nonempty reference")
+        })
+        .collect();
+    for (head, reference) in reference.iter().enumerate() {
+        let first = head * g.head_dim;
+        assert_matches(&device[first..first + g.head_dim], reference, &MMA_GATE);
+        for row in 1..N_QUERY {
+            let base = (row * g.q_heads + head) * g.head_dim;
+            for dim in 0..g.head_dim {
+                assert_eq!(
+                    device[base + dim].to_bits(),
+                    device[first + dim].to_bits(),
+                    "equivalent row {row}, head {head}, dimension {dim} changed rounding",
+                );
+            }
+        }
+    }
+    println!("{N_QUERY} equivalent query rows: bit-identical across MMA fragments");
 }
 
 #[test]

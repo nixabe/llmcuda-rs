@@ -1104,6 +1104,26 @@ Two operands, two reuses, and they are complementary: a **token tile**
 amortizes the weight, a **row band** amortizes the activation. The optimum is
 interior and is not where "bigger tile is better" would put it.
 
+## Prefill attention: keep softmax values in their owning warp
+
+One warp owns each query head, and the scores from `Q K^T` already have the
+fragment layout that `P V` consumes. Sending them through shared memory
+only to redistribute the rows for softmax adds a handoff with no cross-warp
+reuse. Scores, probabilities, maxima, and normalizers therefore stay in
+registers. Even and odd key subsequences reduce separately before a quad
+leader broadcast, preserving the former writer lane's addition tree.
+
+The score product rounds explicitly, and the normalizer update uses explicit
+FMA. Relying on contraction of the source expression changed a model ranking;
+the rejected form is recorded below. The query and eight-key tiles, output
+accumulator, and K/V prefetch depth remain unchanged. K/V still use shared
+memory and two block barriers per eight keys. Runtime allocation is 255
+registers with zero local bytes and 8,320 dynamic shared bytes per block;
+registers still limit residency to one block per SM. Offline barrier sites
+are unchanged, so removing the source-level softmax fences is not a claim
+of fewer hardware barrier instructions. The measured benefit is confirmed
+by the [full-model prefill pairs](OPTIMIZATION_CAMPAIGN.md#full-model-prefill-pairs).
+
 ## Residency: every projection on the card once, in the form its reader wants
 
 The same question, asked of the card instead of a grid: *how many copies of
@@ -1747,6 +1767,7 @@ proposed twice.
 
 | Attempt | Result |
 | --- | --- |
+| Relying on implicit FMA contraction after moving prefill softmax state into registers | The fragment layout passed all ten attention differentials and batch prefill/decode, then failed the 19-token forward golden at **rank 4** (captured separation **0.153701**, shared top-logit error **0.088937**). Direct old/new attention differs by at most **2.384e-7** on four small shapes. NVRTC moved one normalizer addition across MMA control flow, splitting the original FMA into a rounded multiply and add. Explicit `__fmaf_rn` restores bit identity on those shapes and the original golden result. Preserve the compiled arithmetic, not just the source expression; isolated tolerance gates cannot replace the model golden. No timing conclusion was drawn from the failing version. |
 | Alternating shared K/V buffers in prefill attention | Removes the arrival barrier before staging each 8-key tile, preserving arithmetic and the existing register prefetch. Shared memory grows 13,952 → 22,272 B; offline CUDA 12.4 `ptxas` uses 255 registers without spills in both arms. Four prefill CPU differentials (including 128K keys), carried-chunk and wide N=3 prefill checks, and the 19-token/40-block forward golden passed; the optional divergence audit was not run. Three GPU 1 pairs, middle reversed, with `rust-kernels` in both arms: N=3 **2K** at total chunk 6,144 gives **3640.53 / 3622.19 / 3631.72 → 3635.66 / 3630.55 / 3626.47 tok/s** (−0.13 / +0.23 / −0.14%); **8K** at chunk 24,576 gives **3490.51 / 3481.65 / 3475.60 → 3491.82 / 3482.26 / 3477.35** (+0.04 / +0.02 / +0.05%). One warmup and three timed repetitions per process; 8K within-process SD is 9.80–23.47 tok/s, much larger than the difference. The 2,048-query CUDA-event attention bench gains 1.2–1.5% at offset zero but loses 5.0–16.6% at offset 8K, and changes sign at several deeper offsets. Fewer barriers bought no meaningful full-prefill throughput. Reverted; full-model depths above 8K were not measured. |
 | Applying two token groups to every Rust tiled RoPE grid | Six alternating GPU 1 pairs: at 512 tokens × 2 heads, splitting alternate tokens across the otherwise idle rotary threads improves **51.2–51.6%** throughput. At 512 × 16 it loses **5.0–5.2%**. More active rotary warps help the underfilled grid, but duplicate double-precision frequency work. Use two groups only at at most 72 blocks on this 72-SM target; retain 16-token frequency reuse for larger grids. |
 | Keeping the literal production tiled RoPE port's unused rotary threads | Six alternating GPU 1 pairs at the model's 512-token per-sequence chunk: NVRTC **19.437–19.511 us**, Rust **20.400–20.426 us**, **4.5–4.7% lower throughput** over 2 key heads. The grid has only 64 blocks on 72 SMs, while half the rotary threads exit and the remaining group processes all 16 tokens. Splitting alternate tokens into that unused half is an independently gated layout change, not a benefit of translation alone. |
@@ -1766,7 +1787,7 @@ proposed twice.
 | Widening the prefill softmax-rescale tile (`MMA_KEY_TRIPS` 2/4) | A wash then **1.96× slower**. The kernel sits at 252 of 255 registers with zero spill; the wider prefetch arrays spill immediately. |
 | `MMA_KOCT=4` (32-key prefill staging tile) | **−30%**. Same mechanism: the cross-tile prefetch arrays grow with the tile and spill. One octet is the largest tile whose prefetch fits beside `o` and `qa` at head_dim 256. |
 | Staging `Q` to shared in the decode MMA kernel | 73 registers freed, zero spill, and **37–40% slower** at every depth. Shared grew past the 3-blocks/SM line, and 64 shared loads per warp per trip replaced registers that were free. llama.cpp's own Turing config keeps `Q` in registers here too. |
-| Per-warp online softmax without the cross-warp round trip | 255 registers and 104–120 B of spill at both occupancy widths; the shared-memory mitigation collapses to 1 block/SM by arithmetic. Not built past `ptxas`. |
+| Per-warp online softmax in decode without the cross-warp round trip | 255 registers and 104–120 B of spill at both occupancy widths; the shared-memory mitigation collapses to 1 block/SM by arithmetic. Not built past `ptxas`. |
 | fp16 `P V` accumulation | 54 registers freed — and **209× over `MMA_GATE`** on the constant-`V` test, growing with depth. With `V` coherent the accumulator grows purely additively between rescales until increments round away entirely; an IID-random-`V` simulation held with 26–30× margin and tested the wrong regime. Also buys nothing: fp16- and fp32-accumulate `m16n8k8` measured within 0.4% on this card. |
 | `__expf` in the prefill softmax | 1.075× on attention, and a **real rank-4 ranking error** against llama.cpp's separation. Greedy decoding would not notice; sampling would. |
 | `half2` on the decode `P V` accumulator | Fewer registers, fewer instructions, **11.3% slower**. `pack_h2`'s broadcast of the scalar softmax weight added 40 `PRMT` and 16 `F2F` on a value that was already in a register. Instruction counting is retired as a predictor for this kernel. |
@@ -1974,15 +1995,6 @@ engine decomposes into three things this engine forbids:
    at once, measured shut from four directions.
 3. **`mmvq`/dp4a activation quantization**, rejected above on the serving
    contract rather than on accuracy in isolation.
-
-**Deep prefill (128K).** `attn_flash_causal_mma` is 60–72% of a deep chunk's
-kernel time and is latency-bound at one resident block per SM. Its barrier
-density is ~5× llama.cpp's (2 block-wide syncs per 8-key octet against 3 per
-64-key tile), which is real, sized, and the same register-bound lever already
-tried: the kernel is at 252/255 registers with zero spill, so widening the tile
-trades occupancy away rather than buying anything. Closing it needs a
-structural, register-neutral rewrite of the staging and synchronization
-pattern, not a parameter change.
 
 **Aggregate concurrency.** The per-sequence state term — 131.7 MB/token of GDN
 recurrent and conv state — **never amortizes at any batch width**, because

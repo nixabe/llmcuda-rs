@@ -1,8 +1,13 @@
 # Inference optimization campaign
 
-Status: the original baseline, profiling, and capture-tool validation are
-complete. No inference optimization has been accepted or rejected in this
-campaign yet.
+Status: the original baseline, profiling, capture-tool validation, and
+deep-prefill attention phase are complete. The corrected fragment-softmax
+implementation is accepted. Exact-order GDN gates are next.
+
+| Experiment | Kernel throughput change | Prefill throughput change | Decode throughput change | Correct | Decision |
+| --- | ---: | ---: | ---: | --- | --- |
+| Fragment softmax with implicit normalizer FMA | Not timed | Not timed | Not timed | No: forward golden | Reject arithmetic form |
+| Fragment softmax with explicit original rounding | +21.69–22.77% at 128K | +12.09–12.11% at 128K, N=3 | Not separately measured | Yes; full suite and new regression | Keep |
 
 ## Scope and provenance
 
@@ -323,10 +328,141 @@ release workspace run: 87 completed targets, 974 successful test returns,
 zero failures, and the same 12 explicitly reported skips. Bounded Nsight
 captures were validated against the expected chunk, layer, and kernel counts.
 
+## Deep-prefill attention experiment
+
+Candidate: keep score, probability, maximum, and normalizer values in the
+`m16n8k8` fragment layout. Each lane holds two keys from each of two query
+rows. Reduce even and odd key subsequences separately, add their totals, and
+broadcast the quad leader's sum. This reproduces the former eight-lane
+XOR(4,2,1) sum at the lane that wrote the normalizer. Explicitly round the
+score scaling product before the softmax subtraction, preserving the
+rounding previously imposed by the shared store.
+
+The query tile, eight-key tile, Q residency, output ownership, and K/V
+prefetch depth remain unchanged. This differs from the previously rejected
+decode warp-softmax experiment: it does not enlarge or duplicate the output
+accumulator. The comparison with llama.cpp's `flash_attn_ext_f16_iter` and
+`flash_attn_ext_f16_process_tile` informed fragment ownership; its tile
+sizes, softmax grouping, and numeric choices were not copied.
+
+| Resource | Original | Candidate |
+| --- | ---: | ---: |
+| Offline registers/thread | 252 | 255 |
+| Runtime registers/thread | 255 | 255 |
+| Offline spill stores/loads and stack bytes | 0 | 0 |
+| Runtime local bytes/thread | 0 | 0 |
+| Dynamic shared bytes/block | 13,952 | 8,320 |
+| Threads/block | 256 | 256 |
+| Register-limited blocks/SM | 1 | 1 |
+| Block barriers/eight keys | 2 | 2 |
+
+At source level, both softmax warp fences disappear with their shared
+handoffs. Offline SASS has two `BAR.SYNC` sites and one `WARPSYNC` site in
+both kernels; source fence removal must not be described as a measured
+reduction in hardware barrier instructions. Static shared-load/store sites
+fall from 144/23 to 64/3 and shuffle sites from 24 to 14. MMA sites remain
+64 and no local-load/store sites appear. These counts explain the candidate;
+they do not establish a performance result.
+
+The first implementation passed all ten attention differentials, batch
+decode, and batch prefill but failed the forward golden at rank 4: the
+captured pair is separated by 0.153701, beyond the 0.088937 measured error
+on the shared top logits. Performance evaluation stopped. Direct original
+versus candidate GPU comparisons differed by up to 2.384e-7; the CPU
+attention tolerances alone did not expose the model consequence.
+
+PTX identified the arithmetic change: NVRTC moved one normalizer addition
+past the following MMA control flow, leaving a separately rounded multiply
+and add where the original shared-state update used FMA. The correction is
+an explicit `__fmaf_rn`, preserving the original operation. It produces
+bit-identical output against the original in four direct GPU comparisons:
+19/32 cold queries and 19/64 queries at offsets 61/256 (548,864 elements).
+Registers and local-memory usage are unchanged. The corrected version
+passes all eight forward-golden tests, returning the original argmax 25358
+and logit 19.950254. The corrected version also passes workspace Clippy and
+the full GPU 1 release workspace suite: 87 completed targets, 974 successful
+test returns, zero failures, and the same 12 explicit skips listed above.
+The repeated attention, batch, GDN, MoE, LM-head, and available speculative
+identity checks ran. The timing results follow below.
+
+### Isolated attention pairs
+
+Three N=3 queries use separate KV caches and 2,046 new tokens each. Each
+process discards two warmups and measures five repetitions using CUDA
+events. Values below are milliseconds; A is the preserved original and B
+is the corrected candidate. Columns retain execution order, including the
+reversed middle pair. Throughput change is `A_ms / B_ms - 1`.
+
+| Existing keys | A1 | B1 | B2 | A2 | A3 | B3 | Paired throughput change |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 0 | 4.481 | 3.713 | 3.713 | 4.606 | 4.608 | 3.710 | +20.68% / +24.05% / +24.20% |
+| 2,048 | 12.421 | 10.432 | 8.443 | 10.845 | 12.632 | 10.281 | +19.07% / +28.45% / +22.87% |
+| 8,192 | 29.957 | 24.610 | 24.771 | 30.617 | 30.827 | 25.132 | +21.73% / +23.60% / +22.66% |
+| 32,768 | 111.396 | 90.917 | 91.178 | 113.548 | 113.944 | 92.686 | +22.52% / +24.53% / +22.94% |
+| 65,536 | 232.395 | 190.520 | 190.773 | 236.391 | 237.269 | 193.856 | +21.98% / +23.91% / +22.39% |
+| 98,304 | 346.364 | 283.970 | 285.826 | 353.563 | 355.089 | 290.371 | +21.97% / +23.70% / +22.29% |
+| 131,072 | 460.313 | 378.254 | 382.427 | 469.514 | 472.848 | 386.069 | +21.69% / +22.77% / +22.48% |
+
+The candidate wins all three pairs at every offset. At 131,072 existing
+keys the throughput change is +21.69% to +22.77%. Short points have a larger
+spread, particularly offset 2,048, so their isolated percentages are not a
+model-level claim. The full prefill ladder was measured separately below.
+
+### Full-model prefill pairs
+
+Three pairs use the original protocol at every depth: N=3, one discarded
+warmup and one timed pass per process and depth. A uses the original
+inference kernels with the same benchmark capture hooks as B; capture is
+disabled in both. The 512-token point uses 1,536 physical rows; the ladder
+uses 6,138 rows with states allocated for 130,944 positions. All rates are
+aggregate tokens/s. No build, test, or other GPU job ran alongside these
+pairs. Columns retain the actual `A B, B A, A B` execution order.
+
+| Tokens/sequence | A1 | B1 | B2 | A2 | A3 | B3 | Paired throughput change |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 512 | 3211.210 | 3184.750 | 3187.230 | 3183.970 | 3184.170 | 3186.330 | -0.82% / +0.10% / +0.07% |
+| 2,046 | 3642.280 | 3631.270 | 3641.570 | 3617.000 | 3619.730 | 3635.720 | -0.30% / +0.68% / +0.44% |
+| 8,184 | 3379.600 | 3414.880 | 3416.000 | 3360.920 | 3361.280 | 3418.490 | +1.04% / +1.64% / +1.70% |
+| 32,736 | 2644.980 | 2782.300 | 2781.250 | 2642.710 | 2646.250 | 2785.440 | +5.19% / +5.24% / +5.26% |
+| 65,472 | 2080.270 | 2255.790 | 2256.610 | 2079.690 | 2079.530 | 2255.900 | +8.44% / +8.51% / +8.48% |
+| 130,944 | 1460.730 | 1637.610 | 1636.970 | 1460.380 | 1461.130 | 1637.730 | +12.11% / +12.09% / +12.09% |
+
+The process-level means and sample standard deviations are:
+
+| Tokens/sequence | A mean ± sample SD | B mean ± sample SD |
+| ---: | ---: | ---: |
+| 512 | 3193.12 ± 15.67 | 3186.10 ± 1.26 |
+| 2,046 | 3626.34 ± 13.87 | 3636.19 ± 5.17 |
+| 8,184 | 3367.27 ± 10.68 | 3416.46 ± 1.85 |
+| 32,736 | 2644.65 ± 1.79 | 2783.00 ± 2.18 |
+| 65,472 | 2079.83 ± 0.39 | 2256.10 ± 0.45 |
+| 130,944 | 1460.75 ± 0.38 | 1637.44 ± 0.41 |
+
+The 8K, 32K, 65K, and 128K comparisons win in every pair. At 128K the
+full-model gain is **12.09–12.11%**, following a **21.69–22.77%** isolated
+attention gain at that offset. The 512 and 2K results change sign across
+pairs and lie within the observed short-run drift; no throughput improvement
+or regression is established there. Peak reported VRAM remains 32.229 GiB
+for 512 and 42.104 GiB for the long ladder. Decode throughput was not
+separately attributed to this prefill-only experiment.
+
+The performance gate is satisfied. A new fixture-free regression gives all
+query rows of a head an identical live prefix while forcing the running
+maximum to change. It checks their output against the scalar CPU oracle and
+requires bit identity across equivalent rows, including different halves
+of an MMA fragment. The corrected kernel passes; temporarily replacing the
+explicit FMA with the original source expression makes row 8, head 0 differ
+by one bit and fails the test. The correct source was restored afterward.
+Final comment cleanup and removal of an unused helper produce byte-identical
+PTX to the measured version. The fresh full GPU 1 release workspace run,
+including this regression, completed 87 targets with 975 successful test
+returns, zero failures, and the same 12 explicit skips. Formatting and
+workspace Clippy are clean. The corrected implementation is kept.
+
 ## Results still required
 
-1. Investigate deep-prefill attention, exact-order GDN gates, consumer
-   normalization, additional launch fusion, and one persistent fragment,
+1. Investigate exact-order GDN gates, consumer normalization, additional
+   launch fusion, and one persistent fragment,
    in that order unless the profile establishes a different priority.
 2. Prototype or implement safe same-slot continuation and measure multi-turn
    time to first token, transferred bytes, reuse, and conversation time.

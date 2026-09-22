@@ -2,12 +2,15 @@
 
 Status: the original baseline, profiling, capture-tool validation, and
 deep-prefill attention phase are complete. The corrected fragment-softmax
-implementation is accepted. Exact-order GDN gates are next.
+implementation is accepted. The exact-order gate experiments are complete and rejected. Consumer-side
+normalization is next.
 
 | Experiment | Kernel throughput change | Prefill throughput change | Decode throughput change | Correct | Decision |
 | --- | ---: | ---: | ---: | --- | --- |
 | Fragment softmax with implicit normalizer FMA | Not timed | Not timed | Not timed | No: forward golden | Reject arithmetic form |
 | Fragment softmax with explicit original rounding | +21.69–22.77% at 128K | +12.09–12.11% at 128K, N=3 | Not separately measured | Yes; full suite and new regression | Keep |
+| Cooperative gate loading | Cache dependent; N=3 resident loss | Not measured | Not measured | Bit-exact isolated probe | Reject |
+| One head per gate block | Cache dependent | Not measured | −0.09–0.14% at 2K, N=3 | Yes; targeted model checks | Reject |
 
 ## Scope and provenance
 
@@ -459,10 +462,89 @@ including this regression, completed 87 targets with 975 successful test
 returns, zero failures, and the same 12 explicit skips. Formatting and
 workspace Clippy are clean. The corrected implementation is kept.
 
+## Exact-order GDN gate experiments
+
+The current target's alpha/beta gates cost about 0.181 ms per shallow N=3
+decode step, 1.35% of active GPU time. The older 1 ms estimate describes a
+different measurement and does not size the remaining opportunity here.
+
+The loading prototype gives each (head, token) a 256-thread block. Threads
+cooperatively load both weight rows and the input row into 24 KiB of shared
+memory; only the first warp performs the original ascending lane-strided
+FMA loop and XOR(16,8,4,2,1) reduction. This changes loading and grid
+coverage, without splitting the arithmetic among additional warps. A
+control runs the unchanged kernel with one head per block instead of four.
+
+All five gate outputs are bit-identical to the original for N=1, N=3, and
+N=7 on deterministic random inputs, 1,760 output values in total. Runtime
+and offline register counts are 64 for the original/control and 45 for
+cooperative loading; neither has spills, stack allocation, or runtime local
+memory. The original/control use no shared memory. At N=3 their grids
+contain 24/96 blocks of 128/32 threads; the prototype has 96 blocks of 256
+threads and 24,576 dynamic shared bytes per block. The resource ceiling is
+32 resident warps/SM for the original, 16 for the one-warp control (block
+count limit), and 16 for cooperative loading (two shared-memory blocks).
+Only one warp per cooperative block continues into the contraction.
+
+The isolated probe captures 300 launches per CUDA graph and times ten graph
+replays with CUDA events after three warmups. It compares repeated use of
+one 512 KiB weight pair with rotation through 30 pairs (15 MiB, beyond L2),
+to expose cache sensitivity. A is the original four-head grid, B cooperative
+loading, and C the one-head control. Values are microseconds per launch;
+columns preserve the actual alternating execution order. All measurements
+ran alone on GPU 1, with the campaign's NVRTC options.
+
+| N | Weight reuse | A1 | B1 | C1 | C2 | B2 | A2 | A3 | B3 | C3 |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | resident | 5.2425 | 4.9335 | 4.7192 | 4.7180 | 4.9524 | 5.2601 | 5.2595 | 4.9534 | 4.7179 |
+| 1 | 30 layers | 5.9747 | 4.9299 | 4.8345 | 4.8325 | 4.9317 | 5.3166 | 5.3194 | 4.9329 | 4.8193 |
+| 3 | resident | 3.8567 | 4.2375 | 4.3241 | 4.3209 | 4.2454 | 3.8694 | 3.8685 | 4.2448 | 4.3181 |
+| 3 | 30 layers | 5.2412 | 5.0085 | 4.9360 | 4.9332 | 5.0332 | 5.2731 | 5.2719 | 5.0415 | 4.9377 |
+| 7 | resident | 4.8539 | 6.7925 | 5.7315 | 5.7312 | 6.8086 | 4.9046 | 4.9028 | 6.8595 | 5.7364 |
+| 7 | 30 layers | 5.7141 | 7.8752 | 6.3345 | 6.3380 | 7.8943 | 5.7294 | 5.7296 | 7.8958 | 6.3229 |
+
+Cooperative loading does not establish a cache-independent win. At N=3 it
+loses with resident weights and improves when rotating weights; the
+one-head control is faster in the rotating case. Both alternatives lose
+at N=7, so the model experiment restricts the control to the target's
+2,048-wide, 32-head F32 gates at at most three tokens. Wider batches and
+other geometries keep their original dispatch. The first rotating N=1
+baseline is visibly slower than its later repetitions; it remains in the
+table, and no conclusion rests on that pair alone.
+
+
+### Gate-grid full-model pairs
+
+Model B uses the one-head control. Three pairs at context 2,048 use the
+accepted attention kernel in both arms, N=1/N=3, four discarded warmup
+steps, and 128 timed steps. Rates include greedy sampling. No compilation,
+test, or other GPU work overlaps the pairs. Values are aggregate tokens/s.
+
+| Shape | A1 | B1 | B2 | A2 | A3 | B3 | Paired change | A mean ± SD | B mean ± SD |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| single_stream | 114.1 | 114.3 | 113.9 | 113.6 | 113.6 | 113.9 | +0.18% / +0.26% / +0.26% | 113.77 ± 0.29 | 114.03 ± 0.23 |
+| batch 1 | 114.8 | 114.8 | 114.7 | 114.3 | 114.3 | 114.4 | +0.00% / +0.35% / +0.09% | 114.47 ± 0.29 | 114.63 ± 0.21 |
+| batch 3 | 216.8 | 216.6 | 215.8 | 216.1 | 215.7 | 215.5 | -0.09% / -0.14% / -0.09% | 216.20 ± 0.56 | 215.97 ± 0.57 |
+
+N=3 loses all three pairs, by 0.09–0.14%. Single-stream N=1 changes by
++0.18–0.26%, while batch N=1 includes one tie; these small changes are below
+the observed 0.4–0.5% drift across baseline repetitions. They do not justify
+a new N=1-only dispatch. The one-head grid is reverted; no deeper-context
+or prefill timing is claimed. Cooperative staging is also rejected at the
+isolated gate: it loses at N=3 with resident weights and trails the simpler
+control when rotating weights. It was not integrated into a full model.
+
+The model control passed GDN differentials, exact Q6_K/F32 gate comparisons,
+the forward golden, batch decode, and batch prefill: five targets, 19
+successful returns, no failures, and one explicit opt-in audit skip. The
+restored inference source is identical to the attention phase's fully tested
+tree (87 targets, 975 successful returns, zero failures, 12 explicit skips).
+Formatting and Clippy are checked again for this documentation-only result.
+
 ## Results still required
 
-1. Investigate exact-order GDN gates, consumer normalization, additional
-   launch fusion, and one persistent fragment,
+1. Investigate consumer normalization, additional launch fusion, and one
+   persistent fragment,
    in that order unless the profile establishes a different priority.
 2. Prototype or implement safe same-slot continuation and measure multi-turn
    time to first token, transferred bytes, reuse, and conversation time.

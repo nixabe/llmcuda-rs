@@ -113,8 +113,8 @@ file actually stores — as the case whose answer is known in advance.
 
 ## The GDN equivalence test
 
-This is the most valuable check in the crate, and the reason milestone 01
-precedes the harness in the plan.
+This is the most valuable check in the crate: it validates the recurrent
+and chunked formulations independently of captured model activations.
 
 The chunked parallel form (prefill) and the recurrent form (decode) compute the
 same function by very different routes — the chunked form requires inverting a
@@ -161,8 +161,8 @@ Qwen3-Next/3.5 code path they share.
 **Derived, not ported.** No scalar chunked reference exists upstream — vLLM's
 is Triton-JIT and llama.cpp has none — so the chunked form was derived from the
 verified recurrence via the WY representation. The derivation yields
-`(I + A)^{-1}` rather than the `(I − A)^{-1}` the planning document paraphrased;
-both are valid under different sign conventions, and the equivalence test is
+`(I + A)^{-1}`; `(I − A)^{-1}` is valid under the opposite sign convention,
+and the equivalence test is
 what actually validates it.
 
 Other provenance: `moe::dispatch` follows vLLM's `moe_align_block_size` output

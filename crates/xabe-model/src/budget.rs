@@ -6,18 +6,17 @@
 //! module does not blur the two: `xabe-cuda` and `xabe-cache` are load-
 //! bearing on the exact ones (KV pool size, GDN state size), while the
 //! estimates (compute-buffer scratch, CUDA context overhead) exist only to
-//! give a complete VRAM picture before milestone 06 produces a measured one
-//! — see `AGENTS.md`'s "Reporting results honestly" section. Nothing here
+//! give an approximate VRAM picture — see `AGENTS.md`'s "Reporting results
+//! honestly" section. Nothing here
 //! should be read as a measurement.
 //!
-//! The reference numbers in this module's doc comments and tests come from
-//! two places: the closed-form parameter counts in [`crate::config`]
-//! (cross-checked against the real tensor shapes in
-//! `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` while building `xabe-gguf`), and the
-//! project's own planning document, `qwen36-rust-engine-plan.md` §03–04.
-//! Where the two disagree, this module follows the closed-form derivation
-//! and documents the gap rather than quietly adopting the plan's rougher
-//! figure — see [`WeightBytesPerParam::observed_in_target_file`].
+//! Parameter counts come from [`crate::config`], cross-checked against the
+//! real tensor shapes in `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf`. Quantization
+//! assumptions are documented in
+//! [`WeightBytesPerParam::observed_in_target_file`]; the VRAM examples use
+//! historical reference inputs, not a measurement of current allocations.
+//! See `docs/MODEL.md` for the resource model and `docs/BENCHMARKS.md` for
+//! measured performance.
 
 use crate::config::ModelConfig;
 
@@ -31,19 +30,16 @@ const GIB: u64 = 1024 * 1024 * 1024;
 /// Estimated CUDA driver context plus cuBLAS/cuBLASLt handle overhead, per
 /// GPU.
 ///
-/// **Not measured.** No CUDA kernels exist yet (see `AGENTS.md`'s milestone
-/// table); this is the "estimate"-confidence figure from
-/// `qwen36-rust-engine-plan.md` §03, carried over unchanged. Treat it as a
-/// placeholder pending a real measurement, not as ground truth.
+/// **Not measured.** This is a historical 0.5 GiB budget allowance. Treat
+/// it as a placeholder pending a measurement of these allocations.
 pub const CUDA_CONTEXT_OVERHEAD_BYTES: u64 = GIB / 2;
 
 /// Estimated scratch/workspace VRAM for chunked-prefill compute at the
 /// reference micro-batch size (`-ub 4096`): activation buffers, the MoE
 /// token-permutation scratch, and prefill intermediate tensors.
 ///
-/// **Not measured**, for the same reason as
-/// [`CUDA_CONTEXT_OVERHEAD_BYTES`]. This is `qwen36-rust-engine-plan.md`
-/// §03's own "estimate"-confidence figure for this segment.
+/// **Not measured.** This historical 2.2 GiB allowance is independent of
+/// actual scratch allocations, as is [`CUDA_CONTEXT_OVERHEAD_BYTES`].
 pub const COMPUTE_BUFFER_BYTES: u64 = (11 * GIB) / 5; // 2.2 GiB
 
 /// Per-card VRAM segmentation for one worker replica.
@@ -53,12 +49,8 @@ pub const COMPUTE_BUFFER_BYTES: u64 = (11 * GIB) / 5; // 2.2 GiB
 /// tensor-parallel split (see the README's architecture section) — so every
 /// field here is the footprint on *one* GPU, not summed across the fleet.
 ///
-/// Deliberately excludes the vision encoder (`mmproj-F16.gguf`): this
-/// engine is text-only (`AGENTS.md`, "Scope"), so a vision-encoder segment
-/// would describe VRAM this crate never allocates. The planning document's
-/// own total (`qwen36-rust-engine-plan.md` §03) includes a ~1.5 GiB vision
-/// segment that has no counterpart here; expect this module's total to run
-/// about that much lower for the same inputs, not higher.
+/// Covers the text path and excludes the vision encoder (`mmproj-F16.gguf`).
+/// Serving images requires budgeting that separate allocation as well.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VramBudget {
     /// Model weights resident on this card, as reported by the loader.
@@ -105,8 +97,7 @@ impl VramBudget {
 /// `AGENTS.md` rule 1 warns about, applied to slots instead of cache
 /// groups). `context_tokens` here *is* that aggregate capacity — for the
 /// reference configuration (393,216 tokens, f16 KV) it is exactly
-/// `20,480 B/token * 393,216 = 7.5 GiB`, matching
-/// `qwen36-rust-engine-plan.md` §03's "derived"-confidence figure.
+/// `20,480 B/token * 393,216 = 7.5 GiB`.
 ///
 /// # Why `gdn_state` *is* multiplied by `slots`
 ///
@@ -178,18 +169,10 @@ impl WeightBytesPerParam {
     ///   (`attn_qkv`, `attn_gate`, `ssm_out`, `attn_q`, `attn_k`, `attn_v`,
     ///   `attn_output`) is Q8_0.
     ///
-    /// **This disagrees with `qwen36-rust-engine-plan.md` §04**, whose
-    /// "GDN + attention projections" row (0.944B params, 774 MB/token)
-    /// implies both a smaller parameter count than
-    /// [`ModelConfig::projection_params`] actually derives (1.305B — that
-    /// figure is independently verified against the real tensor shapes,
-    /// unlike the plan's estimate) and a Q6_K-level byte rate rather than
-    /// the Q8_0 actually used. Using this constant, projection traffic
-    /// comes out to ~1.39 GB/token rather than the plan's 774 MB/token, and
-    /// total weight bytes/token at any context length is correspondingly
-    /// higher than the plan's table states. This was reported upstream
-    /// rather than silently reconciled — the plan's table has not been
-    /// corrected to match.
+    /// [`ModelConfig::projection_params`] derives 1.305B projection
+    /// parameters from the tensor geometry. At the observed Q8_0 byte rate,
+    /// projection traffic is ~1.39 GB/token. Assuming Q6_K for these tensors
+    /// would understate that traffic; see `docs/MODEL.md` for the arithmetic.
     pub const fn observed_in_target_file() -> Self {
         Self {
             active_ffn: Self::Q6_K,
@@ -214,8 +197,7 @@ pub struct DecodeBandwidth {
     pub total_bytes: u64,
     /// `gpu_bandwidth_bytes_per_sec / total_bytes` — a ceiling, not a
     /// prediction. It assumes perfect bandwidth utilization and zero
-    /// compute-bound stalls, neither of which has been measured on this
-    /// hardware yet.
+    /// compute-bound stalls; see `docs/BENCHMARKS.md` for measured rates.
     pub roofline_tokens_per_sec: f64,
 }
 
@@ -270,14 +252,13 @@ mod tests {
 
     // -- VRAM segmentation --------------------------------------------
 
-    /// Reference config from `qwen36-rust-engine-plan.md` §03: context
-    /// 393,216, 3 slots, f16 KV.
+    /// Reference configuration: aggregate context 393,216, 3 slots, f16 KV.
     fn reference_vram(weights_bytes: u64) -> VramBudget {
         vram_budget(&cfg(), 393_216, 3, 2, weights_bytes)
     }
 
     #[test]
-    fn kv_pool_matches_the_plans_derived_figure_exactly() {
+    fn kv_pool_matches_the_derived_reference_exactly() {
         // 20,480 B/token * 393,216 tokens = 8,053,063,680 B = exactly 7.5 GiB.
         // This is an exact closed-form result, not an estimate, so it is
         // asserted exactly rather than within a tolerance.
@@ -286,25 +267,22 @@ mod tests {
     }
 
     #[test]
-    fn gdn_state_matches_the_plans_derived_figure_within_1_percent() {
+    fn gdn_state_matches_the_rounded_reference_within_3_percent() {
         // 30 GDN layers * 2 MiB/layer * 3 slots = 188,743,680 B ~= 0.176
-        // GiB, which the plan rounds to "0.18 GiB".
+        // GiB, rounded to 0.18 GiB in the reference budget.
         let b = reference_vram(0);
         let gib = b.gdn_state_bytes as f64 / GIB as f64;
         assert!(
             relative_error(gib, 0.18) < 0.03,
-            "GDN state {gib:.4} GiB should be within 3% of the plan's rounded 0.18 GiB"
+            "GDN state {gib:.4} GiB should be within 3% of the rounded 0.18 GiB reference"
         );
     }
 
     #[test]
-    fn total_vram_is_within_a_few_percent_of_the_plans_total_excluding_vision() {
-        // The plan's own total (~41.3 GiB) includes a ~1.5 GiB vision-
-        // encoder segment (`mmproj-F16.gguf`) that this crate does not
-        // budget for — this engine is text-only (AGENTS.md, "Scope"). The
-        // correct comparison point is the plan's total minus that segment,
-        // ~39.8 GiB, not the raw headline figure.
-        const WEIGHTS_BYTES: u64 = (296 * GIB) / 10; // 29.6 GiB, plan's "measured" figure
+    fn total_vram_is_within_a_few_percent_of_the_text_path_reference() {
+        // Historical reference budget: ~41.3 GiB including a ~1.5 GiB
+        // vision allocation. This function budgets only the text path.
+        const WEIGHTS_BYTES: u64 = (296 * GIB) / 10; // historical 29.6 GiB input
         const REFERENCE_TOTAL_EXCLUDING_VISION_GIB: f64 = 41.3 - 1.5;
 
         let b = reference_vram(WEIGHTS_BYTES);
@@ -312,7 +290,7 @@ mod tests {
         assert!(
             relative_error(total_gib, REFERENCE_TOTAL_EXCLUDING_VISION_GIB) < 0.03,
             "total {total_gib:.3} GiB should be within 3% of {REFERENCE_TOTAL_EXCLUDING_VISION_GIB:.3} GiB \
-             (the plan's ~41.3 GiB minus its ~1.5 GiB out-of-scope vision segment)"
+             (the historical ~41.3 GiB budget minus its ~1.5 GiB vision segment)"
         );
 
         let headroom_gib = b.headroom_bytes((475 * GIB) / 10) as f64 / GIB as f64;
@@ -333,7 +311,7 @@ mod tests {
     const RTX_8000_BANDWIDTH_BYTES_PER_SEC: f64 = 672e9;
 
     #[test]
-    fn lm_head_bytes_match_the_plans_reference_within_1_percent() {
+    fn lm_head_bytes_match_the_reference_within_1_percent() {
         let bw = decode_bandwidth(
             &cfg(),
             131_072, // 128K — context is irrelevant to weight_bytes, held fixed here
@@ -344,17 +322,17 @@ mod tests {
         let lm_head_mb = cfg().lm_head_params() as f64 * WeightBytesPerParam::Q8_0 / 1e6;
         assert!(
             relative_error(lm_head_mb, 540.0) < 0.01,
-            "LM head {lm_head_mb:.1} MB should be within 1% of the plan's 540 MB"
+            "LM head {lm_head_mb:.1} MB should be within 1% of the 540 MB reference"
         );
         let _ = bw; // exercised for its side effect of not panicking
     }
 
     #[test]
-    fn active_expert_bytes_match_the_plans_reference_within_1_percent() {
+    fn active_expert_bytes_match_the_reference_within_1_percent() {
         let expert_mb = cfg().active_ffn_params() as f64 * WeightBytesPerParam::Q6_K / 1e6;
         assert!(
             relative_error(expert_mb, 929.0) < 0.01,
-            "active expert traffic {expert_mb:.1} MB should be within 1% of the plan's 929 MB"
+            "active expert traffic {expert_mb:.1} MB should be within 1% of the 929 MB reference"
         );
     }
 
@@ -373,14 +351,9 @@ mod tests {
 
     #[test]
     fn kv_reads_grow_past_weight_reads_somewhere_in_the_hundred_k_token_region() {
-        // The plan's own crossover estimate (~109K, from its 2.24 GB/token
-        // weight figure) and this module's closed-form-derived crossover
-        // (~139K, from the higher, tensor-verified weight_bytes figure —
-        // see `WeightBytesPerParam::observed_in_target_file`'s doc comment)
-        // disagree by about 28%. Rather than assert either point estimate
-        // tightly, this test asserts the qualitative claim both agree on:
-        // the crossover lands somewhere in the tens-of-hundred-K region,
-        // not at 10K and not at 1M.
+        // The reference geometry and observed weight formats put the
+        // crossover near 139K tokens. Check its scale without treating
+        // this approximate traffic model as an exact performance prediction.
         let c = cfg();
         let weight_bytes = (c.active_ffn_params() as f64 * WeightBytesPerParam::Q6_K
             + c.lm_head_params() as f64 * WeightBytesPerParam::Q8_0

@@ -185,8 +185,8 @@ optimizations that were correct for the wrong bound and measured slower.
   message — file and function, not just project name; upstream paths drift.
   (A stretch of recent history used sentence-style subjects; that experiment
   is over and survives only in those log entries.)
-- **Never commit `qwen36-rust-engine-plan.md`.** It is a local design draft and
-  is listed in `.gitignore`. Its content belongs in `docs/` once settled.
+- **Never commit local design drafts.** Keep them ignored; settled content
+  belongs in `docs/`.
 - **Never commit model weights**, captured goldens, or benchmark output.
 - `cargo fmt --all` and `cargo clippy --workspace --all-targets` must be clean
   before you commit.

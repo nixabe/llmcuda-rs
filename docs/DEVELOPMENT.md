@@ -11,12 +11,11 @@
 | Rust | nightly, pinned by `rust-toolchain.toml` |
 
 Device figures above are measured, not quoted — run
-`cargo run -p xabe-cuda --bin probe` to reproduce them. Two are worth noting
-because the design plan carried them as estimates:
+`cargo run -p xabe-cuda --bin probe` to reproduce them:
 
 - Peak bandwidth derives to **exactly 672 GB/s** from a 384-bit bus at 7001 MHz
   effective. Every roofline in [MODEL.md](MODEL.md) is stated against this.
-- Usable memory is **47.3 GiB**, against the plan's ~47.5 GiB assumption. The
+- Usable memory is **47.3 GiB**. The
   VRAM budget in [MODEL.md](MODEL.md) uses the measured figure.
 
 ## Building
@@ -95,17 +94,13 @@ purposes and should not be substituted for one another — see
 | llama.cpp | `/home/nixabe/llama.cpp` | Anything that must run on sm_75 |
 | vLLM | `/home/nixabe/vllm` | Everything above the kernel |
 
-> The design plan gives vLLM's path as `/home/nixabe/vLLM`. It is actually
-> lowercase `vllm`.
-
 Paths inside those trees drift on master. Treat the tables in
 [KERNELS.md](KERNELS.md) as areas to search, not addresses, and confirm against
 the checkout in front of you.
 
 llama.cpp master already ships `ggml/src/ggml-cuda/gated_delta_net.cu`, which
 is the only Turing-validated reference for this project's critical-path kernel.
-Its HEAD also serializes MTP ubatches, which answers the plan's open question
-about whether MTP is supported for this architecture.
+Its HEAD also serializes MTP ubatches for this architecture.
 
 ## Model files
 

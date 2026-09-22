@@ -114,7 +114,7 @@ All 753 tensors match, with none left unclaimed.
 Tensor type histogram: `q6_K` 80 tensors / 16.41 GiB, `q8_0` 303 / 13.86 GiB,
 `f32` 368 / 0.10 GiB, `bf16` 2. Total tensor data 30.36 GiB.
 
-**Quantization is mixed, and not the way the planning document assumed.**
+**Quantization is mixed.**
 The LM head *and the projections* are Q8_0. That matters for the bandwidth
 arithmetic below.
 
@@ -338,11 +338,10 @@ metadata anyway — `general.name` is what the server reports the model as.
 
 ### Three findings from the real file
 
-1. **The GDN state shape is confirmed, not merely derived.** The planning
-   document carried 32 × 128 × 128 × fp32 per layer as an unverified
-   derivation. It matches llama.cpp's own `n_embd_s()` formula
+1. **The GDN state shape is confirmed, not merely derived.** The
+   32 × 128 × 128 × fp32 state per layer matches llama.cpp's `n_embd_s()` formula
    (`ssm_d_state 128 × ssm_d_inner 4096`) computed from the file's metadata,
-   and every GDN weight tensor shape agrees. This closes an open question.
+   and every GDN weight tensor shape agrees.
 
 2. **`block_count` is 41, not 40.** Block 40 is an extra attention-type layer
    carrying the MTP (`nextn.*`) tensors — about 0.008 B parameters.
@@ -382,9 +381,8 @@ At context 393,216, 3 slots, f16 KV, Q6_K_XL weights, against 47.3 GiB usable
 | **Total** | **39.98** | |
 | **Headroom** | **7.52** | |
 
-This runs below the planning document's ~41.3 GiB because it **excludes the
-vision encoder**. This engine is text-only, so the ~1.5 GiB `mmproj` cost does
-not apply; that is a scope difference, not an error.
+This budget covers the text path and **excludes the vision encoder**.
+Serving images requires budgeting the separate `mmproj` allocation as well.
 
 The two estimate rows are inherited unmeasured and are the next thing to
 measure.
@@ -409,14 +407,10 @@ Q8_0 LM head and projections:
 | GDN + attention projections (Q8_0) | 1.305 B | 1,387 MB |
 | **Total weights** | | **2.86 GB** |
 
-> **This differs from the planning document's 2.24 GB by about 28%.** Two
-> causes, both verified against the file: the projections are structurally
-> larger than that document's 0.944 B estimate, and they are stored at Q8_0
-> rather than the Q6_K its arithmetic implied. The active-expert (929 MB) and
-> LM-head (540 MB) figures match it to within 1%.
->
-> Since the config's projection count is itself ~9% *below* what the real file
-> holds, 2.86 GB is a floor, not a ceiling.
+The projection traffic uses the structurally derived 1.305 B parameters
+and the Q8_0 format observed in the file. Since the config's projection
+count is itself ~9% below what the real file holds, 2.86 GB is a floor,
+not a ceiling.
 
 ### Per-token KV read
 
@@ -444,10 +438,9 @@ falls short of them.
 
 ### Conclusions
 
-1. **Long-context decode is KV-bound, but the crossover is later than
-   assumed.** KV reads overtake weight reads at about **139K tokens**, not the
-   ~109K the planning document implied. The hybrid architecture already saved
-   4× on KV; what remains still comes to dominate, just further out.
+1. **KV reads overtake weight reads at about 139K tokens** in this model.
+   The hybrid architecture saves 4× on KV compared with attention on every
+   layer, but the remaining KV traffic still grows with context.
 
 2. **`-ctk q8_0 -ctv q8_0` was benchmarked, and it is worse.** −15.5% at 32K
    and −35.8% at 128K. The roofline argument for it assumed the KV path had

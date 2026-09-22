@@ -3,7 +3,7 @@
 *.pdb
 
 # Local design drafts are kept out of the tree deliberately; see AGENTS.md.
-/qwen36-rust-engine-plan.md
+/*-plan.md
 
 # OMC session state
 .omc/

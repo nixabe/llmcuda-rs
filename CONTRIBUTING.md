@@ -93,8 +93,7 @@ committing.
 
 ## Things that must never be committed
 
-- `qwen36-rust-engine-plan.md` — local design draft, gitignored. Settled
-  content belongs in `docs/`.
+- Local design drafts. Keep them ignored; settled content belongs in `docs/`.
 - Model weights, GGUF files, captured activation goldens.
 - Benchmark output.
 

@@ -5,9 +5,8 @@
 //!
 //! Every number here is either a closed-form derivation from
 //! [`xabe_model::config::ModelConfig`] or an explicitly labeled estimate —
-//! see `crates/xabe-model/src/budget.rs`'s module doc for which is which,
-//! and for where this diverges from `qwen36-rust-engine-plan.md`'s own
-//! reference tables (and why).
+//! see `crates/xabe-model/src/budget.rs`'s module doc for the assumptions
+//! and `docs/MODEL.md` for the resource model.
 
 use tracing::info;
 use xabe_model::budget::{self, WeightBytesPerParam};
@@ -16,15 +15,15 @@ use xabe_model::config::ModelConfig;
 /// 1 GiB in bytes.
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// Quadro RTX 8000: 48 GiB total, ~47.5 GiB usable after driver/display
-/// reservation (`qwen36-rust-engine-plan.md` §03).
+/// Historical budget input: ~47.5 GiB usable on a 48 GiB Quadro RTX 8000.
+/// Current measured usable capacity is recorded in `docs/DEVELOPMENT.md`.
 const USABLE_VRAM_BYTES: u64 = (475 * GIB) / 10;
 
-/// Measured on-disk size of `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf`'s tensor data
-/// (`qwen36-rust-engine-plan.md` §03's "measured"-confidence figure).
+/// Historical 29.6 GiB weight-budget input. This example does not load or
+/// measure the model file; its tensor-directory size is in `docs/MODEL.md`.
 const WEIGHTS_BYTES: u64 = (296 * GIB) / 10;
 
-/// `-c 393216 -np 3` from the plan's llama.cpp reference invocation (§03).
+/// Reference serving configuration: `-c 393216 -np 3`.
 const REFERENCE_CONTEXT_TOKENS: u64 = 393_216;
 const REFERENCE_SLOTS: u32 = 3;
 
@@ -82,10 +81,9 @@ fn main() {
         vram.headroom_bytes(USABLE_VRAM_BYTES) as f64 / GIB as f64
     );
     info!(
-        "\nNote: excludes the vision encoder (mmproj) — this engine is \
-         text-only per AGENTS.md, so the total below runs lower than the \
-         planning document's own ~41.3 GiB figure by roughly the vision \
-         encoder's ~1.5 GiB, not by error.\n"
+        "\nNote: this budget covers the text path and excludes the vision \
+         encoder (mmproj). Serving images requires budgeting that separate \
+         allocation as well.\n"
     );
 
     info!("=== Per-token decode bandwidth roofline ===");
@@ -138,10 +136,8 @@ fn main() {
          by KV bytes/token past this point)."
     );
     info!(
-        "This differs from qwen36-rust-engine-plan.md \u{a7}04's ~109K crossover \
-         estimate — see WeightBytesPerParam::observed_in_target_file's doc \
-         comment for the derivation gap (projection_params is structurally \
-         larger, and observed as Q8_0 rather than Q6_K, versus that plan's \
-         rougher estimate)."
+        "This estimate uses structurally derived projection dimensions and \
+         their observed Q8_0 format. See \
+         WeightBytesPerParam::observed_in_target_file and docs/MODEL.md."
     );
 }

@@ -23,7 +23,7 @@
 /goldens/
 /.golden/
 /bench-results/
-/qwen36-rust-engine-plan.md
+/*-plan.md
 
 # Editor and agent scratch.
 /.omc

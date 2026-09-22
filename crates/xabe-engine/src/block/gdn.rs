@@ -752,6 +752,79 @@ __global__ void NAME(                                                           
 GDN_GATES(gdn_alpha_beta_gates,    8)
 GDN_GATES(gdn_alpha_beta_gates_t1, 1)
 
+// Consumer-side input normalization for the target F32 gates at decode width.
+// Four virtual bands preserve rms_norm_rows' 1024-thread reduction tree.
+// Head zero publishes the normalized row for the other GDN projections.
+__global__ void gdn_norm_alpha_beta_gates(
+    const float* __restrict__ w_alpha,
+    const float* __restrict__ w_beta,
+    const float* __restrict__ x,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ ssm_a,
+    float* __restrict__ alpha,
+    float* __restrict__ beta_raw,
+    float* __restrict__ a_softplus,
+    float* __restrict__ log_decay,
+    float* __restrict__ beta,
+    int k_dim,
+    int heads,
+    int tokens,
+    const float* __restrict__ norm_weight,
+    float* __restrict__ normed,
+    float eps
+) {
+    int tid = threadIdx.x, lane = tid & 31;
+    int n = blockIdx.x, t = blockIdx.y;
+    extern __shared__ float data[];
+    float* scratch = data + k_dim;
+    for (int i = tid; i < k_dim; i += 256)
+        data[i] = x[(long long)t * k_dim + i];
+    __syncthreads();
+    // Emulate the original 1024-thread norm tree with four virtual bands.
+    for (int band = 0; band < 4; ++band) {
+        float partial = 0.0f;
+        for (int j = tid + band * 256; j < k_dim; j += 1024)
+            partial = __fmaf_rn(data[j], data[j], partial);
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_down_sync(0xffffffff, partial, off);
+        if (lane == 0) scratch[band * 8 + (tid >> 5)] = partial;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sum_sq = 0.0f;
+        for (int w = 0; w < 32; ++w) sum_sq += scratch[w];
+        scratch[0] = 1.0f / sqrtf(sum_sq / (float)k_dim + eps);
+    }
+    __syncthreads();
+    float inv_rms = scratch[0];
+    for (int j = tid; j < k_dim; j += 256) {
+        float normalized = data[j] * inv_rms * norm_weight[j];
+        data[j] = normalized;
+        // Other GDN projections still need the normalized row.
+        if (n == 0) normed[(long long)t * k_dim + j] = normalized;
+    }
+    __syncthreads();
+    if (tid >= 32) return;
+    float aa = 0.0f, bb = 0.0f;
+    for (int i = lane; i < k_dim; i += 32) {
+        aa += w_alpha[(long long)n * k_dim + i] * data[i];
+        bb += w_beta[(long long)n * k_dim + i] * data[i];
+    }
+    float a_sum = warp_reduce_sum(aa);
+    float b_sum = warp_reduce_sum(bb);
+    if (lane == 0) {
+        long long i = (long long)t * heads + n;
+        alpha[i] = a_sum;
+        beta_raw[i] = b_sum;
+        float a = a_sum + dt_bias[n];
+        float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
+        a_softplus[i] = sp;
+        log_decay[i] = sp * ssm_a[n];
+        beta[i] = 1.0f / (1.0f + expf(-b_sum));
+    }
+}
+
+
 // The same kernel over Q8_0 `ssm_alpha` / `ssm_beta`.
 //
 // `Qwen3.6-35B-A3B-UD-Q6_K_XL` stores these two f32; `Qwen3.8-27B-UD-Q8_K_XL`
@@ -2334,6 +2407,7 @@ pub struct GdnBlock {
     proj_quant: [CudaFunction; 7],
     alpha_beta_gates: CudaFunction,
     alpha_beta_gates_t1: CudaFunction,
+    norm_alpha_beta_gates: CudaFunction,
     alpha_beta_gates_q8: CudaFunction,
     alpha_beta_gates_q8_t1: CudaFunction,
     alpha_beta_gates_q6k: CudaFunction,
@@ -2349,6 +2423,84 @@ pub struct GdnBlock {
 }
 
 impl GdnBlock {
+    /// Normalize the input, returning whether its gate consumer also ran.
+    fn normalize_input(
+        &self,
+        stream: &Arc<CudaStream>,
+        hidden: &CudaSlice<f32>,
+        w: &GdnLayerWeights,
+        s: &mut Scratch,
+        tokens: usize,
+    ) -> Result<bool, GdnBlockError> {
+        let g = self.geometry;
+        let fused = g.hidden == 2048
+            && g.value_heads == 32
+            && (1..=3).contains(&tokens)
+            && w.alpha.format() == GateFormat::F32
+            && w.beta.format() == GateFormat::F32;
+        if !fused {
+            self.layer_ops.rms_norm(
+                stream,
+                hidden,
+                &w.input_norm,
+                &mut s.normed,
+                tokens,
+                g.hidden,
+                g.rms_eps,
+            )?;
+            return Ok(false);
+        }
+        let (GateProjection::F32(wa), GateProjection::F32(wb)) = (&w.alpha, &w.beta) else {
+            unreachable!("the fused consumer requires F32 weights");
+        };
+        let n = tokens * g.value_heads;
+        check_len("norm gates input", tokens * g.hidden, hidden.len())?;
+        check_len("norm gates norm weight", g.hidden, w.input_norm.len())?;
+        check_len(
+            "norm gates alpha weight",
+            g.hidden * g.value_heads,
+            wa.len(),
+        )?;
+        check_len("norm gates beta weight", g.hidden * g.value_heads, wb.len())?;
+        check_len("norm gates dt bias", g.value_heads, w.dt_bias.len())?;
+        check_len("norm gates decay weight", g.value_heads, w.a.len())?;
+        check_len("norm gates normed", tokens * g.hidden, s.normed.len())?;
+        check_len("norm gates alpha", n, s.alpha.len())?;
+        check_len("norm gates beta raw", n, s.beta_raw.len())?;
+        check_len("norm gates softplus", n, s.a_softplus.len())?;
+        check_len("norm gates log decay", n, s.log_decay.len())?;
+        check_len("norm gates beta", n, s.beta.len())?;
+        let cfg = LaunchConfig {
+            grid_dim: (g.value_heads as u32, tokens as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: ((g.hidden + 32) * size_of::<f32>()) as u32,
+        };
+        let (k, h, t) = (g.hidden as i32, g.value_heads as i32, tokens as i32);
+        let mut builder = stream.launch_builder(&self.norm_alpha_beta_gates);
+        builder
+            .arg(wa)
+            .arg(wb)
+            .arg(hidden)
+            .arg(&w.dt_bias)
+            .arg(&w.a)
+            .arg(&mut s.alpha)
+            .arg(&mut s.beta_raw)
+            .arg(&mut s.a_softplus)
+            .arg(&mut s.log_decay)
+            .arg(&mut s.beta)
+            .arg(&k)
+            .arg(&h)
+            .arg(&t)
+            .arg(&w.input_norm)
+            .arg(&mut s.normed)
+            .arg(&g.rms_eps);
+        // SAFETY: all inputs and outputs were checked against the target
+        // geometry. Each block owns one (head, token), only head zero writes
+        // normed, and the shared arena holds one input row plus 32 partials.
+        unsafe { builder.launch(cfg) }?;
+        Ok(true)
+    }
+
     /// Compile every kernel this block needs, for `geometry`.
     ///
     /// Both mixer kernels get the model's real `qk_heads` (16), so they apply
@@ -2429,6 +2581,7 @@ impl GdnBlock {
             ],
             alpha_beta_gates: module.load_function("gdn_alpha_beta_gates")?,
             alpha_beta_gates_t1: module.load_function("gdn_alpha_beta_gates_t1")?,
+            norm_alpha_beta_gates: module.load_function("gdn_norm_alpha_beta_gates")?,
             alpha_beta_gates_q8: module.load_function("gdn_alpha_beta_gates_q8")?,
             alpha_beta_gates_q8_t1: module.load_function("gdn_alpha_beta_gates_q8_t1")?,
             alpha_beta_gates_q6k: module.load_function("gdn_alpha_beta_gates_q6k")?,
@@ -2826,15 +2979,7 @@ impl GdnBlock {
         let split_tiled = tc.filter(|_| tokens > 1 && !Self::uses_tensor_cores(tokens));
         let tc = tc.filter(|_| Self::uses_tensor_cores(tokens));
 
-        self.layer_ops.rms_norm(
-            stream,
-            hidden,
-            &w.input_norm,
-            &mut s.normed,
-            tokens,
-            g.hidden,
-            g.rms_eps,
-        )?;
+        let gates_ready = self.normalize_input(stream, hidden, w, s, tokens)?;
         if let Some(i8w) = tc {
             self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
             let (xq, xs) = self.xq.as_ref().expect("quantized above");
@@ -2932,20 +3077,22 @@ impl GdnBlock {
             &mut s.v,
             tokens,
         )?;
-        self.alpha_beta_gates(
-            stream,
-            &w.alpha,
-            &w.beta,
-            &s.normed,
-            &w.dt_bias,
-            &w.a,
-            &mut s.alpha,
-            &mut s.beta_raw,
-            &mut s.a_softplus,
-            &mut s.log_decay,
-            &mut s.beta,
-            tokens,
-        )?;
+        if !gates_ready {
+            self.alpha_beta_gates(
+                stream,
+                &w.alpha,
+                &w.beta,
+                &s.normed,
+                &w.dt_bias,
+                &w.a,
+                &mut s.alpha,
+                &mut s.beta_raw,
+                &mut s.a_softplus,
+                &mut s.log_decay,
+                &mut s.beta,
+                tokens,
+            )?;
+        }
 
         // The scans share no data across sequences, and each is a 44%-
         // occupancy whole-chunk sequential walk — serializing them on one
@@ -3120,15 +3267,7 @@ impl GdnBlock {
         let tc = tc.filter(|_| Self::uses_tensor_cores(tokens));
 
         // 1. attn_norm-N, over every sequence's row.
-        self.layer_ops.rms_norm(
-            stream,
-            hidden,
-            &w.input_norm,
-            &mut s.normed,
-            tokens,
-            g.hidden,
-            g.rms_eps,
-        )?;
+        let gates_ready = self.normalize_input(stream, hidden, w, s, tokens)?;
 
         // 2. linear_attn_qkv_mixed-N and z-N. No state, so this is exactly
         //    the batched form `run` already has for a multi-token prefill —
@@ -3276,20 +3415,22 @@ impl GdnBlock {
 
         // 5. alpha-N / a_softplus-N / gate-N and beta-N / beta_sigmoid-N. No
         //    state, batches the same way step 2 does.
-        self.alpha_beta_gates(
-            stream,
-            &w.alpha,
-            &w.beta,
-            &s.normed,
-            &w.dt_bias,
-            &w.a,
-            &mut s.alpha,
-            &mut s.beta_raw,
-            &mut s.a_softplus,
-            &mut s.log_decay,
-            &mut s.beta,
-            tokens,
-        )?;
+        if !gates_ready {
+            self.alpha_beta_gates(
+                stream,
+                &w.alpha,
+                &w.beta,
+                &s.normed,
+                &w.dt_bias,
+                &w.a,
+                &mut s.alpha,
+                &mut s.beta_raw,
+                &mut s.a_softplus,
+                &mut s.log_decay,
+                &mut s.beta,
+                tokens,
+            )?;
+        }
 
         // 6. The delta rule — the other half of what step 3 could not batch
         //    over the token axis, batched over the launch the same way: the
@@ -3464,15 +3605,7 @@ impl GdnBlock {
         let tc = tc.filter(|_| Self::uses_tensor_cores(tokens));
 
         // 1. attn_norm-N
-        self.layer_ops.rms_norm(
-            stream,
-            hidden,
-            &w.input_norm,
-            &mut s.normed,
-            tokens,
-            g.hidden,
-            g.rms_eps,
-        )?;
+        let gates_ready = self.normalize_input(stream, hidden, w, s, tokens)?;
 
         // 2. linear_attn_qkv_mixed-N, and the output gate z-N alongside it.
         if let Some(i8w) = tc {
@@ -3572,20 +3705,22 @@ impl GdnBlock {
         // 6. alpha-N / a_softplus-N / gate-N and beta-N / beta_sigmoid-N.
         //    One launch: both projections read the same `normed` and the
         //    gates read nothing but their outputs.
-        self.alpha_beta_gates(
-            stream,
-            &w.alpha,
-            &w.beta,
-            &s.normed,
-            &w.dt_bias,
-            &w.a,
-            &mut s.alpha,
-            &mut s.beta_raw,
-            &mut s.a_softplus,
-            &mut s.log_decay,
-            &mut s.beta,
-            tokens,
-        )?;
+        if !gates_ready {
+            self.alpha_beta_gates(
+                stream,
+                &w.alpha,
+                &w.beta,
+                &s.normed,
+                &w.dt_bias,
+                &w.a,
+                &mut s.alpha,
+                &mut s.beta_raw,
+                &mut s.a_softplus,
+                &mut s.log_decay,
+                &mut s.beta,
+                tokens,
+            )?;
+        }
 
         // 7. The delta rule.
         self.mixer = self.mix(
@@ -4984,3 +5119,6 @@ mod tests {
         assert_eq!(elementwise_cfg(1 << 30).grid_dim.0, 1024);
     }
 }
+
+#[cfg(test)]
+mod normalization_tests;

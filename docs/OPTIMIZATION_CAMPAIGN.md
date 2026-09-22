@@ -2,8 +2,9 @@
 
 Status: the original baseline, profiling, capture-tool validation, and
 deep-prefill attention phase are complete. The corrected fragment-softmax
-implementation is accepted. The exact-order gate experiments are complete and rejected. Consumer-side
-normalization is next.
+implementation is accepted. The exact-order gate experiments are complete and
+rejected. Consumer-side normalization is accepted after paired model measurements
+and the complete release suite.
 
 | Experiment | Kernel throughput change | Prefill throughput change | Decode throughput change | Correct | Decision |
 | --- | ---: | ---: | ---: | --- | --- |
@@ -11,6 +12,7 @@ normalization is next.
 | Fragment softmax with explicit original rounding | +21.69–22.77% at 128K | +12.09–12.11% at 128K, N=3 | Not separately measured | Yes; full suite and new regression | Keep |
 | Cooperative gate loading | Cache dependent; N=3 resident loss | Not measured | Not measured | Bit-exact isolated probe | Reject |
 | One head per gate block | Cache dependent | Not measured | −0.09–0.14% at 2K, N=3 | Yes; targeted model checks | Reject |
+| Consumer RMSNorm plus GDN gates | About +21% resident / +39% rotating weights, N=3 | Not separately measured | +0.14–0.32% at 2K; +0.42–0.48% at 32K, N=3 | Yes; full suite and CPU/GPU regression | Keep |
 
 ## Scope and provenance
 
@@ -541,11 +543,114 @@ restored inference source is identical to the attention phase's fully tested
 tree (87 targets, 975 successful returns, zero failures, 12 explicit skips).
 Formatting and Clippy are checked again for this documentation-only result.
 
+## Consumer-side RMSNorm experiment
+
+The GDN alpha/beta projections each consume a complete normalized row. One
+256-thread block per (head, token) combines that consumer
+with normalization, using four virtual thread bands to reproduce the
+existing 1,024-thread norm reduction. Each virtual thread accumulates its
+original square sequence, each warp uses the original down-shuffle tree,
+and thread zero adds the 32 warp partials in their original order. The
+first warp then performs the unchanged gate contraction and nonlinearities.
+Head zero writes the normalized row needed by QKV and output-gate
+projections; other heads only keep their own normalized row in shared
+memory. Kernel completion supplies the dependency for those projections.
+
+This is consumer-side fusion with duplicated statistics, rather than a
+producer-side cross-block reduction. It removes one launch per GDN layer
+when selected, but still materializes the normalized row for other
+consumers. The dispatch covers target F32 gates at one through three
+tokens; larger shapes and other geometries/formats retain their existing
+normalization and gate launches. Gate calculation moves ahead of the QKV
+projection, so its isolated saving requires a whole-model cache-state check.
+
+The integrated and isolated kernels both report 57 registers, zero local
+bytes, no offline stack/spills, and 8,320 dynamic shared bytes per block.
+The original norm uses 22 registers, 1,024 threads and 128 shared bytes;
+the gate uses 64 registers, 128 threads and no shared memory. All three
+resource ceilings permit 32 resident warps/SM. The fused block can have
+four resident blocks/SM, though only its first warp performs the contraction
+after normalization. These are resource ceilings, not measured occupancy.
+
+N=1 and N=3 isolated checks compare the normalized rows and all five gate
+outputs, 8,832 floats total: every value matches the standalone GPU paths
+bit for bit. The integrated trial also passes the forward golden, batch
+decode, carried and wide batch prefill, GDN differential, and gate-format
+identity checks: five targets, 19 successful returns, zero failures, one
+explicit opt-in audit skip. No tolerance changes are made.
+
+### Normalization fragment timings
+
+A is standalone RMSNorm followed by the original gate launch; B is the fused
+consumer. Each graph contains 300 complete fragments and each CUDA-event
+measurement covers ten replays. Rates below are microseconds per fragment,
+including both launches in A. A pilot used three warmup replays and exposed
+clock ramp-up in its N=1 points; all pilot values are retained here. The
+repeat uses 200 warmup replays per measurement to make the short workload
+sustain GPU activity before timing. No clock policy was changed.
+
+| Warmup replays | N | Weight reuse | A1 | B1 | B2 | A2 | A3 | B3 |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 | 1 | resident | 8.4062 | 6.1850 | 6.1851 | 8.1962 | 8.1953 | 6.0634 |
+| 3 | 1 | 30 layers | 10.3629 | 7.2684 | 7.2649 | 8.3784 | 8.3081 | 5.8001 |
+| 3 | 3 | resident | 6.2719 | 5.1865 | 5.1890 | 6.2466 | 6.2482 | 5.1851 |
+| 3 | 3 | 30 layers | 8.2262 | 5.9208 | 5.9197 | 8.2215 | 8.2232 | 5.9187 |
+| 200 | 1 | resident | 6.0867 | 4.4822 | 4.4823 | 6.0836 | 6.0839 | 4.4845 |
+| 200 | 1 | 30 layers | 8.2603 | 5.7900 | 5.8186 | 8.2657 | 8.2627 | 5.8539 |
+| 200 | 3 | resident | 6.2893 | 5.2159 | 5.2161 | 6.2902 | 6.2865 | 5.2155 |
+| 200 | 3 | 30 layers | 8.2565 | 5.9453 | 5.9440 | 8.2452 | 8.2507 | 5.9539 |
+
+With sustained warmup, N=3 fragment throughput improves about 21% with
+resident weights and 39% when rotating 30 weight pairs. This qualifies the
+consumer for model measurements; it is not an inference throughput claim.
+The full-model pairs follow below.
+
+### Normalization full-model pairs
+
+A is the accepted attention implementation with standalone input norms and
+gates. B adds only this consumer fusion. Each process discards four warmup
+steps and times 128 decode steps, including greedy sampling. All three
+execution shapes are reported separately. Columns preserve the reversed
+middle pair; values are aggregate tokens/s.
+
+| Context | Shape | A1 | B1 | B2 | A2 | A3 | B3 | Paired change | A mean ± SD | B mean ± SD |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 2,048 | single_stream | 114.3 | 114.8 | 114.2 | 113.5 | 113.4 | 114.1 | +0.44% / +0.62% / +0.62% | 113.73 ± 0.49 | 114.37 ± 0.38 |
+| 2,048 | batch 1 | 114.6 | 115.2 | 115.1 | 114.2 | 114.1 | 114.9 | +0.52% / +0.79% / +0.70% | 114.30 ± 0.26 | 115.07 ± 0.15 |
+| 2,048 | batch 3 | 216.3 | 216.7 | 216.1 | 215.8 | 215.5 | 216.2 | +0.18% / +0.14% / +0.32% | 215.87 ± 0.40 | 216.33 ± 0.32 |
+| 32,768 | single_stream | 97.5 | 97.7 | 97.6 | 97.0 | 96.8 | 97.6 | +0.21% / +0.62% / +0.83% | 97.10 ± 0.36 | 97.63 ± 0.06 |
+| 32,768 | batch 1 | 97.6 | 98.1 | 98.0 | 97.4 | 97.1 | 97.9 | +0.51% / +0.62% / +0.82% | 97.37 ± 0.25 | 98.00 ± 0.10 |
+| 32,768 | batch 3 | 166.0 | 166.7 | 166.8 | 166.0 | 165.6 | 166.4 | +0.42% / +0.48% / +0.48% | 165.87 ± 0.23 | 166.63 ± 0.21 |
+
+All three pairs favor B at both contexts and all measured execution shapes.
+The small N=3 margins satisfy the directional criterion; they do not imply
+large decode headroom. Peak reported VRAM is unchanged: 31.805 GiB at 2K
+and 33.555 GiB at 32K for N=3. No separate prefill gain is claimed: the
+ordinary prefill chunks do not select this fusion. The change is accepted.
+The complete GPU 1 release suite passes: 87 targets, 976 successful returns,
+zero failures, and 12 explicit skips for the same unavailable fixtures and
+opt-in audits listed above. Formatting and workspace all-target Clippy are
+clean. The fixture-free regression passes: at N=1/2/3 and the N=4 fallback, it compares every
+normalized value and gate output in bits against the separate GPU kernels
+and against the existing CPU RMSNorm, GEMV, softplus, and sigmoid references.
+It includes a zero input row and biases on both sides of the softplus
+passthrough threshold. The existing RMSNorm and anchored GDN elementwise
+tolerances are reused unchanged.
+
+A bounded Nsight attribution capture at 2K, N=3, 32 timed steps confirms
+659 → 629 kernel calls per step. Standalone RMSNorm calls fall from 101 to
+71; the 30 separate gate calls become 30 combined calls. The combined
+kernel reports the same 57 registers and 8,320 shared bytes in the trace.
+These instrumented captures are not throughput evidence: active kernel
+intervals total 13.2660 ms/step in A and 13.2718 in B, while clocks and
+profiling overhead are uncontrolled between them. The unprofiled reversed
+pairs above determine acceptance. Final source formatting produces
+byte-identical NVRTC PTX to the measured implementation.
+
 ## Results still required
 
-1. Investigate consumer normalization, additional launch fusion, and one
-   persistent fragment,
-   in that order unless the profile establishes a different priority.
+1. Investigate additional launch fusion and one persistent fragment, in
+   that order unless the profile establishes a different priority.
 2. Prototype or implement safe same-slot continuation and measure multi-turn
    time to first token, transferred bytes, reuse, and conversation time.
 3. Re-evaluate the available speculative drafters after the kernel work.

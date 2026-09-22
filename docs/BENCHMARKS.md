@@ -1124,6 +1124,28 @@ are unchanged, so removing the source-level softmax fences is not a claim
 of fewer hardware barrier instructions. The measured benefit is confirmed
 by the [full-model prefill pairs](OPTIMIZATION_CAMPAIGN.md#full-model-prefill-pairs).
 
+## GDN input normalization: consume the row before leaving the block
+
+The alpha/beta projection consumes a complete normalized input row. At the
+target's small decode widths, one block per head computes that normalization
+and feeds its first warp directly from shared memory. Head zero also writes
+the normalized row for the other projections. Their dependency is ordinary
+kernel completion; the consumer needs no cross-block reduction or ownership
+handoff.
+
+Four virtual bands of 256 threads preserve the standalone norm's logical
+1,024-thread accumulation order, followed by the same warp reductions and
+ascending sum of 32 partials. The gate retains its original lane-strided FMA
+and XOR tree. This duplicates statistics across heads, so it is selected
+only for the measured 2,048-wide, 32-head F32 geometry at N≤3. Other shapes
+keep the separate launches. The combined kernel uses 57 registers, 8,320
+shared bytes, and no spills or local memory; its resource ceiling remains
+32 resident warps per SM. The normalized row and all gate outputs agree in
+bits with the separate kernels and are also checked against composed CPU
+references. The [model pairs](OPTIMIZATION_CAMPAIGN.md#normalization-full-model-pairs)
+establish a small decode gain; the larger isolated fragment gain is not the
+model result.
+
 ## Residency: every projection on the card once, in the form its reader wants
 
 The same question, asked of the card instead of a grid: *how many copies of

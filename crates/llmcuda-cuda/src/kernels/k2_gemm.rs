@@ -111,11 +111,14 @@ extern "C" __global__ void k2_quantize(const float* x,signed char* q,signed char
 
 template<int Q,int IR=4>
 __device__ __forceinline__ const unsigned char* weight_row(const unsigned char* w,int e,int r,int inner,int rows){return w+((long long)e*((rows+IR-1)/IR)+r/IR)*IR*(inner/256)*(Q==3 ? 160 : 224)+(r%IR)*4;}
+// Native records interleave aligned words across rows. Load d/dmin as one
+// word and Q6 d as one halfword without changing the float conversion.
+__device__ __forceinline__ float k2_half_bits(unsigned short bits){float f;asm("cvt.f32.f16 %0,%1;":"=f"(f):"h"(bits));return f;}
 template<int Q,int IR=4>
 __device__ __forceinline__ unsigned raw_pack4(const unsigned char* w,unsigned i,float* scale,float* minimum) {
     int r=i&255,g=r>>5,z=(r&31)>>2;const unsigned char* b=w+(i>>8)*(Q==3 ? 160 : 224)*IR;
-    if(Q==3){*scale=load_half_le(b+128*IR)*(float)b[((132+g)>>2)*(4*IR)+((132+g)&3)];*minimum=load_half_le(b+128*IR+2)*(float)b[((140+g)>>2)*(4*IR)+((140+g)&3)];unsigned code=*(const unsigned*)(b+((z%4)*32+g*4)*IR);return (z<4 ? code : code>>4)&0x0f0f0f0f;}
-    *scale=load_half_le(b+192*IR)*(float)((const signed char*)b)[((194+r/16)>>2)*(4*IR)+((194+r/16)&3)];*minimum=0;
+    if(Q==3){unsigned dm=*(const unsigned*)(b+128*IR);*scale=k2_half_bits((unsigned short)dm)*(float)b[((132+g)>>2)*(4*IR)+((132+g)&3)];*minimum=k2_half_bits((unsigned short)(dm>>16))*(float)b[((140+g)>>2)*(4*IR)+((140+g)&3)];unsigned code=*(const unsigned*)(b+((z%4)*32+g*4)*IR);return (z<4 ? code : code>>4)&0x0f0f0f0f;}
+    *scale=k2_half_bits(*(const unsigned short*)(b+192*IR))*(float)((const signed char*)b)[((194+r/16)>>2)*(4*IR)+((194+r/16)&3)];*minimum=0;
     int bit=(r%16)*6,word=bit/32,shift=bit%32,base=(r/16)*12;
     unsigned v=*(const unsigned*)(b+(base+word*4)*IR)>>shift;
     if(shift>8)v|=*(const unsigned*)(b+(base+(word+1)*4)*IR)<<(32-shift);
@@ -154,7 +157,7 @@ __device__ __forceinline__ int weight_sum(const unsigned char* row,unsigned i){
     const unsigned* p=(const unsigned*)(b+148*IR);unsigned code=p[pos*IR]>>shift;if(shift>23)code|=p[(pos+1)*IR]<<(32-shift);return (int)(code&511);
 }
 template<int IR> __device__ __forceinline__ float q6_subscale(const unsigned char* row,int i){const unsigned char* b=row+(i/256)*224*IR;int off=194+(i%256)/16;return (float)((const signed char*)b)[(off/4)*(4*IR)+(off%4)];}
-template<int IR> __device__ __forceinline__ float q6_delta(const unsigned char* row,int i){return load_half_le(row+(i/256)*224*IR+192*IR);}
+template<int IR> __device__ __forceinline__ float q6_delta(const unsigned char* row,int i){return k2_half_bits(*(const unsigned short*)(row+(i/256)*224*IR+192*IR));}
 template<int Q,int NT,bool ROUTED>
 __device__ void raw_gemv(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* ids,float* out,int inner,int rows,int pairs,int topk,int mode) {
     constexpr int IR=ROUTED ? 4 : 1;

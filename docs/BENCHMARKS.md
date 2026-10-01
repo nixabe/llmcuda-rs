@@ -168,10 +168,10 @@ quality scores.
 
 | quant | prompt tokens | engine tok/s | publisher tok/s | publisher ubatch |
 | --- | ---: | ---: | ---: | ---: |
-| Q4_K_M | 512 | 1264.04 ± 17.28 | 1777.98 ± 3.80 | 2048 |
-| Q4_K_M | 2,048 | 1503.49 ± 21.22 | 2552.20 ± 4.95 | 2048 |
-| Q6_K | 512 | 1087.36 ± 0.26 | 1621.73 ± 5.73 | 2048 |
-| Q6_K | 2,048 | 1236.10 ± 1.73 | 2394.07 ± 2.79 | 2048 |
+| Q4_K_M | 512 | 1290.82 ± 1.10 | 1775.47 ± 1.38 | 2048 |
+| Q4_K_M | 2,048 | 1541.99 ± 1.18 | 2549.59 ± 1.21 | 2048 |
+| Q6_K | 512 | 1096.46 ± 0.37 | 1627.00 ± 4.43 | 2048 |
+| Q6_K | 2,048 | 1247.14 ± 0.31 | 2396.13 ± 2.43 | 2048 |
 
 Decode uses greedy sampling with token readback, four warmup steps and 64 timed
 steps per process. The engine replays its CUDA graph. The reference harness
@@ -184,27 +184,27 @@ cover each process's 64 steps.
 
 | quant | starting context | N | engine tok/s | publisher tok/s | publisher ubatch |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Q4_K_M | 512 | 1 | 51.7 | 76.8 | 4096 |
-| Q4_K_M | 512 | 3 | 96.2 | 144.1 | 4096 |
-| Q4_K_M | 2,048 | 1 | 45.4 | 73.3 | 4096 |
-| Q4_K_M | 2,048 | 3 | 80.4 | 133.8 | 4096 |
-| Q6_K | 512 | 1 | 49.8 | 65.0 | 4096 |
-| Q6_K | 512 | 3 | 83.7 | 125.0 | 4096 |
-| Q6_K | 2,048 | 1 | 43.8 | 62.6 | 2048 |
-| Q6_K | 2,048 | 3 | 71.2 | 114.5 | 4096 |
+| Q4_K_M | 512 | 1 | 52.7 | 76.9 | 2048 |
+| Q4_K_M | 512 | 3 | 97.7 | 144.3 | 2048 |
+| Q4_K_M | 2,048 | 1 | 46.2 | 73.3 | 4096 |
+| Q4_K_M | 2,048 | 3 | 81.5 | 133.9 | 4096 |
+| Q6_K | 512 | 1 | 51.2 | 65.1 | 4096 |
+| Q6_K | 512 | 3 | 88.8 | 125.0 | 4096 |
+| Q6_K | 2,048 | 1 | 45.0 | 62.5 | 4096 |
+| Q6_K | 2,048 | 3 | 74.9 | 114.6 | 4096 |
 
 Latency in milliseconds:
 
 | quant | starting context | N | engine mean (range) | engine p95 range | publisher mean (range) | publisher p95 range |
 | --- | ---: | ---: | --- | --- | --- | --- |
-| Q4_K_M | 512 | 1 | 19.33 (19.28–19.41) | 19.38–19.51 | 13.02 (13.01–13.03) | 13.05–13.09 |
-| Q4_K_M | 512 | 3 | 31.20 (31.07–31.27) | 31.27–31.54 | 20.81 (20.74–20.89) | 21.00–21.67 |
-| Q4_K_M | 2,048 | 1 | 22.02 (22.00–22.05) | 22.09–22.20 | 13.63 (13.62–13.64) | 13.66–13.72 |
-| Q4_K_M | 2,048 | 3 | 37.33 (37.31–37.35) | 37.60–37.68 | 22.42 (22.39–22.45) | 22.70–22.87 |
-| Q6_K | 512 | 1 | 20.10 (20.09–20.10) | 20.33–20.56 | 15.38 (15.37–15.40) | 15.46–15.55 |
-| Q6_K | 512 | 3 | 35.83 (35.79–35.86) | 36.03–36.23 | 24.01 (23.98–24.02) | 24.37–24.42 |
-| Q6_K | 2,048 | 1 | 22.80 (22.78–22.81) | 22.97–23.24 | 15.98 (15.98–15.99) | 16.08–16.08 |
-| Q6_K | 2,048 | 3 | 42.10 (42.06–42.13) | 42.25–42.50 | 26.20 (26.17–26.21) | 26.39–26.48 |
+| Q4_K_M | 512 | 1 | 18.97 (18.94–19.00) | 19.02–19.14 | 13.00 (12.99–13.02) | 13.04–13.06 |
+| Q4_K_M | 512 | 3 | 30.72 (30.71–30.74) | 30.99–31.03 | 20.80 (20.76–20.83) | 21.05–21.17 |
+| Q4_K_M | 2,048 | 1 | 21.63 (21.58–21.67) | 21.68–21.83 | 13.63 (13.63–13.64) | 13.63–13.67 |
+| Q4_K_M | 2,048 | 3 | 36.82 (36.75–36.93) | 37.01–37.21 | 22.41 (22.40–22.44) | 22.65–22.72 |
+| Q6_K | 512 | 1 | 19.52 (19.50–19.53) | 19.74–19.96 | 15.37 (15.35–15.38) | 15.43–15.54 |
+| Q6_K | 512 | 3 | 33.80 (33.78–33.83) | 34.05–34.24 | 24.00 (23.98–24.03) | 24.38–24.41 |
+| Q6_K | 2,048 | 1 | 22.21 (22.20–22.22) | 22.30–22.66 | 15.99 (15.98–16.00) | 16.03–16.14 |
+| Q6_K | 2,048 | 3 | 40.08 (39.96–40.27) | 40.23–40.67 | 26.18 (26.17–26.20) | 26.38–26.43 |
 
 The publisher is faster in every measured K2 cell. K2 contractions here use
 sixteen-bit activation codes and fp32 scaled accumulation; these measurements
@@ -802,6 +802,10 @@ DP4A; prefill uses Turing integer tensor cores. Q4 codes remain nibbles, and Q6
 codes remain six bits. Dense rows are contiguous; expert records interleave
 words across four rows. These formats have their own residency calculation;
 using the Qwen weight constant in K2 preflight would misreport free memory.
+Native record boundaries preserve word alignment: Q4's `d/dmin` is loaded as
+one 32-bit word and Q6's `d` as one 16-bit halfword. Hardware half widening
+retains their original bit patterns while avoiding byte assembly on the
+integer projection path.
 
 Q4's affine minimum multiplies the original activation sum, retaining the
 warp's summation tree. Q6 combines its two sixteen-value subscale dots before

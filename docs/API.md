@@ -1,6 +1,6 @@
 # HTTP API
 
-`llmxabe` serves four generation endpoints in three request dialects, all
+`llmcuda-rs` serves four generation endpoints in three request dialects, all
 backed by one engine and one shared prefix cache:
 
 | Endpoint | Dialect | Streaming |
@@ -18,12 +18,12 @@ probe the server without holding a key.
 
 ## Authentication
 
-Set a key with `--api-key`, or with the `LLMXABE_API_KEY` environment
+Set a key with `--api-key`, or with the `LLMCUDA_API_KEY` environment
 variable:
 
 ```sh
-llmxabe --api-key sk-my-key
-LLMXABE_API_KEY=sk-my-key llmxabe
+llmcuda --api-key sk-my-key
+LLMCUDA_API_KEY=sk-my-key llmcuda
 ```
 
 Callers may present it either way, on any endpoint:
@@ -194,7 +194,7 @@ loop, see [Server-side MCP](MCP.md). Ordinary requests continue returning calls
 for the harness to execute.
 
 For harness-owned sandbox execution, including AgentENV, see
-[Sandbox tool calls](SANDBOX.md) and the `xabe_server::sandbox::Sandbox` trait.
+[Sandbox tool calls](SANDBOX.md) and the `llmcuda_server::sandbox::Sandbox` trait.
 
 All three chat dialects take tool definitions and return structured calls:
 
@@ -414,7 +414,7 @@ them byte-identical.
 The template that ships in the GGUF is Jinja, and rendering it would mean
 carrying a Jinja engine plus shims for the Python string methods it calls.
 This markup is written directly instead and pinned by unit tests in
-`crates/xabe-server/src/http/chat.rs`.
+`crates/llmcuda-server/src/http/chat.rs`.
 
 ## Token accounting
 

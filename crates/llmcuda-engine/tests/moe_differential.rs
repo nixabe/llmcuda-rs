@@ -1,0 +1,1805 @@
+//! Differential test: the device MoE path against the `llmcuda-kernels` CPU
+//! reference, at Qwen3.6's real MoE geometry and on real quantized expert
+//! weights taken from the model file.
+//!
+//! This is the milestone-05 gate. MoE runs on **every one of the 40 layers**
+//! plus the MTP head, so an error here is an error on every token; and
+//! unlike the numeric kernels, most of what can go wrong is *discrete* — a
+//! different expert selected, a token placed in the wrong run, a padding
+//! slot read as a real token. Those do not show up as a slightly worse
+//! cosine similarity. They show up as a different model.
+//!
+//! ## What is compared, and how strictly
+//!
+//! | Stage | Reference | Gate |
+//! |---|---|---|
+//! | routing | `route_batch` | selected expert ids **exactly**, weights under tolerance |
+//! | dispatch tables | `moe_align_block_size` | `sorted_token_ids` and `expert_ids` **exactly**, padding slots included |
+//! | grouped GEMM | `grouped_forward`, cross-checked against `naive_forward` | tolerance |
+//! | shared expert | `expert_mlp` | tolerance |
+//!
+//! The first two are exact because they have no floating-point freedom in
+//! their content: a top-k selection is a set of integers and a dispatch
+//! table is a permutation with padding. Only the GEMM output is gated on a
+//! tolerance, and only because the reference sums a 2,048-term dot product
+//! sequentially while the kernel reduces it in a warp-shuffle tree.
+//!
+//! ## Why real weights
+//!
+//! Synthetic fp32 experts would exercise none of the Q6_K per-group scale
+//! distribution, none of its sign patterns, and none of the denormal deltas
+//! the quantizer emits for near-zero blocks. They would also hide the fact —
+//! verified here against the file's own tensor directory, not assumed — that
+//! `Qwen3.6-35B-A3B-UD-Q6_K_XL` is **mixed**: `ffn_gate_exps` and
+//! `ffn_up_exps` are Q6_K but `ffn_down_exps` is Q8_0. A kernel that
+//! hard-coded one format passes on synthetic data and reads garbage on the
+//! real file.
+//!
+//! Only one layer's expert stacks are loaded (about 700 MiB of the model's
+//! 29.65 GiB); the full model is never resident.
+//!
+//! SKIPS — reporting that it skipped — without a driver, a supported device,
+//! or the model file.
+
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use llmcuda_cuda::device::{DeviceInfo, driver_available};
+use llmcuda_cuda::kernels::moe::{
+    ExpertQuant, MoeBuffers, MoeGeometry, MoeKernels, QuantTensor, to_device_layout,
+};
+use llmcuda_gguf::{GgmlType, GgufFile};
+use llmcuda_kernels::compare::{Tolerance, assert_matches, compare};
+use llmcuda_kernels::moe::dispatch::{INACTIVE_EXPERT, moe_align_block_size, padding_sentinel};
+use llmcuda_kernels::moe::gemm::{ExpertWeights, expert_mlp, grouped_forward, naive_forward};
+use llmcuda_kernels::moe::router::{RoutingDecision, route_batch};
+use llmcuda_kernels::quant::{dequantize_row_q6_k, dequantize_row_q8_0};
+use llmcuda_kernels::rng::Xorshift64Star;
+use llmcuda_model::config::ModelConfig;
+use llmcuda_model::weights::{Role, WeightSchema};
+
+const DEFAULT_MODEL_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf"
+);
+
+/// Tokens in the batch under test.
+///
+/// 37 is deliberately awkward: it is not a multiple of [`BLOCK_SIZE`], and
+/// `37 * 8 = 296` flat `(token, k)` pairs is not either, so essentially
+/// every active expert's run ends mid-block and the padding slots are
+/// exercised rather than incidentally absent.
+const NUM_TOKENS: usize = 37;
+
+/// Grouped-GEMM tile width the dispatch tables pad to.
+const BLOCK_SIZE: usize = 16;
+
+/// Buffer capacity, in tokens. Larger than [`NUM_TOKENS`] on purpose: it is
+/// what proves the launch shapes come from the geometry rather than from the
+/// live batch, and it means the sentinel fill has to cover slots the live
+/// step never touches.
+const MAX_TOKENS: usize = 64;
+
+/// The layer whose expert stacks are pulled from the file.
+const LAYER: u32 = 0;
+
+/// Fixed seeds, one per test, so a failure is reproducible from the name
+/// alone rather than from whatever order the harness ran things in.
+const ROUTE_SEED: u64 = 0x_5EED_0A01;
+const DISPATCH_SEED: u64 = 0x_5EED_0B02;
+const GEMM_ROUTE_SEED: u64 = 0x_5EED_0C03;
+const GEMM_INPUT_SEED: u64 = 0x_5EED_0D04;
+const SHARED_INPUT_SEED: u64 = 0x_5EED_0E05;
+
+/// Tolerance for the routed grouped GEMM against the fp32 scalar reference.
+///
+/// The dequantized *weights* are bit-identical to the reference — the
+/// milestone-04 gate proved that, and this module reuses the same operand
+/// order. What is left is a 2,048-term dot product summed sequentially on
+/// the host and in a warp-shuffle tree on the device, plus the same again
+/// over 512 terms in the down projection. fp32 addition is not associative,
+/// so the gate is a tolerance.
+///
+/// **`max_abs_error` and `min_cosine_similarity` are the gate;
+/// `max_rel_error` is not.** `compare()` computes relative error as
+/// `|c - r| / max(|r|, 1e-6)`, and a MoE output whose mean magnitude is
+/// ~1.5e-3 is full of elements below that floor — for those the denominator
+/// *is* the floor, so the ratio reports `abs_error / 1e-6` rather than
+/// anything about accuracy. The tests assert, below, that the element
+/// driving `max_rel_error` really is near zero, so if that stops being true
+/// the justification fails loudly instead of quietly covering a real error.
+///
+/// Measured worst case at the real geometry, 37 tokens x top-8 of 256, real
+/// Q6_K gate/up and Q8_0 down from layer 0: `max_abs = 9.78e-9`,
+/// `cosine = 1.000000`. The bound below is ~51x that — room for hardware and
+/// driver variation, not room for a formulation bug, which would land orders
+/// of magnitude away on an output whose own max magnitude is only 1.0e-2.
+/// The same output from the integer tensor-core path, which is a different
+/// arithmetic and needs a different bound.
+///
+/// [`ROUTED_GATE`] gates fp32 summation order — a disagreement in the last
+/// bits. This gates something larger and deliberate: the activations are
+/// quantized to int8 with one fp32 scale per 32, which costs about `1/254` of
+/// the block's largest magnitude per element. The *weights* are not
+/// approximated at all — a Q6_K quant is an integer in `[-32, 31]` and the
+/// tensor core multiplies it exactly — and the int32 accumulation is exact, so
+/// activation quantization is the whole of the error.
+///
+/// Measured at the real geometry, 37 tokens x top-8 of 256, real Q6_K gate/up
+/// from layer 0: `max_abs = 4.59e-5`, `cosine = 0.999988`, on an output whose
+/// own max magnitude is 1.0e-2. The bound is ~2x the measured worst case.
+///
+/// It is still a real gate. The characteristic defect of hand-written MMA is a
+/// wrong fragment layout — mixing up the operand split (stride 4) with the
+/// accumulator split (stride 2) — and that does not produce a slightly worse
+/// answer, it produces a differently-shaped one. The cosine floor is what
+/// catches it; `max_abs_error` alone would not.
+///
+/// `max_rel_error` is excluded for the same floor reason as [`ROUTED_GATE`].
+const ROUTED_MMA_GATE: Tolerance = Tolerance {
+    max_abs_error: 1.0e-4,
+    max_rel_error: f32::INFINITY,
+    min_cosine_similarity: 0.9999,
+    allow_non_finite: false,
+};
+
+const ROUTED_GATE: Tolerance = Tolerance {
+    max_abs_error: 5e-7,
+    max_rel_error: 5e-2,
+    min_cosine_similarity: 1.0 - 1e-6,
+    allow_non_finite: false,
+};
+
+/// As [`ROUTED_GATE`], for the shared expert.
+///
+/// Looser in absolute terms for one reason: the shared expert carries no
+/// routing weight, so its output is not divided across 8 contributions and
+/// its magnitude is correspondingly larger. Measured worst case on layer 0's
+/// real Q8_0 shared expert: `max_abs = 2.98e-7`, `cosine = 1.000000`; the
+/// bound is ~17x that.
+const SHARED_GATE: Tolerance = Tolerance {
+    max_abs_error: 5e-6,
+    max_rel_error: 5e-2,
+    min_cosine_similarity: 1.0 - 1e-6,
+    allow_non_finite: false,
+};
+
+fn model_path() -> PathBuf {
+    std::env::var_os("LLMCUDA_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH))
+}
+
+/// A context on the only visible device, or `None` with a printed reason.
+fn device() -> Option<Arc<CudaContext>> {
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver present");
+        return None;
+    }
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SKIPPED: could not create a context on device 0: {e}");
+            return None;
+        }
+    };
+    let info = DeviceInfo::from_context(0, &ctx).expect("device properties readable");
+    if !info.is_supported() {
+        println!("SKIPPED: device 0 is below the sm_75 minimum");
+        return None;
+    }
+    Some(ctx)
+}
+
+fn device_and_model() -> Option<(Arc<CudaContext>, GgufFile)> {
+    let ctx = device()?;
+    let path = model_path();
+    if !path.exists() {
+        println!("SKIPPED: model file not found at {}", path.display());
+        return None;
+    }
+    Some((ctx, GgufFile::open(&path).expect("valid GGUF v3")))
+}
+
+fn geometry() -> MoeGeometry {
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    MoeGeometry {
+        num_experts: moe_cfg(&config).num_experts as usize,
+        experts_per_token: moe_cfg(&config).experts_per_token as usize,
+        hidden: config.hidden_size as usize,
+        intermediate: moe_cfg(&config).expert_intermediate as usize,
+        block_size: BLOCK_SIZE,
+        max_tokens: MAX_TOKENS,
+    }
+}
+
+/// Router logits with realistic spread, plus the same rows padded to the
+/// buffer capacity.
+///
+/// Rows past `NUM_TOKENS` are filled with a hugely negative constant rather
+/// than zeros: if a kernel ever routed a slot it should not, the resulting
+/// selection would be the fixed set `0..k` rather than something that blends
+/// in with real routing.
+fn router_logits(g: &MoeGeometry, seed: u64) -> (Vec<Vec<f32>>, Vec<f32>) {
+    let mut rng = Xorshift64Star::new(seed);
+    let live: Vec<Vec<f32>> = (0..NUM_TOKENS)
+        .map(|_| rng.vec_f32(g.num_experts, -8.0, 8.0))
+        .collect();
+    let mut flat: Vec<f32> = Vec::with_capacity(g.max_tokens * g.num_experts);
+    for row in &live {
+        flat.extend_from_slice(row);
+    }
+    flat.resize(g.max_tokens * g.num_experts, -1.0e30);
+    (live, flat)
+}
+
+fn dequant_slice(ty: GgmlType, bytes: &[u8]) -> Vec<f32> {
+    match ty {
+        GgmlType::Q6K => dequantize_row_q6_k(bytes).expect("reference q6_K"),
+        GgmlType::Q8_0 => dequantize_row_q8_0(bytes).expect("reference q8_0"),
+        other => panic!(
+            "expert stack is {}, which this test cannot unpack",
+            other.name()
+        ),
+    }
+}
+
+fn quant_of(ty: GgmlType) -> ExpertQuant {
+    match ty {
+        GgmlType::Q6K => ExpertQuant::Q6K,
+        GgmlType::Q8_0 => ExpertQuant::Q8_0,
+        other => panic!("unexpected expert stack type {}", other.name()),
+    }
+}
+
+/// Serialized bytes and elements per block for a GGUF quantized type.
+///
+/// The *file's* stride. The device copy is re-strided on upload -- Q6_K is
+/// padded from 210 to 224 so its superblocks are 16-byte aligned -- so
+/// anything walking GGUF bytes wants this and anything sizing a device buffer
+/// wants `block_bytes`.
+fn block_shape(ty: GgmlType) -> (usize, usize) {
+    let q = quant_of(ty);
+    (q.file_block_bytes(), q.block_elements())
+}
+
+/// Guard against a tensor that would compare perfectly while proving
+/// nothing.
+fn assert_carries_signal(name: &str, v: &[f32]) {
+    let nonzero = v.iter().filter(|x| **x != 0.0).count();
+    let frac = nonzero as f64 / v.len() as f64;
+    assert!(
+        frac > 0.25,
+        "{name}: only {:.1}% of {} sampled values are non-zero — an all-zero \
+         tensor would pass every comparison below vacuously",
+        frac * 100.0,
+        v.len(),
+    );
+    assert!(
+        v.iter().all(|x| x.is_finite()),
+        "{name}: contains a non-finite value",
+    );
+}
+
+/// Route on the device and read the decision back.
+fn device_routing(
+    kernels: &MoeKernels,
+    stream: &Arc<CudaStream>,
+    buffers: &mut MoeBuffers,
+    logits: &CudaSlice<f32>,
+) -> (Vec<i32>, Vec<f32>) {
+    kernels.route(stream, buffers, logits).expect("route");
+    let ids = stream.clone_dtoh(buffers.topk_ids()).expect("ids back");
+    let weights = stream
+        .clone_dtoh(buffers.topk_weights())
+        .expect("weights back");
+    stream.synchronize().expect("sync");
+    (ids, weights)
+}
+
+/// The device's top-k for one token, as `u32` for comparison against
+/// [`RoutingDecision::expert_ids`].
+fn device_ids_for(ids: &[i32], token: usize, top_k: usize) -> Vec<u32> {
+    ids[token * top_k..(token + 1) * top_k]
+        .iter()
+        .map(|&v| v as u32)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// (a) routing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn device_routing_selects_exactly_the_same_experts_as_route_batch() {
+    let Some(ctx) = device() else { return };
+    let g = geometry();
+    let stream = ctx.default_stream();
+    let kernels = MoeKernels::new(&ctx, g).expect("kernels must compile for sm_75");
+    let mut buffers = kernels.buffers(&stream).expect("buffers allocate");
+
+    println!(
+        "geometry: {} experts, top-{}, hidden {}, intermediate {}, block_size {}, \
+         {NUM_TOKENS} live tokens in a {MAX_TOKENS}-token buffer",
+        g.num_experts, g.experts_per_token, g.hidden, g.intermediate, g.block_size,
+    );
+
+    let (live, flat) = router_logits(&g, ROUTE_SEED);
+    let all: Vec<f32> = live.concat();
+    assert_carries_signal("router logits", &all);
+
+    let d_logits = stream.clone_htod(&flat).expect("upload logits");
+    kernels
+        .set_valid_tokens(&stream, &mut buffers, NUM_TOKENS)
+        .expect("valid_tokens");
+    let (ids, weights) = device_routing(&kernels, &stream, &mut buffers, &d_logits);
+
+    let reference: Vec<RoutingDecision> = route_batch(&live, g.experts_per_token);
+
+    let mut mismatched = 0usize;
+    for (t, decision) in reference.iter().enumerate() {
+        let got = device_ids_for(&ids, t, g.experts_per_token);
+        if got != decision.expert_ids {
+            mismatched += 1;
+            if mismatched <= 3 {
+                println!(
+                    "  token {t}: device {got:?} vs reference {:?}",
+                    decision.expert_ids
+                );
+            }
+        }
+    }
+    assert_eq!(
+        mismatched, 0,
+        "{mismatched} of {NUM_TOKENS} tokens selected a different expert set — \
+         this comparison is exact on purpose: a different tie-break or a \
+         different top-k silently runs a different model",
+    );
+
+    let candidate: Vec<f32> = weights[..NUM_TOKENS * g.experts_per_token].to_vec();
+    let expected: Vec<f32> = reference.iter().flat_map(|d| d.weights.clone()).collect();
+    let result = compare(&candidate, &expected);
+    println!(
+        "routing weights over {} (token, k) pairs: {result}",
+        candidate.len(),
+    );
+    assert_matches(
+        &candidate,
+        &expected,
+        &Tolerance {
+            max_abs_error: 1e-6,
+            max_rel_error: 1e-3,
+            min_cosine_similarity: 1.0 - 1e-9,
+            allow_non_finite: false,
+        },
+    );
+
+    // Every token's weights must sum to 1 after renormalization; a kernel
+    // that renormalized over all 256 experts instead of the selected 8 would
+    // score near-perfect on cosine and fail here outright.
+    for t in 0..NUM_TOKENS {
+        let base = t * g.experts_per_token;
+        let sum: f32 = candidate[base..base + g.experts_per_token].iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "token {t}: weights sum to {sum}");
+    }
+
+    println!(
+        "expert-id selection matched EXACTLY on all {NUM_TOKENS} tokens \
+         x top-{} over {} experts",
+        g.experts_per_token, g.num_experts,
+    );
+}
+
+#[test]
+fn an_exact_tie_across_every_expert_resolves_to_the_lowest_indices() {
+    // The one case where "close enough" is no defence: with identical logits
+    // the reference picks experts 0..k-1, and any tie-break that depends on
+    // which thread won a shuffle picks something else — and something
+    // different again on the next run.
+    let Some(ctx) = device() else { return };
+    let g = geometry();
+    let stream = ctx.default_stream();
+    let kernels = MoeKernels::new(&ctx, g).expect("compiles");
+    let mut buffers = kernels.buffers(&stream).expect("buffers");
+
+    let flat = vec![0.5f32; g.max_tokens * g.num_experts];
+    let d_logits = stream.clone_htod(&flat).expect("upload");
+    kernels
+        .set_valid_tokens(&stream, &mut buffers, NUM_TOKENS)
+        .expect("valid_tokens");
+
+    let expected: Vec<i32> = (0..g.experts_per_token as i32).collect();
+    for run in 0..4 {
+        let (ids, weights) = device_routing(&kernels, &stream, &mut buffers, &d_logits);
+        for t in 0..NUM_TOKENS {
+            let base = t * g.experts_per_token;
+            assert_eq!(
+                &ids[base..base + g.experts_per_token],
+                &expected[..],
+                "run {run}, token {t}: tie-break did not prefer the lowest indices",
+            );
+        }
+        let w = 1.0 / g.experts_per_token as f32;
+        for &x in &weights[..NUM_TOKENS * g.experts_per_token] {
+            assert!(
+                (x - w).abs() < 1e-6,
+                "tied weights should be uniform, got {x}"
+            );
+        }
+    }
+    println!("all-equal logits resolve to experts {expected:?} on every run");
+}
+
+// ---------------------------------------------------------------------------
+// (b) dispatch tables
+// ---------------------------------------------------------------------------
+
+#[test]
+fn device_dispatch_tables_match_moe_align_block_size_including_padding() {
+    let Some(ctx) = device() else { return };
+    let g = geometry();
+    let stream = ctx.default_stream();
+    let kernels = MoeKernels::new(&ctx, g).expect("compiles");
+    let mut buffers = kernels.buffers(&stream).expect("buffers");
+
+    let (live, flat) = router_logits(&g, DISPATCH_SEED);
+    let d_logits = stream.clone_htod(&flat).expect("upload logits");
+    kernels
+        .set_valid_tokens(&stream, &mut buffers, NUM_TOKENS)
+        .expect("valid_tokens");
+    let (ids, _) = device_routing(&kernels, &stream, &mut buffers, &d_logits);
+
+    let reference = route_batch(&live, g.experts_per_token);
+    let topk_ids: Vec<Vec<u32>> = reference.iter().map(|d| d.expert_ids.clone()).collect();
+
+    // The tables mean nothing unless both sides built them from the same
+    // selection, so establish that before comparing them.
+    for (t, row) in topk_ids.iter().enumerate() {
+        assert_eq!(
+            &device_ids_for(&ids, t, g.experts_per_token),
+            row,
+            "token {t}: routing diverged before dispatch",
+        );
+    }
+
+    kernels
+        .build_dispatch(&stream, &mut buffers)
+        .expect("dispatch");
+    let d_sorted = stream
+        .clone_dtoh(buffers.sorted_token_ids())
+        .expect("sorted back");
+    let d_experts = stream
+        .clone_dtoh(buffers.expert_ids())
+        .expect("expert ids back");
+    let d_post_pad = stream
+        .clone_dtoh(buffers.num_tokens_post_pad())
+        .expect("post-pad back");
+    stream.synchronize().expect("sync");
+
+    let expected = moe_align_block_size(&topk_ids, g.block_size, g.num_experts);
+    let sentinel = padding_sentinel(NUM_TOKENS, g.experts_per_token);
+    let post_pad = d_post_pad[0] as usize;
+
+    assert_eq!(
+        post_pad, expected.num_tokens_post_pad,
+        "num_tokens_post_pad disagrees; the device value lives in device \
+         memory and is what a captured graph would gate on",
+    );
+
+    let device_sorted: Vec<u32> = d_sorted[..post_pad].iter().map(|&v| v as u32).collect();
+    assert_eq!(
+        device_sorted, expected.sorted_token_ids,
+        "sorted_token_ids differ — compared exactly, padding slots included",
+    );
+
+    let num_blocks = post_pad / g.block_size;
+    assert_eq!(
+        &d_experts[..num_blocks],
+        &expected.expert_ids[..],
+        "expert_ids differ",
+    );
+
+    // Slots past the live region must read as padding, not as a previous
+    // step's tokens.
+    assert!(
+        d_sorted[post_pad..].iter().all(|&v| v as u32 == sentinel),
+        "capacity past num_tokens_post_pad is not filled with the sentinel",
+    );
+    assert!(
+        d_experts[num_blocks..]
+            .iter()
+            .all(|&v| v == INACTIVE_EXPERT),
+        "capacity past the last active block is not INACTIVE_EXPERT",
+    );
+
+    let padding_slots = device_sorted.iter().filter(|&&v| v == sentinel).count();
+    let real_slots = device_sorted.len() - padding_slots;
+    let active_experts: BTreeSet<i32> = d_experts[..num_blocks].iter().copied().collect();
+    assert_eq!(
+        real_slots,
+        NUM_TOKENS * g.experts_per_token,
+        "every (token, k) pair must appear exactly once among the valid slots",
+    );
+    assert!(
+        padding_slots > 0,
+        "no padding slots were exercised — {NUM_TOKENS} tokens x top-{} must \
+         not divide evenly into blocks of {}",
+        g.experts_per_token,
+        g.block_size,
+    );
+
+    println!(
+        "dispatch: {NUM_TOKENS} tokens x top-{} = {real_slots} pairs over {} active \
+         experts; num_tokens_post_pad={post_pad} in {num_blocks} blocks of {} \
+         ({padding_slots} padding slots); fixed capacity {} slots / {} blocks",
+        g.experts_per_token,
+        active_experts.len(),
+        g.block_size,
+        g.sorted_capacity(),
+        g.expert_block_capacity(),
+    );
+    println!("sorted_token_ids and expert_ids matched EXACTLY, padding included");
+}
+
+// ---------------------------------------------------------------------------
+// (c) + (d) grouped GEMM on real quantized weights
+// ---------------------------------------------------------------------------
+
+#[test]
+fn device_grouped_forward_matches_the_reference_on_real_expert_weights() {
+    grouped_forward_matches_the_reference(geometry());
+}
+
+/// Same grouped GEMM, same reference, but at a `block_size` above the
+/// narrow/wide MMA split (`MMA_M_NARROW` in `llmcuda-cuda`'s moe kernels is 32).
+/// The test above never leaves the narrow (M=32) `moe_expert_ffn_mma` /
+/// `moe_expert_down_mma` variant, since `BLOCK_SIZE` is 16 — this is the
+/// wide (M=64) variant's only correctness gate. See "Two compiled widths
+/// instead of one" in `docs/BENCHMARKS.md`.
+#[test]
+fn device_grouped_forward_matches_the_reference_at_the_wide_mma_width() {
+    grouped_forward_matches_the_reference(MoeGeometry {
+        block_size: 64,
+        ..geometry()
+    });
+}
+
+fn grouped_forward_matches_the_reference(g: MoeGeometry) {
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+    let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+    let mut buffers = kernels.buffers(&stream).expect("buffers");
+
+    // --- real expert stacks for one layer --------------------------------
+    let stacks: Vec<_> = [Role::MoeGateExps, Role::MoeUpExps, Role::MoeDownExps]
+        .iter()
+        .map(|&role| {
+            directory
+                .find(role, Some(LAYER))
+                .unwrap_or_else(|| panic!("{role} on layer {LAYER} missing"))
+        })
+        .collect();
+    println!(
+        "layer {LAYER} expert stacks: {}",
+        stacks
+            .iter()
+            .map(|e| format!(
+                "{}={} {:?}",
+                e.spec.role,
+                e.info.ggml_type.name(),
+                e.spec.dims
+            ))
+            .collect::<Vec<_>>()
+            .join("  "),
+    );
+    // The file is mixed; if that ever stops being true this test should say
+    // so rather than quietly stop covering one of the two prologues.
+    assert!(
+        stacks.iter().any(|e| e.info.ggml_type == GgmlType::Q6K),
+        "no Q6_K expert stack on layer {LAYER}; the Q6_K prologue would go untested",
+    );
+
+    let bytes: Vec<&[u8]> = stacks
+        .iter()
+        .map(|e| file.tensor_bytes(&e.spec.name).expect("tensor readable"))
+        .collect();
+
+    let t0 = Instant::now();
+    // Through `to_device_layout`, exactly as `MoeLayerWeights::upload` does:
+    // the kernels index superblocks by the device stride.
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload gate");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload up");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload down");
+    stream.synchronize().expect("sync");
+    println!(
+        "uploaded {:.1} MiB of quantized expert weights in {:.2?}",
+        bytes.iter().map(|b| b.len()).sum::<usize>() as f64 / (1024.0 * 1024.0),
+        t0.elapsed(),
+    );
+
+    // --- activations ------------------------------------------------------
+    let mut rng = Xorshift64Star::new(GEMM_INPUT_SEED);
+    let hidden_states: Vec<Vec<f32>> = (0..NUM_TOKENS)
+        .map(|_| rng.vec_f32(g.hidden, -1.0, 1.0))
+        .collect();
+    let live_hidden: Vec<f32> = hidden_states.concat();
+    assert_carries_signal("hidden states", &live_hidden);
+    let mut flat_hidden = live_hidden.clone();
+    flat_hidden.resize(g.max_tokens * g.hidden, 0.0);
+    let d_hidden = stream.clone_htod(&flat_hidden).expect("upload hidden");
+
+    let (live_logits, flat_logits) = router_logits(&g, GEMM_ROUTE_SEED);
+    let d_logits = stream.clone_htod(&flat_logits).expect("upload logits");
+
+    // --- device ------------------------------------------------------------
+    kernels
+        .set_valid_tokens(&stream, &mut buffers, NUM_TOKENS)
+        .expect("valid_tokens");
+    kernels
+        .route(&stream, &mut buffers, &d_logits)
+        .expect("route");
+    kernels
+        .build_dispatch(&stream, &mut buffers)
+        .expect("dispatch");
+
+    let mut d_out = stream
+        .alloc_zeros::<f32>(g.max_tokens * g.hidden)
+        .expect("out allocates");
+    let gate = QuantTensor {
+        bytes: &d_gate,
+        quant: quant_of(stacks[0].info.ggml_type),
+    };
+    let up = QuantTensor {
+        bytes: &d_up,
+        quant: quant_of(stacks[1].info.ggml_type),
+    };
+    let down = QuantTensor {
+        bytes: &d_down,
+        quant: quant_of(stacks[2].info.ggml_type),
+    };
+
+    // The integer path first, while `kernels` still has its `MmaKernels`.
+    // Both runs go through the same dispatch and the same down projection;
+    // only the gate/up GEMM differs, which is what makes the two comparisons
+    // below attributable.
+    assert!(
+        kernels.tensor_cores_enabled(),
+        "this device compiled the integer kernels, so the test must exercise          them — a silent fp32-only run would report a passing gate for a path          it never touched",
+    );
+    let t_mma = Instant::now();
+    kernels
+        .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+        .expect("grouped forward, integer tensor cores");
+    stream.synchronize().expect("sync");
+    let mma_time = t_mma.elapsed();
+    let mma_full = stream.clone_dtoh(&d_out).expect("out back");
+    stream.synchronize().expect("sync");
+    let mma_out: Vec<f32> = mma_full[..NUM_TOKENS * g.hidden].to_vec();
+
+    kernels.disable_tensor_cores();
+    let t1 = Instant::now();
+    kernels
+        .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+        .expect("grouped forward");
+    stream.synchronize().expect("sync");
+    let gpu_time = t1.elapsed();
+    let full_out = stream.clone_dtoh(&d_out).expect("out back");
+    let device_ids = stream.clone_dtoh(buffers.topk_ids()).expect("ids back");
+    stream.synchronize().expect("sync");
+    let device_out: Vec<f32> = full_out[..NUM_TOKENS * g.hidden].to_vec();
+    println!(
+        "device grouped forward (3 launches + one memset): fp32 {gpu_time:.2?},          int8 tensor cores {mma_time:.2?}"
+    );
+
+    // --- host reference ---------------------------------------------------
+    let routing = route_batch(&live_logits, g.experts_per_token);
+    for (t, decision) in routing.iter().enumerate() {
+        assert_eq!(
+            &device_ids_for(&device_ids, t, g.experts_per_token),
+            &decision.expert_ids,
+            "token {t}: routing diverged",
+        );
+    }
+
+    let topk_ids: Vec<Vec<u32>> = routing.iter().map(|d| d.expert_ids.clone()).collect();
+    let flat_weights: Vec<f32> = routing.iter().flat_map(|d| d.weights.clone()).collect();
+    let dispatch = moe_align_block_size(&topk_ids, g.block_size, g.num_experts);
+
+    // Only the experts this batch routes to are unpacked on the host: all 256
+    // in fp32 would be 3.1 GiB for one layer, and neither reference path ever
+    // indexes an unselected expert.
+    let selected: BTreeSet<u32> = topk_ids.iter().flatten().copied().collect();
+    let per_expert = g.intermediate * g.hidden;
+    let t2 = Instant::now();
+    let mut experts: Vec<ExpertWeights> = (0..g.num_experts)
+        .map(|_| ExpertWeights {
+            gate: Vec::new(),
+            up: Vec::new(),
+            down: Vec::new(),
+        })
+        .collect();
+    let mut sampled_weights: Vec<f32> = Vec::new();
+    for &e in &selected {
+        let e = e as usize;
+        let cut = |i: usize| {
+            let ty = stacks[i].info.ggml_type;
+            let (block_bytes, block_elems) = block_shape(ty);
+            let span = per_expert / block_elems * block_bytes;
+            dequant_slice(ty, &bytes[i][e * span..(e + 1) * span])
+        };
+        let w = ExpertWeights {
+            gate: cut(0),
+            up: cut(1),
+            down: cut(2),
+        };
+        if sampled_weights.is_empty() {
+            sampled_weights.extend_from_slice(&w.gate[..4096]);
+            sampled_weights.extend_from_slice(&w.down[..4096]);
+        }
+        experts[e] = w;
+    }
+    println!(
+        "unpacked {} of {} experts on the host in {:.2?} ({:.2} GiB fp32)",
+        selected.len(),
+        g.num_experts,
+        t2.elapsed(),
+        (selected.len() * per_expert * 3 * 4) as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+    assert_carries_signal("real dequantized expert weights", &sampled_weights);
+
+    let t3 = Instant::now();
+    let reference_grouped = grouped_forward(
+        &hidden_states,
+        &dispatch,
+        &flat_weights,
+        g.experts_per_token,
+        &experts,
+        g.hidden,
+        g.intermediate,
+    );
+    let reference_naive =
+        naive_forward(&hidden_states, &routing, &experts, g.hidden, g.intermediate);
+    println!("host references: {:.2?}", t3.elapsed());
+
+    let flat_grouped: Vec<f32> = reference_grouped.concat();
+    let flat_naive: Vec<f32> = reference_naive.concat();
+    assert_carries_signal("reference grouped output", &flat_grouped);
+
+    // The reference's own cross-check: the dispatch path and the naive
+    // per-token loop are structurally different code over the same math.
+    let oracle = compare(&flat_grouped, &flat_naive);
+    println!("host grouped_forward vs naive_forward: {oracle}");
+    assert!(
+        oracle.max_abs_error < 1e-4 && oracle.cosine_similarity > 1.0 - 1e-6,
+        "the CPU oracle disagrees with itself: {oracle}",
+    );
+
+    let vs_grouped = compare(&device_out, &flat_grouped);
+    let vs_naive = compare(&device_out, &flat_naive);
+    println!("device vs host grouped_forward: {vs_grouped}");
+    println!("device vs host naive_forward:   {vs_naive}");
+    println!(
+        "output magnitude: max |ref| = {:.4e}, mean |ref| = {:.4e}",
+        flat_grouped.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+        flat_grouped.iter().map(|v| v.abs()).sum::<f32>() / flat_grouped.len() as f32,
+    );
+
+    // Evidence for GATE's claim that max_rel_error is a floor artefact: the
+    // element driving it must be near zero. If it stops being, the absolute
+    // bound is no longer a sufficient gate and this fails loudly.
+    let driver = flat_grouped[vs_grouped.max_rel_error_index].abs();
+    assert!(
+        driver < 1e-3,
+        "max_rel_error {:.3e} sits on a reference value of {driver:.3e}, large \
+         enough for the ratio to mean something — max_abs_error alone is no \
+         longer a sufficient gate",
+        vs_grouped.max_rel_error,
+    );
+
+    assert_matches(&device_out, &flat_grouped, &ROUTED_GATE);
+    assert_matches(&device_out, &flat_naive, &ROUTED_GATE);
+
+    // The integer path against the same host reference, at the bound int8
+    // activations permit rather than the one fp32 arithmetic does.
+    let vs_mma = compare(&mma_out, &flat_grouped);
+    println!("device int8 tensor cores vs host grouped_forward: {vs_mma}");
+    assert_matches(&mma_out, &flat_grouped, &ROUTED_MMA_GATE);
+    assert!(
+        mma_full[NUM_TOKENS * g.hidden..].iter().all(|&v| v == 0.0),
+        "the integer path wrote past the live token range",
+    );
+
+    // Slots the live batch never used must be untouched, not filled with a
+    // stale or wrapped-around token's output.
+    assert!(
+        full_out[NUM_TOKENS * g.hidden..].iter().all(|&v| v == 0.0),
+        "the kernel wrote past the {NUM_TOKENS} live tokens",
+    );
+
+    println!(
+        "gate: max_abs<{:.0e}, cosine>{:.9} (max_rel is not the gate; see ROUTED_GATE)",
+        ROUTED_GATE.max_abs_error, ROUTED_GATE.min_cosine_similarity,
+    );
+    println!(
+        "fixed buffers: {:.2} MiB, allocated once",
+        buffers.bytes() as f64 / (1024.0 * 1024.0),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// shared expert, hoisted out of the routed path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_shared_expert_runs_for_every_token_with_no_routing() {
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema resolves");
+    let g = geometry();
+    let stream = ctx.default_stream();
+    let kernels = MoeKernels::new(&ctx, g).expect("compiles");
+    let mut buffers = kernels.buffers(&stream).expect("buffers");
+
+    let entries: Vec<_> = [Role::MoeSharedGate, Role::MoeSharedUp, Role::MoeSharedDown]
+        .iter()
+        .map(|&r| {
+            directory
+                .find(r, Some(LAYER))
+                .unwrap_or_else(|| panic!("{r} missing"))
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = entries
+        .iter()
+        .map(|e| file.tensor_bytes(&e.spec.name).expect("readable"))
+        .collect();
+    println!(
+        "layer {LAYER} shared expert: {}",
+        entries
+            .iter()
+            .map(|e| format!("{}={}", e.spec.role, e.info.ggml_type.name()))
+            .collect::<Vec<_>>()
+            .join("  "),
+    );
+
+    let host = ExpertWeights {
+        gate: dequant_slice(entries[0].info.ggml_type, bytes[0]),
+        up: dequant_slice(entries[1].info.ggml_type, bytes[1]),
+        down: dequant_slice(entries[2].info.ggml_type, bytes[2]),
+    };
+    assert_carries_signal("shared expert weights", &host.gate);
+
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload");
+
+    let mut rng = Xorshift64Star::new(SHARED_INPUT_SEED);
+    let hidden_states: Vec<Vec<f32>> = (0..NUM_TOKENS)
+        .map(|_| rng.vec_f32(g.hidden, -1.0, 1.0))
+        .collect();
+    let mut flat_hidden: Vec<f32> = hidden_states.concat();
+    assert_carries_signal("hidden states", &flat_hidden);
+    flat_hidden.resize(g.max_tokens * g.hidden, 0.0);
+    let d_hidden = stream.clone_htod(&flat_hidden).expect("upload");
+
+    let mut d_out = stream
+        .alloc_zeros::<f32>(g.max_tokens * g.hidden)
+        .expect("out");
+    kernels
+        .set_valid_tokens(&stream, &mut buffers, NUM_TOKENS)
+        .expect("valid_tokens");
+    kernels
+        .shared_expert(
+            &stream,
+            &mut buffers,
+            QuantTensor {
+                bytes: &d_gate,
+                quant: quant_of(entries[0].info.ggml_type),
+            },
+            QuantTensor {
+                bytes: &d_up,
+                quant: quant_of(entries[1].info.ggml_type),
+            },
+            QuantTensor {
+                bytes: &d_down,
+                quant: quant_of(entries[2].info.ggml_type),
+            },
+            &d_hidden,
+            &mut d_out,
+        )
+        .expect("shared expert");
+    let device_out = stream.clone_dtoh(&d_out).expect("out back");
+    stream.synchronize().expect("sync");
+
+    let reference: Vec<f32> = hidden_states
+        .iter()
+        .flat_map(|x| expert_mlp(&host, x, g.hidden, g.intermediate))
+        .collect();
+    let candidate = &device_out[..NUM_TOKENS * g.hidden];
+    assert_carries_signal("shared expert reference output", &reference);
+    let result = compare(candidate, &reference);
+    println!("shared expert vs expert_mlp, {NUM_TOKENS} tokens: {result}");
+    println!(
+        "output magnitude: max |ref| = {:.4e}, mean |ref| = {:.4e}",
+        reference.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+        reference.iter().map(|v| v.abs()).sum::<f32>() / reference.len() as f32,
+    );
+
+    // Same evidence as the routed path: the element driving max_rel_error is
+    // below `compare()`'s 1e-6 relative-error floor, so its ratio is an
+    // artefact of the floor rather than a measurement.
+    let driver = reference[result.max_rel_error_index].abs();
+    assert!(
+        driver < 1e-3,
+        "max_rel_error {:.3e} sits on a reference value of {driver:.3e}, large \
+         enough for the ratio to be meaningful — max_abs_error alone is no \
+         longer a sufficient gate",
+        result.max_rel_error,
+    );
+
+    assert_matches(candidate, &reference, &SHARED_GATE);
+    assert!(
+        device_out[NUM_TOKENS * g.hidden..]
+            .iter()
+            .all(|&v| v == 0.0),
+        "the shared expert wrote past the live tokens",
+    );
+    println!("shared expert ran for every token with no dispatch table consulted");
+}
+
+/// The one-token dispatch path against the same `moe_align_block_size`
+/// reference the batch path is held to.
+///
+/// A decode step builds its dispatch table with `moe_dispatch_t1`, a
+/// single-block kernel that exists because the batch shape — 256 blocks, a
+/// block-wide count reduction, a 256-add serial prefix sum per block and a
+/// Hillis-Steele scan to place the pairs — spends all of that discovering
+/// that eight flat pairs exist. It is a **different kernel**, and the test
+/// above never runs it: that one builds a 64-token geometry.
+///
+/// The failure it is here to catch is not a wrong answer on average. A
+/// dispatch table that places a pair in the wrong slot, or that leaves a
+/// stale slot from the previous step where the sentinel should be, runs a
+/// different expert for that token and produces fluent, finite, wrong output
+/// — which is why every slot is compared exactly, padding included, rather
+/// than the live prefix.
+///
+/// SKIPS — reporting that it skipped — without a driver or a supported device.
+#[test]
+fn the_one_token_dispatch_matches_the_reference_slot_for_slot() {
+    let Some(ctx) = device() else { return };
+    let mut g = geometry();
+    g.max_tokens = 1;
+    let stream = ctx.default_stream();
+    let kernels = MoeKernels::new(&ctx, g).expect("compiles");
+    let mut buffers = kernels.buffers(&stream).expect("buffers");
+
+    let mut rng = Xorshift64Star::new(DISPATCH_SEED ^ 0x00D1_5A7C);
+    let live = vec![rng.vec_f32(g.num_experts, -8.0, 8.0)];
+    let d_logits = stream.clone_htod(&live[0]).expect("upload logits");
+    kernels
+        .set_valid_tokens(&stream, &mut buffers, 1)
+        .expect("valid_tokens");
+    let (ids, _) = device_routing(&kernels, &stream, &mut buffers, &d_logits);
+
+    let reference = route_batch(&live, g.experts_per_token);
+    let topk_ids: Vec<Vec<u32>> = reference.iter().map(|d| d.expert_ids.clone()).collect();
+    assert_eq!(
+        &device_ids_for(&ids, 0, g.experts_per_token),
+        &topk_ids[0],
+        "routing diverged before dispatch",
+    );
+
+    kernels
+        .build_dispatch(&stream, &mut buffers)
+        .expect("dispatch");
+    let d_sorted = stream
+        .clone_dtoh(buffers.sorted_token_ids())
+        .expect("sorted back");
+    let d_experts = stream
+        .clone_dtoh(buffers.expert_ids())
+        .expect("expert ids back");
+    let d_post_pad = stream
+        .clone_dtoh(buffers.num_tokens_post_pad())
+        .expect("post-pad back");
+    stream.synchronize().expect("sync");
+
+    let expected = moe_align_block_size(&topk_ids, g.block_size, g.num_experts);
+    let sentinel = padding_sentinel(1, g.experts_per_token);
+    let post_pad = d_post_pad[0] as usize;
+    assert_eq!(
+        post_pad, expected.num_tokens_post_pad,
+        "num_tokens_post_pad"
+    );
+
+    let device_sorted: Vec<u32> = d_sorted[..post_pad].iter().map(|&v| v as u32).collect();
+    assert_eq!(
+        device_sorted, expected.sorted_token_ids,
+        "sorted_token_ids differ — compared exactly, padding slots included",
+    );
+    let num_blocks = post_pad / g.block_size;
+    assert_eq!(
+        &d_experts[..num_blocks],
+        &expected.expert_ids[..],
+        "expert_ids differ",
+    );
+    assert!(
+        d_sorted[post_pad..].iter().all(|&v| v as u32 == sentinel),
+        "capacity past num_tokens_post_pad is not filled with the sentinel",
+    );
+    assert!(
+        d_experts[num_blocks..]
+            .iter()
+            .all(|&v| v == INACTIVE_EXPERT),
+        "capacity past the last active block is not INACTIVE_EXPERT",
+    );
+    println!(
+        "one token, top-{}: {} slots post-pad over {} blocks, every slot equal \
+         to the reference",
+        g.experts_per_token, post_pad, num_blocks,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// gemv vs. direct decode: bit identity across compiled entry points.
+// ---------------------------------------------------------------------------
+
+/// One live token, decoded twice through two different **compiled entry
+/// points** with bit-identical inputs and identical routing: once through
+/// `max_tokens = 1` (the true single-stream shape, `moe_expert_ffn_gemv`/
+/// `moe_expert_down_gemv`), once through `max_tokens = 2` with only one
+/// valid token (`gemv` is false at `max_tokens > 1`, so this takes
+/// `moe_expert_ffn_direct`/`moe_expert_down_direct`). Every routed bucket
+/// holds exactly one live slot when there is exactly one valid token.
+///
+/// With one live token there is no collision and no staged tile: this checks
+/// that independently compiled one-row kernels preserve the established
+/// bit-identical single-stream result.
+#[test]
+fn gemv_and_direct_isolate_the_one_live_token_case() {
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+
+    let stacks: Vec<_> = [Role::MoeGateExps, Role::MoeUpExps, Role::MoeDownExps]
+        .iter()
+        .map(|&role| {
+            directory
+                .find(role, Some(LAYER))
+                .unwrap_or_else(|| panic!("{role} on layer {LAYER} missing"))
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = stacks
+        .iter()
+        .map(|e| file.tensor_bytes(&e.spec.name).expect("tensor readable"))
+        .collect();
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload gate");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload up");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload down");
+    stream.synchronize().expect("sync");
+
+    let mut rng = Xorshift64Star::new(0x_5EED_BB01);
+    let hidden: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    assert_carries_signal("hidden state", &hidden);
+    let logits: Vec<f32> = rng.vec_f32(moe_cfg(&config).num_experts as usize, -8.0, 8.0);
+
+    let gate = QuantTensor {
+        bytes: &d_gate,
+        quant: quant_of(stacks[0].info.ggml_type),
+    };
+    let up = QuantTensor {
+        bytes: &d_up,
+        quant: quant_of(stacks[1].info.ggml_type),
+    };
+    let down = QuantTensor {
+        bytes: &d_down,
+        quant: quant_of(stacks[2].info.ggml_type),
+    };
+
+    let run = |max_tokens: usize| -> Vec<f32> {
+        let g = MoeGeometry {
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens,
+        };
+        let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        // Both sides stay on the fp32 dequant path -- the integer tensor
+        // cores are a third, unrelated kernel family this probe is not
+        // about, and `MMA_MIN_TOKENS` (8) is above both shapes tested here
+        // anyway.
+        kernels.disable_tensor_cores();
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+
+        let mut flat_hidden = hidden.clone();
+        flat_hidden.resize(max_tokens * g.hidden, 0.0);
+        let d_hidden = stream.clone_htod(&flat_hidden).expect("upload hidden");
+        let mut flat_logits = logits.clone();
+        flat_logits.resize(max_tokens * g.num_experts, -1.0e30);
+        let d_logits = stream.clone_htod(&flat_logits).expect("upload logits");
+
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, 1)
+            .expect("valid_tokens");
+        kernels
+            .route(&stream, &mut buffers, &d_logits)
+            .expect("route");
+        kernels
+            .build_dispatch(&stream, &mut buffers)
+            .expect("dispatch");
+
+        let mut d_out = stream
+            .alloc_zeros::<f32>(max_tokens * g.hidden)
+            .expect("out allocates");
+        kernels
+            .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("grouped forward");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        stream.synchronize().expect("sync");
+        full[..g.hidden].to_vec()
+    };
+
+    let via_gemv = run(1);
+    // `MOE_NARROW_DECODE_MAX` is 4 in `llmcuda-cuda`; 2 is comfortably inside
+    // it and above 1, so `gemv` is false and `narrow` is true -- with one
+    // live token, `bucket_live[blk] == 1` for every active bucket, so grid.z
+    // slot zero is the only direct block that performs work.
+    let via_direct = run(2);
+
+    let result = compare(&via_gemv, &via_direct);
+    println!("gemv (max_tokens=1) vs direct (max_tokens=2, 1 live token): {result}");
+    println!(
+        "output magnitude: max |gemv| = {:.4e}",
+        via_gemv.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+    );
+
+    assert_eq!(
+        via_gemv, via_direct,
+        "gemv and direct decode disagree on the one-live-token case",
+    );
+}
+
+/// As [`gemv_and_direct_isolate_the_one_live_token_case`], with two tokens
+/// routed to the same expert set. Every active bucket has `bucket_live == 2`,
+/// so the direct decode kernels launch two independent grid.z blocks that
+/// read the same expert weights and write distinct dispatch slots.
+///
+/// Token 0's row is compared against the same token, alone, through
+/// `max_tokens = 1` (`gemv`) -- identical hidden state, identical routing.
+#[test]
+fn gemv_and_direct_isolate_the_two_live_token_case() {
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+
+    let stacks: Vec<_> = [Role::MoeGateExps, Role::MoeUpExps, Role::MoeDownExps]
+        .iter()
+        .map(|&role| {
+            directory
+                .find(role, Some(LAYER))
+                .unwrap_or_else(|| panic!("{role} on layer {LAYER} missing"))
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = stacks
+        .iter()
+        .map(|e| file.tensor_bytes(&e.spec.name).expect("tensor readable"))
+        .collect();
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload gate");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload up");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload down");
+    stream.synchronize().expect("sync");
+
+    let mut rng = Xorshift64Star::new(0x_5EED_BB02);
+    let hidden0: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    let hidden1: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    assert_carries_signal("hidden state", &hidden0);
+    // Same logits for both tokens -- identical top-k, so every one of the
+    // 8 buckets they land in has `bucket_live == 2`, not a mix of 1 and 2.
+    let logits: Vec<f32> = rng.vec_f32(moe_cfg(&config).num_experts as usize, -8.0, 8.0);
+
+    let gate = QuantTensor {
+        bytes: &d_gate,
+        quant: quant_of(stacks[0].info.ggml_type),
+    };
+    let up = QuantTensor {
+        bytes: &d_up,
+        quant: quant_of(stacks[1].info.ggml_type),
+    };
+    let down = QuantTensor {
+        bytes: &d_down,
+        quant: quant_of(stacks[2].info.ggml_type),
+    };
+
+    let run_gemv = || -> Vec<f32> {
+        let g = MoeGeometry {
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens: 1,
+        };
+        let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        kernels.disable_tensor_cores();
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+        let d_hidden = stream.clone_htod(&hidden0).expect("upload hidden");
+        let d_logits = stream.clone_htod(&logits).expect("upload logits");
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, 1)
+            .expect("valid_tokens");
+        kernels
+            .route(&stream, &mut buffers, &d_logits)
+            .expect("route");
+        kernels
+            .build_dispatch(&stream, &mut buffers)
+            .expect("dispatch");
+        let mut d_out = stream.alloc_zeros::<f32>(g.hidden).expect("out allocates");
+        kernels
+            .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("grouped forward");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        stream.synchronize().expect("sync");
+        full
+    };
+
+    let run_direct_token0 = || -> Vec<f32> {
+        let g = MoeGeometry {
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens: 2,
+        };
+        let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        kernels.disable_tensor_cores();
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+        let mut flat_hidden = hidden0.clone();
+        flat_hidden.extend_from_slice(&hidden1);
+        let d_hidden = stream.clone_htod(&flat_hidden).expect("upload hidden");
+        let mut flat_logits = logits.clone();
+        flat_logits.extend_from_slice(&logits);
+        let d_logits = stream.clone_htod(&flat_logits).expect("upload logits");
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, 2)
+            .expect("valid_tokens");
+        kernels
+            .route(&stream, &mut buffers, &d_logits)
+            .expect("route");
+        kernels
+            .build_dispatch(&stream, &mut buffers)
+            .expect("dispatch");
+        // Confirm the routing this test's whole premise depends on: both
+        // tokens really did land in the same buckets, so `bucket_live == 2`
+        // is what the kernel actually saw, not an artifact of a router
+        // tie-break this test did not anticipate.
+        let ids = stream.clone_dtoh(buffers.topk_ids()).expect("ids back");
+        stream.synchronize().expect("sync");
+        assert_eq!(
+            device_ids_for(&ids, 0, g.experts_per_token),
+            device_ids_for(&ids, 1, g.experts_per_token),
+            "both tokens must route to the same experts for this probe to \
+             exercise bucket_live == 2",
+        );
+        let mut d_out = stream
+            .alloc_zeros::<f32>(2 * g.hidden)
+            .expect("out allocates");
+        kernels
+            .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("grouped forward");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        stream.synchronize().expect("sync");
+        full[..g.hidden].to_vec()
+    };
+
+    let via_gemv = run_gemv();
+    let via_direct = run_direct_token0();
+
+    let result = compare(&via_gemv, &via_direct);
+    println!("gemv (alone) vs direct token 0 (bucket_live=2): {result}");
+    println!(
+        "output magnitude: max |gemv| = {:.4e}",
+        via_gemv.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+    );
+
+    assert_eq!(
+        via_gemv, via_direct,
+        "gemv and direct decode disagree on token 0 when bucket_live == 2",
+    );
+}
+
+/// The exact decode regime (`set_exact_decode_regime`) at a verify-window
+/// width: eight distinct tokens with distinct routings, forced onto the
+/// flat direct-pair kernels at `max_tokens = 8` — a width whose default
+/// selection is the integer-tensor-core path — and every token's row
+/// compared **exactly** against the same token run alone through the
+/// one-token GEMV. This is the property `Forward::run_batch_verify` stands
+/// on: a batched verify row's floats must land where plain decode's would,
+/// and `tests/batch_verify.rs` can only see the end-to-end argmax — this
+/// probe sees the vector.
+#[test]
+fn the_exact_regime_at_eight_tokens_matches_the_gemv_token_for_token() {
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+
+    let stacks: Vec<_> = [Role::MoeGateExps, Role::MoeUpExps, Role::MoeDownExps]
+        .iter()
+        .map(|&role| {
+            directory
+                .find(role, Some(LAYER))
+                .unwrap_or_else(|| panic!("{role} on layer {LAYER} missing"))
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = stacks
+        .iter()
+        .map(|e| file.tensor_bytes(&e.spec.name).expect("tensor readable"))
+        .collect();
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload gate");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload up");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload down");
+    stream.synchronize().expect("sync");
+
+    const WIDTH: usize = 8;
+    let mut rng = Xorshift64Star::new(0x_5EED_BB03);
+    let hiddens: Vec<Vec<f32>> = (0..WIDTH)
+        .map(|_| rng.vec_f32(config.hidden_size as usize, -1.0, 1.0))
+        .collect();
+    assert_carries_signal("hidden state", &hiddens[0]);
+    let token_logits: Vec<Vec<f32>> = (0..WIDTH)
+        .map(|_| rng.vec_f32(moe_cfg(&config).num_experts as usize, -8.0, 8.0))
+        .collect();
+
+    let gate = QuantTensor {
+        bytes: &d_gate,
+        quant: quant_of(stacks[0].info.ggml_type),
+    };
+    let up = QuantTensor {
+        bytes: &d_up,
+        quant: quant_of(stacks[1].info.ggml_type),
+    };
+    let down = QuantTensor {
+        bytes: &d_down,
+        quant: quant_of(stacks[2].info.ggml_type),
+    };
+
+    let run_gemv = |t: usize| -> (Vec<f32>, Vec<i32>, Vec<f32>) {
+        let g = MoeGeometry {
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens: 1,
+        };
+        let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        kernels.disable_tensor_cores();
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+        let d_hidden = stream.clone_htod(&hiddens[t]).expect("upload hidden");
+        let d_logits = stream.clone_htod(&token_logits[t]).expect("upload logits");
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, 1)
+            .expect("valid_tokens");
+        kernels
+            .route(&stream, &mut buffers, &d_logits)
+            .expect("route");
+        kernels
+            .build_dispatch(&stream, &mut buffers)
+            .expect("dispatch");
+        let mut d_out = stream.alloc_zeros::<f32>(g.hidden).expect("out allocates");
+        kernels
+            .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("grouped forward");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        let ids = stream.clone_dtoh(buffers.topk_ids()).expect("ids back");
+        let partial = stream.clone_dtoh(buffers.partial()).expect("partial back");
+        stream.synchronize().expect("sync");
+        (full, ids, partial)
+    };
+
+    let run_exact_batch = |width: usize| -> (Vec<f32>, Vec<i32>, Vec<f32>) {
+        let g = MoeGeometry {
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens: width,
+        };
+        let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        kernels.set_exact_decode_regime(true);
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+        let flat_hidden: Vec<f32> = hiddens[..width].iter().flatten().copied().collect();
+        let d_hidden = stream.clone_htod(&flat_hidden).expect("upload hidden");
+        let flat_logits: Vec<f32> = token_logits[..width].iter().flatten().copied().collect();
+        let d_logits = stream.clone_htod(&flat_logits).expect("upload logits");
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, width)
+            .expect("valid_tokens");
+        kernels
+            .route_and_dispatch(&stream, &mut buffers, &d_logits)
+            .expect("route");
+        let mut d_out = stream
+            .alloc_zeros::<f32>(width * g.hidden)
+            .expect("out allocates");
+        kernels
+            .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("grouped forward");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        let ids = stream.clone_dtoh(buffers.topk_ids()).expect("ids back");
+        let partial = stream.clone_dtoh(buffers.partial()).expect("partial back");
+        stream.synchronize().expect("sync");
+        (full, ids, partial)
+    };
+
+    // The regime must hold across the width boundaries the default
+    // selection switches at: 4 is `MOE_NARROW_DECODE_MAX` (where the flag
+    // is a no-op against the native narrow regime), 5 is past it, and 8 is
+    // `MMA_MIN_TOKENS` — where the first version of the flag still let the
+    // Q8_0 down projection slip onto the tensor-core path and read dispatch
+    // tables the exact regime never builds.
+    let (alone0, _, _) = run_gemv(0);
+    for probe_width in [2usize, 4, 5, 8] {
+        let (out, _, _) = run_exact_batch(probe_width);
+        assert_eq!(
+            out[..config.hidden_size as usize],
+            alone0[..],
+            "width {probe_width}: token 0 through the exact regime must match the GEMV",
+        );
+        println!("width {probe_width}: token 0 exact-regime == gemv");
+    }
+
+    let (batch, batch_ids, _) = run_exact_batch(WIDTH);
+    let top_k = moe_cfg(&config).experts_per_token as usize;
+    let hidden_dim = config.hidden_size as usize;
+    for t in 0..WIDTH {
+        let (alone, alone_ids, _) = run_gemv(t);
+        // Routing first: a routing mismatch means the divergence is upstream
+        // of the expert GEMVs entirely, and comparing outputs would only
+        // measure "different experts produce different floats".
+        assert_eq!(
+            device_ids_for(&alone_ids, 0, top_k),
+            device_ids_for(&batch_ids, t, top_k),
+            "token {t}: routing diverged between the one-token run and the batch",
+        );
+        let row = &batch[t * hidden_dim..(t + 1) * hidden_dim];
+        let result = compare(&alone, row);
+        println!("token {t}: gemv (alone) vs exact regime (batch of {WIDTH}): {result}");
+        assert_eq!(
+            alone, row,
+            "token {t}: the exact decode regime at {WIDTH} tokens must match the \
+             one-token GEMV bit for bit",
+        );
+    }
+}
+
+/// The shared expert's one-token GEMV (`moe_shared_ffn_gemv` /
+/// `moe_shared_down_gemv`, `max_tokens == 1`) against its token-tiled
+/// generalization (`moe_shared_ffn_gemv_t*` / `moe_shared_down_gemv_t*`,
+/// `1 < max_tokens <= 16`). The previous pairing — GEMV vs
+/// `moe_shared_ffn` — disagreed at `max_abs = 1.12e-8` because the
+/// GEMV splits the 2,048-term product across four warps and the tile
+/// reduces it in one. This is the gate that the tiled GEMV matches
+/// the one-token kernel operand-for-operand.
+///
+/// Token 0 of a three-token tiled launch is compared against the same
+/// row run alone through the GEMV. Three is the audit's own batch width
+/// and is well below `SHARED_MMA_MIN_TOKENS`, so both sides stay on the
+/// fp32 kernels.
+#[test]
+fn shared_gemv_and_tiled_isolate_the_one_live_token_case() {
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+
+    let entries: Vec<_> = [Role::MoeSharedGate, Role::MoeSharedUp, Role::MoeSharedDown]
+        .iter()
+        .map(|&r| {
+            directory
+                .find(r, Some(LAYER))
+                .unwrap_or_else(|| panic!("{r} missing"))
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = entries
+        .iter()
+        .map(|e| file.tensor_bytes(&e.spec.name).expect("readable"))
+        .collect();
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload gate");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload up");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload down");
+    stream.synchronize().expect("sync");
+
+    let mut rng = Xorshift64Star::new(0x_5EED_BB03);
+    let hidden0: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    let hidden1: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    let hidden2: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    assert_carries_signal("hidden state", &hidden0);
+
+    let gate = QuantTensor {
+        bytes: &d_gate,
+        quant: quant_of(entries[0].info.ggml_type),
+    };
+    let up = QuantTensor {
+        bytes: &d_up,
+        quant: quant_of(entries[1].info.ggml_type),
+    };
+    let down = QuantTensor {
+        bytes: &d_down,
+        quant: quant_of(entries[2].info.ggml_type),
+    };
+
+    let run = |max_tokens: usize, rows: &[Vec<f32>]| -> Vec<f32> {
+        let g = MoeGeometry {
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens,
+        };
+        let kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+        let mut flat = Vec::with_capacity(max_tokens * g.hidden);
+        for row in rows {
+            flat.extend_from_slice(row);
+        }
+        flat.resize(max_tokens * g.hidden, 0.0);
+        let d_hidden = stream.clone_htod(&flat).expect("upload hidden");
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, rows.len())
+            .expect("valid_tokens");
+        let mut d_out = stream
+            .alloc_zeros::<f32>(max_tokens * g.hidden)
+            .expect("out allocates");
+        kernels
+            .shared_expert(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("shared expert");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        stream.synchronize().expect("sync");
+        full[..g.hidden].to_vec()
+    };
+
+    let via_gemv = run(1, std::slice::from_ref(&hidden0));
+    let via_tiled = run(3, &[hidden0, hidden1, hidden2]);
+
+    let result = compare(&via_gemv, &via_tiled);
+    println!("shared gemv (max_tokens=1) vs tiled (max_tokens=3, token 0): {result}");
+    println!(
+        "output magnitude: max |gemv| = {:.4e}",
+        via_gemv.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+    );
+
+    assert_eq!(
+        via_gemv, via_tiled,
+        "shared-expert gemv and tiled disagree on the same row",
+    );
+}
+
+/// The router GEMM's one-token instantiation (`moe_block_router_logits_t1`,
+/// `max_tokens == 1`) against the other two: the three-token tile
+/// (`moe_block_router_logits_t3`) and the eight-token one
+/// (`moe_block_router_logits`, which is what every other width selects). All
+/// three are engineered for bit-identity — `ROUTER_JC` equals the block width
+/// in each — and this is what checks that they are, rather than assuming it.
+///
+/// Token 0 of a wider `MoeBlock` is compared against the same residual row
+/// run alone through a one-token block. The rest of the block (routed
+/// experts, shared expert, combine) is not compared here -- only the logits
+/// the kernels write.
+///
+/// `max_tokens == 2` is here because it is the one serving width no benchmark
+/// produces: it comes from the speculative verify step, it takes the wide
+/// tile with six of its eight token slots clamped onto the last live row, and
+/// a router change that was swept, paired and bit-checked at N=1 and N=3
+/// shipped broken at exactly this width. See `docs/TESTING.md`.
+#[test]
+fn router_t1_and_tiled_isolate_the_same_row() {
+    use llmcuda_engine::block::moe::{MoeBlock, MoeLayerWeights};
+
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+    let eps = MoeBlock::eps_from(&config, &file);
+
+    let mut rng = Xorshift64Star::new(0x_5EED_BB04);
+    let hidden = config.hidden_size as usize;
+    let row0 = rng.vec_f32(hidden, -1.0, 1.0);
+    let row1 = rng.vec_f32(hidden, -1.0, 1.0);
+    let row2 = rng.vec_f32(hidden, -1.0, 1.0);
+    assert_carries_signal("residual", &row0);
+
+    let run = |max_tokens: usize, rows: &[Vec<f32>]| -> Vec<f32> {
+        let g = MoeBlock::geometry_for(&config, BLOCK_SIZE, max_tokens).expect("the routed model");
+        let mut block = MoeBlock::new(&ctx, &stream, g, eps).expect("block builds");
+        block.disable_tensor_cores();
+        let weights =
+            MoeLayerWeights::upload(&stream, &file, &directory, LAYER, &g).expect("weights upload");
+        let mut residual = Vec::with_capacity(max_tokens * hidden);
+        for row in rows {
+            residual.extend_from_slice(row);
+        }
+        residual.resize(max_tokens * hidden, 0.0);
+        let d_residual = stream.clone_htod(&residual).expect("upload residual");
+        let mut ffn_out = stream
+            .alloc_zeros::<f32>(max_tokens * hidden)
+            .expect("ffn_out");
+        let mut l_out = stream
+            .alloc_zeros::<f32>(max_tokens * hidden)
+            .expect("l_out");
+        block
+            .forward(
+                &stream,
+                &weights,
+                &d_residual,
+                rows.len(),
+                &mut ffn_out,
+                &mut l_out,
+            )
+            .expect("moe forward");
+        stream.synchronize().expect("sync");
+        let logits = stream
+            .clone_dtoh(block.router_logits())
+            .expect("logits back");
+        stream.synchronize().expect("sync");
+        logits[..g.num_experts].to_vec()
+    };
+
+    let via_t1 = run(1, std::slice::from_ref(&row0));
+    println!(
+        "output magnitude: max |t1| = {:.4e}",
+        via_t1.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+    );
+
+    // Both other instantiations. Width 2 selects the wide tile and is the
+    // width no bench reaches; width 3 is the serving target's decode shape.
+    for (max_tokens, rows) in [
+        (2, vec![row0.clone(), row1.clone()]),
+        (3, vec![row0.clone(), row1, row2]),
+    ] {
+        let via_tiled = run(max_tokens, &rows);
+        let result = compare(&via_t1, &via_tiled);
+        println!("router t1 vs max_tokens={max_tokens} (token 0): {result}");
+        assert_eq!(
+            via_t1, via_tiled,
+            "router t1 and the max_tokens={max_tokens} tile disagree on the \
+             same row -- every instantiation is engineered for bit-identity \
+             and one is not",
+        );
+    }
+}
+
+/// The routed geometry of the model these differential tests target.
+///
+/// `ModelConfig::ffn` became an enum when the dense `qwen35` architecture
+/// landed; everything in this file is about the routed one.
+fn moe_cfg(c: &ModelConfig) -> llmcuda_model::MoeConfig {
+    c.moe().expect("these tests target the routed model")
+}

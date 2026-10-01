@@ -13,8 +13,10 @@ the internals of three Gated DeltaNet blocks and two Gated Attention blocks.
 **Where it lives:** `.golden/qwen36-golden.bin`, 57,602,888 bytes.
 `.golden/` is gitignored (`.gitignore:15`). It is regenerated, never committed.
 
-**How it is read:** `crates/xabe-engine/tests/golden.rs`, which skips and says
+**How it is read:** `crates/llmcuda-engine/tests/golden.rs`, which skips and says
 so when the file is absent.
+The reader also accepts captures made before the rename; new captures use
+the signature documented below.
 
 ---
 
@@ -22,7 +24,7 @@ so when the file is absent.
 
 | | |
 | --- | --- |
-| Model | `/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` (32,611,711,264 B) |
+| Model | `./models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` (32,611,711,264 B) |
 | llama.cpp | commit `fd6863a69542c74a617a1219f1b18ccf773f41ed`, `b10430-26-gfd6863a69` |
 | Built libraries | `/home/nixabe/llama.cpp/build/bin/libllama.so`, `libggml*.so` |
 | GPU | Quadro RTX 8000, sm_75, driver 595.84, `CUDA_VISIBLE_DEVICES=2` |
@@ -133,7 +135,7 @@ FILTERS='model\.input_embed,result_norm,h_nextn,result_output,attn_norm-[0-9]+,a
 
 mkdir -p .golden
 CUDA_VISIBLE_DEVICES=2 tools/oracle/capture \
-  /home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
+  ./models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
   .golden/qwen36-golden.bin \
   "The capital of France is Paris. The capital of Germany is Berlin. The capital of Japan is" \
   "$FILTERS" | tee .golden/capture.log
@@ -151,7 +153,7 @@ records = 290 (callback matched 288)
 ### Verify
 
 ```sh
-CUDA_VISIBLE_DEVICES=2 cargo test -p xabe-engine --test golden -- --nocapture
+CUDA_VISIBLE_DEVICES=2 cargo test -p llmcuda-engine --test golden -- --nocapture
 ```
 
 Six tests. They check the container parses, the prompt is the expected one,
@@ -256,10 +258,10 @@ wrong one has a documented reason available.
 ## 5. File format
 
 Little-endian, flat, length-prefixed. Deliberately not JSON or npz:
-`xabe-engine` has no serialization dependency and this reader needs none.
+`llmcuda-engine` has no serialization dependency and this reader needs none.
 
 ```
-  magic     "XABEGOLD"                 8 B
+  magic     "LLMCGOLD"                 8 B
   u32       version = 1
   u32       n_records
   record * n_records:
@@ -298,13 +300,13 @@ the output width**.
 
 Applied to this model: `output.weight` is `[2048, 248320]`, i.e. 248,320 rows
 of 2,048 contiguous elements, not 2,048 rows of 248,320.
-`xabe_model::weights::TensorSpec::dims` already documents itself as being in
-this order (`dims[0]` fastest-varying), and `xabe-gguf` reads it that way. The
+`llmcuda_model::weights::TensorSpec::dims` already documents itself as being in
+this order (`dims[0]` fastest-varying), and `llmcuda-gguf` reads it that way. The
 two proofs below are the evidence, not the assertion.
 
 ### 6.2 `Role` ↔ GGUF name ↔ llama.cpp graph node
 
-`Role` is `xabe_model::weights::Role`. The GGUF name is `Role::suffix()` under
+`Role` is `llmcuda_model::weights::Role`. The GGUF name is `Role::suffix()` under
 a `blk.N.` prefix. The graph node is what the golden holds.
 
 | `Role` | GGUF name | `ne` | Graph node it produces |
@@ -340,18 +342,18 @@ table, and it is correct.
 
 `input_embedding_matches_this_repos_own_gguf_reader` in `golden.rs`:
 
-1. `xabe-gguf` opens the model and confirms `token_embd.weight` is `Q8_0` with
+1. `llmcuda-gguf` opens the model and confirms `token_embd.weight` is `Q8_0` with
    dims `[2048, 248320]`.
 2. For each of the 19 prompt tokens `t`, it takes bytes
    `[t * 2176, (t+1) * 2176)` of the tensor — 64 `Q8_0` blocks of 34 bytes,
    which is one row **only if `ne[0]` is the fastest-varying dimension** — and
-   dequantizes them with `xabe_kernels::quant::dequantize_row_q8_0`.
+   dequantizes them with `llmcuda_kernels::quant::dequantize_row_q8_0`.
 3. It compares against column `t` of the captured `model.input_embed`.
 
 Measured:
 
 ```
-token_embd.weight dequantized by xabe-gguf + xabe-kernels vs llama.cpp's
+token_embd.weight dequantized by llmcuda-gguf + llmcuda-kernels vs llama.cpp's
 model.input_embed: 38912/38912 elements bit-identical, max_abs 0.000e0
   correct column 0 head: [-0.0011072159, 0.009411335, -0.008304119, 0.0027680397, 0.0022144318]
   transposed misreading: [-0.0011072159, 0.0073566437, 0.0006380081, -0.009645939, -0.0009417534]
@@ -384,7 +386,7 @@ Zero mismatches under the interleaved reading. Under the "split `attn_q` down
 the middle" reading, 72,960 of 77,824 disagree — the 4,864 that agree are
 exactly head 0 (`256 × 19`), where both readings coincide. So `attn_q` really
 is `[q_h0, gate_h0, q_h1, gate_h1, …]` at stride `head_dim * 2`, as
-`xabe_model::weights` says.
+`llmcuda_model::weights` says.
 
 ---
 
@@ -465,8 +467,8 @@ silently produce a wrong implementation.
    weights and the same captured input:
 
    ```
-   attn_qkv:  llmxabe vs f64  1.907e-6   |  llama.cpp vs f64  7.059e-2   (37,000x)
-   ssm_out:   llmxabe vs f64  2.235e-8   |  llama.cpp vs f64  1.629e-3   (73,000x)
+   attn_qkv:  llmcuda-rs vs f64  1.907e-6   |  llama.cpp vs f64  7.059e-2   (37,000x)
+   ssm_out:   llmcuda-rs vs f64  2.235e-8   |  llama.cpp vs f64  1.629e-3   (73,000x)
    control (ssm_alpha, f32 weights, llama.cpp's unquantized path):  2.384e-6
    ```
 
@@ -572,7 +574,7 @@ round-off on a 155,648-element tensor.
 Tracked at `tools/oracle/capture.cpp`; build it with `tools/oracle/Makefile`.
 
 ```cpp
-// Golden-oracle capture tool for llmxabe.
+// Golden-oracle capture tool for llmcuda-rs.
 //
 // Runs one llama.cpp forward pass over a fixed prompt and writes the full,
 // untruncated contents of selected intermediate graph tensors plus the final

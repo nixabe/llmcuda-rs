@@ -1,11 +1,11 @@
 # Model structure and resource budgets
 
 Everything here derives from
-[`xabe_model::ModelConfig`](../crates/xabe-model/src/config.rs). Run the
+[`llmcuda_model::ModelConfig`](../crates/llmcuda-model/src/config.rs). Run the
 tables yourself:
 
 ```sh
-cargo run -p xabe-model --example budget
+cargo run -p llmcuda-model --example budget
 ```
 
 ## Two architectures
@@ -106,9 +106,9 @@ rather than taken on trust.
 | Total (text path) | 34.660 B | 34.661 B | **−0.001%** |
 
 These are now produced by a test rather than by hand:
-`xabe_model::weights::WeightSchema` derives every expected tensor name and
+`llmcuda_model::weights::WeightSchema` derives every expected tensor name and
 shape from `ModelConfig` alone, and
-`crates/xabe-model/tests/real_model_weights.rs` resolves it against the file.
+`crates/llmcuda-model/tests/real_model_weights.rs` resolves it against the file.
 All 753 tensors match, with none left unclaimed.
 
 Tensor type histogram: `q6_K` 80 tensors / 16.41 GiB, `q8_0` 303 / 13.86 GiB,
@@ -136,7 +136,7 @@ Two consequences, both load-bearing:
 
 - A dequantization prologue that hard-codes Q6_K reads every expert down
   projection as garbage. The format must travel with the pointer — see
-  `QuantTensor` in `crates/xabe-cuda/src/kernels/moe.rs`.
+  `QuantTensor` in `crates/llmcuda-cuda/src/kernels/moe.rs`.
 - Nothing may assume a uniform format *per layer* either. Block 39 is the
   counterexample, and it sits between two blocks that do match the pattern, so
   a spot check on layers 0 and 20 would miss it.
@@ -200,7 +200,7 @@ ERROR: `token_embd.weight` is q6_K, this pass unpacks q8_0
 Those readers now exist, and so do Q4_K, Q5_K, Q4_0 and f16 alongside them, in
 both the head GEMV and the gather — which is what a `Q4_K_M` file needs, since
 llama.cpp's heuristics make that a *mixture* of Q4_K, Q5_K and Q6_K rather
-than a uniform quant. All of them are checked against the `xabe-kernels`
+than a uniform quant. All of them are checked against the `llmcuda-kernels`
 scalar references, which are themselves bit-identical to gguf-py's independent
 implementation.
 
@@ -319,7 +319,7 @@ the projections would carry Q6_K precision under a Q8_0 name, which is the
 kind of thing that misleads a later reader.
 
 Its `mmproj` needs converting too, for a different reason. Ornith publishes
-`mmproj-Ornith-1.5-35B-BF16.gguf`; the loader in `xabe-engine`'s `vision`
+`mmproj-Ornith-1.5-35B-BF16.gguf`; the loader in `llmcuda-engine`'s `vision`
 module reads F32 and F16 and rejects everything else, so a BF16 mmproj fails
 at load rather than at first image. Rewriting the 110 BF16 tensors as F16 is
 safe by inspection — the largest magnitude anywhere in the tower is 1.45,
@@ -493,7 +493,7 @@ The GDN head split is **derived, not stated**. The file gives
 equal to `ssm_d_state`. That gives 48 value heads and 16 q/k heads of 128, and
 it is checked against the file's own tensor shapes rather than trusted:
 `attn_qkv.weight` is `[5120, 10240]` and `2·16·128 + 48·128 = 10240`.
-`crates/xabe-model/tests/real_dense_model_weights.rs` asserts all of it.
+`crates/llmcuda-model/tests/real_dense_model_weights.rs` asserts all of it.
 
 ## Verified against the real file
 
@@ -520,7 +520,7 @@ they are 53 of the file's largest.
 Two of those rows cost kernel work rather than a config field:
 
 - The LM head and the attention q/k/v projections go through the *same*
-  GEMV (`xabe_cuda::kernels::lm_head`), which read Q8_0 only. It now has a
+  GEMV (`llmcuda_cuda::kernels::lm_head`), which read Q8_0 only. It now has a
   bf16 body as well, selected per tensor from the file's directory — see
   [KERNELS.md](KERNELS.md). Widening those on the host was rejected on
   arithmetic: it would put 5.1 GiB on the card for the head alone and double

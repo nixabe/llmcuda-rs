@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
-# llmxabe as a container image.
+# llmcuda-rs as a container image.
 #
 # The runtime base is `nvidia/cuda:*-runtime`, not `*-devel`, because nothing
-# here wants nvcc: `xabe-cuda` has no build script, and cudarc is built with
+# here wants nvcc: `llmcuda-cuda` has no build script, and cudarc is built with
 # `fallback-dynamic-loading` and `nvrtc`, so it resolves the driver at run
 # time and compiles the kernels with NVRTC on the first launch. The three
 # libraries that must exist at run time are `libcuda.so.1` — injected by the
@@ -62,8 +62,8 @@ ENV CARGO_PROFILE_RELEASE_DEBUG=0
 # RUN that produces it.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release --locked -p xabe-server \
-    && install -Dm755 target/release/llmxabe /out/llmxabe
+    cargo build --release --locked -p llmcuda-server \
+    && install -Dm755 target/release/llmcuda /out/llmcuda
 
 # --- serve ------------------------------------------------------------------
 
@@ -75,12 +75,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /out/llmxabe /usr/local/bin/llmxabe
+COPY --from=builder /out/llmcuda /usr/local/bin/llmcuda
 
 # Bind the container's own interface, not its loopback: the port is published
 # by the runtime, and 127.0.0.1 here would be reachable from nothing.
-ENV LLMXABE_HOST=0.0.0.0 \
-    LLMXABE_PORT=8000
+ENV LLMCUDA_HOST=0.0.0.0 \
+    LLMCUDA_PORT=8000
 
 # What the NVIDIA container runtime should inject. `compute` is CUDA itself;
 # `utility` brings nvidia-smi, which is what you reach for when a worker fails
@@ -98,4 +98,4 @@ EXPOSE 8000
 # One worker per visible device, so the image serves whatever the runtime
 # gives it. Arguments append to this — see the `command:` in
 # docker-compose.yml for the configuration this project measured.
-ENTRYPOINT ["llmxabe"]
+ENTRYPOINT ["llmcuda"]

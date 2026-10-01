@@ -9,7 +9,7 @@ cargo test --workspace
 ```
 
 No part of the workspace needs a GPU or a CUDA toolkit to build and test.
-`xabe-cuda` has no build script and reaches the driver and NVRTC by dynamic
+`llmcuda-cuda` has no build script and reaches the driver and NVRTC by dynamic
 loading, so every crate compiles on any machine and the whole suite runs
 there — which is what CI does.
 
@@ -17,7 +17,7 @@ there — which is what CI does.
 Check what the host offers:
 
 ```sh
-cargo run -p xabe-cuda --bin probe
+cargo run -p llmcuda-cuda --bin probe
 ```
 
 Tests requiring a device or the model file skip when they are absent, and they
@@ -35,7 +35,7 @@ is in [README.md](README.md#milestones). Work is roughly ordered by that table.
 The highest-value work available right now is Gated DeltaNet on the GPU
 (milestone 01). It covers 30 of 40 layers, it is the project's critical path,
 and there is a CPU reference plus a differential harness already waiting for it
-in `xabe-kernels`.
+in `llmcuda-kernels`.
 
 ## Design rules that are not up for negotiation
 
@@ -59,7 +59,7 @@ fluent while getting quietly worse, and no throughput benchmark catches it.
 
 Every kernel needs:
 
-- a CPU reference implementation in `xabe-kernels`,
+- a CPU reference implementation in `llmcuda-kernels`,
 - a differential test against that reference with explicit per-tensor max-abs
   and cosine thresholds,
 - and, for GPU kernels, the same test running against the device.
@@ -101,7 +101,7 @@ committing.
 
 Nothing outside a test prints directly. Binaries and examples log through
 `tracing`; libraries emit events and never install a subscriber. Two tests in
-`xabe-log` enforce this by scanning the workspace, so a stray `println!` in a
+`llmcuda-log` enforce this by scanning the workspace, so a stray `println!` in a
 binary fails the build rather than quietly ignoring `--log-level`.
 
 Choosing a level:
@@ -132,7 +132,7 @@ every level the flag accepts, and offering them as values would only let a
 caller hide problems. `INFO`, `DEBUG` and `TRACE` go to stdout and
 `WARN`/`ERROR` to stderr, so piping a table somewhere still leaves
 diagnostics on the terminal. `RUST_LOG` is honoured when the flag is absent,
-including per-target directives (`RUST_LOG=xabe_engine::weights=trace`); an
+including per-target directives (`RUST_LOG=llmcuda_engine::weights=trace`); an
 explicit `--log-level` overrides it and says so.
 
 ## Reporting results

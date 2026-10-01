@@ -1,0 +1,46 @@
+[package]
+name = "llmcuda-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "llmcuda"
+path = "src/main.rs"
+
+[features]
+default = []
+rust-kernels = ["llmcuda-engine/rust-kernels"]
+
+[dependencies]
+llmcuda-mcp.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing.workspace = true
+llmcuda-log.workspace = true
+llmcuda-model.workspace = true
+llmcuda-cache.workspace = true
+llmcuda-sched.workspace = true
+llmcuda-engine.workspace = true
+llmcuda-grammar.workspace = true
+# The model's own `tokenizer.chat_template`, behind `--jinja`. `preserve_order`
+# so a rendered tool schema keeps the key order the caller sent.
+minijinja = { version = "2", features = ["json", "preserve_order"] }
+llmcuda-cuda.workspace = true
+llmcuda-gguf.workspace = true
+llmcuda-kernels.workspace = true
+rustc-hash.workspace = true
+async-stream = "0.3"
+axum = "0.8"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+clap.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokenizers = "0.22"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

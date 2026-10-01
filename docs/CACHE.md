@@ -1,6 +1,6 @@
 # Hybrid cache
 
-Implemented in [`xabe-cache`](../crates/xabe-cache). This document explains
+Implemented in [`llmcuda-cache`](../crates/llmcuda-cache). This document explains
 the two design rules the crate exists to enforce, and why each has a
 regression test rather than a comment.
 
@@ -143,7 +143,7 @@ state.
 
 ### What names a sequence's blocks
 
-`xabe-engine`'s `SequenceChain` owns the hashing, and it hashes nothing but the
+`llmcuda-engine`'s `SequenceChain` owns the hashing, and it hashes nothing but the
 sequence's own tokens in order: the prompt the request was admitted with, then
 every token the runtime reports generating, appended as it is reported. No
 caller supplies hashes, because a chain that disagreed with the tokens would
@@ -237,7 +237,7 @@ Stated rather than discovered later:
   minimum-`last_used` leaf by scanning all nodes. Adequate for a maintenance
   operation, not benchmarked at scale. A production version wants an LRU heap
   or intrusive list, as vLLM uses in `FreeKVCacheBlockQueue`.
-- `xabe-cache` itself does not touch device memory. `xabe-engine` accounts the
+- `llmcuda-cache` itself does not touch device memory. `llmcuda-engine` accounts the
   per-worker device pools during admission and owns the pinned migration arena.
   The cache crate's tests remain host-side logic.
 - **A chat turn's reply is not on the next turn's path**, and no amount of

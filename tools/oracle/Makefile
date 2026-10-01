@@ -1,6 +1,6 @@
 # Builds the llama.cpp reference-tensor capture program.
 #
-# This is the generator for the golden data that `crates/xabe-engine/tests/`
+# This is the generator for the golden data that `crates/llmcuda-engine/tests/`
 # gates the forward pass against. It builds OUT OF TREE against llama.cpp's
 # installed headers and shared objects — no llama.cpp source is modified, and
 # it registers the same public `llama_context_params::cb_eval` hook that

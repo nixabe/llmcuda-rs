@@ -1,7 +1,7 @@
-"""Live MCP and ordinary tool-call checks against a running llmxabe.
+"""Live MCP and ordinary tool-call checks against a running llmcuda-rs.
 
 Start the server with an API key and MCP labels `echo`, `error`, and `slow`,
-pointing at crates/xabe-mcp/tests/fixtures/server.py and allowing the respective
+pointing at crates/llmcuda-mcp/tests/fixtures/server.py and allowing the respective
 tool. This script executes only those fixture tools. Reports belong outside git.
 """
 import argparse
@@ -39,7 +39,7 @@ class Client:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate', required=True)
-    parser.add_argument('--api-key-env', default='LLMXABE_API_KEY')
+    parser.add_argument('--api-key-env', default='LLMCUDA_API_KEY')
     parser.add_argument('--output', type=pathlib.Path, required=True)
     parser.add_argument('--fixture-events', type=pathlib.Path, required=True,
                         help='Event directory passed to the stdio fixture')

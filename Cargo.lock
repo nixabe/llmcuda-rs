@@ -1219,6 +1219,150 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
+name = "llmcuda-cache"
+version = "0.1.0"
+dependencies = [
+ "llmcuda-model",
+ "parking_lot",
+ "rustc-hash",
+ "thiserror",
+]
+
+[[package]]
+name = "llmcuda-cuda"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "half",
+ "llmcuda-log",
+ "tracing",
+]
+
+[[package]]
+name = "llmcuda-engine"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "half",
+ "llmcuda-cache",
+ "llmcuda-cuda",
+ "llmcuda-gguf",
+ "llmcuda-grammar",
+ "llmcuda-kernels",
+ "llmcuda-log",
+ "llmcuda-model",
+ "llmcuda-sched",
+ "parking_lot",
+ "rustc-hash",
+ "smallvec",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
+name = "llmcuda-gguf"
+version = "0.1.0"
+dependencies = [
+ "llmcuda-log",
+ "memmap2",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "llmcuda-grammar"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "smallvec",
+]
+
+[[package]]
+name = "llmcuda-kernels"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "llmcuda-gguf",
+ "llmcuda-log",
+ "llmcuda-model",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "llmcuda-log"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "llmcuda-mcp"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "llmcuda-model"
+version = "0.1.0"
+dependencies = [
+ "llmcuda-gguf",
+ "llmcuda-log",
+ "tracing",
+]
+
+[[package]]
+name = "llmcuda-sched"
+version = "0.1.0"
+dependencies = [
+ "llmcuda-cache",
+ "llmcuda-model",
+ "parking_lot",
+ "rustc-hash",
+ "thiserror",
+]
+
+[[package]]
+name = "llmcuda-server"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "image",
+ "llmcuda-cache",
+ "llmcuda-cuda",
+ "llmcuda-engine",
+ "llmcuda-gguf",
+ "llmcuda-grammar",
+ "llmcuda-kernels",
+ "llmcuda-log",
+ "llmcuda-mcp",
+ "llmcuda-model",
+ "llmcuda-sched",
+ "minijinja",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2938,150 +3082,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "xabe-cache"
-version = "0.1.0"
-dependencies = [
- "parking_lot",
- "rustc-hash",
- "thiserror",
- "xabe-model",
-]
-
-[[package]]
-name = "xabe-cuda"
-version = "0.1.0"
-dependencies = [
- "cudarc",
- "half",
- "tracing",
- "xabe-log",
-]
-
-[[package]]
-name = "xabe-engine"
-version = "0.1.0"
-dependencies = [
- "cudarc",
- "half",
- "parking_lot",
- "rustc-hash",
- "smallvec",
- "tokenizers",
- "tracing",
- "xabe-cache",
- "xabe-cuda",
- "xabe-gguf",
- "xabe-grammar",
- "xabe-kernels",
- "xabe-log",
- "xabe-model",
- "xabe-sched",
-]
-
-[[package]]
-name = "xabe-gguf"
-version = "0.1.0"
-dependencies = [
- "memmap2",
- "thiserror",
- "tracing",
- "xabe-log",
-]
-
-[[package]]
-name = "xabe-grammar"
-version = "0.1.0"
-dependencies = [
- "serde_json",
- "smallvec",
-]
-
-[[package]]
-name = "xabe-kernels"
-version = "0.1.0"
-dependencies = [
- "half",
- "thiserror",
- "tracing",
- "xabe-gguf",
- "xabe-log",
- "xabe-model",
-]
-
-[[package]]
-name = "xabe-log"
-version = "0.1.0"
-dependencies = [
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "xabe-mcp"
-version = "0.1.0"
-dependencies = [
- "axum",
- "rmcp",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "xabe-model"
-version = "0.1.0"
-dependencies = [
- "tracing",
- "xabe-gguf",
- "xabe-log",
-]
-
-[[package]]
-name = "xabe-sched"
-version = "0.1.0"
-dependencies = [
- "parking_lot",
- "rustc-hash",
- "thiserror",
- "xabe-cache",
- "xabe-model",
-]
-
-[[package]]
-name = "xabe-server"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "axum",
- "base64 0.22.1",
- "clap",
- "image",
- "minijinja",
- "rustc-hash",
- "serde",
- "serde_json",
- "tokenizers",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
- "xabe-cache",
- "xabe-cuda",
- "xabe-engine",
- "xabe-gguf",
- "xabe-grammar",
- "xabe-kernels",
- "xabe-log",
- "xabe-mcp",
- "xabe-model",
- "xabe-sched",
-]
 
 [[package]]
 name = "yoke"

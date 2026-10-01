@@ -1,37 +1,37 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/xabe-gguf",
-    "crates/xabe-model",
-    "crates/xabe-cache",
-    "crates/xabe-sched",
-    "crates/xabe-kernels",
-    "crates/xabe-log",
-    "crates/xabe-cuda",
-    "crates/xabe-grammar",
-    "crates/xabe-engine",
-    "crates/xabe-server",
-    "crates/xabe-mcp",
+    "crates/llmcuda-gguf",
+    "crates/llmcuda-model",
+    "crates/llmcuda-cache",
+    "crates/llmcuda-sched",
+    "crates/llmcuda-kernels",
+    "crates/llmcuda-log",
+    "crates/llmcuda-cuda",
+    "crates/llmcuda-grammar",
+    "crates/llmcuda-engine",
+    "crates/llmcuda-server",
+    "crates/llmcuda-mcp",
 ]
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/nixabe/llmxabe"
-authors = ["llmxabe contributors"]
+repository = "https://github.com/nixabe/llmcuda-rs"
+authors = ["llmcuda-rs contributors"]
 
 [workspace.dependencies]
-xabe-mcp = { path = "crates/xabe-mcp" }
-xabe-gguf = { path = "crates/xabe-gguf" }
-xabe-model = { path = "crates/xabe-model" }
-xabe-cache = { path = "crates/xabe-cache" }
-xabe-sched = { path = "crates/xabe-sched" }
-xabe-kernels = { path = "crates/xabe-kernels" }
-xabe-log = { path = "crates/xabe-log" }
-xabe-cuda = { path = "crates/xabe-cuda" }
-xabe-grammar = { path = "crates/xabe-grammar" }
-xabe-engine = { path = "crates/xabe-engine" }
+llmcuda-mcp = { path = "crates/llmcuda-mcp" }
+llmcuda-gguf = { path = "crates/llmcuda-gguf" }
+llmcuda-model = { path = "crates/llmcuda-model" }
+llmcuda-cache = { path = "crates/llmcuda-cache" }
+llmcuda-sched = { path = "crates/llmcuda-sched" }
+llmcuda-kernels = { path = "crates/llmcuda-kernels" }
+llmcuda-log = { path = "crates/llmcuda-log" }
+llmcuda-cuda = { path = "crates/llmcuda-cuda" }
+llmcuda-grammar = { path = "crates/llmcuda-grammar" }
+llmcuda-engine = { path = "crates/llmcuda-engine" }
 
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"

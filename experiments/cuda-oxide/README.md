@@ -21,17 +21,17 @@ come from the pinned revision. Regenerate from the repository root:
 
 ```sh
 python3 experiments/cuda-oxide/regenerate.py
-git diff -- crates/xabe-cuda/src/kernels/rust/tensor_add.ptx
+git diff -- crates/llmcuda-cuda/src/kernels/rust/tensor_add.ptx
 ```
 
 On the target host, the build used these environment overrides (the isolated
 libclang wheel was installed with `python3 -m pip install --target
-/tmp/llmxabe-oxide-python libclang==18.1.1`):
+/tmp/llmcuda-oxide-python libclang==18.1.1`):
 
 ```sh
 export CUDA_HOME=/usr/local/cuda-13.0
 export CUDA_TOOLKIT_PATH=/usr/local/cuda-13.0
-export LIBCLANG_PATH=/tmp/llmxabe-oxide-python/clang/native
+export LIBCLANG_PATH=/tmp/llmcuda-oxide-python/clang/native
 export BINDGEN_EXTRA_CLANG_ARGS='-isystem /usr/lib/gcc/x86_64-linux-gnu/11/include -idirafter /usr/local/cuda-12.4/include'
 ```
 
@@ -44,10 +44,10 @@ Run outside the sandbox, with an idle GPU and no other builds or GPU work
 during timing:
 
 ```sh
-CUDA_VISIBLE_DEVICES=1 cargo run --release -p xabe-engine --bin bench_rust_add -- \
-  crates/xabe-cuda/src/kernels/rust/tensor_add.ptx tensor_add
-CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine \
-  --features xabe-cuda/rust-kernels --test layer_ops_differential -- --nocapture
+CUDA_VISIBLE_DEVICES=1 cargo run --release -p llmcuda-engine --bin bench_rust_add -- \
+  crates/llmcuda-cuda/src/kernels/rust/tensor_add.ptx tensor_add
+CUDA_VISIBLE_DEVICES=1 cargo test --release -p llmcuda-engine \
+  --features llmcuda-cuda/rust-kernels --test layer_ops_differential -- --nocapture
 ```
 
 The narrow gate checks empty and ragged lengths, decode and prefill shapes,
@@ -63,7 +63,7 @@ change directly with the previous Rust artifact. The gate includes all float
 alignments modulo 16, independently offset input/output pointers, and all
 four-float tail lengths; wider accesses must preserve the sliced-buffer ABI.
 
-To test inside the model, pass `--features xabe-cuda/rust-kernels` to
+To test inside the model, pass `--features llmcuda-cuda/rust-kernels` to
 `bench_forward`, `bench_decode_batch`, and the existing forward tests. Keep
 separate target directories for candidate and baseline, build both before
 timing, and alternate processes on the same card. The production default
@@ -79,8 +79,8 @@ aliases, and graph replay. Six alternating pairs time 100 captured launches
 per CUDA event interval, with reversed order on odd pairs:
 
 ```sh
-CUDA_VISIBLE_DEVICES=1 cargo run --release -p xabe-engine --bin bench_rust_activations
-CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --features rust-kernels \
+CUDA_VISIBLE_DEVICES=1 cargo run --release -p llmcuda-engine --bin bench_rust_activations
+CUDA_VISIBLE_DEVICES=1 cargo test --release -p llmcuda-engine --features rust-kernels \
   --test layer_ops_differential --test forward_pass -- --nocapture --test-threads=1
 ```
 
@@ -106,7 +106,7 @@ rows, two epsilon values, guards, in-place standalone RMSNorm, and graph
 replay before reporting six alternating CUDA-event pairs:
 
 ```sh
-CUDA_VISIBLE_DEVICES=1 cargo run --release -p xabe-engine --bin bench_rust_norm
+CUDA_VISIBLE_DEVICES=1 cargo run --release -p llmcuda-engine --bin bench_rust_norm
 ```
 
 `bench_rust_rope` checks rotated spans against CPU `apply_rope`, exact tail
@@ -120,7 +120,7 @@ precision frequency, sine/cosine and input loads. The tail remains a copy.
 boundary, and measures the 96-element decode and 49,152-element prefill shapes.
 
 ```sh
-CUDA_VISIBLE_DEVICES=1 cargo run --release -p xabe-engine --bin bench_rust_rope
+CUDA_VISIBLE_DEVICES=1 cargo run --release -p llmcuda-engine --bin bench_rust_rope
 ```
 
 The production attention counterpart is `attn_rope_partial_neox`. It already

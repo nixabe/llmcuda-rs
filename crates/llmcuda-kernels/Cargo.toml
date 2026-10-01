@@ -1,0 +1,18 @@
+[package]
+name = "llmcuda-kernels"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+llmcuda-model.workspace = true
+half.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tracing.workspace = true
+llmcuda-gguf.workspace = true
+llmcuda-log.workspace = true

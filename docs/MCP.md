@@ -1,12 +1,12 @@
 # Server-side MCP
 
-llmxabe can act as an MCP **client**: it discovers and invokes tools hosted by
+llmcuda-rs can act as an MCP **client**: it discovers and invokes tools hosted by
 configured MCP servers. It supports stdio child processes and Streamable HTTP
-through the official Rust `rmcp` SDK. This does not expose llmxabe itself as an
+through the official Rust `rmcp` SDK. This does not expose llmcuda-rs itself as an
 MCP server.
 
 MCP is disabled unless `--mcp-servers-config` is supplied. Enabling execution
-requires `--api-key` or `LLMXABE_API_KEY`. The ordinary Chat Completions,
+requires `--api-key` or `LLMCUDA_API_KEY`. The ordinary Chat Completions,
 Anthropic, and Responses requests retain their existing tool-calling behavior.
 Only a Responses request containing the `mcp` extension below executes an
 automatic loop. Provider-specific `tools: [{"type":"mcp", ...}]` declarations
@@ -51,7 +51,7 @@ expired-session request replay are disabled. Requests select administrator
 labels, never arbitrary URLs, commands, credentials, or sandbox IDs.
 
 ```bash
-LLMXABE_API_KEY=your-key cargo run --release -p xabe-server -- \
+LLMCUDA_API_KEY=your-key cargo run --release -p llmcuda-server -- \
   --model /path/to/model.gguf --mcp-servers-config /path/to/mcp.json
 ```
 
@@ -168,7 +168,7 @@ template. See [AgentENV's E2B setup](https://kvcache-ai.github.io/AgentENV/dev/i
 
 Install `mcp>=2,<3` and `e2b>=2,<3` in a dedicated Python environment. Export
 `E2B_API_URL`, `E2B_SANDBOX_URL`, `E2B_API_KEY`, and `AENV_TEMPLATE` before starting
-llmxabe; credentials are inherited by the bridge, not offered to the model.
+llmcuda-rs; credentials are inherited by the bridge, not offered to the model.
 Example configuration:
 
 ```json
@@ -177,7 +177,7 @@ Example configuration:
   "mcpServers": {
     "agentenv": {
       "command": "/path/to/venv/bin/python",
-      "args": ["/path/to/llmxabe/examples/agentenv/server.py"],
+      "args": ["/path/to/llmcuda-rs/examples/agentenv/server.py"],
       "allowed_tools": ["run_command"]
     }
   }
@@ -194,7 +194,7 @@ For a live bridge check, select a template with Python and Node installed and ru
 against the configured engine:
 
 ```bash
-LLMXABE_API_KEY=your-key python3 -B tools/serving/check_agentenv.py \
+LLMCUDA_API_KEY=your-key python3 -B tools/serving/check_agentenv.py \
   --candidate http://127.0.0.1:8000 --server agentenv \
   --output /tmp/agentenv-live-report.json
 ```
@@ -216,12 +216,12 @@ rich results have replay tests. The optional Python bridge has offline handler
 tests (`python3 -m unittest discover -s examples/agentenv`).
 
 For live model checks, configure the labels `echo`, `error`, and `slow` to launch
-`python3 -u /absolute/path/to/crates/xabe-mcp/tests/fixtures/server.py /tmp/mcp-events`,
+`python3 -u /absolute/path/to/crates/llmcuda-mcp/tests/fixtures/server.py /tmp/mcp-events`,
 allowlisting the corresponding tool for each label. Create that event directory
 before starting the server, then run:
 
 ```bash
-LLMXABE_API_KEY=your-key python3 tools/serving/check_mcp.py \
+LLMCUDA_API_KEY=your-key python3 tools/serving/check_mcp.py \
   --candidate http://127.0.0.1:8000 --fixture-events /tmp/mcp-events \
   --output /tmp/mcp-live-report.json
 ```
@@ -232,7 +232,7 @@ limits, tool errors, and cancellation after a call reaches the external process.
 It is a fixture-based integration check, not a general tool-selection evaluation
 or a GPU performance benchmark. The separate AgentENV script above checks a live
 deployment. Both scripts were exercised with Qwen3.6-35B-A3B UD-Q6_K_XL on a
-Quadro RTX 8000; the AgentENV check used the `nixabe-ubuntu` template and confirmed
+Quadro RTX 8000; the AgentENV check used the `nillmcuda-ubuntu` template and confirmed
 that both temporary sandboxes were deleted after session closure.
 Prompts/resources discovery,
 OAuth flows, elicitation, sampling callbacks, and MCP task execution are outside

@@ -1,4 +1,4 @@
-# llmxabe — one process, one worker per visible card, one shared prefix cache.
+# llmcuda-rs — one process, one worker per visible card, one shared prefix cache.
 #
 #   docker compose up --build          # build the image and serve
 #   docker compose logs -f             # preflight, then the serving banner
@@ -6,20 +6,20 @@
 #
 # Every value below can be overridden from a `.env` file beside this one, or
 # from the environment. The defaults are this project's own machine: three
-# Quadro RTX 8000 and the GGUF pair under /home/nixabe/llmxabe/models.
+# Quadro RTX 8000 and the GGUF pair under ./models.
 #
 # Nothing here is a benchmark claim. The measurements behind the `command:`
 # are in docs/BENCHMARKS.md, which is the only place numbers belong.
 
-name: llmxabe
+name: llmcuda-rs
 
 services:
-  llmxabe:
+  llmcuda-rs:
     build:
       context: .
       dockerfile: Dockerfile
-    image: llmxabe:latest
-    container_name: llmxabe
+    image: llmcuda-rs:latest
+    container_name: llmcuda-rs
 
     # The serving configuration this project measured; docs/DOCKER.md gives the
     # reasoning flag by flag. Only -c, --max-tokens and --top-p differ from the
@@ -69,16 +69,16 @@ services:
 
     environment:
       # `environment:` wins over `env_file:`, so pinning the bind here keeps a
-      # stray LLMXABE_HOST in a .env from making the published port dead.
-      LLMXABE_HOST: 0.0.0.0
-      LLMXABE_PORT: "8000"
+      # stray LLMCUDA_HOST in a .env from making the published port dead.
+      LLMCUDA_HOST: 0.0.0.0
+      LLMCUDA_PORT: "8000"
       # Paths as seen inside the container, under the read-only mount below.
-      LLMXABE_MODEL: /models/${LLMXABE_MODEL_REL:-Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf}
+      LLMCUDA_MODEL: /models/${LLMCUDA_MODEL_REL:-Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf}
       # Vision. Setting this is what enables image input; a server started
       # without it allocates nothing for the tower and serves text unchanged.
-      LLMXABE_MMPROJ: /models/${LLMXABE_MMPROJ_REL:-Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf}
+      LLMCUDA_MMPROJ: /models/${LLMCUDA_MMPROJ_REL:-Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf}
       # Model id reported by /v1/models and echoed back in responses.
-      LLMXABE_SERVED_MODEL_NAME: ${LLMXABE_SERVED_MODEL_NAME:-qwen3.6-35b-a3b}
+      LLMCUDA_SERVED_MODEL_NAME: ${LLMCUDA_SERVED_MODEL_NAME:-qwen3.6-35b-a3b}
       # Enough pinned snapshots that every slot can restore anywhere in its
       # context — 198 per worker, 59.64 GiB across three cards. Set explicitly
       # because the unset default caps itself at a quarter of MemAvailable,
@@ -88,16 +88,16 @@ services:
       # Lower it if the host shares RAM with anything substantial; an
       # undersized arena is worse than a small one, so read the coverage line
       # preflight prints rather than guessing. See docs/CLI.md#--cache-ram.
-      LLMXABE_CACHE_RAM: ${LLMXABE_CACHE_RAM:-full}
+      LLMCUDA_CACHE_RAM: ${LLMCUDA_CACHE_RAM:-full}
       RUST_BACKTRACE: "1"
 
     # Listed without values on purpose: compose passes these through only when
     # they are set on the host, and an unset key must stay unset. An empty
-    # LLMXABE_API_KEY would not mean "no key" — it would mean callers have to
+    # LLMCUDA_API_KEY would not mean "no key" — it would mean callers have to
     # present an empty one.
     #
-    #   LLMXABE_API_KEY   require Authorization: Bearer / x-api-key
-    #   LLMXABE_DFLASH    path to a DFlash drafter GGUF (--spec-type spec-dflash)
+    #   LLMCUDA_API_KEY   require Authorization: Bearer / x-api-key
+    #   LLMCUDA_DFLASH    path to a DFlash drafter GGUF (--spec-type spec-dflash)
     env_file:
       - path: .env
         required: false
@@ -105,13 +105,13 @@ services:
     volumes:
       # The models directory, read-only — the engine mmaps the GGUF and never
       # writes here.
-      - ${LLMXABE_MODELS_DIR:-/home/nixabe/llmxabe/models}:/models:ro
+      - ${LLMCUDA_MODELS_DIR:-./models}:/models:ro
 
     # Bound to loopback by default. A server with no --api-key accepts every
-    # caller, and its own preflight says so; set LLMXABE_BIND_ADDR=0.0.0.0
-    # only together with LLMXABE_API_KEY.
+    # caller, and its own preflight says so; set LLMCUDA_BIND_ADDR=0.0.0.0
+    # only together with LLMCUDA_API_KEY.
     ports:
-      - "${LLMXABE_BIND_ADDR:-127.0.0.1}:${LLMXABE_HOST_PORT:-8000}:8000"
+      - "${LLMCUDA_BIND_ADDR:-127.0.0.1}:${LLMCUDA_HOST_PORT:-8000}:8000"
 
     # One worker per device. To serve on a subset, replace `count` with
     # `device_ids: ["0", "1"]`.
@@ -120,7 +120,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: ${LLMXABE_GPU_COUNT:-all}
+              count: ${LLMCUDA_GPU_COUNT:-all}
               capabilities: [gpu]
 
     # Not boilerplate. The prefix cache's snapshot arenas are page-locked host

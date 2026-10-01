@@ -1,4 +1,4 @@
-# llmxabe
+# llmcuda-rs
 
 A single-process CUDA inference engine for `Qwen3.6-35B-A3B` on 3× Quadro
 RTX 8000, written in Rust.
@@ -125,33 +125,33 @@ Three consequences drive most of the design:
 3. **The LM head alone costs 540 MB/token** — roughly 58% of what all forty MoE
    layers read combined — because the vocabulary is 248,320 and untied.
 
-`cargo run -p xabe-model --example budget` prints the full VRAM and bandwidth
+`cargo run -p llmcuda-model --example budget` prints the full VRAM and bandwidth
 tables for any context length.
 
 ## Building
 
 ```sh
-git clone <repo> && cd llmxabe
+git clone <repo> && cd llmcuda-rs
 cargo build --workspace
 cargo test --workspace --release
 ```
 
 The experimental Rust residual-add kernel is disabled by default. Enable it
-at compile time with `cargo build --release -p xabe-server --features rust-kernels`.
+at compile time with `cargo build --release -p llmcuda-server --features rust-kernels`.
 See [optional Rust CUDA kernels](docs/DEVELOPMENT.md#optional-rust-cuda-kernels)
 for build, test and regeneration instructions.
 
 The whole workspace builds and tests without a GPU or CUDA toolkit — that is
 what CI runs. Tests that need a device detect its absence and skip, reporting
 that they skipped. Tests that read the real model file look for it at
-`$LLMXABE_MODEL`, falling back to the path in
+`$LLMCUDA_MODEL`, falling back to the path in
 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and skip if it is absent.
 
 Running device work needs a Turing-or-later GPU and its driver at runtime:
 
 ```sh
-cargo run -p xabe-cuda --bin probe     # device inventory and sm_75 gate
-cargo run -p xabe-server               # full engine preflight
+cargo run -p llmcuda-cuda --bin probe     # device inventory and sm_75 gate
+cargo run -p llmcuda-server               # full engine preflight
 ```
 
 The preflight validates the whole startup path — model config, cache geometry,

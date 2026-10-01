@@ -1,6 +1,6 @@
 # Scheduler
 
-Implemented in [`xabe-sched`](../crates/xabe-sched). The design is ported from
+Implemented in [`llmcuda-sched`](../crates/llmcuda-sched). The design is ported from
 vLLM's `Scheduler.schedule()` (`vllm/v1/core/sched/scheduler.py`) — the
 algorithm, not the code. It is well-tested upstream and, more usefully, its
 failure modes are documented.
@@ -154,5 +154,5 @@ Stated explicitly rather than discovered later:
 - **The scheduler does not hold a live `BlockPool`.** It tracks free and total
   attention block counts as integers that a caller keeps in sync with the real
   pool. This keeps `step()` device-free and deterministic; wiring the two
-  together belongs to `xabe-engine`.
+  together belongs to `llmcuda-engine`.
 - No device memory is touched. The scheduler tests are host-side logic.

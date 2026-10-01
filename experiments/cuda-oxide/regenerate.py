@@ -6,7 +6,7 @@ import subprocess
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE / "src/main.rs"
-OUTPUT = HERE.parents[1] / "crates/xabe-cuda/src/kernels/rust/tensor_add.ptx"
+OUTPUT = HERE.parents[1] / "crates/llmcuda-cuda/src/kernels/rust/tensor_add.ptx"
 REVISION = "26754ae52c26c097dc1c465a1e42c4c5d05a3d40"
 
 source_before = SOURCE.read_bytes()
@@ -17,7 +17,7 @@ subprocess.run(
 )
 if SOURCE.read_bytes() != source_before:
     raise SystemExit("Rust source changed during compilation; refusing to publish PTX")
-ptx = (HERE / "xabe_rust_device.ptx").read_text()
+ptx = (HERE / "llmcuda_rust_device.ptx").read_text()
 if ".target sm_75\n" not in ptx or any(
     f".visible .entry {entry}(" not in ptx
     for entry in (

@@ -11,7 +11,7 @@
 | Rust | nightly, pinned by `rust-toolchain.toml` |
 
 Device figures above are measured, not quoted — run
-`cargo run -p xabe-cuda --bin probe` to reproduce them:
+`cargo run -p llmcuda-cuda --bin probe` to reproduce them:
 
 - Peak bandwidth derives to **exactly 672 GB/s** from a 384-bit bus at 7001 MHz
   effective. Every roofline in [MODEL.md](MODEL.md) is stated against this.
@@ -26,18 +26,18 @@ cargo test --workspace --release
 ```
 
 No crate needs a GPU or a CUDA toolkit to build and test, including
-`xabe-cuda`. This is deliberate: the correctness work that matters most
+`llmcuda-cuda`. This is deliberate: the correctness work that matters most
 (kernel references, cache geometry, scheduler invariants) must not be gated on
 device access.
 
-`xabe-cuda` has no build script, and builds against `cudarc` with the
+`llmcuda-cuda` has no build script, and builds against `cudarc` with the
 `cuda-12040` feature, `fallback-dynamic-loading` and `nvrtc` — so it needs no
 headers and no `nvcc` at build time, resolving the driver and compiling
 kernels at runtime instead. Nothing is needed on `PATH` to compile it.
 
 That property is load-bearing rather than incidental, and it is easy to break
 by accident. Everything device-gated funnels through
-`xabe_cuda::device::driver_available`, which has to answer `false` — not
+`llmcuda_cuda::device::driver_available`, which has to answer `false` — not
 abort — on a machine with no driver, because `cudarc` panics rather than
 erroring when it cannot find `libcuda` at all.
 
@@ -47,16 +47,16 @@ erroring when it cannot find `libcuda` at all.
 Enable it when building the server:
 
 ```sh
-cargo build --release -p xabe-server --features rust-kernels
+cargo build --release -p llmcuda-server --features rust-kernels
 ```
 
-This builds `target/release/llmxabe` with the migrated cuda-oxide kernels.
-The server feature forwards through `xabe-engine` to `xabe-cuda`. Engine
+This builds `target/release/llmcuda` with the migrated cuda-oxide kernels.
+The server feature forwards through `llmcuda-engine` to `llmcuda-cuda`. Engine
 benchmarks and tests can use the same flag:
 
 ```sh
-cargo build --release -p xabe-engine --bin bench_decode_batch --features rust-kernels
-CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --features rust-kernels \
+cargo build --release -p llmcuda-engine --bin bench_decode_batch --features rust-kernels
+CUDA_VISIBLE_DEVICES=1 cargo test --release -p llmcuda-engine --features rust-kernels \
   --test layer_ops_differential -- --nocapture
 ```
 
@@ -74,7 +74,7 @@ headers. Regenerating PTX uses the separate toolchain in
 To build the default CUDA C++ path again, omit the feature:
 
 ```sh
-cargo build --release -p xabe-server
+cargo build --release -p llmcuda-server
 ```
 
 Kernel selection is fixed in the compiled binary. There is no runtime flag
@@ -106,10 +106,10 @@ Its HEAD also serializes MTP ubatches for this architecture.
 
 | | |
 | --- | --- |
-| Weights | `/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` (32 GB) |
+| Weights | `./models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` (32 GB) |
 | Vision encoder | `mmproj-F16.gguf` (899 MB), same directory |
 
-Tests that read the model honour `$LLMXABE_MODEL` and fall back to the path
+Tests that read the model honour `$LLMCUDA_MODEL` and fall back to the path
 above. They **skip** when it is absent rather than failing, so the workspace
 stays testable on a machine without 32 GB of weights.
 

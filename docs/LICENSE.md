@@ -4,10 +4,10 @@
 > **AI Agent**. It is NOT fully optimized, tested on multiple devices or
 > production-ready. Issues and undercover bugs are expected.
 
-llmxabe's source code and documentation are licensed under the
+llmcuda-rs's source code and documentation are licensed under the
 [Apache License, Version 2.0](../LICENSE).
 
-Copyright 2026 the llmxabe contributors.
+Copyright 2026 the llmcuda-rs contributors.
 
 The [NOTICE file](../NOTICE) records reference acknowledgements and includes
 the MIT license for llama.cpp algorithms ported by this project. Dependencies

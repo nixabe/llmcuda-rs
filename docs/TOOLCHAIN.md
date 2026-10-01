@@ -4,7 +4,7 @@
 load time.**
 
 This resolves milestone 00. The evidence below was produced by
-`cargo run -p xabe-cuda --bin probe` on the target host, and the same checks
+`cargo run -p llmcuda-cuda --bin probe` on the target host, and the same checks
 run as a test (`spike::tests::milestone_00_gating_spike`), skipping loudly
 when no device is present.
 
@@ -49,14 +49,14 @@ rms_norm_swiglu_rows, softplus_elementwise, rope_partial}` and
 ABIs and supported input/output aliasing.
 It uses a separate Cargo workspace so compiler experiments do not change the
 engine's nightly or dependency graph. The
-[`bench_rust_add`](../crates/xabe-engine/src/bin/bench_rust_add.rs) gate loads
+[`bench_rust_add`](../crates/llmcuda-engine/src/bin/bench_rust_add.rs) gate loads
 its PTX through the engine's existing cudarc runtime, compares both compilers
-against `xabe_kernels::norm::residual_add`, and measures alternating pairs
-with CUDA events. The opt-in `xabe-cuda/rust-kernels` feature embeds the
+against `llmcuda_kernels::norm::residual_add`, and measures alternating pairs
+with CUDA events. The opt-in `llmcuda-cuda/rust-kernels` feature embeds the
 generated PTX, so using it requires neither the experimental compiler nor its
 host runtime at engine build or run time. Source changes require regeneration.
 The server and engine expose a forwarding `rust-kernels` feature: build with
-`cargo build --release -p xabe-server --features rust-kernels` to enable it.
+`cargo build --release -p llmcuda-server --features rust-kernels` to enable it.
 `bench_rust_activations` checks softplus, both sigmoid shapes, waypoint outputs,
 guards, aliases and graph replay against
 the existing CPU tolerances before reporting six alternating event pairs.
@@ -91,7 +91,7 @@ Measured on 3× Quadro RTX 8000, driver 595.84, CUDA 12.4, Rust nightly.
 
 Each check verifies numerical output. None is satisfied by the API returning
 `Ok`, and a check that cannot run reports `Skipped` rather than `Pass` — see
-[`CheckOutcome`](../crates/xabe-cuda/src/spike.rs).
+[`CheckOutcome`](../crates/llmcuda-cuda/src/spike.rs).
 
 Q1 was answered more strictly than "it compiled": NVRTC accepting
 `--gpu-architecture=compute_75` does not by itself prove the right target came
@@ -147,7 +147,7 @@ treat capture-region code as manually ordered.
 
 - **Kernel language.** CUDA C++ through NVRTC means kernel code sits outside
   Rust's type system. Shapes are passed as scalars and validated at the call
-  boundary in `xabe-cuda`, not by the compiler.
+  boundary in `llmcuda-cuda`, not by the compiler.
 - **Tensor-core paths.** Q2 proves inline PTX works; it does not prove any
   particular `mma.sync` shape is correct or profitable on this workload. The
   MoE decode shapes are extremely skinny (batch 3 against 2048×512), so SplitK
@@ -158,8 +158,8 @@ treat capture-region code as manually ordered.
 ## Reproducing
 
 ```sh
-cargo run -p xabe-cuda --bin probe    # full device inventory + gate
-cargo test -p xabe-cuda               # same checks as tests
+cargo run -p llmcuda-cuda --bin probe    # full device inventory + gate
+cargo test -p llmcuda-cuda               # same checks as tests
 ```
 
 Exits non-zero if the fleet fails the capability gate or a check that ran did

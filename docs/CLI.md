@@ -1,12 +1,12 @@
 # Command-line arguments
 
-The `llmxabe` binary (crate `xabe-server`) parses its command line with
+The `llmcuda` binary (crate `llmcuda-server`) parses its command line with
 [clap](https://docs.rs/clap). Run it with:
 
 ```sh
-cargo run -p xabe-server -- [OPTIONS]
+cargo run -p llmcuda-server -- [OPTIONS]
 # or, once built:
-./target/release/llmxabe [OPTIONS]
+./target/release/llmcuda [OPTIONS]
 ```
 
 `--help` prints the full list with defaults; `--version` prints the crate
@@ -25,13 +25,12 @@ For options that also read an environment variable, the order is:
 2. the environment variable,
 3. the built-in default.
 
-`LLMXABE_MODEL` predates the flags and is kept so existing scripts keep
-working; new invocations should prefer the flags. The old `LLMXABE_ADDR`
-variable (a combined `host:port`) is gone, replaced by `LLMXABE_HOST` and
-`LLMXABE_PORT`.
+`LLMCUDA_MODEL` selects the model when `--model` is absent. The combined
+`host:port` variable is no longer supported; use `LLMCUDA_HOST` and
+`LLMCUDA_PORT`.
 
 `--api-key` is the exception to preferring the flag: an argument is visible in
-`ps` output to every user on the host, so prefer `LLMXABE_API_KEY`. Neither
+`ps` output to every user on the host, so prefer `LLMCUDA_API_KEY`. Neither
 the value nor the variable's contents appear in `--help` or in any log line.
 
 ## Options
@@ -40,13 +39,13 @@ the value nor the variable's contents appear in `--help` or in any log line.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `-m, --model <PATH>` | `LLMXABE_MODEL` | the `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` path under `~/llmxabe/models` | GGUF model file to load. The architecture comes from the file's own `general.architecture`: `qwen35moe` (Qwen3.6-35B-A3B) and `qwen35` (Qwen3.8-27B) are implemented, and anything else is refused at preflight by name rather than guessed at. Other quantizations of either are fine. |
-| `--mmproj <PATH>` | `LLMXABE_MMPROJ` | none | Multimodal projector GGUF (the `mmproj-*.gguf` shipped beside the model). Loads the vision tower on every worker and enables image input; without it the server is text-only and image parts get a 400. See [API.md](API.md#image-input). |
+| `-m, --model <PATH>` | `LLMCUDA_MODEL` | `models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf`, relative to the working directory | GGUF model file to load. The architecture comes from the file's own `general.architecture`: `qwen35moe` (Qwen3.6-35B-A3B) and `qwen35` (Qwen3.8-27B) are implemented, and anything else is refused at preflight by name rather than guessed at. Other quantizations of either are fine. |
+| `--mmproj <PATH>` | `LLMCUDA_MMPROJ` | none | Multimodal projector GGUF (the `mmproj-*.gguf` shipped beside the model). Loads the vision tower on every worker and enables image input; without it the server is text-only and image parts get a 400. See [API.md](API.md#image-input). |
 | `--image-max-tokens <N>` | — | `1024` | Most prompt tokens one image may occupy; larger images are resized down to fit. Bounded by the model's own `[8, 4096]` budget. Note this is a *ceiling*; the llama.cpp baseline's `--image-min-tokens 1024` is a floor, so at defaults the two spend image tokens differently. |
-| `--host <HOST>` | `LLMXABE_HOST` | `127.0.0.1` | Host the HTTP server binds. |
-| `--port <PORT>` | `LLMXABE_PORT` | `8000` | Port the HTTP server binds. |
-| `--jinja` / `--no-jinja` | `LLMXABE_NO_JINJA` | `--jinja` | Render prompts with the model's own `tokenizer.chat_template`, as llama.cpp does by default. The alternative is the hand-written ChatML in `http::chat`, which is a *copy* of that template and can drift from it silently; a test renders both ways against the served model's own template and requires them byte-identical, but only for the models it is run against. `--no-jinja` (or `LLMXABE_NO_JINJA=1`) picks the hand-written renderer. A model file with no usable template falls back to the hand-written renderer with a warning — unless `--jinja` was passed by name, which turns the same situation into a startup failure. The template evaluation costs about 35 µs a request against the hand-written renderer's 1 µs, both far under the tokenization that follows. |
-| `--api-key <KEY>` | `LLMXABE_API_KEY` | none | Key callers must present, in `Authorization: Bearer <key>` or `x-api-key: <key>`. With none set the server is open. See [API.md](API.md#authentication). |
+| `--host <HOST>` | `LLMCUDA_HOST` | `127.0.0.1` | Host the HTTP server binds. |
+| `--port <PORT>` | `LLMCUDA_PORT` | `8000` | Port the HTTP server binds. |
+| `--jinja` / `--no-jinja` | `LLMCUDA_NO_JINJA` | `--jinja` | Render prompts with the model's own `tokenizer.chat_template`, as llama.cpp does by default. The alternative is the hand-written ChatML in `http::chat`, which is a *copy* of that template and can drift from it silently; a test renders both ways against the served model's own template and requires them byte-identical, but only for the models it is run against. `--no-jinja` (or `LLMCUDA_NO_JINJA=1`) picks the hand-written renderer. A model file with no usable template falls back to the hand-written renderer with a warning — unless `--jinja` was passed by name, which turns the same situation into a startup failure. The template evaluation costs about 35 µs a request against the hand-written renderer's 1 µs, both far under the tokenization that follows. |
+| `--api-key <KEY>` | `LLMCUDA_API_KEY` | none | Key callers must present, in `Authorization: Bearer <key>` or `x-api-key: <key>`. With none set the server is open. See [API.md](API.md#authentication). |
 
 `--mcp-servers-config <PATH>` enables configured MCP sessions and tool execution.
 It requires an API key; see [Server-side MCP](MCP.md) for the configuration and
@@ -60,7 +59,7 @@ opt-in Responses loop.
 | `-s, --slots-per-worker <N>` | — | `3` | Concurrent request slots per worker. The default matches the llama.cpp baseline's `-np 3` (see [DEVELOPMENT.md](DEVELOPMENT.md)). |
 | `-c, --total-context <N>` | — | `393216` | Total context tokens across all slots, used to size the KV pool and the VRAM budget. The default matches the baseline's `-c 393216`. |
 | `-pc, --prefill-chunk <N>` | — | `4096` | Tokens per chunked-prefill step. |
-| `--cache-ram <SIZE\|full>` | `LLMXABE_CACHE_RAM` | full coverage, capped at a quarter of host `MemAvailable` | Host RAM the prefix cache may pin for retained snapshots, across all workers. See below. |
+| `--cache-ram <SIZE\|full>` | `LLMCUDA_CACHE_RAM` | full coverage, capped at a quarter of host `MemAvailable` | Host RAM the prefix cache may pin for retained snapshots, across all workers. See below. |
 | `--spec-type <TYPE>` | — | `none` | Speculative decoder: `none`, `ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, or `spec-dflash`. See below. |
 | `--spec-ngram-n-max <N>` | — | `3` | `ngram`: most tokens proposed from one suffix match. |
 | `--spec-ngram-min <N>` | — | `2` | `ngram`: shortest suffix worth matching on. |
@@ -81,7 +80,7 @@ opt-in Responses loop.
 | `--spec-draft-n-min <N>` | — | `0` | Drop any draft that comes out shorter than this; `0` keeps every draft. |
 | `--spec-draft-p-min <P>` | — | `0` | `draft-mtp`/`spec-dflash`: stop drafting at the first token whose probability under the drafter's own head falls below this; `0` disables the gate. |
 | `--spec-draft-p-split <P>` | — | `0.1` | Accepted for llama.cpp flag compatibility; no current speculative decoder uses a split probability (llama.cpp's ignore it too). |
-| `--spec-dflash <PATH>` | `LLMXABE_DFLASH` | — | `spec-dflash`: the trained drafter GGUF. Required by that type. |
+| `--spec-dflash <PATH>` | `LLMCUDA_DFLASH` | — | `spec-dflash`: the trained drafter GGUF. Required by that type. |
 | `--watermark <F>` | — | `0.01` | Fraction of the KV pool held back as admission headroom, in `[0, 1)`. Raise it if admission thrashes under load. |
 
 ### Serving defaults
@@ -91,13 +90,13 @@ can set its own without every client having to.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `-a, --alias <NAME>` | `LLMXABE_SERVED_MODEL_NAME` | the file's `general.name` | The name `/v1/models` reports and responses echo. The engine serves one model per process; this is a label, not a selector. Unset, it is what the GGUF calls itself — *not* the architecture's configuration name, which would advertise a second `qwen35moe` checkpoint as Qwen3.6-35B-A3B. Falls back to the configuration name only if the file has no `general.name`. |
+| `-a, --alias <NAME>` | `LLMCUDA_SERVED_MODEL_NAME` | the file's `general.name` | The name `/v1/models` reports and responses echo. The engine serves one model per process; this is a label, not a selector. Unset, it is what the GGUF calls itself — *not* the architecture's configuration name, which would advertise a second `qwen35moe` checkpoint as Qwen3.6-35B-A3B. Falls back to the configuration name only if the file has no `general.name`. |
 | `--max-tokens <N>` | — | `16` | Output limit for a request that sets none. OpenAI's historical 16 truncates most chat replies, so raise it if your clients rely on the default. Raise it with the *reservation* in mind: a request holds `prompt + max output` of KV for its whole life, so a large ceiling here — or from a client that sends one — is taken out of the other slots whether or not it is reached. Anything above one slot's share of the pool is capped to it, and a sequence that reaches the cap stops with `length`. |
 | `--no-reasoning` | — | off | Answer without extended thinking unless a request asks for it. A request that names a mode still wins, either way. See [API.md](API.md#reasoning). |
-| `--temperature <T>` (alias `--temp`) | `LLMXABE_TEMP` | `1.0` | Sampling temperature for a request that sets none; `0` makes silent requests greedy, which is what this server always did before it had a sampler. See [API.md](API.md#sampling). |
-| `--top-p <P>` (alias `--top_p`) | `LLMXABE_TOP_P` | `1.0` | Nucleus cutoff for a request that sets none; `1` disables the filter. |
-| `--min-p <P>` (alias `--min_p`) | `LLMXABE_MIN_P` | `0` | Keep only tokens at least this likely relative to the most likely token, for a request that sets none; `0` disables the filter. |
-| `--top-k <N>` (alias `--top_k`) | `LLMXABE_TOP_K` | `0` | Keep only this many top candidate tokens for a request that sets none; `0` disables the filter. |
+| `--temperature <T>` (alias `--temp`) | `LLMCUDA_TEMP` | `1.0` | Sampling temperature for a request that sets none; `0` makes silent requests greedy, which is what this server always did before it had a sampler. See [API.md](API.md#sampling). |
+| `--top-p <P>` (alias `--top_p`) | `LLMCUDA_TOP_P` | `1.0` | Nucleus cutoff for a request that sets none; `1` disables the filter. |
+| `--min-p <P>` (alias `--min_p`) | `LLMCUDA_MIN_P` | `0` | Keep only tokens at least this likely relative to the most likely token, for a request that sets none; `0` disables the filter. |
+| `--top-k <N>` (alias `--top_k`) | `LLMCUDA_TOP_K` | `0` | Keep only this many top candidate tokens for a request that sets none; `0` disables the filter. |
 
 The two-letter shorts `-pc` and `-tb` are rewritten to their long forms before
 clap parses (clap itself only supports single-character shorts), so they accept
@@ -112,9 +111,9 @@ VRAM, and that pool is the one thing sizing it costs. `--cache-ram` sets how
 much of it the process may hold across all workers:
 
 ```sh
-llmxabe --cache-ram 8GiB      # also 8G, 8GB, 8192MiB, or a bare byte count
-llmxabe --cache-ram full      # every slot can restore anywhere in its context
-llmxabe --cache-ram 0         # retain nothing; no prefix sharing
+llmcuda --cache-ram 8GiB      # also 8G, 8GB, 8192MiB, or a bare byte count
+llmcuda --cache-ram full      # every slot can restore anywhere in its context
+llmcuda --cache-ram 0         # retain nothing; no prefix sharing
 ```
 
 `full` (spelled `max` or `-1` too, the last because llama.cpp's `-cram -1`
@@ -202,7 +201,7 @@ under greedy decoding, its sample under sampling — and a rejected draft is
 replaced by that token rather than dropped, so speculation changes how many
 weight reads a token costs and never what the token is (under sampling it just
 accepts fewer drafts). That
-is a contract, not a hope: `crates/xabe-engine/tests/speculative_identity.rs`
+is a contract, not a hope: `crates/llmcuda-engine/tests/speculative_identity.rs`
 holds the MTP driver to it, and `--spec-type ngram` was checked against
 `--spec-type none` on the same prompt and came back byte-identical.
 
@@ -220,7 +219,7 @@ last time is proposed. It costs almost nothing to run and pays off on
 repetitive output — code, tables, quoted text — and very little on prose.
 
 ```sh
-llmxabe --spec-type ngram --spec-ngram-n-max 4 --spec-ngram-min 2 --spec-ngram-max 6
+llmcuda --spec-type ngram --spec-ngram-n-max 4 --spec-ngram-min 2 --spec-ngram-max 6
 ```
 
 `--spec-ngram-min` and `--spec-ngram-max` bound the suffix length tried;
@@ -231,11 +230,11 @@ sequence's window (`1 + n` positions) runs through the target in a single
 weight-read pass, and each sequence keeps its accepted prefix plus the
 target's own token at the first mismatch. That is where the weight-read
 saving comes from, and it is what
-`crates/xabe-engine/tests/serving_speculative_identity.rs` gates: identical
+`crates/llmcuda-engine/tests/serving_speculative_identity.rs` gates: identical
 output to `--spec-type none`, fewer steps. The verify machinery costs VRAM —
 one snapshot ring set per decode slot (~300 MiB each at `n = 3`) plus the
 per-width verify passes — allocated only when `--spec-type ngram` is on.
-`LLMXABE_NGRAM_GATED=1` falls back to the older round-gated loop (drafts
+`LLMCUDA_NGRAM_GATED=1` falls back to the older round-gated loop (drafts
 gate extra one-token rounds and are never model inputs), kept as the A/B
 lever for measuring the verify path against.
 
@@ -249,10 +248,10 @@ batched verify pass, the same exactness contract, the same VRAM cost — only
 the choice of what to draft differs.
 
 ```sh
-llmxabe --spec-type ngram-simple  --spec-ngram-simple-size-n 12 --spec-ngram-simple-size-m 48
-llmxabe --spec-type ngram-mod     --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64
-llmxabe --spec-type ngram-map-k   --spec-ngram-map-k-size-n 12 --spec-ngram-map-k-size-m 48
-llmxabe --spec-type ngram-map-k4v --spec-ngram-map-k4v-size-n 12 --spec-ngram-map-k4v-size-m 48 --spec-ngram-map-k4v-min-hits 1
+llmcuda --spec-type ngram-simple  --spec-ngram-simple-size-n 12 --spec-ngram-simple-size-m 48
+llmcuda --spec-type ngram-mod     --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64
+llmcuda --spec-type ngram-map-k   --spec-ngram-map-k-size-n 12 --spec-ngram-map-k-size-m 48
+llmcuda --spec-type ngram-map-k4v --spec-ngram-map-k4v-size-n 12 --spec-ngram-map-k4v-size-m 48 --spec-ngram-map-k4v-min-hits 1
 ```
 
 Each type's draft cap — `size-m`, or `n-max` for `ngram-mod` — **is** the
@@ -333,7 +332,7 @@ proposes a few tokens; `ngram-simple` demands a 12-token repeat, so it fires
 rarely and proposes up to 48 when it does. `ngram`'s index also makes its
 per-step host cost independent of context length, where `ngram-simple`'s scan
 grows with it — which is why `ngram` was written that way in the first place
-(see the module docs in `crates/xabe-sched/src/ngram.rs`). The port keeps the
+(see the module docs in `crates/llmcuda-sched/src/ngram.rs`). The port keeps the
 scan, because parity with upstream's draft choice is the point of having it.
 
 ### `draft-mtp`
@@ -346,7 +345,7 @@ accepts them. Unlike `ngram` it drafts *every* step, on any content — the
 trade is what it costs:
 
 ```sh
-llmxabe --spec-type draft-mtp --spec-draft-n-max 3
+llmcuda --spec-type draft-mtp --spec-draft-n-max 3
 ```
 
 - **One extra layer resident.** Block 40's expert weights are loaded once
@@ -390,7 +389,7 @@ directly into the drafter's KV caches. The query is
 the other types accepts.
 
 ```sh
-llmxabe --spec-type spec-dflash --spec-dflash qwen36-35b-a3b-dflash-Q8_0.gguf --spec-draft-n-max 3
+llmcuda --spec-type spec-dflash --spec-dflash qwen36-35b-a3b-dflash-Q8_0.gguf --spec-draft-n-max 3
 ```
 
 - `--spec-dflash` names the drafter checkpoint and is required. The
@@ -406,7 +405,7 @@ llmxabe --spec-type spec-dflash --spec-dflash qwen36-35b-a3b-dflash-Q8_0.gguf --
 The two upstream implementations disagree about which residual-stream tap
 `target_layers` names (off by one layer) and about causal masking on the
 sliding-window layers; this engine follows llama.cpp, whose ecosystem the
-GGUF comes from — `xabe_model::dflash`'s module docs carry the details.
+GGUF comes from — `llmcuda_model::dflash`'s module docs carry the details.
 
 **Measured, and it does not currently pay:** −14.8% at N=1 and −39.5% at
 N=3 against plain decode, at the default 3-token block, on short prompts.
@@ -465,7 +464,7 @@ the prefix cache switched off, and nothing later will remind you.
 --log-level <info|debug|trace>    console verbosity (default: info)
 ```
 
-This flag is deliberately *not* parsed by clap. `xabe_log::init_from_args`
+This flag is deliberately *not* parsed by clap. `llmcuda_log::init_from_args`
 strips it from the argument list before clap runs, so every binary in the
 workspace — the server, `gguf-info`, the bench tools — parses it identically.
 It still appears at the bottom of `--help`.
@@ -479,7 +478,7 @@ says `RUST_LOG` was ignored. Levels and their meaning are documented in
 
 The KV cache element size (f16, matching the baseline's `-ctk f16 -ctv f16`)
 and the weights size used by the VRAM budget are constants in
-`crates/xabe-server/src/main.rs`. The cache geometry — attention block size,
+`crates/llmcuda-server/src/main.rs`. The cache geometry — attention block size,
 GDN retention interval — comes from `CacheConfig::with_defaults`; exposing
 those as flags would invite exactly the misconfigurations design rules 1 and 2
 exist to prevent, so they stay out of the CLI until there is a reason.

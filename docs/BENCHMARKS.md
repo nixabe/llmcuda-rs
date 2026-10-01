@@ -1,6 +1,6 @@
 # Benchmarks
 
-Where `llmxabe` stands against `llama.cpp` on the target host, and the
+Where `llmcuda-rs` stands against `llama.cpp` on the target host, and the
 reasoning that produced it.
 
 This file is **not a journal**. It carries the current standing, the method
@@ -111,7 +111,7 @@ The newer [engine-only comparison](OPTIMIZATION_CAMPAIGN.md#final-comparison-wit
 has its own original-versus-final pairs. These cross-engine margins have
 not been re-measured for those changes.
 
-| cell | llmxabe tok/s | llama.cpp tok/s | margin |
+| cell | llmcuda-rs tok/s | llama.cpp tok/s | margin |
 | :--- | ---: | ---: | ---: |
 | prefill 512 | 3,281.0 ± 8.6 | 3,007.5 | **+9.1%** |
 | prefill 2K | 3,819.4 ± 23.4 | 3,201.5 | **+19.3%** |
@@ -196,7 +196,7 @@ re-measured on a later day, same card, same settings: **186.22 tok/s** at
 run-to-run spread. That matters beyond one row — llama.cpp not having drifted
 is what keeps the other seven cells on live footing rather than stale, and it
 is the cheap half of any head-to-head because that side runs whether or not
-our column has moved. The llmxabe column was **not** re-measured into this
+our column has moved. The llmcuda-rs column was **not** re-measured into this
 table on that day: the run that would have supplied it was taken on a tree
 carrying an unrelated 5% regression, so it was discarded rather than
 published. Re-checking the opponent is worth doing on its own.
@@ -215,10 +215,10 @@ expectation carries across from the table above — and none of it did.
 **Read the file column before the margin column.** On this model the
 quantization of the *file* moves the result more than anything either engine
 does, and a margin quoted without it is meaningless. Two files, both measured
-same-card, three interleaved reps, llmxabe's spread under 0.2% and
+same-card, three interleaved reps, llmcuda-rs's spread under 0.2% and
 llama.cpp's up to 3% at N=3:
 
-| cell | file | llmxabe agg | per slot | llama.cpp agg | per slot | margin |
+| cell | file | llmcuda-rs agg | per slot | llama.cpp agg | per slot | margin |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
 | prefill 512, N=1 | UD-Q8_K_XL | 361.6 | 361.6 | 681.8 | 681.8 | −47.0% |
 | prefill 512, N=1 | all-Q8_0 | 666.2 | 666.2 | 769.3 | 769.3 | **−13.4%** |
@@ -723,7 +723,7 @@ stated so it transfers to the next kernel rather than as a changelog entry.
 
 ## Rust kernel authoring can keep the existing launcher
 
-The opt-in `xabe-cuda/rust-kernels` feature replaces `tensor_add` with
+The opt-in `llmcuda-cuda/rust-kernels` feature replaces `tensor_add` with
 cuda-oxide-generated PTX. It preserves the existing cudarc ABI, allocations
 and graph capture. The pinned Rust source, compiler revision and regeneration
 procedure are in [TOOLCHAIN.md](TOOLCHAIN.md) and
@@ -777,7 +777,7 @@ sign-changing model pairs establish no engine throughput improvement.
 The single, disabled-by-default `rust-kernels` feature also selects
 `swiglu_mul` and `sigmoid_gate_mul`, including per-row broadcasting and the
 separate sigmoid waypoint. It forwards from the server through the engine
-to `xabe-cuda`. Their raw-pointer ABI and launch geometry are unchanged;
+to `llmcuda-cuda`. Their raw-pointer ABI and launch geometry are unchanged;
 loading happens at construction. The same generated PTX contains the
 residual entry, whose instructions are unchanged apart from label numbering.
 
@@ -993,7 +993,7 @@ no occupancy regression against the 33-kernel baseline anywhere, no spills
 anywhere, and module compile 3.13 s -> 3.82 s.
 
 **And it is a win, not merely a wash.** `bench_decode_batch 2048 32`,
-`LLMXABE_BATCH_N=1,2,3`, GPU 0, box otherwise idle, three interleaved pairs
+`LLMCUDA_BATCH_N=1,2,3`, GPU 0, box otherwise idle, three interleaved pairs
 with the order reversed in the middle one, against the immediately preceding
 commit:
 
@@ -1077,7 +1077,7 @@ taken. N=1 decode is unaffected. On `qwen35moe`, where all four projections
 are Q8_0, the new predicate and the old one are the same predicate:
 prefill 2452.4 → 2446.3 (spreads overlap), decode 100.87 → 100.83 at N=1 and
 204.73 → 204.73 at N=3, peak VRAM byte-identical.
-`LLMXABE_ATTN_INT8_ALL_OR_NOTHING=1` restores the old predicate in the same
+`LLMCUDA_ATTN_INT8_ALL_OR_NOTHING=1` restores the old predicate in the same
 binary, which is how those two rows were measured rather than asserted.
 
 ## Memory: find the index the operand does not depend on
@@ -1614,7 +1614,7 @@ admission` and no way to tell an impossible prompt from a full queue, because
 ## Concurrency is a lock property before it is a scheduler property
 
 Nine sessions across three cards were not concurrent for four reasons, and
-not one of them lived in `xabe-sched`. They all presented identically — as a
+not one of them lived in `llmcuda-sched`. They all presented identically — as a
 scheduler that refused to share — and each was diagnosed only once a step
 logged what it actually carried, which is why that log is in the tree.
 
@@ -1937,7 +1937,7 @@ Recorded because the *reasoning* is what misleads, not the number.
 - **A green test target is not a test that ran.** `forward_pass` reports
   `ok, 8 passed` in 0.36 s when it cannot find the golden, because a skip is
   a pass and cargo captures stdout. `.golden/` is gitignored, so **every run
-  from a `git worktree` skips it silently** unless `LLMXABE_GOLDEN` points at
+  from a `git worktree` skips it silently** unless `LLMCUDA_GOLDEN` points at
   the main checkout's copy. Related: a `cargo test | grep` pipeline reports
   grep's exit status, and a sweep that died at target 29 of 60 is
   indistinguishable from one that passed. All three were live in one
@@ -2007,11 +2007,11 @@ The named workstreams that would legally reopen (1) and (3) are recorded in
 ## Reproducing
 
 ```sh
-# llmxabe, N=3 decode and prefill
-CUDA_VISIBLE_DEVICES=1 LLMXABE_BATCH_N=3 \
+# llmcuda-rs, N=3 decode and prefill
+CUDA_VISIBLE_DEVICES=1 LLMCUDA_BATCH_N=3 \
   ./target/release/bench_decode_batch 32768 16
-CUDA_VISIBLE_DEVICES=2 LLMXABE_PREFILL_SEQUENCES=3 LLMXABE_BENCH_CHUNK=6138 \
-  LLMXABE_BENCH_N=2046 cargo run --release -p xabe-engine --bin bench_forward
+CUDA_VISIBLE_DEVICES=2 LLMCUDA_PREFILL_SEQUENCES=3 LLMCUDA_BENCH_CHUNK=6138 \
+  LLMCUDA_BENCH_N=2046 cargo run --release -p llmcuda-engine --bin bench_forward
 
 # llama.cpp, same card, alternating with the above
 CUDA_VISIBLE_DEVICES=1 llama-batched-bench \
@@ -2026,14 +2026,14 @@ architecture:
 
 ```sh
 M=Qwen3.8-27B-UD-Q8_K_XL.gguf
-LLMXABE_MODEL="$M" CUDA_VISIBLE_DEVICES=1 ./target/release/bench_forward
-LLMXABE_MODEL="$M" CUDA_VISIBLE_DEVICES=1 ./target/release/bench_decode
+LLMCUDA_MODEL="$M" CUDA_VISIBLE_DEVICES=1 ./target/release/bench_forward
+LLMCUDA_MODEL="$M" CUDA_VISIBLE_DEVICES=1 ./target/release/bench_decode
 
 # N=3. bench_decode_batch prints aggregate and per-seq columns itself, and
 # carries its own single_stream baseline in the same process.
-LLMXABE_MODEL="$M" LLMXABE_PREFILL_SEQUENCES=3 LLMXABE_BENCH_CHUNK=1536 \
-  LLMXABE_BENCH_N=512 CUDA_VISIBLE_DEVICES=1 ./target/release/bench_forward
-LLMXABE_MODEL="$M" LLMXABE_BATCH_N=1,3 CUDA_VISIBLE_DEVICES=1 \
+LLMCUDA_MODEL="$M" LLMCUDA_PREFILL_SEQUENCES=3 LLMCUDA_BENCH_CHUNK=1536 \
+  LLMCUDA_BENCH_N=512 CUDA_VISIBLE_DEVICES=1 ./target/release/bench_forward
+LLMCUDA_MODEL="$M" LLMCUDA_BATCH_N=1,3 CUDA_VISIBLE_DEVICES=1 \
   ./target/release/bench_decode_batch 512 64
 
 CUDA_VISIBLE_DEVICES=1 llama-batched-bench -m "$M" \
@@ -2043,35 +2043,35 @@ CUDA_VISIBLE_DEVICES=1 llama-batched-bench -m "$M" \
 # The dense FFN alone, at decode widths, with the card's measured streaming
 # ceiling printed above the table. ~10 s per A/B against `bench_decode`'s
 # ~90 s, which is what makes an inner-loop change measurable at all.
-LLMXABE_MODEL="$M" CUDA_VISIBLE_DEVICES=1 ./target/release/bench_dense_ffn
-LLMXABE_DENSE_SPLIT_ROWS=8 ...                  # override the RT table
-LLMXABE_FFN_N=4,6,8,12,16,32 ...                # the GEMV/GEMM width sweep
+LLMCUDA_MODEL="$M" CUDA_VISIBLE_DEVICES=1 ./target/release/bench_dense_ffn
+LLMCUDA_DENSE_SPLIT_ROWS=8 ...                  # override the RT table
+LLMCUDA_FFN_N=4,6,8,12,16,32 ...                # the GEMV/GEMM width sweep
 
 # A second qwen35moe checkpoint. Requant to the shipped mix first — a
 # uniformly-Q6_K file stops at the first projection. Recipe in MODEL.md.
-LLMXABE_MODEL=Ornith-1.5-35B-A3B-UD-Q6_K_XL.gguf CUDA_VISIBLE_DEVICES=2 \
-  LLMXABE_PREFILL_SEQUENCES=3 LLMXABE_BENCH_CHUNK=6138 LLMXABE_BENCH_N=130944 \
+LLMCUDA_MODEL=Ornith-1.5-35B-A3B-UD-Q6_K_XL.gguf CUDA_VISIBLE_DEVICES=2 \
+  LLMCUDA_PREFILL_SEQUENCES=3 LLMCUDA_BENCH_CHUNK=6138 LLMCUDA_BENCH_N=130944 \
   ./target/release/bench_forward     # depths are multiples of 6138/3 = 2046
 
-# The speculative table. `LLMXABE_SPEC` takes any of the seven drafter names.
-LLMXABE_MODEL="$M" LLMXABE_SPEC=draft-mtp CUDA_VISIBLE_DEVICES=1 \
+# The speculative table. `LLMCUDA_SPEC` takes any of the seven drafter names.
+LLMCUDA_MODEL="$M" LLMCUDA_SPEC=draft-mtp CUDA_VISIBLE_DEVICES=1 \
   ./target/release/bench_worker_spec           # context 256, 512 tok/seq
 # Fixed N=3 deep window; use the same reservation for every comparison arm.
-LLMXABE_MODEL="$M" LLMXABE_SPEC=ngram-map-k4v LLMXABE_SPEC_DRAFTS=8 \
-  LLMXABE_BATCH_N=3 LLMXABE_TIMED_STEPS=32 LLMXABE_MAX_OUTPUT=4096 \
+LLMCUDA_MODEL="$M" LLMCUDA_SPEC=ngram-map-k4v LLMCUDA_SPEC_DRAFTS=8 \
+  LLMCUDA_BATCH_N=3 LLMCUDA_TIMED_STEPS=32 LLMCUDA_MAX_OUTPUT=4096 \
   CUDA_VISIBLE_DEVICES=1 ./target/release/bench_worker_spec 122880 512
 
 # Per-kernel attribution of a decode step. `--cuda-graph-trace=node` is not
 # optional: decode replays a captured graph and without it nsys attributes one
 # pass and drops the rest.
-LLMXABE_PROFILE_TIMED=1 LLMXABE_SKIP_SINGLE_STREAM=1 LLMXABE_BATCH_N=3 \
+LLMCUDA_PROFILE_TIMED=1 LLMCUDA_SKIP_SINGLE_STREAM=1 LLMCUDA_BATCH_N=3 \
   CUDA_VISIBLE_DEVICES=1 nsys profile -t cuda --cuda-graph-trace=node \
   -c cudaProfilerApi --capture-range-end=repeat -s none -o d \
   ./target/release/bench_decode_batch 32768 32
 nsys export --type sqlite -o d.sqlite d.nsys-rep
 ```
 
-`LLMXABE_PROFILE_TIMED` excludes loading, prefill setup, and discarded
+`LLMCUDA_PROFILE_TIMED` excludes loading, prefill setup, and discarded
 decode warmups from capture. `bench_forward` accepts the same switch and
 captures each timed prefill chunk separately; repeated ranges produce
 numbered reports. Export and sum their kernel intervals individually.
@@ -2107,7 +2107,7 @@ mode, which applies the chat template and makes the two sides incomparable.
 The serving tables come from a running server rather than a kernel harness:
 
 ```sh
-CUDA_VISIBLE_DEVICES=0 ./target/release/llmxabe \
+CUDA_VISIBLE_DEVICES=0 ./target/release/llmcuda \
   --spec-type none -c 405504 -s 3 --token-budget 4096 --prefill-chunk 2048 &
 python3 tools/serving/bench_server.py http://127.0.0.1:8000 out.json \
   '{"depths":[2800,5500,11000,22000],"sessions":[1,2,3],"trials":3,"max_tokens":48}'
@@ -2120,7 +2120,7 @@ length through `usage.prompt_tokens` and reports against that. Drop
 was run.
 
 Narrow harnesses, for anything smaller than a whole-pass change:
-`bench_attention` (`LLMXABE_ATTN_CHUNK=1` for decode shape), `bench_moe`,
+`bench_attention` (`LLMCUDA_ATTN_CHUNK=1` for decode shape), `bench_moe`,
 `bench_moe_mma`, `bench_mma`, `bench_decode`, `bench_worker_decode`,
 `profile_forward`, and `audit_batch_divergence` for per-layer
 batch-vs-single-stream divergence.

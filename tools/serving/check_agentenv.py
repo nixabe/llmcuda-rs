@@ -22,7 +22,7 @@ def command_output(result):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--candidate', required=True)
-    parser.add_argument('--api-key-env', default='LLMXABE_API_KEY')
+    parser.add_argument('--api-key-env', default='LLMCUDA_API_KEY')
     parser.add_argument('--server', default='agentenv')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
@@ -37,7 +37,7 @@ def main():
         first=client.request('/mcp/sessions',{'servers':[args.server]}); sessions.append(first['session_id'])
         second=client.request('/mcp/sessions',{'servers':[args.server]}); sessions.append(second['session_id'])
         alias=first['tools'][0]['name']
-        path='/tmp/llmxabe-mcp-'+uuid.uuid4().hex
+        path='/tmp/llmcuda-mcp-'+uuid.uuid4().hex
         result=client.request('/tools',{'session_id':sessions[0],'tool':alias,'params':{'command':f"printf 'session-one' > {path}; cat {path}"}})
         assert not result.get('isError') and command_output(result)['stdout']=='session-one',result
         isolated=client.request('/tools',{'session_id':sessions[1],'tool':second['tools'][0]['name'],'params':{'command':f'test ! -e {path} && echo isolated'}})

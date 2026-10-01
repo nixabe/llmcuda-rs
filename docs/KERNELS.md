@@ -21,7 +21,7 @@
 | Vision encoder (mmproj) | 27 | medium | SigLIP tower + merger, f16 GEMM via cuBLASLt | **sm_75 path, cosine 0.999990 vs reference on the real mmproj** |
 | Interleaved M-RoPE (imrope) | 10 | low | Per-token (t, h, w) triples on image chunks | **sm_75 kernel, 1.2e-7 max_abs; bit-exact scalar collapse** |
 
-"CPU reference" means a scalar fp32 implementation exists in `xabe-kernels`
+"CPU reference" means a scalar fp32 implementation exists in `llmcuda-kernels`
 with differential tests, and no GPU kernel has been written. Where a device
 kernel exists the measured agreement against that reference is quoted, because
 "implemented" without a number is not a status. See [TESTING.md](TESTING.md).
@@ -38,7 +38,7 @@ into the delta rule; see [MODEL.md](MODEL.md).
 > wiring a GDN layer from the docs alone would have dropped the activation and
 > produced a plausible, wrong model.
 >
-> `xabe_kernels::conv::causal_depthwise_conv1d` is deliberately the pure
+> `llmcuda_kernels::conv::causal_depthwise_conv1d` is deliberately the pure
 > convolution, matching `ggml_ssm_conv`'s boundary exactly; the caller applies
 > the SiLU. Whoever assembles the GDN block owns that step.
 
@@ -135,7 +135,7 @@ Two forms are needed:
   the difficulty lives.
 
 The two forms must agree to tight tolerance on identical input. That
-equivalence test is the single most valuable check in `xabe-kernels`, because
+equivalence test is the single most valuable check in `llmcuda-kernels`, because
 it is what will later reveal whether a GPU chunked kernel is wrong.
 
 Reference: `ggml/src/ggml-cuda/gated_delta_net.cu` in llama.cpp, which is
@@ -204,7 +204,7 @@ decode batch of three.
 
 ### As landed, and where the plan above was wrong
 
-`crates/xabe-cuda/src/kernels/moe.rs`. The routed-expert path is not one
+`crates/llmcuda-cuda/src/kernels/moe.rs`. The routed-expert path is not one
 kernel; it is a family selected by token width, because the right shape at
 2,048 tokens and at three tokens are different kernels rather than different
 constants of one:

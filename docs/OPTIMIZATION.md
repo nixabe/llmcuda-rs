@@ -139,7 +139,7 @@ primitives.
 
 `vllm/v1/core/sched/scheduler.py`. One step admits a token budget rather than a
 request count, so prefill chunks and decode steps share a batch. The rule that
-falls out of it and is enforced in `xabe-sched`: the per-step token budget must
+falls out of it and is enforced in `llmcuda-sched`: the per-step token budget must
 exceed `block_size + max_concurrent_decodes`, or a single decoding request
 starves prefill admission and execution serializes to batch 1.
 
@@ -147,25 +147,25 @@ starves prefill admission and execution serializes to batch 1.
 
 `vllm/v1/core/kv_cache_manager.py`, `block_pool.py`, `kv_cache_utils.py`.
 
-Already matched by `xabe-cache`: block-hash chaining so identical prefixes
+Already matched by `llmcuda-cache`: block-hash chaining so identical prefixes
 converge regardless of who inserted them, reference counting and eviction of
 unreferenced blocks, and a retention interval for recurrent-state checkpoints
 that must be a multiple of the attention block size.
 
-Where `xabe-cache` is behind: vLLM's free list is intrusive and doubly linked,
+Where `llmcuda-cache` is behind: vLLM's free list is intrusive and doubly linked,
 giving O(1) removal from the middle where `evict_unreferenced` is an O(n) scan;
 vLLM caches *partial* blocks, so a hit need not land on a block boundary; and
 it pins the shared-prefix junction so the retention interval cannot drop the
 one boundary that enables cross-request reuse.
 
-Where `xabe-cache` is ahead, and vLLM's own source proves it: vLLM *requires*
+Where `llmcuda-cache` is ahead, and vLLM's own source proves it: vLLM *requires*
 uniform page size across cache groups (`kv_cache_utils.py`, "Breaking this
 assumption is non-trivial due to memory fragmentation concerns"). It satisfies
 that by raising the attention block size in tokens until the attention page
 matches the Mamba page — for this geometry, a ~1,024-token attention block with
 one recurrent checkpoint per block:
 
-| | `xabe-cache` | vLLM |
+| | `llmcuda-cache` | vLLM |
 | --- | --- | --- |
 | Attention block | 256 tokens | ~1,024 tokens (derived) |
 | Checkpoint interval `R` | 2,048 tokens (8 blocks) | = block size (1 block) |
@@ -183,7 +183,7 @@ and reuse-forecasting admission come from.
 `vllm/model_executor/layers/fused_moe/fused_moe.py`, `moe_align_block_size.py`.
 The sorted-token indirection — count per expert, exclusive-scan to bucket
 offsets, scatter token ids into per-expert buckets padded to the tile width — is
-the structure `xabe-cuda`'s dispatch uses. Two of vLLM's own tuning rules do
+the structure `llmcuda-cuda`'s dispatch uses. Two of vLLM's own tuning rules do
 **not** transfer to this shape: `SPLIT_K` is 1 in every default config, and
 `GROUP_SIZE_M` is 1 whenever `M // E` is small, which at decode it always is.
 

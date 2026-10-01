@@ -1,6 +1,6 @@
 # Sandbox tool calls
 
-`xabe-server` exposes `xabe_server::sandbox` for Rust harnesses. Its `Sandbox`
+`llmcuda-server` exposes `llmcuda_server::sandbox` for Rust harnesses. Its `Sandbox`
 trait accepts a tool name and JSON object arguments asynchronously; the harness
 implements the backend. The same adapter supports AgentENV, Docker, or another
 execution service without changing the inference engine.
@@ -8,21 +8,21 @@ execution service without changing the inference engine.
 [AgentENV](https://github.com/kvcache-ai/AgentENV#-e2b-compatibility) exposes an
 E2B-compatible API. An AgentENV harness can use the E2B SDK pointed at its
 AgentENV server and map registered tool names to that SDK's operations. There
-is no built-in AgentENV network client or sandbox provisioning in llmxabe.
+is no built-in AgentENV network client or sandbox provisioning in llmcuda-rs.
 Ordinary HTTP requests generate calls for the harness. The opt-in
 [server-side MCP mode](MCP.md) can execute configured MCP tools and run a
 bounded generation loop. An optional AgentENV bridge is documented there.
 
 ## Rust integration
 
-Add a path dependency on `crates/xabe-server`, then implement `Sandbox::execute`
+Add a path dependency on `crates/llmcuda-server`, then implement `Sandbox::execute`
 on your backend. Match each registered tool name and deserialize its arguments
 before calling the corresponding sandbox operation. The backend owns the
 sandbox instance, execution timeouts, tool allowlist, and errors.
 
 ```rust
 use serde_json::Value;
-use xabe_server::sandbox::{Sandbox, ToolDialect, ToolInvocation};
+use llmcuda_server::sandbox::{Sandbox, ToolDialect, ToolInvocation};
 
 async fn run_call<S: Sandbox<Error = String>>(
     backend: &mut S,
@@ -59,7 +59,7 @@ propagate to the harness so it can apply its own error reporting policy.
 JSON, and a tool-error flag. `dispatch` preserves content blocks and correlation
 IDs in each dialect; structured data is also rendered as JSON text. Backend
 errors remain separate from tool-error results. `McpSandbox` implements this
-trait for an explicit `xabe-mcp` session.
+trait for an explicit `llmcuda-mcp` session.
 
 For streaming, assemble each call's argument deltas before parsing and
 executing it. A block-start event with empty input is not a completed call.

@@ -6,7 +6,7 @@ less prescription.
 
 ## What this project is
 
-`llmxabe` is a single-process, three-worker CUDA inference engine for
+`llmcuda-rs` is a single-process, three-worker CUDA inference engine for
 `Qwen3.6-35B-A3B` on 3× Quadro RTX 8000 (sm_75, 48 GB, 672 GB/s each).
 
 It also serves `Qwen3.8-27B`, the dense sibling — same hybrid layer pattern,
@@ -68,22 +68,22 @@ system. Each one has a regression test. Do not relax them to make a test pass.
    ~32 KiB; a Gated DeltaNet state block is ~1.1 MiB — about 35×. Padding every
    group to the max produced ~7× KV capacity misreporting upstream. Allocate at
    natural per-group page sizes and report capacity per group.
-   Enforced by `xabe-cache`.
+   Enforced by `llmcuda-cache`.
 
 2. **GDN snapshot retention interval `R` is independent of attention block
    size.** Snapshotting recurrent state at every block boundary let snapshots
    consume ~80% of the pool, collapsing prefix hit rate ~85% → ~75% and
    tripling p99. `R` defaults to 2048 tokens against a 256-token attention
-   block. Enforced by `xabe-cache`.
+   block. Enforced by `llmcuda-cache`.
 
 3. **Per-step token budget must exceed `block_size + max_concurrent_decodes`.**
    At budget == block size, a single decoding request starves prefill admission
    and execution serializes to batch 1 (~7× throughput loss). This is asserted
-   at startup, not documented and hoped for. Enforced by `xabe-sched`.
+   at startup, not documented and hoped for. Enforced by `llmcuda-sched`.
 
 4. **Admission checks the full sequence length, not the first chunk.** Chunked
    prefill splits compute, not memory. A 32K request reserves 32K of KV for its
-   whole life. Enforced by `xabe-sched`.
+   whole life. Enforced by `llmcuda-sched`.
 
 5. **MoE indirection tables are built on-device into fixed-size buffers.**
    Anything sized by a host-side value breaks CUDA graph capture. Capture has
@@ -102,7 +102,7 @@ system. Each one has a regression test. Do not relax them to make a test pass.
 Numerics drift is the highest-likelihood risk in this project: the engine stays
 fluent while getting quietly worse, and no benchmark catches it.
 
-Every kernel ships with a CPU reference implementation in `xabe-kernels` and a
+Every kernel ships with a CPU reference implementation in `llmcuda-kernels` and a
 differential test against it. Thresholds are per-tensor max-abs and cosine
 similarity, not eyeball comparison of generated text. See
 [docs/TESTING.md](docs/TESTING.md).
@@ -114,18 +114,18 @@ it runs.
 
 | Crate | Owns | Depends on |
 | --- | --- | --- |
-| `xabe-gguf` | GGUF container parsing, tensor layout, mmap | — |
-| `xabe-model` | Qwen3.6 config, VRAM and bandwidth budgets | `xabe-gguf` |
-| `xabe-cache` | Two-group pager, radix prefix tree, snapshot retention | `xabe-model` |
-| `xabe-sched` | Chunked prefill, decode priority, admission control | `xabe-model`, `xabe-cache` |
-| `xabe-kernels` | CPU reference kernels, differential harness | `xabe-model` |
-| `xabe-grammar` | Tool-call grammar, vocabulary mask for constrained decoding | — |
-| `xabe-cuda` | Driver API, streams, graphs, device probe | — |
-| `xabe-engine` | Worker, cache-aware router, orchestration | all of the above |
-| `xabe-server` | HTTP surface, admission queue | `xabe-engine` |
-| `xabe-log` | `tracing` setup, `--log-level`, output format | — |
+| `llmcuda-gguf` | GGUF container parsing, tensor layout, mmap | — |
+| `llmcuda-model` | Qwen3.6 config, VRAM and bandwidth budgets | `llmcuda-gguf` |
+| `llmcuda-cache` | Two-group pager, radix prefix tree, snapshot retention | `llmcuda-model` |
+| `llmcuda-sched` | Chunked prefill, decode priority, admission control | `llmcuda-model`, `llmcuda-cache` |
+| `llmcuda-kernels` | CPU reference kernels, differential harness | `llmcuda-model` |
+| `llmcuda-grammar` | Tool-call grammar, vocabulary mask for constrained decoding | — |
+| `llmcuda-cuda` | Driver API, streams, graphs, device probe | — |
+| `llmcuda-engine` | Worker, cache-aware router, orchestration | all of the above |
+| `llmcuda-server` | HTTP surface, admission queue | `llmcuda-engine` |
+| `llmcuda-log` | `tracing` setup, `--log-level`, output format | — |
 
-Dependencies point one way only. If you need `xabe-cache` to know something
+Dependencies point one way only. If you need `llmcuda-cache` to know something
 about scheduling, the abstraction is wrong — fix the boundary, do not add the
 edge.
 
@@ -171,11 +171,11 @@ optimizations that were correct for the wrong bound and measured slower.
   the crate, one logical change per commit:**
 
   ```
-  feat(xabe-cache): add two-group pager with per-group page geometry
-  fix(xabe-sched): reject token budget <= block size at construction
+  feat(llmcuda-cache): add two-group pager with per-group page geometry
+  fix(llmcuda-sched): reject token budget <= block size at construction
   docs: document snapshot retention interval rationale
-  test(xabe-kernels): add cosine threshold for chunked delta rule
-  perf(xabe-cuda): hoist shared expert out of the routed path
+  test(llmcuda-kernels): add cosine threshold for chunked delta rule
+  perf(llmcuda-cuda): hoist shared expert out of the routed path
   ```
 
   A commit should build and pass tests on its own. The commit message body is
@@ -195,7 +195,7 @@ optimizations that were correct for the wrong bound and measured slower.
 - **Never `println!` outside a test.** Binaries and examples log through
   `tracing`; libraries emit events and never install a subscriber. Tool
   output — tables, results — is `info!`, because `INFO` is the level that
-  means "appears by default". `xabe-log`'s `tests/layering.rs` scans the
+  means "appears by default". `llmcuda-log`'s `tests/layering.rs` scans the
   workspace and fails the build otherwise. Levels are documented in
   [CONTRIBUTING.md](CONTRIBUTING.md#console-output).
 
@@ -206,7 +206,7 @@ The project's measurement discipline is what has kept it honest; follow it.
 - **Kernel-level first.** `bench_attention` (~6 s per A/B) exists because
   whole-forward A/Bs are so expensive that the honest response to a small
   change was to not measure it. Prefer the narrow bench, then confirm
-  end-to-end: `bench_forward` (chunked prefill via `LLMXABE_BENCH_CHUNK`),
+  end-to-end: `bench_forward` (chunked prefill via `LLMCUDA_BENCH_CHUNK`),
   `bench_decode`, `bench_decode_batch`, `bench_dense_ffn` (the `qwen35` FFN
   alone, and it prints the card's measured streaming ceiling), `bench_moe`,
   `bench_mma`, `profile_forward`. **A narrow bench that wins is a candidate,

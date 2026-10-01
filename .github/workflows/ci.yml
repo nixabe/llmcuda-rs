@@ -20,7 +20,7 @@ jobs:
   # cache geometry, scheduler invariants) must never be gated on device
   # access, and every test that does need a device skips and says so.
   #
-  # No CUDA toolkit is installed because none is needed. `xabe-cuda` has no
+  # No CUDA toolkit is installed because none is needed. `llmcuda-cuda` has no
   # build script, and cudarc is built with `fallback-dynamic-loading` and
   # `nvrtc`, so it resolves the driver at runtime and compiles kernels at
   # runtime. Nothing wants a header or nvcc at build time.

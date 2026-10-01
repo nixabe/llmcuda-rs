@@ -1,0 +1,31 @@
+[package]
+name = "llmcuda-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+rust-kernels = ["llmcuda-cuda/rust-kernels"]
+
+[dependencies]
+tracing.workspace = true
+llmcuda-log.workspace = true
+llmcuda-model.workspace = true
+llmcuda-gguf.workspace = true
+llmcuda-cuda.workspace = true
+cudarc = { version = "0.19.9", features = ["driver", "nvrtc", "fallback-dynamic-loading", "cuda-12040"] }
+llmcuda-cache.workspace = true
+llmcuda-sched.workspace = true
+llmcuda-kernels.workspace = true
+llmcuda-grammar.workspace = true
+parking_lot.workspace = true
+rustc-hash.workspace = true
+half.workspace = true
+smallvec = "1"
+
+[dev-dependencies]
+tokenizers = "0.22"

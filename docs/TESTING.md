@@ -13,11 +13,11 @@ how fast it runs.**
 ## The structure
 
 Every kernel has a scalar fp32 CPU reference in
-[`xabe-kernels`](../crates/xabe-kernels), written for obvious correctness
+[`llmcuda-kernels`](../crates/llmcuda-kernels), written for obvious correctness
 rather than speed. These are the oracle. A clever reference that is subtly
 wrong is worse than no reference at all, so they are deliberately naive.
 
-`xabe-kernels` depends on no CUDA and no device. That is a design property,
+`llmcuda-kernels` depends on no CUDA and no device. That is a design property,
 not an accident: the correctness work must be runnable and debuggable on a
 laptop, and must never be blocked on GPU access.
 
@@ -181,13 +181,13 @@ for this crate — validated not just by construction but against llama.cpp
 `llama-mtmd-debug`'s synthetic images through the reference and compares the
 final embeddings value-for-value against that tool's tensor dumps. Captured
 logs are never committed; the test reads them from
-`LLMXABE_MTMD_GOLDEN_DIR` and skips without it. Generate with, for `IMG` in
+`LLMCUDA_MTMD_GOLDEN_DIR` and skips without it. Generate with, for `IMG` in
 `gray`/`red`/`cb` and `N` in `64`/`96`:
 
 ```sh
 llama-mtmd-debug -m <model.gguf> --mmproj <mmproj-F16.gguf> \
   -p encode --image $IMG -n $N --no-mmproj-offload -ngl 0 --no-warmup \
-  > $LLMXABE_MTMD_GOLDEN_DIR/golden-$IMG-$N.log 2>&1
+  > $LLMCUDA_MTMD_GOLDEN_DIR/golden-$IMG-$N.log 2>&1
 ```
 
 Agreement at last check: ≤ 3.2e-4 on output mass, ≤ 5e-3 per printed value —
@@ -195,7 +195,7 @@ the budget covers llama.cpp's f16 GELU table (`GGML_GELU_FP16`) against the
 reference's exact tanh form. Text-side M-RoPE (`mrope`) is ported from
 `ggml_mrope_cache_init`'s `IMROPE` branch and carries a bit-exactness test
 that scalar positions collapse to `rope::apply_rope` — the same reduction
-`xabe-engine`'s text path depends on.
+`llmcuda-engine`'s text path depends on.
 
 ## The dense architecture (`qwen35`)
 
@@ -205,8 +205,8 @@ What is new is gated by two files:
 
 | Test | What it asserts | Needs |
 | --- | --- | --- |
-| `xabe-model/tests/real_dense_model_weights.rs` | `WeightSchema` resolves against all 866 tensors of the real file with none left unclaimed; every derived hyperparameter (the GDN head split above all) agrees with the file's own metadata; the file carries no routed tensor; and the *routed* schema refuses it by architecture rather than by a wall of shapes | the file |
-| `xabe-engine/tests/dense_ffn_differential.rs` | The whole dense block against `expert_mlp` + `rms_norm` on real Q8_0 weights, at all three of its kernel paths | the file, a device |
+| `llmcuda-model/tests/real_dense_model_weights.rs` | `WeightSchema` resolves against all 866 tensors of the real file with none left unclaimed; every derived hyperparameter (the GDN head split above all) agrees with the file's own metadata; the file carries no routed tensor; and the *routed* schema refuses it by architecture rather than by a wall of shapes | the file |
+| `llmcuda-engine/tests/dense_ffn_differential.rs` | The whole dense block against `expert_mlp` + `rms_norm` on real Q8_0 weights, at all three of its kernel paths | the file, a device |
 
 The differential is the interesting one, because the dense block runs on the
 MoE crate's shared-expert kernels and so what is genuinely new is the *block*:
@@ -300,7 +300,7 @@ engine below it needs a GPU and a 30 GiB model and so cannot be stood up in a
   matched its cold arm.
 
 Everything below the wire format is covered by the unit tests in
-`crates/xabe-server/src/http/`: the ChatML rendering is pinned string by
+`crates/llmcuda-server/src/http/`: the ChatML rendering is pinned string by
 string, and stop-sequence hold-back, header parsing, and constant-time key
 comparison have their own tests.
 
@@ -315,9 +315,9 @@ runtime plumbing is not where throughput goes. Serving numbers belong in
 
 ```sh
 cargo test --workspace --release -- --test-threads=1 # serialize GPU allocations
-cargo test --release -p xabe-kernels                 # references and harness
-cargo test --release -p xabe-kernels gdn             # the critical path
-cargo run -p xabe-cuda --bin probe    # device gate and milestone-00 spike
+cargo test --release -p llmcuda-kernels                 # references and harness
+cargo test --release -p llmcuda-kernels gdn             # the critical path
+cargo run -p llmcuda-cuda --bin probe    # device gate and milestone-00 spike
 ```
 
 ### Live llama.cpp parity
@@ -331,7 +331,7 @@ checks each dialect's streaming tool response. Results go outside the repository
 ```sh
 python tools/serving/check_correctness.py \
   --candidate http://127.0.0.1:18080 --reference http://127.0.0.1:18081 \
-  --output /tmp/llmxabe-quality.json
+  --output /tmp/llmcuda-quality.json
 ```
 
 Start the candidate fresh for the first long prompt to be a cold control. The
@@ -342,7 +342,7 @@ differ. This is an acceptance check, not a performance benchmark or proof of
 equivalence on arbitrary prompts, models, or context lengths. It does not test
 vision or execute real tools.
 
-For another checkpoint such as Ornith 1.5, set `LLMXABE_MODEL` for the live
+For another checkpoint such as Ornith 1.5, set `LLMCUDA_MODEL` for the live
 template test and capture a separate numerical golden from that exact GGUF
 using [the oracle procedure](ORACLE.md). Never pair Ornith weights with the
 Qwen3.6 golden. Matching architecture and vocabulary do not establish equal
@@ -367,8 +367,8 @@ renderers cannot. Start llama-server with `--jinja --no-prefill-assistant` and
 the same model, then run (requires `curl`):
 
 ```sh
-LLMXABE_LLAMA_URL=http://127.0.0.1:18081 \
-  cargo test --release -p xabe-server \
+LLMCUDA_LLAMA_URL=http://127.0.0.1:18081 \
+  cargo test --release -p llmcuda-server \
   the_model_template_matches_llama_cpp_when_requested -- --nocapture
 ```
 
@@ -397,8 +397,8 @@ in `.gitignore`, so the capture does not come along. Point it at the one in
 the main checkout:
 
 ```sh
-LLMXABE_GOLDEN=/home/nixabe/llmxabe/.golden/qwen36-golden.bin \
-  cargo test --release -p xabe-engine --test forward_pass -- --nocapture
+LLMCUDA_GOLDEN=/home/nixabe/llmcuda-rs/.golden/qwen36-golden.bin \
+  cargo test --release -p llmcuda-engine --test forward_pass -- --nocapture
 ```
 
 The real thing takes ~21 s and prints its cosine against llama.cpp's captured
@@ -438,7 +438,7 @@ kernel's dynamic shared memory and dispatched a different kernel at exactly
 
 ```sh
 CUDA_VISIBLE_DEVICES=1 \
-  cargo test --release -p xabe-engine --test serving_speculative_identity
+  cargo test --release -p llmcuda-engine --test serving_speculative_identity
 ```
 
 About 180 s. It failed with `CUDA_ERROR_ILLEGAL_ADDRESS`, and no bench, no
@@ -464,18 +464,18 @@ forward benchmarks:
 
 ```sh
 # One visible card, N=1 or N=3 through Worker::step_device.
-CUDA_VISIBLE_DEVICES=0 LLMXABE_BATCH_N=3 \
-  cargo run --release -p xabe-engine --bin worker_smoke
+CUDA_VISIBLE_DEVICES=0 LLMCUDA_BATCH_N=3 \
+  cargo run --release -p llmcuda-engine --bin worker_smoke
 
 # Three visible cards, nine requests, including a 2-decode + 1-prefill step
 # on every worker.
 CUDA_VISIBLE_DEVICES=0,1,2 \
-  cargo run --release -p xabe-engine --bin engine_smoke
+  cargo run --release -p llmcuda-engine --bin engine_smoke
 
 # Two separate CUDA contexts: cold 2K prefill versus pinned-host KV/GDN
 # restore, compared by exact emitted token ids.
 CUDA_VISIBLE_DEVICES=0,1 \
-  cargo run --release -p xabe-engine --bin cross_worker_restore
+  cargo run --release -p llmcuda-engine --bin cross_worker_restore
 ```
 
 These commands are acceptance checks, not benchmarks. Run the interleaved
@@ -494,8 +494,8 @@ together exhaust a 48 GiB card and fail with `CUDA_ERROR_OUT_OF_MEMORY`. That
 is contention, not a regression — the same tests pass serialized:
 
 ```sh
-CUDA_VISIBLE_DEVICES=0 cargo test --release -p xabe-engine --test batch_decode  -- --test-threads=1
-CUDA_VISIBLE_DEVICES=0 cargo test --release -p xabe-engine --test batch_prefill -- --test-threads=1
+CUDA_VISIBLE_DEVICES=0 cargo test --release -p llmcuda-engine --test batch_decode  -- --test-threads=1
+CUDA_VISIBLE_DEVICES=0 cargo test --release -p llmcuda-engine --test batch_prefill -- --test-threads=1
 cargo test --workspace --release --lib --bins
 ```
 

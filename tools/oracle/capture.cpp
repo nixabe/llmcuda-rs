@@ -1,4 +1,4 @@
-// Golden-oracle capture tool for llmxabe.
+// Golden-oracle capture tool for llmcuda-rs.
 //
 // Runs one llama.cpp forward pass over a fixed prompt and writes the full,
 // untruncated contents of selected intermediate graph tensors plus the final
@@ -35,7 +35,7 @@
 // host are the same x86-64 machine, and the file is regenerated rather than
 // shipped, so no byte-swapping path is warranted.
 //
-//   magic   "XABEGOLD"                       8 bytes
+//   magic   "LLMCGOLD"                       8 bytes
 //   u32     version                          = 1
 //   u32     n_records
 //   record*:
@@ -51,7 +51,7 @@
 // nb[], so a reader never has to know ggml's stride rules.
 // ---------------------------------------------------------------------------
 
-static const char MAGIC[8] = { 'X','A','B','E','G','O','L','D' };
+static const char MAGIC[8] = { 'L','L','M','C','G','O','L','D' };
 
 struct writer {
     FILE * f = nullptr;

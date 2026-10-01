@@ -69,44 +69,44 @@ compile-time specialization on fixed shapes, which is still unmeasured. See
 
 ## Crate boundaries
 
-Dependencies point one way. If `xabe-cache` needs to know something about
+Dependencies point one way. If `llmcuda-cache` needs to know something about
 scheduling, the boundary is wrong.
 
 ```
-xabe-gguf ──> xabe-model ──┬──> xabe-cache ──┐
-                           ├──> xabe-sched ──┼──> xabe-engine ──> xabe-server
-                           └──> xabe-kernels ┘
-              xabe-cuda ───────────────────────┘
+llmcuda-gguf ──> llmcuda-model ──┬──> llmcuda-cache ──┐
+                           ├──> llmcuda-sched ──┼──> llmcuda-engine ──> llmcuda-server
+                           └──> llmcuda-kernels ┘
+              llmcuda-cuda ───────────────────────┘
 ```
 
 | Crate | Owns | Deliberately does not know |
 | --- | --- | --- |
-| `xabe-gguf` | Container parsing, tensor layout, mmap | Anything about Qwen |
-| `xabe-model` | Architecture, VRAM and bandwidth budgets | Anything about devices |
-| `xabe-cache` | Two-group pager, radix prefix tree | Scheduling policy |
-| `xabe-sched` | Chunked prefill, admission, preemption | Device memory |
-| `xabe-kernels` | CPU reference kernels, differential harness | CUDA |
-| `xabe-cuda` | Driver API, NVRTC, graphs, capability gate | Layers and experts |
-| `xabe-engine` | Worker lifecycle, router, orchestration | HTTP |
-| `xabe-server` | HTTP surface, admission queue | Everything below the engine |
-| `xabe-log` | `tracing` setup, `--log-level` parsing, output format | Every other crate |
+| `llmcuda-gguf` | Container parsing, tensor layout, mmap | Anything about Qwen |
+| `llmcuda-model` | Architecture, VRAM and bandwidth budgets | Anything about devices |
+| `llmcuda-cache` | Two-group pager, radix prefix tree | Scheduling policy |
+| `llmcuda-sched` | Chunked prefill, admission, preemption | Device memory |
+| `llmcuda-kernels` | CPU reference kernels, differential harness | CUDA |
+| `llmcuda-cuda` | Driver API, NVRTC, graphs, capability gate | Layers and experts |
+| `llmcuda-engine` | Worker lifecycle, router, orchestration | HTTP |
+| `llmcuda-server` | HTTP surface, admission queue | Everything below the engine |
+| `llmcuda-log` | `tracing` setup, `--log-level` parsing, output format | Every other crate |
 
-`xabe-log` sits outside the dependency chain above: it is a leaf that anything
+`llmcuda-log` sits outside the dependency chain above: it is a leaf that anything
 may depend on and that depends on nothing in the workspace.
 
 The rule that matters is about *who installs the subscriber*. Binaries call
-`xabe_log::init_from_args()` exactly once at startup; **library code emits
+`llmcuda_log::init_from_args()` exactly once at startup; **library code emits
 `tracing` events and never installs a subscriber**, so an embedding process
 keeps control of where output goes and a test binary is free to install its
-own. No `xabe_log` symbol appears outside a `src/bin/`, `examples/` or
-`main.rs` file, and `crates_do_not_install_a_subscriber` in `xabe-log`'s test
+own. No `llmcuda_log` symbol appears outside a `src/bin/`, `examples/` or
+`main.rs` file, and `crates_do_not_install_a_subscriber` in `llmcuda-log`'s test
 module asserts that by scanning the workspace.
 
 Cargo has no per-target dependency section, so the crates whose *binaries*
-need `xabe-log` list it as an ordinary dependency even though their libraries
+need `llmcuda-log` list it as an ordinary dependency even though their libraries
 do not use it. That is a manifest limitation, not a layering claim.
 
-The split that earns its keep is `xabe-kernels` knowing nothing about CUDA.
+The split that earns its keep is `llmcuda-kernels` knowing nothing about CUDA.
 Reference implementations are the oracle for every GPU kernel, and they must be
 runnable and debuggable on a machine with no GPU. See [TESTING.md](TESTING.md).
 
@@ -231,8 +231,8 @@ Video stays out of scope, and so does fetching remote image URLs.
 
 ## MCP serving layer
 
-`xabe-mcp` owns session-scoped MCP connections, bounded discovery, tool routing,
-and execution. It depends on neither the engine nor the cache. `xabe-server`
+`llmcuda-mcp` owns session-scoped MCP connections, bounded discovery, tool routing,
+and execution. It depends on neither the engine nor the cache. `llmcuda-server`
 adds authenticated session/tool endpoints and an opt-in Responses loop above
 normal generation. Each model turn releases its inference request before tool
 execution. See [MCP.md](MCP.md) for lifecycle, limits, and verification.

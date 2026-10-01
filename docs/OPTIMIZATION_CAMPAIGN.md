@@ -84,16 +84,16 @@ The commands for one original round, using the preserved executables, are:
 
 ```sh
 export CUDA_VISIBLE_DEVICES=1
-export LLMXABE_MODEL=/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf
-LLMXABE_PREFILL_SEQUENCES=3 LLMXABE_BENCH_CHUNK=1536 \
-  LLMXABE_BENCH_N=512 LLMXABE_BENCH_REPS=1 \
+export LLMCUDA_MODEL=./models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf
+LLMCUDA_PREFILL_SEQUENCES=3 LLMCUDA_BENCH_CHUNK=1536 \
+  LLMCUDA_BENCH_N=512 LLMCUDA_BENCH_REPS=1 \
   bench-results/campaign-d398f19/original/bench_forward
-LLMXABE_PREFILL_SEQUENCES=3 LLMXABE_BENCH_CHUNK=6138 \
-  LLMXABE_BENCH_N=2046,8184,32736,65472,130944 LLMXABE_BENCH_REPS=1 \
+LLMCUDA_PREFILL_SEQUENCES=3 LLMCUDA_BENCH_CHUNK=6138 \
+  LLMCUDA_BENCH_N=2046,8184,32736,65472,130944 LLMCUDA_BENCH_REPS=1 \
   bench-results/campaign-d398f19/original/bench_forward
-LLMXABE_BATCH_N=1,3 bench-results/campaign-d398f19/original/bench_decode_batch 2048 32
-LLMXABE_BATCH_N=1,3 bench-results/campaign-d398f19/original/bench_decode_batch 32768 32
-LLMXABE_BATCH_N=3 bench-results/campaign-d398f19/original/bench_decode_batch 122880 32
+LLMCUDA_BATCH_N=1,3 bench-results/campaign-d398f19/original/bench_decode_batch 2048 32
+LLMCUDA_BATCH_N=1,3 bench-results/campaign-d398f19/original/bench_decode_batch 32768 32
+LLMCUDA_BATCH_N=3 bench-results/campaign-d398f19/original/bench_decode_batch 122880 32
 ```
 
 For candidates, use at least three alternating pairs with a reversal:
@@ -114,7 +114,7 @@ projections reuse LM-head kernels, and tensor-core projections are shared
 between GDN, attention, and the shared expert. Check the expected layer and
 embedding counts before accepting a trace summary.
 
-For bounded capture, set `LLMXABE_PROFILE_TIMED=1` and pass
+For bounded capture, set `LLMCUDA_PROFILE_TIMED=1` and pass
 `-c cudaProfilerApi --capture-range-end=repeat` to Nsight. Decode brackets
 the timed step loop. Prefill brackets each timed chunk and synchronizes its
 stream before ending the capture; discarded warmups remain untraced.
@@ -255,7 +255,7 @@ Before changing inference code, the following completed on GPU 1:
 cargo fmt --all
 cargo clippy --workspace --all-targets
 CUDA_VISIBLE_DEVICES=1 \
-  LLMXABE_GOLDEN=/home/nixabe/llmxabe/.golden/qwen36-golden.bin \
+  LLMCUDA_GOLDEN=/home/nixabe/llmcuda-rs/.golden/qwen36-golden.bin \
   cargo test --workspace --release -- --test-threads=1 --nocapture
 ```
 
@@ -273,7 +273,7 @@ the captured argmax.
 The N=3 decode profile covers 32 timed steps at each depth, after four
 discarded warmup steps. Each step contains **659 kernel launches**. The
 2K trace was filtered after collection; the 32K trace uses the opt-in
-`LLMXABE_PROFILE_TIMED` capture boundary. Nsight failed to import the
+`LLMCUDA_PROFILE_TIMED` capture boundary. Nsight failed to import the
 original long 32K trace with an event-order error, so the benchmark tools
 now support bounded captures through `-c cudaProfilerApi`. No inference
 kernel was changed for this instrumentation.
@@ -863,7 +863,7 @@ The canonical 128-thread normalization uses four warp partials. The
 prototype's other four warps contribute positive zeros after those partials;
 the finite square sum keeps its original bits. State-row float4 loads,
 decay, delta correction, FMA order and warp XOR reductions are copied from
-`xabe-cuda`'s `gdn_recurrent_step`. Q/K remain resident in 1,024 shared bytes,
+`llmcuda-cuda`'s `gdn_recurrent_step`. Q/K remain resident in 1,024 shared bytes,
 with another 32 bytes for reductions. The two value heads sharing one Q/K
 head duplicate its normalization. Only one writes the normalized waypoint.
 Every warp loops over its disjoint rows, with sequence selected by the same
@@ -1019,7 +1019,7 @@ Common input-token and position uploads remain and are listed separately.
 Reproduce after checking the GPU is idle:
 
 ```sh
-CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --lib \
+CUDA_VISIBLE_DEVICES=1 cargo test --release -p llmcuda-engine --lib \
   resident_continuation::conversations::agent_conversations -- \
   --ignored --nocapture --test-threads=1
 ```
@@ -1207,7 +1207,7 @@ verification repairs. Formatting and workspace all-target Clippy are clean.
 cargo fmt --all
 cargo clippy --workspace --all-targets
 CUDA_VISIBLE_DEVICES=1 \
-  LLMXABE_GOLDEN=/home/nixabe/llmxabe/.golden/qwen36-golden.bin \
+  LLMCUDA_GOLDEN=/home/nixabe/llmcuda-rs/.golden/qwen36-golden.bin \
   cargo test --workspace --release -- --test-threads=1 --nocapture
 ```
 

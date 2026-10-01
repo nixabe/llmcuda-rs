@@ -1,5 +1,6 @@
 //! K2 dense and routed value projections in isolation, with real GGUF weights.
 //! Use LLMCUDA_MODEL and optionally LLMCUDA_K2_N (default 1,3,128,512).
+//! LLMCUDA_K2_SHARED_ROUTES selects identical experts across token rows.
 //! CUDA events include dispatch for the grouped value path. Each round
 //! alternates scalar and tiled kernels; full-model benches remain the gate.
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaContext, CudaStream, sys::CUevent_flags};
 use llmcuda_cuda::kernels::{
     k2::{K2Dispatch, K2Kernels},
+    k2_gemm::K2Gemm,
     moe::{ExpertQuant, to_device_layout},
 };
 use llmcuda_gguf::{GgmlType, GgufFile};
@@ -69,27 +71,68 @@ fn run() -> Result<()> {
             quant,
             file.tensor_bytes(name).ok_or("unreadable projection")?,
         ))?;
+        let packed = K2Gemm::repack(&ctx, &stream, &dw, quant, inner, rows, experts)?;
         info!("{name}: {quant:?}, inner {inner}, rows {rows}, experts {experts}");
         for &tokens in &shapes {
             let topk = if experts == 1 { 1 } else { 4 };
             let input: Vec<f32> = (0..tokens * inner)
                 .map(|i| (i as f32 * 0.013).sin())
                 .collect();
+            let stride = if std::env::var_os("LLMCUDA_K2_SHARED_ROUTES").is_some() {
+                0
+            } else {
+                13
+            };
             let ids: Vec<i32> = (0..tokens)
-                .flat_map(|t| (0..topk).map(move |k| ((t * 13 + k * 7) % experts) as i32))
+                .flat_map(|t| (0..topk).map(move |k| ((t * stride + k * 7) % experts) as i32))
                 .collect();
             let dx = stream.clone_htod(&input)?;
             let di = stream.clone_htod(&ids)?;
             let mut out = stream.alloc_zeros::<f32>(tokens * topk * rows)?;
             let mut dispatch = K2Dispatch::new(&stream, tokens, topk, experts)?;
+            let mut bd = K2Dispatch::new_gemm(&stream, tokens, topk, experts)?;
+            let mut gemm = K2Gemm::new_with_activation_bits(
+                &ctx,
+                &stream,
+                tokens,
+                topk,
+                experts,
+                inner * rows * experts,
+                inner,
+                rows,
+                std::env::var("LLMCUDA_K2_BITS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16),
+            )?;
             for round in 1..=3 {
-                for tile in if experts == 1 {
-                    &[1, 4, 8][..]
+                let mut tiles = if experts == 1 {
+                    vec![1, 4, 8, 0]
                 } else {
-                    &[1, 8][..]
-                } {
+                    vec![1, 8, 0]
+                };
+                if round % 2 == 0 {
+                    tiles.reverse();
+                }
+                for tile in &tiles {
                     let ms = measure(&ctx, &stream, || {
-                        if experts > 1 && *tile == 8 {
+                        if *tile == 0 {
+                            if experts > 1 {
+                                ops.dispatch_gemm(&stream, &di, &mut bd)?;
+                            }
+                            gemm.project(
+                                &stream,
+                                &packed,
+                                quant,
+                                &dx,
+                                &mut out,
+                                inner,
+                                rows,
+                                experts,
+                                if experts > 1 { Some(&bd) } else { None },
+                                false,
+                            )?;
+                        } else if experts > 1 && *tile == 8 {
                             ops.project_grouped(
                                 &stream,
                                 &dw,
@@ -119,7 +162,12 @@ fn run() -> Result<()> {
                         }
                         Ok(())
                     })?;
-                    info!("T={tokens} round={round} tile={tile}: {ms:.4} ms");
+                    let path = if *tile == 0 {
+                        "integer".to_owned()
+                    } else {
+                        format!("scalar-tile-{tile}")
+                    };
+                    info!("T={tokens} round={round} path={path}: {ms:.4} ms");
                 }
             }
         }

@@ -5,12 +5,14 @@ use super::{
     attention::{AttentionBlockError, AttnScratch, KvCache, RopeSource},
     moe::{MoeBlockError, dense_tensor, quantized_tensor},
 };
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr};
 use llmcuda_cuda::kernels::{
-    attention::{AttentionKernels, AttnDecodeScratch},
+    attention::{AttentionKernels, AttnDecodeScratch, STEP_SLOTS},
     k2::{K2Dispatch, K2Kernels},
+    k2_gemm::{K2Gemm, K2Prepared},
+    k2_rope::K2Rope,
     layer_ops::LayerOpsKernels,
-    moe::{ExpertQuant, MoeBuffers, MoeGeometry, MoeKernels, QuantTensor, to_device_layout},
+    moe::{ExpertQuant, MoeGeometry, to_device_layout},
 };
 use llmcuda_gguf::{GgmlType, GgufFile};
 use llmcuda_model::{Directory, ModelConfig, Role};
@@ -49,7 +51,13 @@ impl Projection {
             (stream.clone_htod(src)?, None)
         } else {
             let (src, q) = quantized_tensor(file, directory, role, layer, elems)?;
-            (stream.clone_htod(&*to_device_layout(q, src))?, Some(q))
+            {
+                let source = stream.clone_htod(&*to_device_layout(q, src))?;
+                (
+                    K2Gemm::repack(stream.context(), stream, &source, q, inner, rows, experts)?,
+                    Some(q),
+                )
+            }
         };
         Ok(Self {
             bytes,
@@ -59,11 +67,61 @@ impl Projection {
             experts,
         })
     }
-    fn tensor(&self) -> QuantTensor<'_> {
-        QuantTensor {
-            bytes: &self.bytes,
-            quant: self.quant.expect("expert matrices are quantized"),
+    fn prefill(
+        &self,
+        ops: &K2Kernels,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        ids: &CudaSlice<i32>,
+        out: &mut CudaSlice<f32>,
+        gemm: &mut K2Gemm,
+    ) -> Result<(), MoeBlockError> {
+        if let Some(q) = self.quant {
+            gemm.project(
+                stream,
+                &self.bytes,
+                q,
+                x,
+                out,
+                self.inner,
+                self.rows,
+                self.experts,
+                None,
+                false,
+            )?;
+        } else {
+            self.forward(ops, stream, x, ids, out, 1, false)?;
         }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_prepared(
+        &self,
+        ops: &K2Kernels,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        ids: &CudaSlice<i32>,
+        out: &mut CudaSlice<f32>,
+        gemm: &mut K2Gemm,
+        prepared: K2Prepared,
+    ) -> Result<(), MoeBlockError> {
+        if let Some(q) = self.quant {
+            gemm.project_prepared(
+                stream,
+                &self.bytes,
+                q,
+                prepared,
+                out,
+                self.inner,
+                self.rows,
+                self.experts,
+                None,
+                false,
+            )?;
+        } else {
+            self.forward(ops, stream, x, ids, out, 1, false)?;
+        }
+        Ok(())
     }
     #[allow(clippy::too_many_arguments)]
     fn forward(
@@ -105,7 +163,10 @@ fn vector(
 }
 
 pub(crate) struct K2ValueScratch {
+    rotary: K2Rope,
     dispatch: K2Dispatch,
+    batch_decode: Option<AttnDecodeScratch>,
+    gemm: K2Gemm,
     logits: CudaSlice<f32>,
     ids: CudaSlice<i32>,
     weights: CudaSlice<f32>,
@@ -121,7 +182,40 @@ impl K2ValueScratch {
         let top = k.values_per_token as usize;
         let rows = (c.attention.kv_heads * c.attention.head_dim) as usize;
         Ok(Self {
-            dispatch: K2Dispatch::new(stream, t, top, k.value_experts as usize)?,
+            rotary: K2Rope::new(
+                stream.context(),
+                stream,
+                t,
+                c.attention.head_dim as usize,
+                c.attention.rope_dim as usize,
+            )?,
+            dispatch: K2Dispatch::new_gemm(stream, t, top, k.value_experts as usize)?,
+            batch_decode: if t <= STEP_SLOTS {
+                Some(AttnDecodeScratch::new_batch(
+                    stream,
+                    c.attention.q_heads as usize,
+                    c.attention.head_dim as usize,
+                    t,
+                )?)
+            } else {
+                None
+            },
+            gemm: K2Gemm::new(
+                stream.context(),
+                stream,
+                t,
+                top,
+                k.value_experts as usize,
+                (k.value_experts as usize * c.hidden_size as usize * rows).max(
+                    c.hidden_size as usize
+                        * c.attention.q_heads as usize
+                        * c.attention.head_dim as usize,
+                ),
+                (c.hidden_size as usize)
+                    .max(c.attention.q_heads as usize * c.attention.head_dim as usize),
+                (c.hidden_size as usize)
+                    .max(c.attention.q_heads as usize * c.attention.head_dim as usize),
+            )?,
             logits: stream.alloc_zeros::<f32>(t * k.value_experts as usize)?,
             ids: stream.alloc_zeros::<i32>(t * top)?,
             weights: stream.alloc_zeros::<f32>(t * top)?,
@@ -130,6 +224,7 @@ impl K2ValueScratch {
     }
 }
 pub(crate) struct K2AttentionWeights {
+    layer: u32,
     norm: CudaSlice<f32>,
     q: Projection,
     k: Projection,
@@ -164,6 +259,7 @@ impl K2AttentionWeights {
             None
         };
         Ok(Self {
+            layer,
             norm: vector(
                 stream,
                 file,
@@ -264,12 +360,54 @@ impl K2AttentionBlock {
             self.eps,
         )?;
         let vs = sc.k2.as_mut().expect("K2 scratch allocated at startup");
-        w.q.forward(ops, stream, &sc.normed, &vs.ids, &mut sc.query, 1, false)?;
-        w.k.forward(ops, stream, &sc.normed, &vs.ids, &mut sc.key, 1, false)?;
-        w.gate
-            .forward(ops, stream, &sc.normed, &vs.ids, &mut sc.gate, 1, false)?;
+        let prepared = vs.gemm.prepare(
+            stream,
+            &sc.normed,
+            c.hidden_size as usize,
+            [&w.q, &w.k, &w.gate, &w.v]
+                .iter()
+                .any(|p| p.quant == Some(ExpertQuant::Q4K))
+                || w.router
+                    .as_ref()
+                    .is_some_and(|(p, _)| p.quant == Some(ExpertQuant::Q4K)),
+        )?;
+        w.q.prefill_prepared(
+            ops,
+            stream,
+            &sc.normed,
+            &vs.ids,
+            &mut sc.query,
+            &mut vs.gemm,
+            prepared,
+        )?;
+        w.k.prefill_prepared(
+            ops,
+            stream,
+            &sc.normed,
+            &vs.ids,
+            &mut sc.key,
+            &mut vs.gemm,
+            prepared,
+        )?;
+        w.gate.prefill_prepared(
+            ops,
+            stream,
+            &sc.normed,
+            &vs.ids,
+            &mut sc.gate,
+            &mut vs.gemm,
+            prepared,
+        )?;
         if let Some((router, bias)) = &w.router {
-            router.forward(ops, stream, &sc.normed, &vs.ids, &mut vs.logits, 1, false)?;
+            router.prefill_prepared(
+                ops,
+                stream,
+                &sc.normed,
+                &vs.ids,
+                &mut vs.logits,
+                &mut vs.gemm,
+                prepared,
+            )?;
             ops.route(
                 stream,
                 &vs.logits,
@@ -279,27 +417,19 @@ impl K2AttentionBlock {
                 k.values_per_token as usize,
                 k.route_scale(),
             )?;
-            if self.tokens >= 8 {
-                ops.project_grouped(
+            {
+                ops.dispatch_gemm(stream, &vs.ids, &mut vs.dispatch)?;
+                vs.gemm.project_prepared(
                     stream,
                     &w.v.bytes,
                     w.v.quant.unwrap(),
-                    &sc.normed,
-                    &vs.ids,
+                    prepared,
                     &mut vs.projections,
                     w.v.inner,
                     w.v.rows,
-                    &mut vs.dispatch,
-                )?;
-            } else {
-                w.v.forward(
-                    ops,
-                    stream,
-                    &sc.normed,
-                    &vs.ids,
-                    &mut vs.projections,
-                    k.values_per_token as usize,
-                    true,
+                    w.v.experts,
+                    Some(&vs.dispatch),
+                    false,
                 )?;
             }
             ops.values(
@@ -311,7 +441,15 @@ impl K2AttentionBlock {
                 k.values_per_token as usize,
             )?;
         } else {
-            w.v.forward(ops, stream, &sc.normed, &vs.ids, &mut sc.value, 1, false)?;
+            w.v.prefill_prepared(
+                ops,
+                stream,
+                &sc.normed,
+                &vs.ids,
+                &mut sc.value,
+                &mut vs.gemm,
+                prepared,
+            )?;
         }
         Ok(())
     }
@@ -324,14 +462,14 @@ impl K2AttentionBlock {
     ) -> Result<(), AttentionBlockError> {
         let ops = &self.kernels.ops;
         ops.gate(stream, &sc.pregate, &sc.gate, &mut sc.gated)?;
-        self.weights.out.forward(
+        let vs = sc.k2.as_mut().unwrap();
+        self.weights.out.prefill(
             ops,
             stream,
             &sc.gated,
-            &sc.k2.as_ref().unwrap().ids,
+            &vs.ids,
             &mut sc.projected,
-            1,
-            false,
+            &mut vs.gemm,
         )?;
         self.kernels
             .add
@@ -365,6 +503,26 @@ impl K2AttentionBlock {
                 actual: 3,
             });
         };
+        if self.weights.layer == 0 {
+            if rope.len() != 1 {
+                return Err(AttentionBlockError::BufferShape {
+                    what: "K2 rotary position",
+                    expected: 1,
+                    actual: rope.len(),
+                });
+            }
+            let pointer = rope.device_ptr(stream).0;
+            // SAFETY: the checked scalar remains live on this pass's stream.
+            unsafe {
+                sc.k2.as_mut().unwrap().rotary.prepare_raw(
+                    stream,
+                    &[pointer],
+                    self.tokens,
+                    0,
+                    self.theta,
+                )?;
+            }
+        }
         self.attend(
             stream,
             &sc.query,
@@ -378,7 +536,8 @@ impl K2AttentionBlock {
             self.tokens,
             offset,
             position,
-            rope,
+            &sc.k2.as_ref().unwrap().rotary,
+            0,
         )?;
         self.finish(stream, sc, x, out)
     }
@@ -397,29 +556,18 @@ impl K2AttentionBlock {
         t: usize,
         offset: usize,
         position: &CudaSlice<i32>,
-        rope: &CudaSlice<i32>,
+        rotary: &K2Rope,
+        rotary_offset: usize,
     ) -> Result<(), AttentionBlockError> {
         let c = &self.config;
         let a = &self.kernels.attention;
-        a.rope(
-            stream,
-            q,
-            qr,
-            t,
-            c.attention.q_heads as usize,
-            c.attention.rope_dim as usize,
-            rope,
-            self.theta,
-        )?;
-        a.rope(
+        rotary.apply(stream, q, qr, c.attention.q_heads as usize, rotary_offset)?;
+        rotary.apply(
             stream,
             key,
             kr,
-            t,
             c.attention.kv_heads as usize,
-            c.attention.rope_dim as usize,
-            rope,
-            self.theta,
+            rotary_offset,
         )?;
         a.append_kv(
             stream,
@@ -431,7 +579,7 @@ impl K2AttentionBlock {
             cache.max_seq,
             position,
         )?;
-        a.forward(
+        a.forward_k2(
             stream,
             decode,
             qr,
@@ -483,6 +631,103 @@ impl K2AttentionBlock {
         self.projections(stream, sc, x)?;
         let qdim = (self.config.attention.q_heads * self.config.attention.head_dim) as usize;
         let vdim = (self.config.attention.kv_heads * self.config.attention.head_dim) as usize;
+        if self.weights.layer == 0 {
+            for (batch, positions) in rope.chunks(STEP_SLOTS).enumerate() {
+                let mut pointers = [0u64; STEP_SLOTS];
+                for (i, position) in positions.iter().enumerate() {
+                    if position.len() != 1 {
+                        return Err(AttentionBlockError::BufferShape {
+                            what: "K2 rotary position",
+                            expected: 1,
+                            actual: position.len(),
+                        });
+                    }
+                    pointers[i] = position.device_ptr(stream).0;
+                }
+                // SAFETY: checked scalar slots are live through this launch.
+                unsafe {
+                    sc.k2.as_mut().unwrap().rotary.prepare_raw(
+                        stream,
+                        &pointers[..positions.len()],
+                        chunk,
+                        batch * STEP_SLOTS * chunk,
+                        self.theta,
+                    )?;
+                }
+            }
+        }
+        if chunk == 1 && n <= STEP_SLOTS {
+            let a = &self.kernels.attention;
+            let (mut ap, mut kc, mut vc) =
+                ([0u64; STEP_SLOTS], [0u64; STEP_SLOTS], [0u64; STEP_SLOTS]);
+            for i in 0..n {
+                if positions[i].len() != 1 || rope[i].len() != 1 {
+                    return Err(AttentionBlockError::BufferShape {
+                        what: "K2 batch positions",
+                        expected: 1,
+                        actual: positions[i].len().max(rope[i].len()),
+                    });
+                }
+                ap[i] = positions[i].device_ptr(stream).0;
+                kc[i] = caches[i].k.device_ptr(stream).0;
+                vc[i] = caches[i].v.device_ptr(stream).0;
+            }
+            // SAFETY: checked cache capacity and distinct sequence caches are
+            // borrowed exclusively above; the slots are live for this launch.
+            unsafe {
+                sc.k2.as_ref().unwrap().rotary.append_raw(
+                    stream,
+                    &sc.query,
+                    &mut sc.query_roped,
+                    &sc.key,
+                    &mut sc.key_roped,
+                    &sc.value,
+                    &ap[..n],
+                    &kc[..n],
+                    &vc[..n],
+                    self.config.attention.q_heads as usize,
+                    self.config.attention.kv_heads as usize,
+                )
+            }?;
+            if offsets.iter().all(|o| a.k2_batch_uses_warp(o + 1)) {
+                // SAFETY: the same checked slots, with one independent window
+                // per sequence; scratch was allocated for this physical width.
+                unsafe {
+                    a.decode_batch_k2_raw(
+                        stream,
+                        sc.k2.as_mut().unwrap().batch_decode.as_mut().unwrap(),
+                        &sc.query_roped,
+                        &mut sc.pregate,
+                        &ap[..n],
+                        &kc[..n],
+                        &vc[..n],
+                    )
+                }?;
+            } else {
+                for i in 0..n {
+                    // SAFETY: sequence slices are disjoint and inside the
+                    // validated physical activation buffers.
+                    let q = unsafe {
+                        crate::viewslice::subslice(stream, &sc.query_roped, i * qdim, qdim)
+                    };
+                    let mut y =
+                        unsafe { crate::viewslice::subslice(stream, &sc.pregate, i * qdim, qdim) };
+                    a.forward_k2(
+                        stream,
+                        &mut sc.decode[0],
+                        &q,
+                        &caches[i].k,
+                        &caches[i].v,
+                        &mut y,
+                        1,
+                        caches[i].max_seq,
+                        offsets[i] + 1,
+                        positions[i],
+                    )?;
+                }
+            }
+            return self.finish(stream, sc, x, out);
+        }
         for i in 0..n {
             // SAFETY: all flattened buffers are shape-sized, and i < sequences.
             let q = unsafe {
@@ -516,7 +761,8 @@ impl K2AttentionBlock {
                 chunk,
                 offsets[i],
                 positions[i],
-                rope[i],
+                &sc.k2.as_ref().unwrap().rotary,
+                i * chunk,
             )?;
         }
         self.finish(stream, sc, x, out)
@@ -612,10 +858,24 @@ impl K2FfnWeights {
     }
 }
 /// Fixed scratch and device routing for the mixed K2 feed-forward layers.
+struct K2FfnGemmScratch {
+    dispatch: K2Dispatch,
+    gemm: K2Gemm,
+    dense_gemm: K2Gemm,
+    gate: CudaSlice<f32>,
+    up: CudaSlice<f32>,
+    inter: CudaSlice<f32>,
+    partial: CudaSlice<f32>,
+    shared_gate: CudaSlice<f32>,
+    shared_up: CudaSlice<f32>,
+    shared_inter: CudaSlice<f32>,
+}
 pub struct K2FfnBlock {
     ops: K2Kernels,
-    moe: MoeKernels,
-    buffers: MoeBuffers,
+    geometry: MoeGeometry,
+    ids: CudaSlice<i32>,
+    weights: CudaSlice<f32>,
+    gemm: K2FfnGemmScratch,
     layer_ops: LayerOpsKernels,
     config: ModelConfig,
     eps: f32,
@@ -635,14 +895,53 @@ impl K2FfnBlock {
         g: MoeGeometry,
         eps: f32,
     ) -> Result<Self, MoeBlockError> {
-        let mut moe = MoeKernels::new(ctx, g)?;
-        moe.disable_tensor_cores();
-        let buffers = moe.buffers(stream)?;
         let dense = c.k2.unwrap().dense_intermediate as usize;
         Ok(Self {
             ops: K2Kernels::new(ctx)?,
-            moe,
-            buffers,
+            geometry: g,
+            ids: stream.alloc_zeros::<i32>(g.max_tokens * g.experts_per_token)?,
+            weights: stream.alloc_zeros::<f32>(g.max_tokens * g.experts_per_token)?,
+            gemm: K2FfnGemmScratch {
+                dispatch: K2Dispatch::new_gemm(
+                    stream,
+                    g.max_tokens,
+                    g.experts_per_token,
+                    g.num_experts,
+                )?,
+                gemm: K2Gemm::new_with_activation_bits(
+                    ctx,
+                    stream,
+                    g.max_tokens,
+                    g.experts_per_token,
+                    g.num_experts,
+                    (g.num_experts * g.hidden * g.intermediate).max(g.hidden * dense),
+                    g.hidden.max(g.intermediate),
+                    g.hidden.max(g.intermediate),
+                    16,
+                )?,
+                dense_gemm: K2Gemm::new_with_activation_bits(
+                    ctx,
+                    stream,
+                    g.max_tokens,
+                    1,
+                    1,
+                    g.hidden * dense,
+                    g.hidden.max(dense),
+                    g.hidden.max(dense),
+                    16,
+                )?,
+                gate: stream
+                    .alloc_zeros::<f32>(g.max_tokens * g.experts_per_token * g.intermediate)?,
+                up: stream
+                    .alloc_zeros::<f32>(g.max_tokens * g.experts_per_token * g.intermediate)?,
+                inter: stream
+                    .alloc_zeros::<f32>(g.max_tokens * g.experts_per_token * g.intermediate)?,
+                shared_gate: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
+                shared_up: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
+                shared_inter: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
+                partial: stream
+                    .alloc_zeros::<f32>(g.max_tokens * g.experts_per_token * g.hidden)?,
+            },
             layer_ops: LayerOpsKernels::new(ctx)?,
             config: c.clone(),
             eps,
@@ -656,7 +955,7 @@ impl K2FfnBlock {
         })
     }
     pub fn geometry(&self) -> MoeGeometry {
-        self.moe.geometry()
+        self.geometry
     }
     pub fn normed(&self) -> &CudaSlice<f32> {
         &self.normed
@@ -666,8 +965,13 @@ impl K2FfnBlock {
         stream: &Arc<CudaStream>,
         tokens: usize,
     ) -> Result<(), MoeBlockError> {
-        self.moe
-            .set_valid_tokens(stream, &mut self.buffers, tokens)?;
+        let _ = stream;
+        if tokens > self.geometry.max_tokens {
+            return Err(MoeBlockError::FfnKindMismatch {
+                block: "K2 token capacity",
+                weights: "too many tokens",
+            });
+        }
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -682,7 +986,7 @@ impl K2FfnBlock {
     ) -> Result<(), MoeBlockError> {
         let c = &self.config;
         let k = c.k2.unwrap();
-        let g = self.moe.geometry();
+        let g = self.geometry;
         if tokens != g.max_tokens {
             return Err(MoeBlockError::FfnKindMismatch {
                 block: "fixed K2 token shape",
@@ -703,12 +1007,12 @@ impl K2FfnBlock {
                 &self.ops,
                 stream,
                 &self.normed,
-                self.buffers.topk_ids(),
+                &self.ids,
                 &mut self.logits,
                 1,
                 false,
             )?;
-            let (ids, weights) = self.buffers.routing_mut();
+            let (ids, weights) = (&mut self.ids, &mut self.weights);
             self.ops.route(
                 stream,
                 &self.logits,
@@ -718,46 +1022,130 @@ impl K2FfnBlock {
                 g.experts_per_token,
                 k.route_scale(),
             )?;
-            self.moe.build_dispatch(stream, &mut self.buffers)?;
-            self.moe.grouped_forward(
-                stream,
-                &mut self.buffers,
-                w.gate.tensor(),
-                w.up.tensor(),
-                w.down.tensor(),
-                &self.normed,
-                &mut self.routed,
-            )?;
+            {
+                let sc = &mut self.gemm;
+                self.ops
+                    .dispatch_gemm(stream, &self.ids, &mut sc.dispatch)?;
+                let prepared = sc.gemm.prepare(
+                    stream,
+                    &self.normed,
+                    g.hidden,
+                    w.gate.quant == Some(ExpertQuant::Q4K) || w.up.quant == Some(ExpertQuant::Q4K),
+                )?;
+                sc.gemm.project_prepared(
+                    stream,
+                    &w.gate.bytes,
+                    w.gate.quant.unwrap(),
+                    prepared,
+                    &mut sc.gate,
+                    g.hidden,
+                    g.intermediate,
+                    g.num_experts,
+                    Some(&sc.dispatch),
+                    false,
+                )?;
+                sc.gemm.project_prepared(
+                    stream,
+                    &w.up.bytes,
+                    w.up.quant.unwrap(),
+                    prepared,
+                    &mut sc.up,
+                    g.hidden,
+                    g.intermediate,
+                    g.num_experts,
+                    Some(&sc.dispatch),
+                    false,
+                )?;
+                self.layer_ops
+                    .swiglu(stream, &sc.gate, &sc.up, &mut sc.inter, sc.gate.len())?;
+                sc.gemm.project(
+                    stream,
+                    &w.down.bytes,
+                    w.down.quant.unwrap(),
+                    &sc.inter,
+                    &mut sc.partial,
+                    g.intermediate,
+                    g.hidden,
+                    g.num_experts,
+                    Some(&sc.dispatch),
+                    true,
+                )?;
+                self.ops.combine(
+                    stream,
+                    &sc.partial,
+                    &self.weights,
+                    &mut self.routed,
+                    g.hidden,
+                    g.experts_per_token,
+                )?;
+            }
             let (sg, su, sd) = w.shared.as_ref().unwrap();
-            self.moe.shared_expert(
+            let sc = &mut self.gemm;
+            let prepared = sc.dense_gemm.prepare(
                 stream,
-                &mut self.buffers,
-                sg.tensor(),
-                su.tensor(),
-                sd.tensor(),
                 &self.normed,
+                g.hidden,
+                sg.quant == Some(ExpertQuant::Q4K) || su.quant == Some(ExpertQuant::Q4K),
+            )?;
+            sg.prefill_prepared(
+                &self.ops,
+                stream,
+                &self.normed,
+                &self.ids,
+                &mut sc.shared_gate,
+                &mut sc.dense_gemm,
+                prepared,
+            )?;
+            su.prefill_prepared(
+                &self.ops,
+                stream,
+                &self.normed,
+                &self.ids,
+                &mut sc.shared_up,
+                &mut sc.dense_gemm,
+                prepared,
+            )?;
+            self.layer_ops.swiglu(
+                stream,
+                &sc.shared_gate,
+                &sc.shared_up,
+                &mut sc.shared_inter,
+                sc.shared_gate.len(),
+            )?;
+            sd.prefill(
+                &self.ops,
+                stream,
+                &sc.shared_inter,
+                &self.ids,
                 &mut self.shared,
+                &mut sc.dense_gemm,
             )?;
             self.layer_ops
                 .add(stream, &self.routed, &self.shared, ffn, ffn.len())?;
         } else {
-            w.gate.forward(
-                &self.ops,
+            let prepared = self.gemm.dense_gemm.prepare(
                 stream,
                 &self.normed,
-                self.buffers.topk_ids(),
-                &mut self.dense_gate,
-                1,
-                false,
+                g.hidden,
+                w.gate.quant == Some(ExpertQuant::Q4K) || w.up.quant == Some(ExpertQuant::Q4K),
             )?;
-            w.up.forward(
+            w.gate.prefill_prepared(
                 &self.ops,
                 stream,
                 &self.normed,
-                self.buffers.topk_ids(),
+                &self.ids,
+                &mut self.dense_gate,
+                &mut self.gemm.dense_gemm,
+                prepared,
+            )?;
+            w.up.prefill_prepared(
+                &self.ops,
+                stream,
+                &self.normed,
+                &self.ids,
                 &mut self.dense_up,
-                1,
-                false,
+                &mut self.gemm.dense_gemm,
+                prepared,
             )?;
             self.layer_ops.swiglu(
                 stream,
@@ -766,14 +1154,13 @@ impl K2FfnBlock {
                 &mut self.dense_inter,
                 self.dense_gate.len(),
             )?;
-            w.down.forward(
+            w.down.prefill(
                 &self.ops,
                 stream,
                 &self.dense_inter,
-                self.buffers.topk_ids(),
+                &self.ids,
                 ffn,
-                1,
-                false,
+                &mut self.gemm.dense_gemm,
             )?;
         }
         self.layer_ops.add(stream, x, ffn, out, out.len())?;

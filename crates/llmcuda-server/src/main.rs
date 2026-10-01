@@ -518,7 +518,9 @@ fn gate_mtp(args: &mut Args, available: bool) {
 /// Opening the GGUF here costs an mmap and a header parse; the alternative —
 /// defaulting to one architecture and letting `WeightSchema::resolve` object
 /// — produces a hundred shape mismatches for what is one fact.
-fn model_config_for(path: &std::path::Path) -> Result<(ModelConfig, Option<String>, bool), String> {
+fn model_config_for(
+    path: &std::path::Path,
+) -> Result<(ModelConfig, Option<String>, bool, u64), String> {
     if !path.is_file() {
         return Err(format!("{} is not a file", path.display()));
     }
@@ -531,10 +533,20 @@ fn model_config_for(path: &std::path::Path) -> Result<(ModelConfig, Option<Strin
     // checkpoint of the same architecture would advertise itself as the
     // first. See the `qwen35moe` note in docs/MODEL.md.
     let mtp_available = config.mtp_available(&file);
+    let weights_bytes = if config.k2.is_some() {
+        let schema = llmcuda_model::WeightSchema::new(&config);
+        let directory = schema
+            .resolve(&file)
+            .map_err(|e| format!("{}: {e:?}", path.display()))?;
+        llmcuda_engine::DeviceWeights::k2_required_bytes(&directory)
+    } else {
+        WEIGHTS_BYTES
+    };
     Ok((
         config,
         file.get_str("general.name").map(str::to_owned),
         mtp_available,
+        weights_bytes,
     ))
 }
 
@@ -586,7 +598,7 @@ fn main() -> std::process::ExitCode {
     //    engine serves have the same tensor *names* for the mixer and would
     //    otherwise fail deep in the weight resolver with a wall of shape
     //    mismatches instead of one line naming the architecture.
-    let (model, file_name, mtp_available) = match model_config_for(&args.model) {
+    let (model, file_name, mtp_available, weights_bytes) = match model_config_for(&args.model) {
         Ok(m) => m,
         Err(e) => {
             error!("model            FAIL — {e}");
@@ -819,7 +831,7 @@ fn main() -> std::process::ExitCode {
         u64::from(args.total_context),
         args.slots_per_worker,
         KV_ELEM_BYTES_F16,
-        WEIGHTS_BYTES,
+        weights_bytes,
     );
     let usable = devices[0].total_memory;
     let headroom = vram.headroom_bytes(usable);

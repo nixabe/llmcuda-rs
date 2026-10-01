@@ -511,6 +511,18 @@ value projections must also match the scalar GPU contraction **bit for bit**,
 including ragged token tiles, inactive experts and padded runs. Router cases
 include ties, 512 experts, saturated sigmoid scores and the normalization floor.
 
+The K2 integer projection gate separately compares eight-, twelve- and
+sixteen-bit activation references, including Q4 affine correction. It requires
+identical bits across one/three-token GEMV and eight/eleven/32/65-token GEMM,
+normal and flat routed inputs, dense matrices, inactive experts and a 135-row
+tail that crosses both row-tile sizes. Explicit activation reuse must preserve
+those results, and stale generations must be rejected. Rotary reuse is checked
+against the CPU and direct GPU kernel, including tails, independent sequence
+positions up to 524,280, coefficient refresh and f16 cache writes. Production
+uses sixteen bits. K2 attention has CPU gates for compensated prefill and
+decode; batched warp
+attention must match serial calls exactly over independent windows up to 32K.
+
 The mixed Q4_K/Q6_K FFN cases in `moe_quant_formats_differential` check both
 format orders against the scalar reference. Dispatch pads the end of each run;
 the community kernels may skip an empty tail tile, but must retain every live
@@ -519,9 +531,14 @@ row and its original contribution order.
 For both real K2 quants, `k2_model` with `LLMCUDA_K2_MODEL` and
 `LLMCUDA_K2_GOLDEN` checks all 48 block boundaries, final grouped normalization,
 logits and argmax against the publisher's capture. It also checks chunking,
-batched prefill and decode, and graph replay. See [MODEL.md](MODEL.md#k2-horizon)
-for capture and invocation instructions. The six-token oracle's N=2 prefill
-exercises the tiled and grouped kernels at twelve physical rows.
+batched prefill and decode, and graph replay, including a repeated prefix
+beyond the tiny-context attention path and a full-width versus chunked
+prefill comparison that exercises the tensor-core query tiles. The predicted
+packed-weight residency must equal the runtime weight report. See
+[MODEL.md](MODEL.md#k2-horizon) for capture and invocation instructions. These publisher thresholds were
+calibrated on that six-token prompt; they are not a broader quality evaluation.
+The six-token oracle's N=3 prefill exercises the tiled and grouped kernels at
+eighteen physical rows.
 
 `bench_k2` measures actual GGUF query and value-expert tensors using CUDA events,
 including device dispatch in the grouped timing. Run it with `LLMCUDA_MODEL`

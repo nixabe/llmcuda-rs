@@ -10,6 +10,8 @@ use cudarc::driver::{
 };
 use std::sync::Arc;
 
+pub(crate) const K2_ROUTED_TILE: usize = 64;
+
 const SRC: &str = r#"
 extern "C" {
 __global__ void k2_norm(const float* x, const float* w, float* y, int width, int groups, float eps) {
@@ -138,7 +140,7 @@ __global__ void k2_project_b8(const unsigned char* w, int quant, const float* x,
 // order. Prefix offsets pack padded runs; unused runs carry expert=-1.
 // This follows moe_align_block_size's device-side counting and padding.
 __global__ void k2_dispatch(const int* ids, int* sorted, int* owners,
-                            int tokens, int topk, int experts, int capacity) {
+                            int tokens, int topk, int experts, int capacity, int tile) {
     __shared__ int counts[128], starts[128];
     int e=threadIdx.x, pairs=tokens*topk;
     for(int b=threadIdx.x;b<capacity;b+=blockDim.x) owners[b]=-1;
@@ -148,15 +150,38 @@ __global__ void k2_dispatch(const int* ids, int* sorted, int* owners,
     __syncthreads();
     if(e==0) {
         int cursor=0;
-        for(int j=0;j<experts;++j) { starts[j]=cursor; cursor+=(counts[j]+7)/8*8; }
+        for(int j=0;j<experts;++j) { starts[j]=cursor; cursor+=(counts[j]+tile-1)/tile*tile; }
     }
     __syncthreads();
     if(e>=experts) return;
     int cursor=starts[e];
     for(int f=0;f<pairs;++f) if(ids[f]==e) sorted[cursor++]=f;
-    int end=starts[e]+(counts[e]+7)/8*8;
+    int end=starts[e]+(counts[e]+tile-1)/tile*tile;
     for(int f=cursor;f<end;++f) sorted[f]=pairs;
-    for(int f=starts[e];f<end;f+=8) owners[f/8]=e;
+    for(int f=starts[e];f<end;f+=tile) owners[f/tile]=e;
+}
+// Each lane owns a contiguous slice of flat ids. The prefix of lane counts
+// keeps the original route order without host counts or atomic scatter.
+__global__ void k2_dispatch_count(const int* ids,int* counts,int pairs) {
+    int e=blockIdx.x,t=threadIdx.x,chunk=(pairs+127)/128;
+    int n=0;for(int f=t*chunk;f<min((t+1)*chunk,pairs);++f)n+=ids[f]==e;
+    counts[e*128+t]=n;
+}
+__global__ void k2_dispatch_prefix(const int* counts,int* starts,int* owners,int experts,int capacity,int tile) {
+    __shared__ int totals[128];int t=threadIdx.x,n=0;
+    if(t<experts)for(int j=0;j<128;++j)n+=counts[t*128+j];
+    totals[t]=(n+tile-1)/tile*tile;
+    for(int b=t;b<capacity;b+=128)owners[b]=-1;
+    __syncthreads();int start=0;for(int e=0;e<t;++e)start+=totals[e];
+    if(t<experts){starts[t]=start;for(int f=start;f<start+totals[t];f+=tile)owners[f/tile]=t;}
+}
+__global__ void k2_dispatch_gather(const int* ids,const int* counts,const int* starts,int* sorted,int pairs,int tile) {
+    int e=blockIdx.x,t=threadIdx.x,chunk=(pairs+127)/128;
+    __shared__ int prefix[128];prefix[t]=counts[e*128+t];__syncthreads();
+    for(int d=1;d<128;d*=2){int v=t>=d ? prefix[t-d] : 0;__syncthreads();prefix[t]+=v;__syncthreads();}
+    int total=prefix[127],cursor=starts[e]+prefix[t]-counts[e*128+t];
+    for(int f=t*chunk;f<min((t+1)*chunk,pairs);++f)if(ids[f]==e)sorted[cursor++]=f;
+    for(int f=total+t;f<(total+tile-1)/tile*tile;f+=128)sorted[starts[e]+f]=pairs;
 }
 __global__ void k2_project_grouped(const unsigned char* w, int quant, const float* x,
                                   const int* sorted, const int* owners, float* out,
@@ -182,6 +207,11 @@ __global__ void k2_project_grouped(const unsigned char* w, int quant, const floa
         for(int d=16;d>0;d>>=1) acc[b]+=__shfl_down_sync(0xffffffff,acc[b],d);
         if(threadIdx.x==0 && flats[b]<tokens*topk) out[(long long)flats[b]*rows+row]=acc[b];
     }
+}
+__global__ void k2_combine(const float* p,const float* w,float* out,int rows,int topk) {
+    int j=blockIdx.x*blockDim.x+threadIdx.x,t=blockIdx.y;if(j>=rows)return;
+    float a=0;for(int k=0;k<topk;++k) a+=p[((long long)t*topk+k)*rows+j]*w[t*topk+k];
+    out[(long long)t*rows+j]=a;
 }
 __global__ void k2_values(const float* projections, const float* weights, float* out, int rows, int topk) {
     int j=blockIdx.x*blockDim.x+threadIdx.x, token=blockIdx.y;
@@ -217,11 +247,15 @@ pub fn quant_code(q: ExpertQuant) -> i32 {
 /// Fixed device dispatch workspace for selected projections. Natural token
 /// capacity plus at most one padded run per expert bounds every write.
 pub struct K2Dispatch {
-    sorted: CudaSlice<i32>,
-    owners: CudaSlice<i32>,
-    tokens: usize,
-    topk: usize,
-    experts: usize,
+    counts: CudaSlice<i32>,
+    starts: CudaSlice<i32>,
+    pub(crate) direct: CudaSlice<i32>,
+    pub(crate) sorted: CudaSlice<i32>,
+    pub(crate) owners: CudaSlice<i32>,
+    pub(crate) tokens: usize,
+    pub(crate) topk: usize,
+    pub(crate) experts: usize,
+    pub(crate) tile: usize,
 }
 impl K2Dispatch {
     /// Allocate once for a fixed projection shape, never during inference.
@@ -231,6 +265,24 @@ impl K2Dispatch {
         topk: usize,
         experts: usize,
     ) -> Result<Self, MoeError> {
+        Self::with_tile(stream, tokens, topk, experts, 8)
+    }
+    /// Fixed 64-slot runs for tensor-core batching.
+    pub fn new_gemm(
+        stream: &Arc<CudaStream>,
+        tokens: usize,
+        topk: usize,
+        experts: usize,
+    ) -> Result<Self, MoeError> {
+        Self::with_tile(stream, tokens, topk, experts, K2_ROUTED_TILE)
+    }
+    fn with_tile(
+        stream: &Arc<CudaStream>,
+        tokens: usize,
+        topk: usize,
+        experts: usize,
+        tile: usize,
+    ) -> Result<Self, MoeError> {
         if tokens == 0 || experts == 0 || experts > 128 || topk == 0 || topk > experts {
             return Err(MoeError::WrongElementCount {
                 which: "K2 dispatch geometry",
@@ -238,13 +290,17 @@ impl K2Dispatch {
                 found: experts,
             });
         }
-        let capacity = (tokens * topk).div_ceil(8) + experts;
+        let capacity = (tokens * topk).div_ceil(tile) + experts;
         Ok(Self {
-            sorted: stream.alloc_zeros::<i32>(capacity * 8)?,
+            counts: stream.alloc_zeros::<i32>(experts * 128)?,
+            starts: stream.alloc_zeros::<i32>(experts)?,
+            direct: stream.alloc_zeros::<i32>(tokens * topk)?,
+            sorted: stream.alloc_zeros::<i32>(capacity * tile)?,
             owners: stream.alloc_zeros::<i32>(capacity)?,
             tokens,
             topk,
             experts,
+            tile,
         })
     }
 }
@@ -256,8 +312,12 @@ pub struct K2Kernels {
     project: CudaFunction,
     project_tiles: [CudaFunction; 2],
     dispatch: CudaFunction,
+    dispatch_count: CudaFunction,
+    dispatch_prefix: CudaFunction,
+    dispatch_gather: CudaFunction,
     project_grouped: CudaFunction,
     values: CudaFunction,
+    combine: CudaFunction,
     gate: CudaFunction,
 }
 impl K2Kernels {
@@ -278,8 +338,12 @@ impl K2Kernels {
                 module.load_function("k2_project_b8")?,
             ],
             dispatch: module.load_function("k2_dispatch")?,
+            dispatch_count: module.load_function("k2_dispatch_count")?,
+            dispatch_prefix: module.load_function("k2_dispatch_prefix")?,
+            dispatch_gather: module.load_function("k2_dispatch_gather")?,
             project_grouped: module.load_function("k2_project_grouped")?,
             values: module.load_function("k2_values")?,
+            combine: module.load_function("k2_combine")?,
             gate: module.load_function("k2_gate")?,
         })
     }
@@ -544,6 +608,8 @@ impl K2Kernels {
             inner * rows * experts / quant.block_elements() * quant.block_bytes(),
             w.len(),
         )?;
+        check("K2 scalar dispatch tile", 8, dispatch.tile)?;
+        let tile = dispatch.tile as i32;
         let capacity = dispatch.owners.len() as i32;
         let (tokens, topk, experts, inner, rows, code) = (
             tokens as i32,
@@ -563,6 +629,7 @@ impl K2Kernels {
                 .arg(&topk)
                 .arg(&experts)
                 .arg(&capacity)
+                .arg(&tile)
                 .launch(LaunchConfig {
                     grid_dim: (1, 1, 1),
                     block_dim: (128, 1, 1),
@@ -583,6 +650,107 @@ impl K2Kernels {
                 .launch(LaunchConfig {
                     grid_dim: ((rows as u32).div_ceil(4), capacity as u32, 1),
                     block_dim: (32, 4, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+    /// Build fixed expert runs on-device for the batched contraction.
+    pub fn dispatch_gemm(
+        &self,
+        stream: &Arc<CudaStream>,
+        ids: &CudaSlice<i32>,
+        d: &mut K2Dispatch,
+    ) -> Result<(), MoeError> {
+        if ![8, 16, 32, 64].contains(&d.tile) {
+            return Err(MoeError::WrongElementCount {
+                which: "K2 dispatch tile",
+                expected: 64,
+                found: d.tile,
+            });
+        };
+        check("K2 BLAS dispatch ids", d.tokens * d.topk, ids.len())?;
+        stream.memcpy_dtod(ids, &mut d.direct)?;
+        // Small shapes read direct ids and never consume padded runs.
+        if d.tokens < 8 {
+            return Ok(());
+        }
+        let pairs = (d.tokens * d.topk) as i32;
+        let experts = d.experts as i32;
+        let capacity = d.owners.len() as i32;
+        let tile = d.tile as i32;
+        // SAFETY: one fixed block per expert, disjoint count and padded runs;
+        // the prefix is device-resident and capacity includes expert padding.
+        unsafe {
+            let cfg = LaunchConfig {
+                grid_dim: (d.experts as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            stream
+                .launch_builder(&self.dispatch_count)
+                .arg(ids)
+                .arg(&mut d.counts)
+                .arg(&pairs)
+                .launch(cfg)?;
+            stream
+                .launch_builder(&self.dispatch_prefix)
+                .arg(&d.counts)
+                .arg(&mut d.starts)
+                .arg(&mut d.owners)
+                .arg(&experts)
+                .arg(&capacity)
+                .arg(&tile)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    ..cfg
+                })?;
+            stream
+                .launch_builder(&self.dispatch_gather)
+                .arg(ids)
+                .arg(&d.counts)
+                .arg(&d.starts)
+                .arg(&mut d.sorted)
+                .arg(&pairs)
+                .arg(&tile)
+                .launch(cfg)?;
+        }
+        Ok(())
+    }
+    /// Sum routed FFN projections in route order without an activation.
+    pub fn combine(
+        &self,
+        stream: &Arc<CudaStream>,
+        p: &CudaSlice<f32>,
+        weights: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        rows: usize,
+        topk: usize,
+    ) -> Result<(), MoeError> {
+        if rows == 0 || topk == 0 {
+            return Err(MoeError::WrongElementCount {
+                which: "K2 combine geometry",
+                expected: 1,
+                found: 0,
+            });
+        }
+        let tokens = out.len() / rows;
+        check("K2 combine output", tokens * rows, out.len())?;
+        check("K2 combine partial", tokens * topk * rows, p.len())?;
+        check("K2 combine weights", tokens * topk, weights.len())?;
+        let (rows, topk) = (rows as i32, topk as i32);
+        // SAFETY: output, partial and route-weight checks bound every access.
+        unsafe {
+            stream
+                .launch_builder(&self.combine)
+                .arg(p)
+                .arg(weights)
+                .arg(out)
+                .arg(&rows)
+                .arg(&topk)
+                .launch(LaunchConfig {
+                    grid_dim: ((rows as u32).div_ceil(256), tokens as u32, 1),
+                    block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
         }

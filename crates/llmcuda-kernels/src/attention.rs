@@ -68,43 +68,45 @@ pub fn causal_attention_streaming(q: &[Vec<f32>], k: &[Vec<f32>], v: &[Vec<f32>]
     assert_eq!(k.len(), seq_len);
     assert_eq!(v.len(), seq_len);
     assert!(seq_len > 0, "causal_attention_streaming: empty sequence");
-    let head_dim = q[0].len();
+    q.iter()
+        .enumerate()
+        .map(|(t, row)| attention_decode(row, &k[..=t], &v[..=t]))
+        .collect()
+}
+
+/// Online softmax for one query over its visible key/value window.
+/// This is the same ordered contraction as `causal_attention_streaming`,
+/// without computing the preceding query rows during decode validation.
+pub fn attention_decode(q: &[f32], k: &[Vec<f32>], v: &[Vec<f32>]) -> Vec<f32> {
+    assert!(!q.is_empty() && !k.is_empty());
+    assert_eq!(k.len(), v.len());
+    let head_dim = q.len();
     let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-    let mut out = vec![vec![0.0f32; head_dim]; seq_len];
-
-    for t in 0..seq_len {
-        let mut running_max = f32::NEG_INFINITY;
-        let mut running_sum = 0.0f32;
-        let mut acc = vec![0.0f32; head_dim];
-
-        for i in 0..=t {
-            let dot: f32 = q[t].iter().zip(k[i].iter()).map(|(&a, &b)| a * b).sum();
-            let score = dot * scale;
-
-            let new_max = running_max.max(score);
-            // Rescale the existing accumulator and normalizer into the new
-            // max's frame before folding in this key's contribution.
-            let correction = if running_max == f32::NEG_INFINITY {
-                0.0
-            } else {
-                (running_max - new_max).exp()
-            };
-            let weight = (score - new_max).exp();
-
-            running_sum = running_sum * correction + weight;
-            for d in 0..head_dim {
-                acc[d] = acc[d] * correction + weight * v[i][d];
-            }
-            running_max = new_max;
-        }
-
+    let mut running_max = f32::NEG_INFINITY;
+    let mut running_sum = 0.0f32;
+    let mut acc = vec![0.0f32; head_dim];
+    for (key, value) in k.iter().zip(v) {
+        assert_eq!(key.len(), head_dim);
+        assert_eq!(value.len(), head_dim);
+        let dot: f32 = q.iter().zip(key).map(|(&a, &b)| a * b).sum();
+        let score = dot * scale;
+        let new_max = running_max.max(score);
+        let correction = if running_max == f32::NEG_INFINITY {
+            0.0
+        } else {
+            (running_max - new_max).exp()
+        };
+        let weight = (score - new_max).exp();
+        running_sum = running_sum * correction + weight;
         for d in 0..head_dim {
-            out[t][d] = acc[d] / running_sum;
+            acc[d] = acc[d] * correction + weight * value[d];
         }
+        running_max = new_max;
     }
-
-    out
+    for value in &mut acc {
+        *value /= running_sum;
+    }
+    acc
 }
 
 /// Maps a query head index to its key/value head under grouped-query

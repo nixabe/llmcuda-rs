@@ -211,6 +211,7 @@ const MMA_SHARED_CEILING: usize = 64 * 1024;
 
 /// Key slices the scalar warp decode uses. Mirrors `DEC_WARP_SPLITS`.
 const WARP_DECODE_SPLITS: usize = 96;
+const K2_WARP_DECODE_SPLITS: usize = 32;
 
 /// Key slices the tensor-core decode uses by default.
 ///
@@ -851,7 +852,9 @@ __device__ __forceinline__ float mma_softmax_pair(
     return correction;
 }
 
-__global__ void attn_flash_causal_mma(
+} // extern C
+template<bool COMP,int HPB,int MAXT>
+__device__ void attn_flash_causal_mma_body(
     const float* __restrict__ q,
     const unsigned short* __restrict__ k,
     const unsigned short* __restrict__ v,
@@ -891,12 +894,12 @@ __global__ void attn_flash_causal_mma(
     int hslot = warp / MMA_WPH;
     int sub = warp % MMA_WPH;
     long long qi0 = (long long)blockIdx.x * MMA_QT;
-    int h = blockIdx.y * MMA_HPB + hslot;
+    int h = blockIdx.y * HPB + hslot;
     int kvh = h / (q_heads / kv_heads);
 
     int dpw = head_dim / MMA_WPH;     // output dims this warp owns
     int dbase = sub * dpw;
-    int ntile = dpw >> 3;             // MMA n-tiles of 8 dims, <= MMA_MAXT
+    int ntile = dpw >> 3;             // MMA n-tiles of 8 dims, <= MAXT
 
     float maximum0 = neg_inf(), maximum1 = neg_inf();
     float normalizer0 = 0.0f, normalizer1 = 0.0f;
@@ -907,7 +910,8 @@ __global__ void attn_flash_causal_mma(
     // `a1`. Read once per block and never again, so the scatter across eight
     // rows costs nothing measurable against the key stream.
     int steps = head_dim >> 3;
-    unsigned qa0[MMA_QSTEPS], qa1[MMA_QSTEPS];
+    unsigned qa0[(COMP ? 16 : MMA_QSTEPS)], qa1[(COMP ? 16 : MMA_QSTEPS)];
+    unsigned qal0[COMP ? 16 : 1],qal1[COMP ? 16 : 1];
     {
         long long r0 = qi0 + g;
         long long r1 = qi0 + g + 8;
@@ -916,20 +920,21 @@ __global__ void attn_flash_causal_mma(
         const float* qp1 = (r1 < (long long)n_query)
             ? q + (r1 * (long long)q_heads + h) * (long long)head_dim : 0;
         #pragma unroll
-        for (int s = 0; s < MMA_QSTEPS; ++s) {
+        for (int s = 0; s < (COMP ? 16 : MMA_QSTEPS); ++s) {
             qa0[s] = 0u;
             qa1[s] = 0u;
             if (s < steps) {
                 int c = 4 * s + tg;
                 if (qp0) qa0[s] = pack_h2(qp0[2 * c], qp0[2 * c + 1]);
                 if (qp1) qa1[s] = pack_h2(qp1[2 * c], qp1[2 * c + 1]);
+                if(COMP){qal0[s]=qp0 ? pack_h2(qp0[2*c]-h2f((unsigned short)qa0[s]),qp0[2*c+1]-h2f((unsigned short)(qa0[s]>>16))) : 0;qal1[s]=qp1 ? pack_h2(qp1[2*c]-h2f((unsigned short)qa1[s]),qp1[2*c+1]-h2f((unsigned short)(qa1[s]>>16))) : 0;}
             }
         }
     }
 
-    float o[MMA_MAXT][4];
+    float o[MAXT][4];
     #pragma unroll
-    for (int t = 0; t < MMA_MAXT; ++t) {
+    for (int t = 0; t < MAXT; ++t) {
         o[t][0] = 0.0f; o[t][1] = 0.0f; o[t][2] = 0.0f; o[t][3] = 0.0f;
     }
 
@@ -1066,10 +1071,11 @@ __global__ void attn_flash_causal_mma(
         // shared memory and redistributing rows for the softmax.
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         #pragma unroll
-        for (int s = 0; s < MMA_QSTEPS; ++s) {
+        for (int s = 0; s < (COMP ? 16 : MMA_QSTEPS); ++s) {
             if (s < steps) {
                 unsigned b0 = k_sh[g * qstride + 4 * s + tg];
                 mma_m16n8k8(s0, s1, s2, s3, qa0[s], qa1[s], b0);
+                if(COMP)mma_m16n8k8(s0,s1,s2,s3,qal0[s],qal1[s],b0);
             }
         }
         float scale2 = scale * ATTN_LOG2E;
@@ -1089,24 +1095,26 @@ __global__ void attn_flash_causal_mma(
             maximum1, normalizer1);
         unsigned a0 = pack_h2(s0, s1);
         unsigned a1 = pack_h2(s2, s3);
+        unsigned al0=0,al1=0;if(COMP){al0=pack_h2(s0-h2f((unsigned short)a0),s1-h2f((unsigned short)(a0>>16)));al1=pack_h2(s2-h2f((unsigned short)a1),s3-h2f((unsigned short)(a1>>16)));}
 
         // Rescale remains unconditional: the old vote to skip an identity
         // correction cost more than these multiplies (see BENCHMARKS.md).
         #pragma unroll
-        for (int t = 0; t < MMA_MAXT; ++t) {
+        for (int t = 0; t < MAXT; ++t) {
             o[t][0] *= cg; o[t][1] *= cg; o[t][2] *= cg8; o[t][3] *= cg8;
         }
         #pragma unroll
-        for (int t = 0; t < MMA_MAXT; ++t) {
+        for (int t = 0; t < MAXT; ++t) {
             if (t < ntile) {
                 unsigned b0 = v_sh[(dbase + 8 * t + g) * vstride + tg];
                 mma_m16n8k8(o[t][0], o[t][1], o[t][2], o[t][3], a0, a1, b0);
+                if(COMP)mma_m16n8k8(o[t][0],o[t][1],o[t][2],o[t][3],al0,al1,b0);
             }
         }
     }
 
     #pragma unroll
-    for (int t = 0; t < MMA_MAXT; ++t) {
+    for (int t = 0; t < MAXT; ++t) {
         if (t < ntile) {
             int d = dbase + 8 * t + 2 * tg;
             long long r0 = qi0 + g;
@@ -1126,6 +1134,11 @@ __global__ void attn_flash_causal_mma(
         }
     }
 }
+
+
+extern "C" {
+__global__ void attn_flash_causal_mma(const float* q,const unsigned short* k,const unsigned short* v,float* out,int q_heads,int kv_heads,int head_dim,const int* key_offset,float scale,int n_query){attn_flash_causal_mma_body<false,8,32>(q,k,v,out,q_heads,kv_heads,head_dim,key_offset,scale,n_query);}
+__global__ void attn_flash_causal_mma_k2(const float* q,const unsigned short* k,const unsigned short* v,float* out,int q_heads,int kv_heads,int head_dim,const int* key_offset,float scale,int n_query){attn_flash_causal_mma_body<true,4,16>(q,k,v,out,q_heads,kv_heads,head_dim,key_offset,scale,n_query);}
 
 // ---------------------------------------------------------------------------
 // The same attention, with the KV head — not the query head — on the grid.
@@ -1890,7 +1903,7 @@ __global__ void attn_flash_decode_combine(
 // attn_flash_decode_warp at a 131,072-key window, diagnosed as one resident
 // block per SM against Turing's ~64 KiB shared-memory budget with nothing
 // else to hide the K/V staging latency behind.
-#define ATTN_DECODE_MMA(NAME, WPO)                                                \
+#define ATTN_DECODE_MMA(NAME, WPO, COMP_P)                                                \
 __global__ void NAME(                                                            \
     const float* __restrict__ q,                                                \
     const unsigned short* __restrict__ k,                                       \
@@ -2154,6 +2167,7 @@ __global__ void NAME(                                                           
                     s_sh[g * (8 * (WPO)) + 8 * oc + 2 * tg],                   \
                     s_sh[g * (8 * (WPO)) + 8 * oc + 2 * tg + 1]) : 0u;         \
                 unsigned a1 = 0u;                                              \
+                if(COMP_P && g<gqa){float p0=s_sh[g*(8*(WPO))+8*oc+2*tg],p1=s_sh[g*(8*(WPO))+8*oc+2*tg+1];a1=pack_h2(p0-h2f((unsigned short)a0),p1-h2f((unsigned short)(a0>>16)));} \
                 _Pragma("unroll")                                              \
                 for (int t = 0; t < DMMA_MAXT_((WPO)); ++t) {                  \
                     if (t < ntile) {                                           \
@@ -2161,6 +2175,7 @@ __global__ void NAME(                                                           
                             v_sh[(dbase + 8 * t + g) * vstride + 4 * oc + tg]; \
                         float dead0 = 0.0f, dead1 = 0.0f;                       \
                         mma_m16n8k8(o[t][0], o[t][1], dead0, dead1, a0, a1, b0); \
+                        if(COMP_P){o[t][0]+=dead0;o[t][1]+=dead1;}              \
                     }                                                          \
                 }                                                              \
             }                                                                  \
@@ -2197,8 +2212,10 @@ __global__ void NAME(                                                           
 #define DMMA_QSTEPS 32
 #define DMMA_MAXT_(WPO) (256 / (8 * (WPO)))
 
-ATTN_DECODE_MMA(attn_flash_decode_mma_wpo4, 4)
-ATTN_DECODE_MMA(attn_flash_decode_mma_wpo2, 2)
+ATTN_DECODE_MMA(attn_flash_decode_mma_wpo4, 4, false)
+ATTN_DECODE_MMA(attn_flash_decode_mma_wpo2, 2, false)
+ATTN_DECODE_MMA(attn_flash_decode_mma_k2_wpo2, 2, true)
+ATTN_DECODE_MMA(attn_flash_decode_mma_k2_wpo4, 4, true)
 
 __global__ void attn_flash_causal_t1(
     const float* __restrict__ q,
@@ -2472,6 +2489,209 @@ __global__ void attn_decode_rope_append_batch(
     }
 }
 
+// Same split arithmetic, with independent sequence pointer slots.
+__global__ void attn_flash_decode_warp_k2_batch(
+    const float* __restrict__ q,
+    float* __restrict__ part_acc,
+    float* __restrict__ part_m,
+    float* __restrict__ part_l,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    float scale,
+    int n_splits,
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3, unsigned long long p4, unsigned long long p5, unsigned long long p6, unsigned long long p7,
+    unsigned long long k0, unsigned long long k1, unsigned long long k2, unsigned long long k3, unsigned long long k4, unsigned long long k5, unsigned long long k6, unsigned long long k7,
+    unsigned long long v0, unsigned long long v1, unsigned long long v2, unsigned long long v3, unsigned long long v4, unsigned long long v5, unsigned long long v6, unsigned long long v7
+) {
+    int seq=blockIdx.z;
+    q+=(long long)seq*q_heads*head_dim;
+    part_acc+=(long long)seq*n_splits*q_heads*head_dim;
+    part_m+=(long long)seq*n_splits*q_heads;part_l+=(long long)seq*n_splits*q_heads;
+    const int* key_offset=(const int*)attn_slot(seq,p0,p1,p2,p3,p4,p5,p6,p7);
+    const unsigned short* k=(const unsigned short*)attn_slot(seq,k0,k1,k2,k3,k4,k5,k6,k7);
+    const unsigned short* v=(const unsigned short*)attn_slot(seq,v0,v1,v2,v3,v4,v5,v6,v7);
+    int gqa = q_heads / kv_heads;
+    int dpl = head_dim >> 5;          // dimensions this lane owns
+    int wpl = dpl >> 1;               // packed 32-bit words behind them
+    int lane = threadIdx.x;
+    int split = blockIdx.x;
+    int kvh = blockIdx.y;
+
+    long long n_visible = (long long)(*key_offset) + 1;
+    long long per = (n_visible + n_splits - 1) / n_splits;
+    long long begin = (long long)split * per;
+    long long end = begin + per;
+    if (end > n_visible) end = n_visible;
+
+    float qr[DEC_MAXG][ATTN_MAXD];
+    float acc[DEC_MAXG][ATTN_MAXD];
+    float m[DEC_MAXG], l[DEC_MAXG];
+    #pragma unroll
+    for (int hh = 0; hh < DEC_MAXG; ++hh) {
+        m[hh] = neg_inf();
+        l[hh] = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < ATTN_MAXD; ++i) { qr[hh][i] = 0.0f; acc[hh][i] = 0.0f; }
+        if (hh < gqa) {
+            const float* qp =
+                q + (long long)(kvh * gqa + hh) * (long long)head_dim;
+            #pragma unroll
+            for (int i = 0; i < ATTN_MAXD; ++i) {
+                if (i < dpl) qr[hh][i] = qp[dpl * lane + i];
+            }
+        }
+    }
+
+    // Keys are taken `DEC_KB` at a time with every load issued before any of
+    // the arithmetic. The loop bound is a runtime value, so ptxas cannot
+    // unroll it and the next key's loads would otherwise wait on this key's
+    // registers -- one key in flight per warp, which is the same
+    // memory-parallelism bound that held the prefill staging to a third of
+    // peak. A batch of `DEC_KB` puts `8 * DEC_KB` requests in flight instead.
+    for (long long j0 = begin; j0 < end; j0 += DEC_KB) {
+        unsigned kw[DEC_KB][ATTN_MAXD / 2], vw[DEC_KB][ATTN_MAXD / 2];
+        #pragma unroll
+        for (int jj = 0; jj < DEC_KB; ++jj) {
+            long long key = j0 + jj;
+            bool live = key < end;
+            long long at = (key * (long long)kv_heads + kvh) * (long long)head_dim;
+            const unsigned* kp = (const unsigned*)(k + at);
+            const unsigned* vp = (const unsigned*)(v + at);
+            // A lane owns `wpl` consecutive words, so `kp[wpl * lane + p]` is a
+            // stride-`wpl` access across the warp -- not the single `uint4` the
+            // partition above describes. At head_dim 256 that is a 16-byte
+            // stride: each of the four loads touches all sixteen 32-byte
+            // sectors of the 512-byte key and takes four bytes from each, and
+            // the four loads then request the same sixteen sectors again. Four
+            // times the sector traffic for the same bytes, which caps the
+            // kernel near a quarter of peak -- 27.5% was measured.
+            //
+            // ptxas cannot rescue it: `wpl` comes from the runtime `head_dim`
+            // argument, so neither `wpl == 4` nor 16-byte alignment is provable
+            // at compile time, and the per-element `p < wpl` predicate blocks
+            // vectorisation on its own. `cuobjdump -sass` confirmed the kernel
+            // emitted no `LDG.E.128` at all while `attn_flash_causal_mma` in
+            // this same file emits two, so the compiler vectorises here when
+            // the pattern permits and this pattern did not permit it.
+            //
+            // Naming the width restores it. `at` is a multiple of `head_dim`,
+            // so at head_dim 256 the address is 512-byte aligned and a `uint4`
+            // load is legal; lane `l` takes bytes `[16l, 16l+16)`, which is the
+            // same eight binary16 dimensions `[8l, 8l+8)` it read before as
+            // four strided words. Identical data, one instruction, and the warp
+            // now covers 512 contiguous bytes with every sector fully consumed.
+            if (wpl == 4) {
+                const uint4* kp4 = (const uint4*)kp;
+                const uint4* vp4 = (const uint4*)vp;
+                uint4 kq = make_uint4(0u, 0u, 0u, 0u);
+                uint4 vq = make_uint4(0u, 0u, 0u, 0u);
+                if (live) { kq = kp4[lane]; vq = vp4[lane]; }
+                kw[jj][0] = kq.x; kw[jj][1] = kq.y;
+                kw[jj][2] = kq.z; kw[jj][3] = kq.w;
+                vw[jj][0] = vq.x; vw[jj][1] = vq.y;
+                vw[jj][2] = vq.z; vw[jj][3] = vq.w;
+            } else {
+                #pragma unroll
+                for (int p = 0; p < (ATTN_MAXD >> 1); ++p) {
+                    kw[jj][p] = (live && p < wpl) ? kp[wpl * lane + p] : 0u;
+                    vw[jj][p] = (live && p < wpl) ? vp[wpl * lane + p] : 0u;
+                }
+            }
+        }
+        #pragma unroll
+        for (int jj = 0; jj < DEC_KB; ++jj) {
+        if (j0 + jj >= end) break;
+        float kk[ATTN_MAXD], vv[ATTN_MAXD];
+        #pragma unroll
+        for (int p = 0; p < (ATTN_MAXD >> 1); ++p) {
+            if (p < wpl) {
+                h2f2(kw[jj][p], &kk[2 * p], &kk[2 * p + 1]);
+                h2f2(vw[jj][p], &vv[2 * p], &vv[2 * p + 1]);
+            }
+        }
+        #pragma unroll
+        for (int hh = 0; hh < DEC_MAXG; ++hh) {
+            if (hh < gqa) {
+                float part = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < ATTN_MAXD; ++i) {
+                    if (i < dpl) part += qr[hh][i] * kk[i];
+                }
+                for (int off = 16; off > 0; off >>= 1) {
+                    part += __shfl_xor_sync(0xffffffff, part, off);
+                }
+                // Identical in every lane from here, so the branch below is
+                // warp-uniform and the scalars need no broadcast.
+                float s = part * scale;
+                float nm = fmaxf(m[hh], s);
+                if (nm != m[hh]) {
+                    float corr = (m[hh] == neg_inf()) ? 0.0f : expf(m[hh] - nm);
+                    l[hh] *= corr;
+                    #pragma unroll
+                    for (int i = 0; i < ATTN_MAXD; ++i) acc[hh][i] *= corr;
+                    m[hh] = nm;
+                }
+                float e = expf(s - nm);
+                l[hh] += e;
+                #pragma unroll
+                for (int i = 0; i < ATTN_MAXD; ++i) {
+                    if (i < dpl) acc[hh][i] += e * vv[i];
+                }
+            }
+        }
+        }
+    }
+
+    #pragma unroll
+    for (int hh = 0; hh < DEC_MAXG; ++hh) {
+        if (hh < gqa) {
+            int h = kvh * gqa + hh;
+            float* pa =
+                part_acc + ((long long)split * q_heads + h) * (long long)head_dim;
+            #pragma unroll
+            for (int i = 0; i < ATTN_MAXD; ++i) {
+                if (i < dpl) pa[dpl * lane + i] = acc[hh][i];
+            }
+            if (lane == 0) {
+                part_m[split * q_heads + h] = m[hh];
+                part_l[split * q_heads + h] = l[hh];
+            }
+        }
+    }
+}
+__global__ void attn_flash_decode_combine_k2_batch(
+    const float* __restrict__ part_acc,
+    const float* __restrict__ part_m,
+    const float* __restrict__ part_l,
+    float* __restrict__ out,
+    int q_heads,
+    int head_dim,
+    int n_splits
+) {
+    int seq=blockIdx.y;
+    part_acc+=(long long)seq*n_splits*q_heads*head_dim;
+    part_m+=(long long)seq*n_splits*q_heads;part_l+=(long long)seq*n_splits*q_heads;
+    out+=(long long)seq*q_heads*head_dim;
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+
+    // Split 0 always holds at least key 0, so this is never -inf and the
+    // subtraction below never forms inf - inf.
+    float gm = neg_inf();
+    for (int s = 0; s < n_splits; ++s) gm = fmaxf(gm, part_m[s * q_heads + h]);
+
+    float num = 0.0f;
+    float den = 0.0f;
+    for (int s = 0; s < n_splits; ++s) {
+        float ms = part_m[s * q_heads + h];
+        float f = (ms == neg_inf()) ? 0.0f : expf(ms - gm);
+        num += f * part_acc[((long long)s * q_heads + h) * (long long)head_dim + d];
+        den += f * part_l[s * q_heads + h];
+    }
+    out[(long long)h * (long long)head_dim + d] = num / den;
+}
+
 }
 "#;
 
@@ -2598,6 +2818,20 @@ impl AttnDecodeScratch {
         })
     }
 
+    /// Allocate independent partials for a fixed decode batch at startup.
+    pub fn new_batch(
+        stream: &Arc<CudaStream>,
+        q_heads: usize,
+        head_dim: usize,
+        sequences: usize,
+    ) -> Result<Self, AttentionError> {
+        Ok(Self {
+            acc: stream.alloc_zeros::<f32>(sequences * DECODE_SPLITS * q_heads * head_dim)?,
+            m: stream.alloc_zeros::<f32>(sequences * DECODE_SPLITS * q_heads)?,
+            l: stream.alloc_zeros::<f32>(sequences * DECODE_SPLITS * q_heads)?,
+        })
+    }
+
     /// Bytes held, for the VRAM accounting the engine prints.
     pub fn bytes(&self) -> usize {
         (self.acc.len() + self.m.len() + self.l.len()) * size_of::<f32>()
@@ -2614,10 +2848,15 @@ pub struct AttentionKernels {
     /// `attn_row_positions`, for the row-at-a-time decode path.
     row_positions: CudaFunction,
     flash_mma: CudaFunction,
+    flash_mma_k2: CudaFunction,
     decode_split: CudaFunction,
     decode_warp: CudaFunction,
+    decode_warp_k2_batch: CudaFunction,
+    decode_combine_k2_batch: CudaFunction,
     decode_mma_wpo4: CudaFunction,
     decode_mma_wpo2: CudaFunction,
+    decode_mma_k2_wpo2: CudaFunction,
+    decode_mma_k2_wpo4: CudaFunction,
     decode_combine: CudaFunction,
     flash_t1: CudaFunction,
     append: CudaFunction,
@@ -2716,8 +2955,13 @@ impl AttentionKernels {
                 )?;
                 f
             },
+            decode_mma_k2_wpo2: module.load_function("attn_flash_decode_mma_k2_wpo2")?,
+            decode_mma_k2_wpo4: module.load_function("attn_flash_decode_mma_k2_wpo4")?,
+            flash_mma_k2: module.load_function("attn_flash_causal_mma_k2")?,
             decode_split: module.load_function("attn_flash_decode_split")?,
             decode_warp: module.load_function("attn_flash_decode_warp")?,
+            decode_warp_k2_batch: module.load_function("attn_flash_decode_warp_k2_batch")?,
+            decode_combine_k2_batch: module.load_function("attn_flash_decode_combine_k2_batch")?,
             decode_mma_wpo4: {
                 let f = module.load_function("attn_flash_decode_mma_wpo4")?;
                 f.set_attribute(
@@ -3304,6 +3548,47 @@ impl AttentionKernels {
         key_depth: usize,
         positions: &CudaSlice<i32>,
     ) -> Result<(), AttentionError> {
+        self.forward_impl(
+            stream, dec, q, k, v, out, n_query, max_keys, key_depth, positions, false,
+        )
+    }
+
+    /// K2 uses one compensated query tile at every prefill width, including
+    /// single-token shallow chunks. Deep single-token calls use decode splits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_k2(
+        &self,
+        stream: &Arc<CudaStream>,
+        dec: &mut AttnDecodeScratch,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<u16>,
+        v: &CudaSlice<u16>,
+        out: &mut CudaSlice<f32>,
+        n_query: usize,
+        max_keys: usize,
+        key_depth: usize,
+        positions: &CudaSlice<i32>,
+    ) -> Result<(), AttentionError> {
+        self.forward_impl(
+            stream, dec, q, k, v, out, n_query, max_keys, key_depth, positions, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_impl(
+        &self,
+        stream: &Arc<CudaStream>,
+        dec: &mut AttnDecodeScratch,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<u16>,
+        v: &CudaSlice<u16>,
+        out: &mut CudaSlice<f32>,
+        n_query: usize,
+        max_keys: usize,
+        key_depth: usize,
+        positions: &CudaSlice<i32>,
+        canonical_shallow: bool,
+    ) -> Result<(), AttentionError> {
         Self::expect_len("attention position", positions.len(), 1)?;
         let q_elems = n_query * self.q_heads * self.head_dim;
         let kv_elems = max_keys * self.kv_heads * self.head_dim;
@@ -3320,8 +3605,21 @@ impl AttentionKernels {
         // Decode gets its own two-pass shape. See the kernel comment: a single
         // query row cannot be tiled, so `attn_flash_causal_t1` could only ever
         // launch `q_heads` blocks, and this splits the key axis instead.
-        if n_query == 1 && self.decode_split_is_available() {
-            return self.decode(stream, dec, q, k, v, out, key_depth, positions);
+        if n_query == 1
+            && self.decode_split_is_available()
+            && !(canonical_shallow && key_depth <= 32)
+        {
+            return self.decode(
+                stream,
+                dec,
+                q,
+                k,
+                v,
+                out,
+                key_depth,
+                positions,
+                canonical_shallow,
+            );
         }
 
         // Three shapes, narrowest first.
@@ -3334,47 +3632,62 @@ impl AttentionKernels {
         // Above it the GQA-shared kernel is the default, because it reads K and
         // V once per KV head instead of once per query head. It cannot service
         // every geometry; `attn_flash_causal` can, and is the fallback.
-        let (f, grid, block, shared) = if n_query < GQA_QUERY_TILE {
-            (
-                &self.flash_t1,
-                (n_query as u32, self.q_heads as u32, 1),
-                self.head_dim as u32,
-                self.shared_bytes_t1(),
-            )
-        } else if n_query >= MMA_QUERY_TILE && self.mma_is_available() {
-            (
-                &self.flash_mma,
+        let (f, grid, block, shared) =
+            if canonical_shallow && self.gqa_ratio() == 4 && self.head_dim == 128 {
+                // One arithmetic path for every K2 prefill width, including
+                // masked short chunks. Changing its precision at sixteen queries
+                // perturbs the recurrently reused KV inputs and can change routes.
                 (
-                    (n_query as u32).div_ceil(MMA_QUERY_TILE as u32),
-                    (self.q_heads / MMA_HEADS_PER_BLOCK) as u32,
-                    1,
-                ),
-                256,
-                self.shared_bytes_mma(),
-            )
-        } else if self.gqa_shared_is_available() {
-            (
-                &self.flash_gqa,
+                    &self.flash_mma_k2,
+                    (
+                        (n_query as u32).div_ceil(MMA_QUERY_TILE as u32),
+                        (self.q_heads / 4) as u32,
+                        1,
+                    ),
+                    128,
+                    self.shared_bytes_mma(),
+                )
+            } else if n_query < GQA_QUERY_TILE {
                 (
-                    (n_query as u32).div_ceil(GQA_QUERY_TILE as u32),
-                    self.kv_heads as u32,
-                    1,
-                ),
-                (self.gqa_ratio() * 32) as u32,
-                self.shared_bytes_gqa(),
-            )
-        } else {
-            (
-                &self.flash,
+                    &self.flash_t1,
+                    (n_query as u32, self.q_heads as u32, 1),
+                    self.head_dim as u32,
+                    self.shared_bytes_t1(),
+                )
+            } else if n_query >= MMA_QUERY_TILE && self.mma_is_available() {
                 (
-                    (n_query as u32).div_ceil(QUERY_TILE as u32),
-                    self.q_heads as u32,
-                    1,
-                ),
-                self.head_dim as u32,
-                self.shared_bytes(),
-            )
-        };
+                    &self.flash_mma,
+                    (
+                        (n_query as u32).div_ceil(MMA_QUERY_TILE as u32),
+                        (self.q_heads / MMA_HEADS_PER_BLOCK) as u32,
+                        1,
+                    ),
+                    256,
+                    self.shared_bytes_mma(),
+                )
+            } else if self.gqa_shared_is_available() {
+                (
+                    &self.flash_gqa,
+                    (
+                        (n_query as u32).div_ceil(GQA_QUERY_TILE as u32),
+                        self.kv_heads as u32,
+                        1,
+                    ),
+                    (self.gqa_ratio() * 32) as u32,
+                    self.shared_bytes_gqa(),
+                )
+            } else {
+                (
+                    &self.flash,
+                    (
+                        (n_query as u32).div_ceil(QUERY_TILE as u32),
+                        self.q_heads as u32,
+                        1,
+                    ),
+                    self.head_dim as u32,
+                    self.shared_bytes(),
+                )
+            };
         let cfg = LaunchConfig {
             grid_dim: grid,
             block_dim: (block, 1, 1),
@@ -3430,6 +3743,7 @@ impl AttentionKernels {
         out: &mut CudaSlice<f32>,
         key_depth: usize,
         positions: &CudaSlice<i32>,
+        compensated: bool,
     ) -> Result<(), AttentionError> {
         let partials = DECODE_SPLITS * self.q_heads;
         Self::expect_len(
@@ -3456,6 +3770,8 @@ impl AttentionKernels {
         let mma = self.active_decode_mma(key_depth);
         let decode_splits = if mma.is_some() {
             self.mma_decode_splits
+        } else if compensated {
+            K2_WARP_DECODE_SPLITS
         } else {
             WARP_DECODE_SPLITS
         };
@@ -3502,7 +3818,11 @@ impl AttentionKernels {
             },
         };
         let f = if let Some(wpo) = mma {
-            if wpo == 4 {
+            if compensated && wpo == 4 {
+                &self.decode_mma_k2_wpo4
+            } else if compensated {
+                &self.decode_mma_k2_wpo2
+            } else if wpo == 4 {
                 &self.decode_mma_wpo4
             } else {
                 &self.decode_mma_wpo2
@@ -3555,6 +3875,101 @@ impl AttentionKernels {
         // write covers `out` exactly once — `out` is `q_heads * head_dim` at
         // `n_query == 1`, which the caller checked.
         unsafe { builder.launch(combine_cfg) }?;
+        Ok(())
+    }
+
+    /// Whether a K2 call can batch the ordinary warp split path.
+    pub fn k2_batch_uses_warp(&self, depth: usize) -> bool {
+        depth > 32 && self.decode_warp_is_available() && self.active_decode_mma(depth).is_none()
+    }
+
+    /// Decode independent K2 caches in one grid, retaining the scalar split order.
+    ///
+    /// # Safety
+    /// The first `n` pointer slots must reference live positions and distinct
+    /// caches, each containing keys through its position, as checked by the engine.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn decode_batch_k2_raw(
+        &self,
+        stream: &Arc<CudaStream>,
+        dec: &mut AttnDecodeScratch,
+        q: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        positions: &[u64],
+        k_caches: &[u64],
+        v_caches: &[u64],
+    ) -> Result<(), AttentionError> {
+        let n = positions.len();
+        if n == 0 || n > STEP_SLOTS || !self.decode_warp_is_available() {
+            return Err(AttentionError::BufferShape {
+                what: "K2 batch warp geometry",
+                expected: STEP_SLOTS,
+                actual: n,
+            });
+        }
+        Self::expect_len("K2 batch K slots", k_caches.len(), n)?;
+        Self::expect_len("K2 batch V slots", v_caches.len(), n)?;
+        Self::expect_len(
+            "K2 batch queries",
+            q.len(),
+            n * self.q_heads * self.head_dim,
+        )?;
+        Self::expect_len("K2 batch output", out.len(), q.len())?;
+        let partials = n * K2_WARP_DECODE_SPLITS * self.q_heads;
+        Self::expect_at_least("K2 batch partials", dec.acc.len(), partials * self.head_dim)?;
+        Self::expect_at_least("K2 batch maxima", dec.m.len(), partials)?;
+        Self::expect_at_least("K2 batch normalizers", dec.l.len(), partials)?;
+        let fill = |src: &[u64]| {
+            let mut slots = [src[0]; STEP_SLOTS];
+            slots[..n].copy_from_slice(src);
+            slots
+        };
+        let (p, k, v) = (fill(positions), fill(k_caches), fill(v_caches));
+        let (qh, kh, hd, splits) = (
+            self.q_heads as i32,
+            self.kv_heads as i32,
+            self.head_dim as i32,
+            K2_WARP_DECODE_SPLITS as i32,
+        );
+        let scale = self.scale();
+        let mut b = stream.launch_builder(&self.decode_warp_k2_batch);
+        b.arg(q)
+            .arg(&mut dec.acc)
+            .arg(&mut dec.m)
+            .arg(&mut dec.l)
+            .arg(&qh)
+            .arg(&kh)
+            .arg(&hd)
+            .arg(&scale)
+            .arg(&splits);
+        for slot in p.iter().chain(&k).chain(&v) {
+            b.arg(slot);
+        }
+        // SAFETY: fixed grids bound sequence slots and checked partial buffers;
+        // the caller guarantees each cache's valid window and position pointer.
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (K2_WARP_DECODE_SPLITS as u32, self.kv_heads as u32, n as u32),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }?;
+        let mut b = stream.launch_builder(&self.decode_combine_k2_batch);
+        b.arg(&dec.acc)
+            .arg(&dec.m)
+            .arg(&dec.l)
+            .arg(out)
+            .arg(&qh)
+            .arg(&hd)
+            .arg(&splits);
+        // SAFETY: one block per sequence/head, matching the validated output.
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (self.q_heads as u32, n as u32, 1),
+                block_dim: (self.head_dim as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }?;
         Ok(())
     }
 

@@ -272,6 +272,11 @@ pub struct BlockQ4K {
     pub qs: [u8; QK_K / 2],
 }
 
+/// The affine minima for a Q4_K superblock's eight scale groups.
+pub fn q4_k_minima(block: &BlockQ4K) -> [f32; 8] {
+    std::array::from_fn(|g| block.dmin.to_f32() * f32::from(get_scale_min_k4(g, &block.scales).1))
+}
+
 /// Dequantizes one Q4_K superblock.
 ///
 /// Ported from `dequantize_row_q4_K`. The superblock is four 64-element

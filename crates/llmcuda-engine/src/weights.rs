@@ -257,6 +257,39 @@ impl DeviceWeights {
             .sum()
     }
 
+    /// K2 resident weights: global arena alignment, fp32 norm/bias vectors,
+    /// and the integer kernels' packed projection layout. Excludes scratch.
+    pub fn k2_required_bytes(directory: &Directory<'_>) -> u64 {
+        let globals = Self::required_bytes_where(directory, Role::is_global);
+        globals
+            + directory
+                .entries()
+                .iter()
+                .filter(|e| !e.spec.role.is_global())
+                .map(|e| {
+                    let dims = &e.info.dims;
+                    let elements = dims.iter().product::<u64>();
+                    if dims.len() == 1 {
+                        elements * 4
+                    } else if matches!(e.info.ggml_type, GgmlType::Q4K | GgmlType::Q6K) {
+                        let quant = if e.info.ggml_type == GgmlType::Q4K {
+                            llmcuda_cuda::kernels::moe::ExpertQuant::Q4K
+                        } else {
+                            llmcuda_cuda::kernels::moe::ExpertQuant::Q6K
+                        };
+                        llmcuda_cuda::kernels::k2_gemm::K2Gemm::weight_bytes(
+                            quant,
+                            dims[0] as usize,
+                            dims[1] as usize,
+                            dims.get(2).copied().unwrap_or(1) as usize,
+                        ) as u64
+                    } else {
+                        e.info.n_bytes
+                    }
+                })
+                .sum::<u64>()
+    }
+
     /// Copy every tensor in `directory` from `file` onto the device.
     ///
     /// `file` must be the same file `directory` was resolved against.

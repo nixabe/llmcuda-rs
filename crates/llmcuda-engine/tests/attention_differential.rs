@@ -608,7 +608,7 @@ fn device_attention_matches_the_reference_for_a_mid_sequence_query_block() {
 ///
 /// Run three times over the same depths: once at the `Auto` default (which,
 /// below `DECODE_MMA_DEPTH_THRESHOLD`, takes `attn_flash_decode_warp` for all
-/// three -- the reference `causal_attention_streaming` is `O(n_keys^2)`, so
+/// three. The single-query reference visits only the visible keys;
 /// this suite stays at depths cheap enough to run in a test rather than at
 /// the threshold's own 16,384+), then again with the tensor-core kernel
 /// forced on at each occupancy width. Forcing is what keeps
@@ -647,9 +647,9 @@ fn device_decode_matches_the_reference_over_a_deep_window() {
                 let q_h = head_rows(&q_full, n_keys, g.q_heads, g.head_dim, h);
                 let k_h = head_rows(&k, n_keys, g.kv_heads, g.head_dim, kvh);
                 let v_h = head_rows(&v, n_keys, g.kv_heads, g.head_dim, kvh);
-                let full = causal_attention_streaming(&q_h, &k_h, &v_h);
-
-                let reference = &full[key_offset];
+                let decoded =
+                    llmcuda_kernels::attention::attention_decode(&q_h[key_offset], &k_h, &v_h);
+                let reference = &decoded;
                 let base = h * g.head_dim;
                 let candidate = &device[base..base + g.head_dim];
                 let result = compare(candidate, reference);
@@ -1370,5 +1370,180 @@ fn batched_rope_append_agrees_with_the_separate_launches() {
             );
         }
         println!("n {n}: roped q/k and {n} key/value caches bit-identical");
+    }
+}
+
+#[test]
+fn k2_compensated_attention_matches_cpu_at_prefill_and_decode_shapes() {
+    let Some(ctx) = setup() else { return };
+    let stream = ctx.default_stream();
+    let (heads, kv_heads, hd) = (32, 8, 128);
+    let kernels = AttentionKernels::new(&ctx, heads, kv_heads, hd).unwrap();
+    for (queries, offset) in [(16, 0), (19, 33), (65, 47), (1, 60), (1, 128)] {
+        let keys = offset + queries + 7;
+        let mut rng = Xorshift64Star::new(0x4B32_1280 + keys as u64);
+        let q = rng.vec_f32(keys * heads * hd, -1.0, 1.0);
+        let k = as_cached(&rng.vec_f32(keys * kv_heads * hd, -1.0, 1.0));
+        let v = as_cached(&rng.vec_f32(keys * kv_heads * hd, -1.0, 1.0));
+        let dq = stream
+            .clone_htod(&q[offset * heads * hd..(offset + queries) * heads * hd])
+            .unwrap();
+        let dk = stream
+            .clone_htod(&k.iter().copied().map(to_f16_bits).collect::<Vec<_>>())
+            .unwrap();
+        let dv = stream
+            .clone_htod(&v.iter().copied().map(to_f16_bits).collect::<Vec<_>>())
+            .unwrap();
+        let dp = stream.clone_htod(&[offset as i32]).unwrap();
+        let mut out = stream.alloc_zeros::<f32>(queries * heads * hd).unwrap();
+        let mut dec = AttnDecodeScratch::new(&stream, heads, hd).unwrap();
+        for lever in [0, 2, 4] {
+            if queries > 1 && lever != 0 {
+                continue;
+            }
+            if lever == 0 {
+                kernels.disable_decode_mma();
+            } else {
+                kernels.set_decode_mma_wpo(lever);
+            }
+            kernels
+                .forward_k2(
+                    &stream,
+                    &mut dec,
+                    &dq,
+                    &dk,
+                    &dv,
+                    &mut out,
+                    queries,
+                    keys,
+                    offset + queries,
+                    &dp,
+                )
+                .unwrap();
+            let device = stream.clone_dtoh(&out).unwrap();
+            let mut worst = 0.0f32;
+            for h in 0..heads {
+                let kh = h / 4;
+                let reference = causal_attention_streaming(
+                    &head_rows(&q, keys, heads, hd, h),
+                    &head_rows(&k, keys, kv_heads, hd, kh),
+                    &head_rows(&v, keys, kv_heads, hd, kh),
+                );
+                let expected = reference[offset..offset + queries]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>();
+                let actual = (0..queries)
+                    .flat_map(|t| {
+                        device[(t * heads + h) * hd..(t * heads + h + 1) * hd]
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<_>>();
+                assert_matches(&actual, &expected, &GATE);
+                worst = worst.max(compare(&actual, &expected).max_abs_error);
+            }
+            println!(
+                "K2 attention queries={queries} offset={offset} decode lever={lever}: max_abs={worst}"
+            );
+        }
+    }
+}
+
+#[test]
+fn k2_batch_decode_keeps_each_sequences_window_and_split_order() {
+    let Some(ctx) = setup() else { return };
+    let stream = ctx.default_stream();
+    let (heads, kv_heads, hd) = (32, 8, 128);
+    let kernels = AttentionKernels::new(&ctx, heads, kv_heads, hd).unwrap();
+    kernels.disable_decode_mma();
+    let mut rng = Xorshift64Star::new(0x4b32_0396);
+    for positions in [
+        vec![33, 61, 511],
+        vec![2047, 8191, 32767],
+        vec![33, 61, 127, 255, 511, 1023, 1535, 2047],
+    ] {
+        let n = positions.len();
+        let queries = rng.vec_f32(n * heads * hd, -1.0, 1.0);
+        let dq = stream.clone_htod(&queries).unwrap();
+        let mut dk = Vec::new();
+        let mut dv = Vec::new();
+        let mut dp = Vec::new();
+        let mut expected = Vec::new();
+        let mut serial = Vec::new();
+        for (i, &position) in positions.iter().enumerate() {
+            let keys = position + 7;
+            let k = as_cached(&rng.vec_f32(keys * kv_heads * hd, -1.0, 1.0));
+            let v = as_cached(&rng.vec_f32(keys * kv_heads * hd, -1.0, 1.0));
+            dk.push(
+                stream
+                    .clone_htod(&k.iter().copied().map(to_f16_bits).collect::<Vec<_>>())
+                    .unwrap(),
+            );
+            dv.push(
+                stream
+                    .clone_htod(&v.iter().copied().map(to_f16_bits).collect::<Vec<_>>())
+                    .unwrap(),
+            );
+            dp.push(stream.clone_htod(&[position as i32]).unwrap());
+            let q = &queries[i * heads * hd..(i + 1) * heads * hd];
+            let mut reference = vec![0.0; heads * hd];
+            for h in 0..heads {
+                let qh = q[h * hd..(h + 1) * hd].to_vec();
+                let result = llmcuda_kernels::attention::attention_decode(
+                    &qh,
+                    &head_rows(&k, keys, kv_heads, hd, h / 4)[..=position],
+                    &head_rows(&v, keys, kv_heads, hd, h / 4)[..=position],
+                );
+                reference[h * hd..(h + 1) * hd].copy_from_slice(&result);
+            }
+            expected.extend(reference);
+            let single_q = stream.clone_htod(q).unwrap();
+            let mut output = stream.alloc_zeros::<f32>(heads * hd).unwrap();
+            let mut dec = AttnDecodeScratch::new(&stream, heads, hd).unwrap();
+            kernels
+                .forward_k2(
+                    &stream,
+                    &mut dec,
+                    &single_q,
+                    &dk[i],
+                    &dv[i],
+                    &mut output,
+                    1,
+                    keys,
+                    position + 1,
+                    &dp[i],
+                )
+                .unwrap();
+            serial.extend(stream.clone_dtoh(&output).unwrap());
+        }
+        let p = dp
+            .iter()
+            .map(|x| x.device_ptr(&stream).0)
+            .collect::<Vec<_>>();
+        let k = dk
+            .iter()
+            .map(|x| x.device_ptr(&stream).0)
+            .collect::<Vec<_>>();
+        let v = dv
+            .iter()
+            .map(|x| x.device_ptr(&stream).0)
+            .collect::<Vec<_>>();
+        let mut output = stream.alloc_zeros::<f32>(n * heads * hd).unwrap();
+        let mut dec = AttnDecodeScratch::new_batch(&stream, heads, hd, n).unwrap();
+        // SAFETY: distinct caches hold every visible position and seven future
+        // keys; all scalar and cache allocations live through the readback.
+        unsafe { kernels.decode_batch_k2_raw(&stream, &mut dec, &dq, &mut output, &p, &k, &v) }
+            .unwrap();
+        let actual = stream.clone_dtoh(&output).unwrap();
+        assert_matches(&actual, &expected, &GATE);
+        assert!(
+            actual
+                .iter()
+                .zip(&serial)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "batch split arithmetic changed"
+        );
     }
 }

@@ -82,6 +82,11 @@ fn k2_full_model() {
         tokens.len(),
     )
     .unwrap();
+    assert_eq!(
+        DeviceWeights::k2_required_bytes(&directory),
+        pass.report().weight_bytes(),
+        "K2 preflight must match resident weight allocations"
+    );
     let mut state = pass.new_state(&stream, 64).unwrap();
     let mut block_checks = Vec::new();
     pass.run(&stream, &mut state, &tokens, |layer, buf| {
@@ -191,14 +196,16 @@ fn k2_full_model() {
     );
 
     let mut batch = pass
-        .reshape(&ctx, &stream, &file, &directory, &weights, 2 * tokens.len())
+        .reshape(&ctx, &stream, &file, &directory, &weights, 3 * tokens.len())
         .unwrap();
-    batch.enable_batch_prefill(&ctx, &stream, 2).unwrap();
+    batch.enable_batch_prefill(&ctx, &stream, 3).unwrap();
     let mut states = vec![
+        pass.new_state(&stream, 64).unwrap(),
         pass.new_state(&stream, 64).unwrap(),
         pass.new_state(&stream, 64).unwrap(),
     ];
     let mut both = tokens.clone();
+    both.extend(&tokens);
     both.extend(&tokens);
     batch
         .run_batch_prefill(&stream, &mut states, &both)
@@ -208,13 +215,13 @@ fn k2_full_model() {
         agreement(row, &cold, "batch prefill", 0.02, 0.99999);
     }
     let mut bd = pass
-        .reshape(&ctx, &stream, &file, &directory, &weights, 2)
+        .reshape(&ctx, &stream, &file, &directory, &weights, 3)
         .unwrap();
     bd.enable_batch_decode(&ctx, &stream).unwrap();
     bd.run_batch_decode_with_stage_waypoints(
         &stream,
         &mut states,
-        &[next, next],
+        &[next, next, next],
         |layer, stage, buf| {
             let actual = stream.clone_dtoh(buf).unwrap();
             let reference = &decode_stages
@@ -233,6 +240,50 @@ fn k2_full_model() {
     let logits = stream.clone_dtoh(bd.batch_logits().unwrap()).unwrap();
     for row in logits.chunks(decoded.len()) {
         agreement(row, &decoded, "batch decode", 0.02, 0.99999);
+    }
+    // Exercise the batched split attention path beyond the shallow oracle
+    // prompt. Both physical widths start from the same chunked prefixes.
+    let repeats = 40 / tokens.len() + 1;
+    if repeats * tokens.len() < 64 {
+        let mut deep = pass.new_state(&stream, 64).unwrap();
+        for state in &mut states {
+            state.reset(&stream).unwrap();
+        }
+        for _ in 0..repeats {
+            pass.run(&stream, &mut deep, &tokens, |_, _| {}).unwrap();
+            batch
+                .run_batch_prefill(&stream, &mut states, &both)
+                .unwrap();
+        }
+        // This width exercises compensated tensor-core attention in the
+        // real model, while the six-token oracle covers masked short tiles.
+        let chunked_logits = stream.clone_dtoh(pass.logits()).unwrap();
+        let prefix = tokens.repeat(repeats);
+        let mut wide = pass
+            .reshape(&ctx, &stream, &file, &directory, &weights, prefix.len())
+            .unwrap();
+        let mut wide_state = wide.new_state(&stream, 64).unwrap();
+        wide.run(&stream, &mut wide_state, &prefix, |_, _| {})
+            .unwrap();
+        agreement(
+            &stream.clone_dtoh(wide.logits()).unwrap(),
+            &chunked_logits,
+            "wide prefill versus chunks",
+            0.02,
+            0.99999,
+        );
+        single.run(&stream, &mut deep, &[next], |_, _| {}).unwrap();
+        let reference = stream.clone_dtoh(single.logits()).unwrap();
+        let graph = bd.capture_batch_step(&stream, &mut states).unwrap();
+        bd.replay_batch_step(&stream, &mut states, &graph, &[next, next, next])
+            .unwrap();
+        for row in stream
+            .clone_dtoh(bd.batch_logits().unwrap())
+            .unwrap()
+            .chunks(reference.len())
+        {
+            agreement(row, &reference, "deep batch decode graph", 0.02, 0.99999);
+        }
     }
     // Defer gates until the whole curve is printed, making a failed audit
     // useful without dropping any layer's numerical checks.

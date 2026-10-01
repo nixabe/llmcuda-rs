@@ -16,6 +16,8 @@ pub mod attention;
 pub mod dequant;
 pub mod gdn;
 pub mod gdn_chunked;
+pub mod k2_gemm;
+pub mod k2_rope;
 pub mod layer_ops;
 pub mod lm_head;
 pub mod mma;

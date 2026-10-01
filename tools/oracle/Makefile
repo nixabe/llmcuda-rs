@@ -10,15 +10,23 @@
 # fidelity controls.
 
 LLAMA ?= /home/nixabe/llama.cpp
+LLAMA_BUILD ?= $(LLAMA)/build
 OUT   ?= capture
+BENCH_OUT ?= bench_decode
 
 $(OUT): capture.cpp
 	g++ -O2 -std=c++17 capture.cpp -o $(OUT) \
 	    -I$(LLAMA)/include -I$(LLAMA)/ggml/include \
-	    -L$(LLAMA)/build/bin -lllama -lggml-base -lggml \
-	    -Wl,-rpath,$(LLAMA)/build/bin
+	    -L$(LLAMA_BUILD)/bin -lllama -lggml-base -lggml \
+	    -Wl,-rpath,$(LLAMA_BUILD)/bin
+
+$(BENCH_OUT): bench_decode.cpp
+	g++ -O2 -std=c++17 bench_decode.cpp -o $(BENCH_OUT) \
+	    -I$(LLAMA)/include -I$(LLAMA)/ggml/include \
+	    -L$(LLAMA_BUILD)/bin -lllama -lggml-base -lggml \
+	    -Wl,-rpath,$(LLAMA_BUILD)/bin
 
 clean:
-	rm -f $(OUT)
+	rm -f $(OUT) $(BENCH_OUT)
 
 .PHONY: clean

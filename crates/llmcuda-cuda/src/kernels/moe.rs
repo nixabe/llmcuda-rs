@@ -4297,6 +4297,9 @@ __global__ void moe_expert_ffn_community(
             }
             rows[m] = src;
         }
+        // Dispatch pads only the tail of each run. Empty token tiles need
+        // no weight reads, particularly for one- and three-token decode.
+        if (rows[0] < 0) break;
 
         float ag[MOE_TM];
         float au[MOE_TM];
@@ -4372,6 +4375,7 @@ __global__ void moe_expert_down_community(
                 ? sorted_token_ids[(long long)blk * block_size + slot]
                 : numel;
         }
+        if (flats[0] >= numel) break;
 
         float ad[MOE_TM];
         #pragma unroll

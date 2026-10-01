@@ -501,3 +501,30 @@ cargo test --workspace --release --lib --bins
 
 Read an OOM in a whole-workspace run as "run them one at a time", and check
 before concluding a device kernel broke.
+
+## K2 projection and routing gates
+
+`k2_differential` checks grouped norms, sigmoid routing, selected values and
+softplus gates against `llmcuda-kernels::k2`. Q8_0 controls accompany Q4_K
+and Q6_K projection cases. Dense four- and eight-token tiles and expert-grouped
+value projections must also match the scalar GPU contraction **bit for bit**,
+including ragged token tiles, inactive experts and padded runs. Router cases
+include ties, 512 experts, saturated sigmoid scores and the normalization floor.
+
+The mixed Q4_K/Q6_K FFN cases in `moe_quant_formats_differential` check both
+format orders against the scalar reference. Dispatch pads the end of each run;
+the community kernels may skip an empty tail tile, but must retain every live
+row and its original contribution order.
+
+For both real K2 quants, `k2_model` with `LLMCUDA_K2_MODEL` and
+`LLMCUDA_K2_GOLDEN` checks all 48 block boundaries, final grouped normalization,
+logits and argmax against the publisher's capture. It also checks chunking,
+batched prefill and decode, and graph replay. See [MODEL.md](MODEL.md#k2-horizon)
+for capture and invocation instructions. The six-token oracle's N=2 prefill
+exercises the tiled and grouped kernels at twelve physical rows.
+
+`bench_k2` measures actual GGUF query and value-expert tensors using CUDA events,
+including device dispatch in the grouped timing. Run it with `LLMCUDA_MODEL`
+and optional `LLMCUDA_K2_N=1,3,128,512`. Its repeated reads have a different
+cache state from a full pass; accept changes only after alternating
+`bench_forward` and `bench_decode_batch` runs confirm them in the model.

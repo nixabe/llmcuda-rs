@@ -149,6 +149,77 @@ measurement; the serving target here remains N=3 on one instance.
 | Parallel sequences | batched decode and flattened batch prefill at N=1–8 |
 | Speculative decode | seven drafters (`ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, `spec-dflash`), each bit-exact against plain decode; off by default. On `qwen35` `draft-mtp` is now a win at N=1 **and** N=3; it stays opt-in because on the shipped `UD-Q8_K_XL` file its extra layer and per-sequence draft cache do not fit beside three 128K-capable caches. See WHY. |
 
+### K2-Horizon on one card
+
+Measured on GPU 0, Quadro RTX 8000 (sm_75), using IFM's Q4_K_M and Q6_K
+files. Three serial alternating process pairs per cell; no concurrent builds,
+tests or work on another card. The publisher reference is
+[MBZUAI-IFM/llama.cpp `42adf019`](https://github.com/MBZUAI-IFM/llama.cpp/tree/42adf019f76013dac873b5b43950d54d5ab27216),
+branch `model/K2Horizon`, built for CUDA sm_75. The reference column takes the
+faster mean of `-ub 2048` and `-ub 4096` per cell, with full GPU offload,
+`-sm none -fa on -b 4096` and f16 KV. Differences between these two settings at
+512 tokens are small; a Q4 calibration also checked `-ub 512`.
+
+Prefill is N=1, cold cache, three timed repetitions per process. The engine
+uses a full 512-token pass at 512 and four 512-token chunks at 2K;
+`llama-bench` uses its own physical microbatch. Reported ± values are sample
+SDs of the three process means. Synthetic token streams exercise routing;
+these are inference timings, not quality scores.
+
+| quant | prompt tokens | engine tok/s | publisher tok/s | publisher ubatch |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K_M | 512 | 241.14 ± 0.21 | 1768.76 ± 5.62 | 2048 |
+| Q4_K_M | 2,048 | 219.10 ± 3.56 | 2540.30 ± 9.74 | 2048 |
+| Q6_K | 512 | 259.86 ± 0.29 | 1616.45 ± 2.82 | 2048 |
+| Q6_K | 2,048 | 232.08 ± 0.31 | 2388.60 ± 4.19 | 2048 |
+
+Decode uses greedy sampling with token readback, four warmup steps and 64 timed
+steps per process. The engine replays its CUDA graph. The reference harness
+[`tools/oracle/bench_decode.cpp`](../tools/oracle/bench_decode.cpp) attaches
+backend greedy sampler chains and uses the same deterministic prompt ids as
+`bench_decode_batch`. Each engine follows its own greedy continuation.
+Throughput is aggregate across N sequences; a step produces one token per
+sequence. Mean latency ranges cover the three process means, and p95 ranges
+cover each process's 64 steps.
+
+| quant | starting context | N | engine tok/s | publisher tok/s | publisher ubatch |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4_K_M | 512 | 1 | 32.3 | 76.9 | 4096 |
+| Q4_K_M | 512 | 3 | 54.3 | 144.0 | 2048 |
+| Q4_K_M | 2,048 | 1 | 29.8 | 73.3 | 4096 |
+| Q4_K_M | 2,048 | 3 | 42.6 | 133.3 | 2048 |
+| Q6_K | 512 | 1 | 50.1 | 65.0 | 2048 |
+| Q6_K | 512 | 3 | 81.4 | 124.8 | 2048 |
+| Q6_K | 2,048 | 1 | 44.8 | 62.4 | 4096 |
+| Q6_K | 2,048 | 3 | 67.8 | 114.3 | 4096 |
+
+Latency in milliseconds:
+
+| quant | starting context | N | engine mean (range) | engine p95 range | publisher mean (range) | publisher p95 range |
+| --- | ---: | ---: | --- | --- | --- | --- |
+| Q4_K_M | 512 | 1 | 30.97 (30.95–30.99) | 31.19–31.26 | 13.01 (12.99–13.02) | 13.02–13.05 |
+| Q4_K_M | 512 | 3 | 55.28 (55.25–55.34) | 57.66–58.12 | 20.83 (20.81–20.86) | 21.08–21.16 |
+| Q4_K_M | 2,048 | 1 | 33.57 (33.50–33.60) | 33.70–33.73 | 13.65 (13.64–13.65) | 13.67–13.70 |
+| Q4_K_M | 2,048 | 3 | 70.40 (70.34–70.45) | 73.59–73.95 | 22.50 (22.45–22.53) | 22.73–22.78 |
+| Q6_K | 512 | 1 | 19.96 (19.95–19.96) | 20.06–20.19 | 15.38 (15.37–15.39) | 15.49–15.59 |
+| Q6_K | 512 | 3 | 36.85 (36.84–36.87) | 37.16–37.24 | 24.03 (24.02–24.05) | 24.41–24.50 |
+| Q6_K | 2,048 | 1 | 22.34 (22.31–22.38) | 22.50–22.59 | 16.02 (16.01–16.03) | 16.04–16.19 |
+| Q6_K | 2,048 | 3 | 44.27 (44.21–44.32) | 44.88–45.63 | 26.25 (26.25–26.25) | 26.46–26.53 |
+
+The publisher is faster in every measured K2 cell. K2 contractions here use
+fp32 accumulation; these measurements do not establish parity with its native
+CUDA implementation. Engine N=3 decode peaks at **22.49 GiB for Q4_K_M** and
+**31.96 GiB for Q6_K** at 2K, including resident prefill and decode workspaces.
+Q6_K decodes faster here despite its larger weight footprint; bit width alone
+does not predict the cost of the two FFN kernel paths.
+
+The measurements cover N=1 prefill and N=1/3 decode on one card at 512 and
+2,048-token contexts. HTTP time to first token, mixed prefill/decode contention,
+three-card serving and deeper K2 contexts were not measured. All 48 block
+boundaries and final logits for both quants pass the publisher golden gates;
+tiled and grouped projection contractions match the scalar GPU path bit for
+bit. See [TESTING.md](TESTING.md#k2-projection-and-routing-gates).
+
 ## A second `qwen35moe` checkpoint
 
 `ornith-ai/Ornith-1.5-35B-A3B` is a different finetune of the same
@@ -720,6 +791,34 @@ enough to flip expert selection and spike a layer's divergence 26×.
 
 The reasons the engine is shaped the way it is. Each is a mechanism that paid,
 stated so it transfers to the next kernel rather than as a changelog entry.
+
+## K2 projections reuse unpacked weights without changing each dot product
+
+A warp's dequantized row serves four tokens at narrow shapes and eight at
+prefill shapes. Each token retains the original sequence of four fp32 FMAs per
+lane and the same shuffle reduction; the differential gate requires identical
+bits. Reusing weights changes the traffic and integer unpack work per token
+without changing activation precision. Qwen projection dispatch is separate.
+
+MoVA values add a second reuse opportunity: tokens selecting the same value
+expert share its row. Device-side counting gathers flat `(token, slot)` ids in
+order, packs runs padded to eight, and labels unused runs with expert `-1`.
+Both workspace and launch grids are fixed at construction. Results scatter
+back to the original slots, so per-expert SiLU and the weighted sum keep their
+original order. This path starts at eight physical tokens; decode retains the
+scalar selected projections because dispatch and padding cost more there.
+
+The router evaluates sigmoid scores in parallel and reduces stable argmaxes,
+resolving ties to the lowest expert id. Lane zero adds selected probabilities
+in top-k order and applies the original normalization floor. Routing bias
+still affects selection only. The community FFN kernels skip fully padded tail
+tiles before unpacking weights; padding is contiguous at the end of each run,
+so no live row is removed. Their Q6_K/Q8_0 tuned counterparts stay separate.
+
+`bench_k2` measures real query and value-expert tensors with CUDA events,
+including grouped dispatch. Full-model results and limits are in
+[Current standing](#current-standing); kernel timing alone does not establish
+serving throughput.
 
 ## Rust kernel authoring can keep the existing launcher
 
@@ -1757,6 +1856,8 @@ proposed twice.
 
 | Attempt | Result |
 | --- | --- |
+| Eight-token dense projection tiles at K2 decode width | At three tokens on GPU 0, real layer-3 query weights, three interleaved CUDA-event rounds: Q4_K four-token tiles take **50.2 / 50.1 / 50.1 us**, eight-token tiles **58.8 / 58.9 / 58.7 us**; Q6_K **36.5 / 36.4 / 36.4** versus **40.8 / 40.8 / 40.8 us**. The wider tile cannot amortize its work over three live tokens. Keep four below eight physical tokens. These are resident-tensor measurements; rejected before changing model dispatch to eight at decode width. |
+| Grouping K2 value experts at decode width | Real layer-3 value stacks, uniform deterministic top-4 routes and dispatch included, GPU 0 CUDA events. Three-token Q4_K scalar/grouped pairs: **115.7/126.1, 114.6/123.2, 112.0/122.9 us**; Q6_K **98.1/120.2, 98.0/120.3, 98.3/120.5 us**. One-token cases also lose in all three rounds. With few selected slots, fixed padded dispatch and a second launch cost more than row reuse saves. Use grouping at eight physical tokens and above; the scalar decode path stays. Rejected at the kernel gate, without a full-model grouped-decode claim. |
 | Cooperative loading before an exact-order GDN gate contraction | One 256-thread block per (head, token) stages the two weight rows and input in 24 KiB shared memory; one warp retains the original FMA and XOR reduction order. All five outputs match bit for bit at N=1/3/7 (1,760 values). Registers fall 64 → 45 without spills, but N=3 resident-weight latency rises **3.857/3.869/3.868 → 4.237/4.245/4.245 us**. Rotating 30 weight pairs improves **5.241/5.273/5.272 → 5.008/5.033/5.041 us**, still slower than simply giving the original kernel one head per block. Loading cooperation does not establish a cache-independent win; rejected before model integration. The current target's gates total only 0.181 ms/step, not the older 1 ms estimate. [All pairs and resources](OPTIMIZATION_CAMPAIGN.md#exact-order-gdn-gate-experiments). |
 | One persistent block per GDN value head for normalization and recurrent update | Exact state, Q/K and output bits over three updates at N=1/N=3; **62 registers, 1,056 shared bytes, no spills**. The N=3 state grid collapses from 3,072 blocks to 96; at N=1 only 32 blocks remain on 72 SMs. Three interleaved CUDA-event pairs lose **30.6–35.2%** throughput at N=1 with one state bank and **21.6–21.7%** with 30. N=3 loses **1.20–1.66%** with one bank, but gains **2.01–2.35%** rotating 30 banks (only **0.55–0.65 us** saved per fragment). Lower registers and one fewer launch do not provide a robust isolated win. Rejected without model integration; a cache-dependent narrow gain is not an inference result. [All pairs and geometry](OPTIMIZATION_CAMPAIGN.md#block-persistent-gdn-fragment). |
 | Query/key head RMSNorm in one disjoint grid | Same 22 registers, 32 shared bytes and exact arithmetic; isolated N=3 fragment throughput improves **72.9–73.8%**. Three interleaved GPU 1 model pairs at 2K favor it by **0.09/0.28/0.14%**, but 32K changes sign: **166.7/166.2/166.6 → 166.5/166.6/166.2 tok/s** (−0.12/+0.24/−0.24%). Batch-1 ties at 32K; single-stream signs also change. The tiny effect is unresolved against the 0.30% baseline spread at depth and does not justify a context cutoff. Forward golden, batch decode/prefill and CPU/GPU norm differentials pass. Reverted; no prefill claim. [All pairs](OPTIMIZATION_CAMPAIGN.md#head-normalization-full-model-pairs). |

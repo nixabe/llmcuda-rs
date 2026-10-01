@@ -22,3 +22,7 @@
 /goldens/
 /.golden/
 /bench-results/
+
+# Optional native reference tools built beside their sources.
+/tools/oracle/capture
+/tools/oracle/bench_decode

@@ -28,25 +28,53 @@ __global__ void k2_norm(const float* x, const float* w, float* y, int width, int
     __syncthreads();
     for (int j = threadIdx.x; j < part; j += blockDim.x) y[base+j] = (x[base+j] * sums[0]) * w[g*part+j];
 }
-// One thread selects the small fixed expert population; no atomics or host reads.
+// Parallel score evaluation and stable argmax. Equal scores select the lowest
+// expert index, as in the scalar scan. Lane zero retains the scalar top-k sum
+// order, so changing the reduction does not change the combine weights.
 __global__ void k2_route(const float* logits, const float* bias, int* ids, float* weights,
                          int experts, int topk, float scale) {
     int token = blockIdx.x;
-    if (threadIdx.x != 0) return;
-    float p[512], selection[512];
-    for (int e = 0; e < experts; ++e) {
+    __shared__ float p[512], selection[512], best_scores[4], sum;
+    __shared__ int best_ids[4], chosen;
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
         p[e] = 1.0f / (1.0f + expf(-logits[(long long)token*experts+e]));
         selection[e] = p[e] + bias[e];
     }
-    float sum = 0.0f;
+    if (threadIdx.x == 0) sum = 0.0f;
+    __syncthreads();
     for (int k = 0; k < topk; ++k) {
-        int best = 0;
-        for (int e = 1; e < experts; ++e) if (selection[e] > selection[best]) best = e;
-        ids[token*topk+k] = best; weights[token*topk+k] = p[best]; sum += p[best];
-        selection[best] = -__int_as_float(0x7f800000);
+        int best = 512;
+        float score = -__int_as_float(0x7f800000);
+        for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+            float s = selection[e];
+            if (s > score || (s == score && e < best)) { score = s; best = e; }
+        }
+        for (int d = 16; d > 0; d >>= 1) {
+            float s = __shfl_down_sync(0xffffffff, score, d);
+            int e = __shfl_down_sync(0xffffffff, best, d);
+            if (s > score || (s == score && e < best)) { score = s; best = e; }
+        }
+        if ((threadIdx.x & 31) == 0) {
+            best_scores[threadIdx.x >> 5] = score;
+            best_ids[threadIdx.x >> 5] = best;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            chosen = best_ids[0]; score = best_scores[0];
+            for (int w = 1; w < 4; ++w) {
+                float s = best_scores[w]; int e = best_ids[w];
+                if (s > score || (s == score && e < chosen)) { score = s; chosen = e; }
+            }
+            ids[token*topk+k] = chosen;
+            weights[token*topk+k] = p[chosen]; sum += p[chosen];
+            selection[chosen] = -__int_as_float(0x7f800000);
+        }
+        __syncthreads();
     }
-    sum = fmaxf(sum, 6.103515625e-5f);
-    for (int k = 0; k < topk; ++k) weights[token*topk+k] = (weights[token*topk+k] / sum) * scale;
+    if (threadIdx.x == 0) {
+        sum = fmaxf(sum, 6.103515625e-5f);
+        for (int k = 0; k < topk; ++k) weights[token*topk+k] = (weights[token*topk+k] / sum) * scale;
+    }
 }
 // One warp per output row, four consecutive contraction elements per lane.
 // `quant=5` is a dense fp32 matrix, used by the FFN router.
@@ -66,6 +94,94 @@ __global__ void k2_project(const unsigned char* w, int quant, const float* x, co
     }
     for (int d=16; d>0; d>>=1) acc += __shfl_down_sync(0xffffffff, acc, d);
     if (threadIdx.x == 0) out[((long long)token*topk+slot)*rows+row] = acc;
+}
+// Batched dense projections reuse the unpacked row across BT tokens. The
+// contraction and shuffle order of each row matches k2_project exactly.
+}
+template<int BT>
+__device__ void project_dense_tile(const unsigned char* w, int quant, const float* x,
+                                  float* out, int inner, int rows, int tokens) {
+    int row = blockIdx.x*4 + threadIdx.y, t0 = blockIdx.y*BT;
+    if (row >= rows) return;
+    long long start = (long long)row*inner;
+    float acc[BT];
+    #pragma unroll
+    for (int b=0; b<BT; ++b) acc[b]=0.0f;
+    for (int j=0; j<inner; j+=128) {
+        float v[4];
+        if (quant == 5) { for (int z=0; z<4; ++z) v[z]=((const float*)w)[start+j+threadIdx.x*4+z]; }
+        else dequant_tile_community(w, quant, start+j, threadIdx.x, v);
+        #pragma unroll
+        for (int b=0; b<BT; ++b) {
+            if (t0+b >= tokens) continue;
+            float4 xv=*(const float4*)(x+(long long)(t0+b)*inner+j+threadIdx.x*4);
+            acc[b]=fmaf(v[0],xv.x,acc[b]); acc[b]=fmaf(v[1],xv.y,acc[b]);
+            acc[b]=fmaf(v[2],xv.z,acc[b]); acc[b]=fmaf(v[3],xv.w,acc[b]);
+        }
+    }
+    #pragma unroll
+    for (int b=0; b<BT; ++b) {
+        for (int d=16; d>0; d>>=1) acc[b]+=__shfl_down_sync(0xffffffff,acc[b],d);
+        if (threadIdx.x==0 && t0+b<tokens) out[(long long)(t0+b)*rows+row]=acc[b];
+    }
+}
+extern "C" {
+__global__ void k2_project_b4(const unsigned char* w, int quant, const float* x,
+                             float* out, int inner, int rows, int tokens) {
+    project_dense_tile<4>(w,quant,x,out,inner,rows,tokens);
+}
+__global__ void k2_project_b8(const unsigned char* w, int quant, const float* x,
+                             float* out, int inner, int rows, int tokens) {
+    project_dense_tile<8>(w,quant,x,out,inner,rows,tokens);
+}
+// One thread per expert gathers flat (token, slot) ids in their original
+// order. Prefix offsets pack padded runs; unused runs carry expert=-1.
+// This follows moe_align_block_size's device-side counting and padding.
+__global__ void k2_dispatch(const int* ids, int* sorted, int* owners,
+                            int tokens, int topk, int experts, int capacity) {
+    __shared__ int counts[128], starts[128];
+    int e=threadIdx.x, pairs=tokens*topk;
+    for(int b=threadIdx.x;b<capacity;b+=blockDim.x) owners[b]=-1;
+    int count=0;
+    if(e<experts) for(int f=0;f<pairs;++f) count += ids[f]==e;
+    counts[e]=count;
+    __syncthreads();
+    if(e==0) {
+        int cursor=0;
+        for(int j=0;j<experts;++j) { starts[j]=cursor; cursor+=(counts[j]+7)/8*8; }
+    }
+    __syncthreads();
+    if(e>=experts) return;
+    int cursor=starts[e];
+    for(int f=0;f<pairs;++f) if(ids[f]==e) sorted[cursor++]=f;
+    int end=starts[e]+(counts[e]+7)/8*8;
+    for(int f=cursor;f<end;++f) sorted[f]=pairs;
+    for(int f=starts[e];f<end;f+=8) owners[f/8]=e;
+}
+__global__ void k2_project_grouped(const unsigned char* w, int quant, const float* x,
+                                  const int* sorted, const int* owners, float* out,
+                                  int inner, int rows, int tokens, int topk) {
+    int e=owners[blockIdx.y], row=blockIdx.x*4+threadIdx.y;
+    if(e<0 || row>=rows) return;
+    int flats[8]; float acc[8];
+    #pragma unroll
+    for(int b=0;b<8;++b) { flats[b]=sorted[blockIdx.y*8+b]; acc[b]=0.0f; }
+    long long start=((long long)e*rows+row)*inner;
+    for(int j=0;j<inner;j+=128) {
+        float v[4]; dequant_tile_community(w,quant,start+j,threadIdx.x,v);
+        #pragma unroll
+        for(int b=0;b<8;++b) {
+            if(flats[b]>=tokens*topk) continue;
+            float4 xv=*(const float4*)(x+(long long)(flats[b]/topk)*inner+j+threadIdx.x*4);
+            acc[b]=fmaf(v[0],xv.x,acc[b]); acc[b]=fmaf(v[1],xv.y,acc[b]);
+            acc[b]=fmaf(v[2],xv.z,acc[b]); acc[b]=fmaf(v[3],xv.w,acc[b]);
+        }
+    }
+    #pragma unroll
+    for(int b=0;b<8;++b) {
+        for(int d=16;d>0;d>>=1) acc[b]+=__shfl_down_sync(0xffffffff,acc[b],d);
+        if(threadIdx.x==0 && flats[b]<tokens*topk) out[(long long)flats[b]*rows+row]=acc[b];
+    }
 }
 __global__ void k2_values(const float* projections, const float* weights, float* out, int rows, int topk) {
     int j=blockIdx.x*blockDim.x+threadIdx.x, token=blockIdx.y;
@@ -98,11 +214,49 @@ pub fn quant_code(q: ExpertQuant) -> i32 {
     }
 }
 
+/// Fixed device dispatch workspace for selected projections. Natural token
+/// capacity plus at most one padded run per expert bounds every write.
+pub struct K2Dispatch {
+    sorted: CudaSlice<i32>,
+    owners: CudaSlice<i32>,
+    tokens: usize,
+    topk: usize,
+    experts: usize,
+}
+impl K2Dispatch {
+    /// Allocate once for a fixed projection shape, never during inference.
+    pub fn new(
+        stream: &Arc<CudaStream>,
+        tokens: usize,
+        topk: usize,
+        experts: usize,
+    ) -> Result<Self, MoeError> {
+        if tokens == 0 || experts == 0 || experts > 128 || topk == 0 || topk > experts {
+            return Err(MoeError::WrongElementCount {
+                which: "K2 dispatch geometry",
+                expected: 128,
+                found: experts,
+            });
+        }
+        let capacity = (tokens * topk).div_ceil(8) + experts;
+        Ok(Self {
+            sorted: stream.alloc_zeros::<i32>(capacity * 8)?,
+            owners: stream.alloc_zeros::<i32>(capacity)?,
+            tokens,
+            topk,
+            experts,
+        })
+    }
+}
+
 /// Compiled operations, shared across layers and shapes.
 pub struct K2Kernels {
     norm: CudaFunction,
     route: CudaFunction,
     project: CudaFunction,
+    project_tiles: [CudaFunction; 2],
+    dispatch: CudaFunction,
+    project_grouped: CudaFunction,
     values: CudaFunction,
     gate: CudaFunction,
 }
@@ -119,6 +273,12 @@ impl K2Kernels {
             norm: module.load_function("k2_norm")?,
             route: module.load_function("k2_route")?,
             project: module.load_function("k2_project")?,
+            project_tiles: [
+                module.load_function("k2_project_b4")?,
+                module.load_function("k2_project_b8")?,
+            ],
+            dispatch: module.load_function("k2_dispatch")?,
+            project_grouped: module.load_function("k2_project_grouped")?,
             values: module.load_function("k2_values")?,
             gate: module.load_function("k2_gate")?,
         })
@@ -197,7 +357,7 @@ impl K2Kernels {
         check("K2 route weights", tokens * topk, weights.len())?;
         let cfg = LaunchConfig {
             grid_dim: (tokens as u32, 1, 1),
-            block_dim: (32, 1, 1),
+            block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
         let (experts, topk) = (experts as i32, topk as i32);
@@ -231,6 +391,52 @@ impl K2Kernels {
         topk: usize,
         routed: bool,
     ) -> Result<(), MoeError> {
+        self.project_with_tile(
+            stream,
+            w,
+            quant,
+            x,
+            ids,
+            out,
+            inner,
+            rows,
+            experts,
+            topk,
+            routed,
+            if routed || topk != 1 {
+                1
+            } else if x.len() / inner.max(1) >= 8 {
+                8
+            } else {
+                4
+            },
+        )
+    }
+    /// Projection tile control for differential tests and kernel benchmarks.
+    /// Routed projections currently use the one-token kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_with_tile(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: &CudaSlice<u8>,
+        quant: Option<ExpertQuant>,
+        x: &CudaSlice<f32>,
+        ids: &CudaSlice<i32>,
+        out: &mut CudaSlice<f32>,
+        inner: usize,
+        rows: usize,
+        experts: usize,
+        topk: usize,
+        routed: bool,
+        tile: usize,
+    ) -> Result<(), MoeError> {
+        if ![1, 4, 8].contains(&tile) || (tile != 1 && (routed || topk != 1)) {
+            return Err(MoeError::WrongElementCount {
+                which: "K2 projection tile",
+                expected: 8,
+                found: tile,
+            });
+        }
         if inner == 0
             || !inner.is_multiple_of(128)
             || topk == 0
@@ -258,6 +464,28 @@ impl K2Kernels {
         };
         check("K2 projection weights", bytes, w.len())?;
         let code = quant.map(quant_code).unwrap_or(5);
+        if tile != 1 {
+            let cfg = LaunchConfig {
+                grid_dim: ((rows as u32).div_ceil(4), tokens.div_ceil(tile) as u32, 1),
+                block_dim: (32, 4, 1),
+                shared_mem_bytes: 0,
+            };
+            let (inner, rows, tokens) = (inner as i32, rows as i32, tokens as i32);
+            let f = &self.project_tiles[usize::from(tile == 8)];
+            unsafe {
+                stream
+                    .launch_builder(f)
+                    .arg(w)
+                    .arg(&code)
+                    .arg(x)
+                    .arg(out)
+                    .arg(&inner)
+                    .arg(&rows)
+                    .arg(&tokens)
+                    .launch(cfg)
+            }?;
+            return Ok(());
+        }
         let (inner, rows, topk, routed) =
             (inner as i32, rows as i32, topk as i32, i32::from(routed));
         let cfg = LaunchConfig {
@@ -279,6 +507,85 @@ impl K2Kernels {
                 .arg(&routed)
                 .launch(cfg)
         }?;
+        Ok(())
+    }
+    /// Group selected value projections by expert, preserving each dot's
+    /// fp32 contraction order. Dispatch and launch sizes stay device-resident.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_grouped(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: &CudaSlice<u8>,
+        quant: ExpertQuant,
+        x: &CudaSlice<f32>,
+        ids: &CudaSlice<i32>,
+        out: &mut CudaSlice<f32>,
+        inner: usize,
+        rows: usize,
+        dispatch: &mut K2Dispatch,
+    ) -> Result<(), MoeError> {
+        if inner == 0
+            || !inner.is_multiple_of(128)
+            || !inner.is_multiple_of(quant.block_elements())
+            || rows == 0
+        {
+            return Err(MoeError::WrongElementCount {
+                which: "K2 grouped projection geometry",
+                expected: quant.block_elements(),
+                found: inner,
+            });
+        }
+        let (tokens, topk, experts) = (dispatch.tokens, dispatch.topk, dispatch.experts);
+        check("K2 grouped input", tokens * inner, x.len())?;
+        check("K2 grouped ids", tokens * topk, ids.len())?;
+        check("K2 grouped output", tokens * topk * rows, out.len())?;
+        check(
+            "K2 grouped weights",
+            inner * rows * experts / quant.block_elements() * quant.block_bytes(),
+            w.len(),
+        )?;
+        let capacity = dispatch.owners.len() as i32;
+        let (tokens, topk, experts, inner, rows, code) = (
+            tokens as i32,
+            topk as i32,
+            experts as i32,
+            inner as i32,
+            rows as i32,
+            quant_code(quant),
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.dispatch)
+                .arg(ids)
+                .arg(&mut dispatch.sorted)
+                .arg(&mut dispatch.owners)
+                .arg(&tokens)
+                .arg(&topk)
+                .arg(&experts)
+                .arg(&capacity)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            stream
+                .launch_builder(&self.project_grouped)
+                .arg(w)
+                .arg(&code)
+                .arg(x)
+                .arg(&dispatch.sorted)
+                .arg(&dispatch.owners)
+                .arg(out)
+                .arg(&inner)
+                .arg(&rows)
+                .arg(&tokens)
+                .arg(&topk)
+                .launch(LaunchConfig {
+                    grid_dim: ((rows as u32).div_ceil(4), capacity as u32, 1),
+                    block_dim: (32, 4, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
         Ok(())
     }
     /// Apply SiLU to each value projection before the weighted sum.

@@ -112,8 +112,10 @@ CUDA_VISIBLE_DEVICES=0 capture /absolute/path/model.gguf /tmp/k2-golden.bin \
   'The capital of Japan is' 'l_out-.*,result_norm,result_output'
 ```
 
-Captures and model weights stay outside version control. K2 performance has
-not been compared with llama.cpp; the current standing remains about Qwen3.6.
+Captures and model weights stay outside version control. K2 throughput, decode
+latency and the publisher comparison are recorded in
+[Current standing](BENCHMARKS.md#k2-horizon-on-one-card). Qwen3.6 remains the
+performance target.
 
 The rest of this document describes `qwen35moe` unless stated otherwise.
 

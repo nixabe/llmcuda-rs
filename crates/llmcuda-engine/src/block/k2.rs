@@ -8,7 +8,7 @@ use super::{
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use llmcuda_cuda::kernels::{
     attention::{AttentionKernels, AttnDecodeScratch},
-    k2::K2Kernels,
+    k2::{K2Dispatch, K2Kernels},
     layer_ops::LayerOpsKernels,
     moe::{ExpertQuant, MoeBuffers, MoeGeometry, MoeKernels, QuantTensor, to_device_layout},
 };
@@ -105,6 +105,7 @@ fn vector(
 }
 
 pub(crate) struct K2ValueScratch {
+    dispatch: K2Dispatch,
     logits: CudaSlice<f32>,
     ids: CudaSlice<i32>,
     weights: CudaSlice<f32>,
@@ -120,6 +121,7 @@ impl K2ValueScratch {
         let top = k.values_per_token as usize;
         let rows = (c.attention.kv_heads * c.attention.head_dim) as usize;
         Ok(Self {
+            dispatch: K2Dispatch::new(stream, t, top, k.value_experts as usize)?,
             logits: stream.alloc_zeros::<f32>(t * k.value_experts as usize)?,
             ids: stream.alloc_zeros::<i32>(t * top)?,
             weights: stream.alloc_zeros::<f32>(t * top)?,
@@ -277,15 +279,29 @@ impl K2AttentionBlock {
                 k.values_per_token as usize,
                 k.route_scale(),
             )?;
-            w.v.forward(
-                ops,
-                stream,
-                &sc.normed,
-                &vs.ids,
-                &mut vs.projections,
-                k.values_per_token as usize,
-                true,
-            )?;
+            if self.tokens >= 8 {
+                ops.project_grouped(
+                    stream,
+                    &w.v.bytes,
+                    w.v.quant.unwrap(),
+                    &sc.normed,
+                    &vs.ids,
+                    &mut vs.projections,
+                    w.v.inner,
+                    w.v.rows,
+                    &mut vs.dispatch,
+                )?;
+            } else {
+                w.v.forward(
+                    ops,
+                    stream,
+                    &sc.normed,
+                    &vs.ids,
+                    &mut vs.projections,
+                    k.values_per_token as usize,
+                    true,
+                )?;
+            }
             ops.values(
                 stream,
                 &vs.projections,

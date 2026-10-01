@@ -41,7 +41,8 @@ The engine also serves [IFM/K2-Horizon-MoVA-36B-A4B-GGUF](https://huggingface.co
 in **Q4_K_M** and **Q6_K**, selected by `general.architecture = k2-horizon`.
 Its routed attention values, grouped normalization and IFM chat template are
 described in [docs/MODEL.md](docs/MODEL.md#k2-horizon).
-Qwen3.6 remains the performance target; K2 has no published performance standing.
+Qwen3.6 remains the performance target. Measured K2 throughput and latency are in
+[Current standing](docs/BENCHMARKS.md#k2-horizon-on-one-card).
 
 ## Why this exists
 

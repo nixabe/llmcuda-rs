@@ -269,7 +269,10 @@ fn main() -> ExitCode {
             samples.push(t.elapsed().as_secs_f64() * 1e3);
         }
         drop(profiling);
-        let (mean, _sd) = stats(&samples);
+        let (mean, sd) = stats(&samples);
+        samples.sort_by(f64::total_cmp);
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
         let (free_now, _) = memory_info(&ctx).expect("memory info");
         info!(
             "{:<16} {:>10.2} {:>14.1} {:>16.1} {:>14.3}",
@@ -279,6 +282,7 @@ fn main() -> ExitCode {
             1e3 / mean,
             free_at_start.saturating_sub(free_now) as f64 / (1u64 << 30) as f64,
         );
+        info!("  latency sd {sd:.2} ms, p50 {p50:.2} ms, p95 {p95:.2} ms");
     }
 
     // ---- The batch sweep: `N` sequences advanced together through
@@ -352,7 +356,10 @@ fn main() -> ExitCode {
             samples.push(t.elapsed().as_secs_f64() * 1e3);
         }
         drop(profiling);
-        let (mean, _sd) = stats(&samples);
+        let (mean, sd) = stats(&samples);
+        samples.sort_by(f64::total_cmp);
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
         let (free_now, _) = memory_info(&ctx).expect("memory info");
         info!(
             "{:<16} {:>10.2} {:>14.1} {:>16.1} {:>14.3}",
@@ -362,6 +369,7 @@ fn main() -> ExitCode {
             1e3 / mean,
             free_at_start.saturating_sub(free_now) as f64 / (1u64 << 30) as f64,
         );
+        info!("  latency sd {sd:.2} ms, p50 {p50:.2} ms, p95 {p95:.2} ms");
     }
 
     info!("");

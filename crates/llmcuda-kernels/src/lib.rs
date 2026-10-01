@@ -54,3 +54,6 @@ pub mod quant;
 pub mod rng;
 pub mod rope;
 pub mod vision;
+
+/// K2-Horizon normalization, routing and attention gating reference.
+pub mod k2;

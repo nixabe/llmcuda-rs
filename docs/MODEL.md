@@ -8,9 +8,9 @@ tables yourself:
 cargo run -p llmcuda-model --example budget
 ```
 
-## Two architectures
+## Qwen architectures
 
-The engine serves two models. They share the hybrid layer pattern, the
+The two Qwen models share the hybrid layer pattern, the
 tokenizer, the partial rotary geometry and the vision tower, and differ in the
 feed-forward block and in every width:
 
@@ -28,7 +28,7 @@ feed-forward block and in every width:
 | GDN state per sequence | ~60 MiB (30 layers) | ~144 MiB (48 layers) |
 
 `ModelConfig::from_gguf` selects semantics from `general.architecture`
-(`qwen35moe` or `qwen35`) and reads geometry from architecture-scoped GGUF
+(`qwen35moe`, `qwen35` or `k2-horizon`) and reads geometry from architecture-scoped GGUF
 metadata: layer count minus MTP blocks, hidden width, attention and GDN heads,
 rotary width, hybrid interval, FFN dimensions, and native context. Vocabulary
 size comes from `tokenizer.ggml.tokens`. Tensor shapes are then checked by
@@ -42,7 +42,7 @@ an engine tuning choice. Missing or malformed required metadata fails loading.
 The family default for an absent attention interval is four; an absent MTP
 count means zero, following llama.cpp.
 
-This is geometry-driven loading within the two implemented architectures,
+This is geometry-driven loading within the implemented architectures,
 not support for arbitrary GGUF architectures. The current representation requires
 whole hybrid periods, matching attention K/V head widths, at most one MTP
 block, and one shared MoE expert with the routed expert width. Explicit recurrent
@@ -54,6 +54,66 @@ logs that MTP is disabled and uses ordinary decode, with no draft token budget
 or MTP weight/cache allocation. Tensor availability never enables MTP by itself.
 The metadata's MTP count still excludes that block from the main transformer
 stack even when an export strips its weights.
+
+## K2-Horizon
+
+[IFM's K2-Horizon-MoVA-36B-A4B GGUF](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B-GGUF)
+is supported in Q4_K_M and Q6_K. Q4_K_M is a mixed file: each projection's
+own GGUF type selects its dequantization, including Q6_K down projections.
+The architecture is explicitly `k2-horizon`; tensor shapes never select it.
+
+| Property | Value |
+| --- | --- |
+| Layers / hidden / vocabulary | 48 / 2560 / 250624 |
+| Attention | 32 query heads, 8 KV heads, dimension 128 |
+| Rotary | all 128 dimensions, Neox ordering, base 10000000 |
+| First three layers | ordinary values; dense SwiGLU, intermediate 6144 |
+| Remaining layers | 64 value experts, top 4; 100 FFN experts, top 8 |
+| FFN expert / shared width | 768 / 768; one ungated shared expert |
+| Normalization | two contiguous RMS groups, epsilon 0.000001 |
+| Attention gate | separate projection; softplus with beta ln(2) |
+| Router | sigmoid; bias affects selection only; normalize then scale by 2.5 |
+| Value aggregation | SiLU on each selected projection before weighted summation |
+| KV per token, f16 | 192 KiB across all 48 layers |
+| Recurrent state / MTP | none / none |
+| Native context | 524288 tokens; usable context depends on allocated memory |
+
+Serve either file with the usual `--model` flag. Choose a context that fits
+alongside the weights: 8192 tokens require 1.5 GiB of KV per sequence.
+For example:
+
+```sh
+cargo run -p llmcuda-server --release -- --model /absolute/path/model.gguf \
+  --total-context 8192 --slots-per-worker 1 --prefill-chunk 64 --cache-ram 0
+```
+
+Chat uses the file's IFM template and special tokens; `--no-jinja` is rejected
+for this architecture. Raw completions add the file's BOS token. Both IFM
+end-of-text and end-of-turn tokens stop generation. IFM XML tool calls are
+parsed; the Qwen tool grammar does not constrain IFM calls.
+
+The numerical semantics follow the publisher's llama.cpp fork,
+[`src/models/k2-horizon.cpp`](https://github.com/MBZUAI-IFM/llama.cpp/blob/model/K2Horizon/src/models/k2-horizon.cpp),
+including final grouped normalization. CPU
+references and GPU differential tests cover the new operations. Real-weight
+validation is opt-in:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 LLMCUDA_K2_MODEL=/absolute/path/model.gguf \
+  cargo test -p llmcuda-engine --release --test k2_model k2_full_model -- --nocapture
+```
+
+Set `LLMCUDA_K2_GOLDEN` to a capture from the publisher's fork using
+`tools/oracle/capture.cpp` to also compare all block boundaries and final logits.
+Capture the fixed prompt and K2 waypoint names:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 capture /absolute/path/model.gguf /tmp/k2-golden.bin \
+  'The capital of Japan is' 'l_out-.*,result_norm,result_output'
+```
+
+Captures and model weights stay outside version control. K2 performance has
+not been compared with llama.cpp; the current standing remains about Qwen3.6.
 
 The rest of this document describes `qwen35moe` unless stated otherwise.
 

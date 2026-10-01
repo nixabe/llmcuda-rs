@@ -60,6 +60,20 @@ pub enum Role {
     AttnQGate,
     /// `blk.N.attn_k.weight`.
     AttnK,
+    /// K2's query projection, without a packed output gate.
+    AttnQ,
+    /// K2's separate softplus attention gate.
+    AttnGate,
+    /// Value-router projection and selection bias.
+    AttnValueRouter,
+    /// Value-router bias, applied only during selection.
+    AttnValueBias,
+    /// Stacked value-expert projections.
+    AttnValueExps,
+    /// K2's grouped pre-FFN norm.
+    K2FfnNorm,
+    /// FFN selection bias, excluded from the combination weights.
+    MoeRouterBias,
     /// `blk.N.attn_v.weight`.
     AttnV,
     /// `blk.N.attn_q_norm.weight` — per-head RMSNorm over `head_dim`.
@@ -161,7 +175,7 @@ impl Role {
             MoeGateExps | MoeUpExps | MoeDownExps => Section::Experts,
             FfnGate | FfnUp | FfnDown => Section::DenseFfn,
             OutputNorm | InputNorm | PostMixerNorm | AttnQNorm | AttnKNorm | GdnNorm | GdnA
-            | GdnDtBias => Section::Norms,
+            | GdnDtBias | K2FfnNorm | AttnValueBias | MoeRouterBias => Section::Norms,
             MtpEhProj | MtpENorm | MtpHNorm | MtpSharedHeadNorm => Section::Mtp,
             _ => Section::Projections,
         }
@@ -180,6 +194,13 @@ impl Role {
             PostMixerNorm => "post_attention_norm.weight",
             AttnQGate => "attn_q.weight",
             AttnK => "attn_k.weight",
+            AttnQ => "attn_q.weight",
+            AttnGate => "attn_gate.weight",
+            AttnValueRouter => "attn_v_gate.weight",
+            AttnValueBias => "attn_v_gate.bias",
+            AttnValueExps => "attn_v_exps.weight",
+            K2FfnNorm => "ffn_norm.weight",
+            MoeRouterBias => "exp_probs_b.bias",
             AttnV => "attn_v.weight",
             AttnQNorm => "attn_q_norm.weight",
             AttnKNorm => "attn_k_norm.weight",
@@ -353,15 +374,23 @@ impl WeightSchema {
         let q_dim = u64::from(a.q_heads) * head_dim;
         let kv_dim = u64::from(a.kv_heads) * head_dim;
 
-        let ff = u64::from(config.ffn.intermediate());
-
         let mtp_blocks = if includes_mtp { config.mtp_layers() } else { 0 };
         for layer in 0..config.num_layers + mtp_blocks {
             let is_mtp = layer >= config.num_layers;
+            let ffn = config.ffn_for_layer(layer);
+            let ff = u64::from(ffn.intermediate());
             let l = Some(layer);
 
             push(Role::InputNorm, l, vec![hidden]);
-            push(Role::PostMixerNorm, l, vec![hidden]);
+            push(
+                if config.k2.is_some() {
+                    Role::K2FfnNorm
+                } else {
+                    Role::PostMixerNorm
+                },
+                l,
+                vec![hidden],
+            );
 
             // The MTP block is dense-attention regardless of where it falls in
             // the repeating pattern — see the `mtp_on_hybrid_qwen` branch in
@@ -376,11 +405,25 @@ impl WeightSchema {
                 LayerKind::GatedAttention => {
                     // Packed query + output gate: two `head_dim` slices per
                     // head, interleaved. See the module docs.
-                    push(Role::AttnQGate, l, vec![hidden, q_dim * 2]);
+                    if let Some(k) = config.k2 {
+                        push(Role::AttnQ, l, vec![hidden, q_dim]);
+                        push(Role::AttnGate, l, vec![hidden, q_dim]);
+                        if layer >= k.leading_dense_layers {
+                            let exps = u64::from(k.value_experts);
+                            push(Role::AttnValueRouter, l, vec![hidden, exps]);
+                            push(Role::AttnValueBias, l, vec![exps]);
+                            push(Role::AttnValueExps, l, vec![hidden, kv_dim, exps]);
+                        } else {
+                            push(Role::AttnV, l, vec![hidden, kv_dim]);
+                        }
+                    } else {
+                        push(Role::AttnQGate, l, vec![hidden, q_dim * 2]);
+                        push(Role::AttnV, l, vec![hidden, kv_dim]);
+                        push(Role::AttnQNorm, l, vec![head_dim]);
+                        push(Role::AttnKNorm, l, vec![head_dim]);
+                    }
                     push(Role::AttnK, l, vec![hidden, kv_dim]);
-                    push(Role::AttnV, l, vec![hidden, kv_dim]);
-                    push(Role::AttnQNorm, l, vec![head_dim]);
-                    push(Role::AttnKNorm, l, vec![head_dim]);
+
                     push(Role::AttnOut, l, vec![q_dim, hidden]);
                 }
                 LayerKind::GatedDeltaNet => {
@@ -400,14 +443,18 @@ impl WeightSchema {
                 }
             }
 
-            match config.ffn {
+            match ffn {
                 FfnConfig::Moe(m) => {
                     let experts = u64::from(m.num_experts);
                     push(Role::MoeRouter, l, vec![hidden, experts]);
                     push(Role::MoeGateExps, l, vec![hidden, ff, experts]);
                     push(Role::MoeUpExps, l, vec![hidden, ff, experts]);
                     push(Role::MoeDownExps, l, vec![ff, hidden, experts]);
-                    push(Role::MoeSharedGateInp, l, vec![hidden]);
+                    if config.k2.is_some() {
+                        push(Role::MoeRouterBias, l, vec![experts]);
+                    } else {
+                        push(Role::MoeSharedGateInp, l, vec![hidden]);
+                    }
                     push(Role::MoeSharedGate, l, vec![hidden, ff]);
                     push(Role::MoeSharedUp, l, vec![hidden, ff]);
                     push(Role::MoeSharedDown, l, vec![ff, hidden]);

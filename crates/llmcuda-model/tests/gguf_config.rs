@@ -5,6 +5,8 @@ use llmcuda_model::{FfnConfig, ModelConfig};
 #[derive(Clone)]
 enum Value {
     Uint(u32),
+    Float(f32),
+    Bool(bool),
     Wide(u64),
     Bools(Vec<bool>),
     Text(String),
@@ -48,6 +50,25 @@ fn fixture(c: &ModelConfig) -> Vec<(String, Value)> {
         }
         FfnConfig::Dense(d) => add("feed_forward_length", d.intermediate),
     }
+    if let Some(k) = c.k2 {
+        for (key, n) in [
+            ("feed_forward_length", k.dense_intermediate),
+            ("leading_dense_block_count", k.leading_dense_layers),
+            ("moe_every_n_layers", 1),
+            ("expert_shared_count", 1),
+            ("expert_gating_func", 2),
+            ("attention.group_norm_groups", k.norm_groups),
+            ("attention.value_expert_count", k.value_experts),
+            ("attention.value_expert_used_count", k.values_per_token),
+        ] {
+            values.push((c.hparam_key(key), Value::Uint(n)));
+        }
+        values.push((
+            c.hparam_key("expert_weights_scale"),
+            Value::Float(k.route_scale()),
+        ));
+        values.push((c.hparam_key("expert_weights_norm"), Value::Bool(true)));
+    }
     values
 }
 
@@ -67,6 +88,14 @@ fn file_with_tensors(values: &[(String, Value)], tensors: &[String]) -> GgufFile
     for (key, value) in values {
         string(&mut bytes, key);
         match value {
+            Value::Float(n) => {
+                bytes.extend(6u32.to_le_bytes());
+                bytes.extend(n.to_le_bytes());
+            }
+            Value::Bool(v) => {
+                bytes.extend(7u32.to_le_bytes());
+                bytes.push(u8::from(*v));
+            }
             Value::Uint(n) => {
                 bytes.extend(4u32.to_le_bytes());
                 bytes.extend(n.to_le_bytes());
@@ -128,7 +157,7 @@ fn both_reference_geometries_are_reconstructed_without_tensor_shapes() {
 
 #[test]
 fn different_sizes_of_each_architecture_do_not_inherit_preset_geometry() {
-    for preset in ModelConfig::KNOWN {
+    for preset in [ModelConfig::qwen3_6_35b_a3b, ModelConfig::qwen3_8_27b] {
         let mut c = preset();
         c.num_layers = 12;
         c.pattern_period = 3;
@@ -254,7 +283,7 @@ fn optional_metadata_defaults_and_explicit_layout_are_checked() {
 
 #[test]
 fn mtp_availability_requires_every_head_tensor_and_preserves_trunk_geometry() {
-    for preset in ModelConfig::KNOWN {
+    for preset in [ModelConfig::qwen3_6_35b_a3b, ModelConfig::qwen3_8_27b] {
         let mut c = preset();
         c.vocab_size = 32;
         let values = fixture(&c);
@@ -284,5 +313,60 @@ fn mtp_availability_requires_every_head_tensor_and_preserves_trunk_geometry() {
         let mut undeclared = loaded;
         undeclared.has_mtp = false;
         assert!(!undeclared.mtp_available(&complete));
+    }
+}
+
+#[test]
+fn k2_schema_and_cache_geometry_follow_the_published_model() {
+    let c = ModelConfig::from_gguf(&file(&fixture(&ModelConfig::k2_horizon_36b_a4b()))).unwrap();
+    assert_eq!(c.num_attention_layers(), 48);
+    assert_eq!(c.num_gdn_layers(), 0);
+    assert_eq!(c.kv_bytes_per_token(2), 196_608);
+    assert_eq!(c.gdn_state_bytes_per_sequence(), 0);
+    let schema = llmcuda_model::WeightSchema::new(&c);
+    assert_eq!(schema.specs().len(), 798);
+    assert_eq!(
+        schema
+            .find(llmcuda_model::Role::AttnQ, Some(0))
+            .unwrap()
+            .dims,
+        [2560, 4096]
+    );
+    assert_eq!(
+        schema
+            .find(llmcuda_model::Role::FfnGate, Some(2))
+            .unwrap()
+            .dims,
+        [2560, 6144]
+    );
+    assert!(schema.find(llmcuda_model::Role::FfnGate, Some(3)).is_none());
+    assert_eq!(
+        schema
+            .find(llmcuda_model::Role::AttnValueExps, Some(3))
+            .unwrap()
+            .dims,
+        [2560, 1024, 64]
+    );
+    assert!(
+        schema
+            .find(llmcuda_model::Role::MoeSharedGateInp, Some(3))
+            .is_none()
+    );
+}
+#[test]
+fn k2_rejects_unsupported_routing_and_malformed_groups() {
+    let c = ModelConfig::k2_horizon_36b_a4b();
+    for (suffix, value) in [
+        ("expert_gating_func", Value::Uint(1)),
+        ("attention.group_norm_groups", Value::Uint(3)),
+        ("expert_weights_scale", Value::Float(f32::NAN)),
+        ("attention.value_expert_used_count", Value::Uint(65)),
+        ("expert_weights_norm", Value::Bool(false)),
+    ] {
+        let mut v = fixture(&c);
+        let key = c.hparam_key(suffix);
+        v.retain(|(k, _)| k != &key);
+        v.push((key, value));
+        assert!(ModelConfig::from_gguf(&file(&v)).is_err(), "{suffix}");
     }
 }

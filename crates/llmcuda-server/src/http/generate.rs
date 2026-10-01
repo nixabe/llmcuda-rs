@@ -568,9 +568,18 @@ impl Generation {
             self.pending.push_str(&delta);
 
             if self.reasoning_open {
-                if let Some(pos) = self.pending.find("</think>") {
+                if let Some((pos, close_len)) = self
+                    .pending
+                    .find("</think>")
+                    .map(|p| (p, "</think>".len()))
+                    .or_else(|| {
+                        self.pending
+                            .find("</ifm|think>")
+                            .map(|p| (p, "</ifm|think>".len()))
+                    })
+                {
                     let before: String = self.pending[..pos].to_owned();
-                    let rest = &self.pending[pos + "</think>".len()..];
+                    let rest = &self.pending[pos + close_len..];
                     let after = rest.strip_prefix('\n').unwrap_or(rest).to_owned();
                     self.pending = after;
                     let flushed = self.chunk(before);
@@ -581,7 +590,12 @@ impl Generation {
                     }
                     continue;
                 }
-                if let Some(pos) = self.pending.find("<tool_call>") {
+                if let Some(pos) = self
+                    .pending
+                    .find("<tool_call>")
+                    .or_else(|| self.pending.find("<ifm|tool_calls>"))
+                    .or_else(|| self.pending.find("<ifm|tool_call>"))
+                {
                     let before: String = self.pending[..pos].to_owned();
                     let rest = self.pending[pos..].to_owned();
                     self.pending = rest;
@@ -606,8 +620,10 @@ impl Generation {
             }
 
             let held = if self.reasoning_open {
-                held_back_len(&self.pending, &self.stop)
-                    .max(held_back_len(&self.pending, &["</think>", "<tool_call>"]))
+                held_back_len(&self.pending, &self.stop).max(held_back_len(
+                    &self.pending,
+                    &["</think>", "</ifm|think>", "<tool_call>", "<ifm|tool_call>"],
+                ))
             } else {
                 held_back_len(&self.pending, &self.stop)
             };

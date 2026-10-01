@@ -41,3 +41,7 @@ pub mod gdn;
 pub mod gdn_verify;
 pub mod moe;
 pub mod mtp;
+
+/// K2-Horizon MoVA and mixed feed-forward layers.
+pub mod k2;
+pub(crate) mod mixer;

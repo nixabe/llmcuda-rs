@@ -202,6 +202,17 @@ fn check_at(
     max_tokens: usize,
     num_tokens: usize,
 ) {
+    check_mixed_at(quant, quant, label, force_community, max_tokens, num_tokens);
+}
+
+fn check_mixed_at(
+    quant: ExpertQuant,
+    down_quant: ExpertQuant,
+    label: &str,
+    force_community: bool,
+    max_tokens: usize,
+    num_tokens: usize,
+) {
     let Some(ctx) = device() else { return };
     let g = geometry_at(max_tokens);
     let stream = ctx.default_stream();
@@ -233,7 +244,7 @@ fn check_at(
 
     let (gate_bytes, gate_ref) = pack(quant, &gate_src);
     let (up_bytes, up_ref) = pack(quant, &up_src);
-    let (down_bytes, down_ref) = pack(quant, &down_src);
+    let (down_bytes, down_ref) = pack(down_quant, &down_src);
 
     let amax = gate_ref.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     let nonzero = gate_ref.iter().filter(|v| **v != 0.0).count();
@@ -256,7 +267,7 @@ fn check_at(
         .clone_htod(&*to_device_layout(quant, &up_bytes))
         .expect("upload up");
     let d_down = stream
-        .clone_htod(&*to_device_layout(quant, &down_bytes))
+        .clone_htod(&*to_device_layout(down_quant, &down_bytes))
         .expect("upload down");
 
     // --- activations and routing -----------------------------------------
@@ -304,7 +315,7 @@ fn check_at(
             },
             QuantTensor {
                 bytes: &d_down,
-                quant,
+                quant: down_quant,
             },
             &d_hidden,
             &mut d_out,
@@ -500,6 +511,26 @@ fn the_shared_expert_control_goes_through_the_community_kernels() {
         for width in [1usize, 4, 8] {
             check_shared(q, l, true, width);
             check_shared(q, l, false, width);
+        }
+    }
+}
+
+/// A narrow batch must keep gate/up and down in the same dispatch order.
+#[test]
+fn k2_mixed_q4_q6_batches_match_the_scalar_reference() {
+    for (gate, down) in [
+        (ExpertQuant::Q4K, ExpertQuant::Q6K),
+        (ExpertQuant::Q6K, ExpertQuant::Q4K),
+    ] {
+        for width in [2, 4, 8] {
+            check_mixed_at(
+                gate,
+                down,
+                &format!("mixed {gate:?}/{down:?} n={width}"),
+                false,
+                width,
+                width,
+            );
         }
     }
 }

@@ -265,7 +265,7 @@ pub(crate) async fn completions(
     };
     let encoding = state
         .tokenizer
-        .encode(prompt, false)
+        .encode(prompt, true)
         .map_err(|error| ApiError::bad_request(DIALECT, error.to_string()))?;
     // A raw completion is not a chat turn, so there is no `<think>` block open
     // and everything the model emits is answer text.

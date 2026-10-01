@@ -57,6 +57,13 @@ impl ChatTemplate {
     /// Compile a template source. A source this engine cannot parse fails
     /// here, at startup, rather than on the first request that needs it.
     pub(crate) fn compile(source: String) -> Result<Arc<Self>, String> {
+        // Hugging Face's generation tags annotate assistant-token masks.
+        // They emit no text; preserve their whitespace controls for prompting.
+        let source = source
+            .replace("{% generation %}", "")
+            .replace("{% endgeneration %}", "")
+            .replace("{%- generation -%}", "{{- '' -}}")
+            .replace("{%- endgeneration -%}", "{{- '' -}}");
         let mut env = Environment::new();
         env.set_unknown_method_callback(python_method);
         // This is a model prompt, not HTML. Minijinja's built-in emits
@@ -434,6 +441,38 @@ mod tests {
             .turns
             .push(Turn::ToolResults(vec!["contents".to_owned()]));
         conversation
+    }
+
+    #[test]
+    fn k2_template_renders_real_ifm_turns() {
+        let Some(path) = std::env::var_os("LLMCUDA_K2_MODEL") else {
+            eprintln!("SKIPPED: set LLMCUDA_K2_MODEL");
+            return;
+        };
+        let source = crate::tokenizer::chat_template_from_gguf(std::path::Path::new(&path))
+            .unwrap()
+            .unwrap();
+        let template = ChatTemplate::compile(source).unwrap();
+        let mut conversation = Conversation::default();
+        conversation.turns.push(Turn::User("Hello".into()));
+        for thinking in [false, true] {
+            let rendered = template.render(&conversation, thinking).unwrap();
+            println!("K2 thinking={thinking}: {rendered}");
+            assert!(rendered.starts_with("<|ifm|begin_of_text|>"));
+            assert!(rendered.contains("<|ifm|im_start|>user\nHello<|ifm|im_end|>"));
+            assert!(rendered.contains("<|ifm|im_start|>assistant"));
+            assert_eq!(rendered.trim_end().ends_with("<ifm|think>"), thinking);
+        }
+        for (name, conversation) in fixtures() {
+            for thinking in [true, false] {
+                assert!(
+                    template
+                        .render(&conversation, thinking)
+                        .unwrap_or_else(|e| panic!("K2 fixture {name}: {e}"))
+                        .starts_with("<|ifm|begin_of_text|>")
+                );
+            }
+        }
     }
 
     #[test]

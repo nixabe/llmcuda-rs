@@ -46,7 +46,7 @@ use std::time::Instant;
 use cudarc::driver::{CudaContext, CudaStream, Profiler};
 use llmcuda_cuda::arena::memory_info;
 use llmcuda_cuda::device::{DeviceInfo, driver_available};
-use llmcuda_engine::forward::{Forward, arena_holds_entry};
+use llmcuda_engine::forward::{Forward, arena_holds_model_entry};
 use llmcuda_engine::weights::DeviceWeights;
 use llmcuda_gguf::GgufFile;
 use llmcuda_model::config::ModelConfig;
@@ -139,7 +139,7 @@ fn main() {
     let load = Instant::now();
     let (weights, report) =
         DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |role, ty| {
-            arena_holds_entry(config.ffn, role, ty)
+            arena_holds_model_entry(&config, role, ty)
         })
         .expect("weight load");
     info!(

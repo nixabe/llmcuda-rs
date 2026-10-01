@@ -256,6 +256,30 @@ impl fmt::Display for UnknownArchitecture {
 
 impl core::error::Error for UnknownArchitecture {}
 
+/// K2-Horizon semantics, separate from Qwen's hybrid geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct K2Config {
+    /// Dense FFN layers before the routed layers.
+    pub leading_dense_layers: u32,
+    /// Intermediate width of those dense layers.
+    pub dense_intermediate: u32,
+    /// Contiguous groups in each residual-stream RMS normalization.
+    pub norm_groups: u32,
+    /// Number of value projections available to the attention router.
+    pub value_experts: u32,
+    /// Value projections evaluated for each token.
+    pub values_per_token: u32,
+    /// IEEE fp32 bits of the selected route scale (keeps config equality exact).
+    pub route_scale_bits: u32,
+}
+
+impl K2Config {
+    /// Scale applied after normalizing the selected, unbiased probabilities.
+    pub fn route_scale(self) -> f32 {
+        f32::from_bits(self.route_scale_bits)
+    }
+}
+
 /// Complete structural description of the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
@@ -297,6 +321,8 @@ pub struct ModelConfig {
     pub yarn_context: u32,
     /// Whether the model ships a trained multi-token-prediction head.
     pub has_mtp: bool,
+    /// Architecture-specific MoVA and mixed-FFN semantics.
+    pub k2: Option<K2Config>,
 }
 
 impl ModelConfig {
@@ -336,6 +362,7 @@ impl ModelConfig {
             native_context: 262_144,
             yarn_context: 1_010_000,
             has_mtp: true,
+            k2: None,
         }
     }
 
@@ -391,11 +418,74 @@ impl ModelConfig {
             native_context: 262_144,
             yarn_context: 1_010_000,
             has_mtp: true,
+            k2: None,
         }
     }
 
     /// Every model this engine has a transcribed configuration for.
-    pub const KNOWN: [fn() -> Self; 2] = [Self::qwen3_6_35b_a3b, Self::qwen3_8_27b];
+    pub const KNOWN: [fn() -> Self; 3] = [
+        Self::qwen3_6_35b_a3b,
+        Self::qwen3_8_27b,
+        Self::k2_horizon_36b_a4b,
+    ];
+
+    /// IFM's published K2-Horizon-MoVA-36B-A4B configuration.
+    pub const fn k2_horizon_36b_a4b() -> Self {
+        Self {
+            name: "K2-Horizon-MoVA-36B-A4B",
+            architecture: "k2-horizon",
+            advertised_params: 36_000_000_000,
+            num_layers: 48,
+            hidden_size: 2560,
+            vocab_size: 250_624,
+            pattern_period: 1,
+            attention_offset: 0,
+            // Unused: this architecture has no recurrent layers.
+            gdn: GdnConfig {
+                value_heads: 1,
+                qk_heads: 1,
+                head_dim: 128,
+                conv_kernel: 4,
+                chunk_len: 64,
+            },
+            attention: AttentionConfig {
+                q_heads: 32,
+                kv_heads: 8,
+                head_dim: 128,
+                rope_dim: 128,
+            },
+            ffn: FfnConfig::Moe(MoeConfig {
+                num_experts: 100,
+                experts_per_token: 8,
+                shared_experts: 1,
+                expert_intermediate: 768,
+            }),
+            native_context: 524_288,
+            yarn_context: 524_288,
+            has_mtp: false,
+            k2: Some(K2Config {
+                leading_dense_layers: 3,
+                dense_intermediate: 6144,
+                norm_groups: 2,
+                value_experts: 64,
+                values_per_token: 4,
+                route_scale_bits: 2.5f32.to_bits(),
+            }),
+        }
+    }
+
+    /// Feed-forward geometry at a particular trunk layer.
+    pub const fn ffn_for_layer(&self, layer: u32) -> FfnConfig {
+        if let Some(k) = self.k2
+            && layer < k.leading_dense_layers
+        {
+            FfnConfig::Dense(DenseFfnConfig {
+                intermediate: k.dense_intermediate,
+            })
+        } else {
+            self.ffn
+        }
+    }
 
     /// The reference preset for an architecture, for examples and tests.
     /// Runtime callers must use [`Self::from_gguf`] to read actual geometry.
@@ -523,7 +613,19 @@ impl ModelConfig {
     /// The bulk of either model: about 32.2B of 34.2B on Qwen3.6-35B-A3B,
     /// about 17.1B of 26.9B on Qwen3.8-27B.
     pub const fn total_ffn_params(&self) -> u64 {
-        self.ffn.units_per_layer() as u64 * self.params_per_ffn_unit() * self.num_layers as u64
+        {
+            let mut total = 0;
+            let mut layer = 0;
+            while layer < self.num_layers {
+                let f = self.ffn_for_layer(layer);
+                total += f.units_per_layer() as u64
+                    * 3
+                    * self.hidden_size as u64
+                    * f.intermediate() as u64;
+                layer += 1;
+            }
+            total
+        }
     }
 
     /// Feed-forward parameters actually read for a single token.
@@ -533,7 +635,17 @@ impl ModelConfig {
     /// why the dense model reads roughly 6x the FFN weight per token despite
     /// being the smaller file.
     pub const fn active_ffn_params(&self) -> u64 {
-        self.ffn.active_units() as u64 * self.params_per_ffn_unit() * self.num_layers as u64
+        {
+            let mut total = 0;
+            let mut layer = 0;
+            while layer < self.num_layers {
+                let f = self.ffn_for_layer(layer);
+                total +=
+                    f.active_units() as u64 * 3 * self.hidden_size as u64 * f.intermediate() as u64;
+                layer += 1;
+            }
+            total
+        }
     }
 
     /// Parameters in the input and output embedding matrices combined.
@@ -551,7 +663,7 @@ impl ModelConfig {
         self.vocab_size as u64 * self.hidden_size as u64
     }
 
-    /// Parameters in per-layer projections, excluding experts and embeddings.
+    /// Parameters in per-layer projections, excluding FFN experts and embeddings.
     ///
     /// Covers GDN q/k/v/gate/beta/output projections, attention q/k/v/output
     /// projections, the MoE router, and the short convolution.
@@ -579,12 +691,23 @@ impl ModelConfig {
                     let q_dim = u64::from(a.q_heads) * u64::from(a.head_dim);
                     let kv_dim = u64::from(a.kv_heads) * u64::from(a.head_dim);
                     // q, k, v, output projections, plus the output gate.
-                    h * (q_dim + 2 * kv_dim) + q_dim * h + h * q_dim
+                    if let Some(k) = self.k2 {
+                        let values = if layer < k.leading_dense_layers {
+                            1
+                        } else {
+                            u64::from(k.value_experts)
+                        };
+                        h * (2 * q_dim + kv_dim + values * kv_dim)
+                            + q_dim * h
+                            + if values > 1 { h * values } else { 0 }
+                    } else {
+                        h * (q_dim + 2 * kv_dim) + q_dim * h + h * q_dim
+                    }
                 }
             };
             // MoE router: hidden -> num_experts, on every layer. The dense
             // model has no router at all, not a router of width one.
-            if let Some(m) = self.moe() {
+            if let Some(m) = self.ffn_for_layer(layer).moe() {
                 total += h * u64::from(m.num_experts);
             }
         }
@@ -602,7 +725,15 @@ impl ModelConfig {
     /// Active experts, the LM head, and all projections — the numerator of the
     /// weight-bandwidth term in `docs/MODEL.md`.
     pub fn active_params_per_token(&self) -> u64 {
-        self.active_ffn_params() + self.lm_head_params() + self.projection_params()
+        let mut projections = self.projection_params();
+        if let Some(k) = self.k2 {
+            // All value experts are resident, but each token reads only top-k.
+            projections -= u64::from(self.num_layers - k.leading_dense_layers)
+                * u64::from(k.value_experts - k.values_per_token)
+                * u64::from(self.hidden_size)
+                * u64::from(self.attention.kv_heads * self.attention.head_dim);
+        }
+        self.active_ffn_params() + self.lm_head_params() + projections
     }
 }
 

@@ -219,3 +219,6 @@ extern "C" __global__ void ptx_cache_probe(float* out) { out[threadIdx.x] = 1.0f
         assert!(sa.contains("probe_a") && sb.contains("probe_b"));
     }
 }
+
+/// K2-Horizon grouped normalization, sigmoid routing and value projections.
+pub mod k2;

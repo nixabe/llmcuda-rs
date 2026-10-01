@@ -1,4 +1,4 @@
-//! Qwen tokenizer construction from the vocabulary embedded in GGUF.
+//! Byte BPE tokenizer construction from the vocabulary embedded in GGUF.
 
 use std::path::Path;
 
@@ -11,6 +11,9 @@ use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 
 const QWEN35_PATTERN: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+// IFM tokenizer.json: triple-digit number chunks and joiner-aware words.
+const K2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\x{200C}|\x{200D})+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 #[derive(Debug)]
 pub enum TokenizerError {
@@ -109,12 +112,24 @@ pub fn pieces_from_gguf(path: &Path) -> Result<(Vec<Vec<u8>>, Vec<u32>), Tokeniz
     let map = byte_of_char();
     let mut pieces = Vec::with_capacity(tokens.len());
     let mut eog = Vec::new();
+    for key in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"] {
+        if let Some(id) = gguf.get_u32(key) {
+            if id as usize >= tokens.len() {
+                return Err(TokenizerError::InvalidMetadata(format!(
+                    "{key} is outside vocabulary"
+                )));
+            }
+            eog.push(id);
+        }
+    }
     for (id, token) in tokens.iter().enumerate() {
         if special[id] {
             // `<|im_end|>` ends a turn; `<tool_call>` and `</tool_call>` are
             // markup the grammar itself writes, and reach it as their own
             // bytes like any other piece.
-            if token == "<|im_end|>" || token == "<|endoftext|>" {
+            if (token == "<|im_end|>" || token == "<|endoftext|>" || token == "<|ifm|im_end|>")
+                && !eog.contains(&(id as u32))
+            {
                 eog.push(id as u32);
             }
             pieces.push(token.as_bytes().to_vec());
@@ -136,9 +151,31 @@ pub fn pieces_from_gguf(path: &Path) -> Result<(Vec<Vec<u8>>, Vec<u32>), Tokeniz
 /// `http::chat`. A GGUF without the key cannot serve that mode, which is a
 /// startup failure rather than a per-request one.
 pub fn chat_template_from_gguf(path: &Path) -> Result<Option<String>, TokenizerError> {
-    Ok(GgufFile::open(path)?
-        .get_str("tokenizer.chat_template")
-        .map(str::to_owned))
+    let gguf = GgufFile::open(path)?;
+    let Some(source) = gguf.get_str("tokenizer.chat_template") else {
+        return Ok(None);
+    };
+    let tokens = gguf
+        .get_string_array("tokenizer.ggml.tokens")
+        .ok_or(TokenizerError::Missing("tokenizer.ggml.tokens"))?;
+    // Bind the exact file's special tokens for templates such as K2's which
+    // explicitly emit bos_token. Tokenization of rendered chat uses no postprocessor.
+    let mut prefix = String::new();
+    for (name, key) in [
+        ("bos_token", "tokenizer.ggml.bos_token_id"),
+        ("eos_token", "tokenizer.ggml.eos_token_id"),
+    ] {
+        if let Some(id) = gguf.get_u32(key) {
+            let token = tokens.get(id as usize).ok_or_else(|| {
+                TokenizerError::InvalidMetadata(format!("{key} is outside vocabulary"))
+            })?;
+            prefix.push_str(&format!(
+                "{{% set {name} = {} %}}",
+                serde_json::to_string(token).expect("token string serializes")
+            ));
+        }
+    }
+    Ok(Some(prefix + source))
 }
 
 /// Load the GPT-2 byte-level BPE used by Qwen3.5/Qwen3.6 from a GGUF file.
@@ -148,11 +185,18 @@ pub fn from_gguf(path: &Path) -> Result<Tokenizer, TokenizerError> {
         .get_string_array("tokenizer.ggml.tokens")
         .ok_or(TokenizerError::Missing("tokenizer.ggml.tokens"))?;
     let special = special_tokens(&gguf, tokens.len())?;
-    if gguf.get_str("tokenizer.ggml.model") != Some("gpt2")
-        || gguf.get_str("tokenizer.ggml.pre") != Some("qwen35")
-    {
+    let (pattern, invert) = match gguf.get_str("tokenizer.ggml.pre") {
+        Some("qwen35") => (QWEN35_PATTERN, true),
+        Some("k2-horizon") => (K2_PATTERN, false),
+        _ => {
+            return Err(TokenizerError::InvalidMetadata(
+                "unsupported GGUF pre-tokenizer".into(),
+            ));
+        }
+    };
+    if gguf.get_str("tokenizer.ggml.model") != Some("gpt2") {
         return Err(TokenizerError::InvalidMetadata(
-            "only gpt2/qwen35 pre-tokenization is implemented".into(),
+            "only gpt2 byte BPE is implemented".into(),
         ));
     }
     let merge_strings = gguf
@@ -179,9 +223,9 @@ pub fn from_gguf(path: &Path) -> Result<Tokenizer, TokenizerError> {
         .map_err(TokenizerError::Build)?;
 
     let split = Split::new(
-        SplitPattern::Regex(QWEN35_PATTERN.to_owned()),
+        SplitPattern::Regex(pattern.to_owned()),
         SplitDelimiterBehavior::Isolated,
-        true,
+        invert,
     )
     .map_err(TokenizerError::Build)?;
     let mut tokenizer = Tokenizer::new(bpe);
@@ -199,6 +243,24 @@ pub fn from_gguf(path: &Path) -> Result<Tokenizer, TokenizerError> {
         .map(|(_, token)| AddedToken::from(token.clone(), true))
         .collect::<Vec<_>>();
     tokenizer.add_special_tokens(&special_tokens);
+    if matches!(
+        gguf.get("tokenizer.ggml.add_bos_token"),
+        Some(llmcuda_gguf::GgufValue::Bool(true))
+    ) {
+        let id = gguf
+            .get_u32("tokenizer.ggml.bos_token_id")
+            .ok_or(TokenizerError::Missing("tokenizer.ggml.bos_token_id"))?;
+        let bos = tokens.get(id as usize).ok_or_else(|| {
+            TokenizerError::InvalidMetadata("BOS id is outside vocabulary".into())
+        })?;
+        let processor = tokenizers::processors::template::TemplateProcessing::builder()
+            .try_single(format!("{bos} $A"))
+            .map_err(|e| TokenizerError::InvalidMetadata(e.to_string()))?
+            .special_tokens(vec![(bos.clone(), id)])
+            .build()
+            .map_err(|e| TokenizerError::InvalidMetadata(e.to_string()))?;
+        tokenizer.with_post_processor(Some(processor));
+    }
     Ok(tokenizer)
 }
 
@@ -207,6 +269,36 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tracing::info;
+
+    #[test]
+    fn k2_tokenizer_matches_publisher_json() {
+        let (Some(model), Some(reference)) = (
+            std::env::var_os("LLMCUDA_K2_MODEL"),
+            std::env::var_os("LLMCUDA_K2_TOKENIZER_JSON"),
+        ) else {
+            eprintln!("SKIPPED: set LLMCUDA_K2_MODEL and LLMCUDA_K2_TOKENIZER_JSON");
+            return;
+        };
+        let actual = from_gguf(Path::new(&model)).unwrap();
+        let expected = Tokenizer::from_file(reference).unwrap();
+        for text in [
+            "The capital of Japan is",
+            "It's 2026.",
+            "Hello 123456789! 你好 café\u{200d}world\n",
+            "<|ifm|im_start|>user\nHi<|ifm|im_end|>",
+        ] {
+            for special in [false, true] {
+                assert_eq!(
+                    actual.encode(text, special).unwrap().get_ids(),
+                    expected.encode(text, special).unwrap().get_ids(),
+                    "{text:?} special={special}"
+                );
+            }
+        }
+        let (_, eog) = pieces_from_gguf(Path::new(&model)).unwrap();
+        assert!(eog.contains(&1));
+        assert!(eog.contains(&250019));
+    }
 
     #[test]
     fn special_tokens_follow_types_even_below_the_old_cutoff() {

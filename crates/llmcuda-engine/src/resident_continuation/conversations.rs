@@ -23,7 +23,7 @@ use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 
 use super::{ResidentSlots, Scope};
 use crate::DeviceWeights;
-use crate::forward::{Forward, arena_holds_entry};
+use crate::forward::{Forward, arena_holds_model_entry};
 use crate::state::{SequenceSnapshot, SequenceState, SnapshotArena};
 
 const CAPACITY: usize = 16_384;
@@ -389,7 +389,7 @@ fn agent_conversations() {
     let directory = schema.resolve(&file).unwrap();
     let (weights, _) =
         DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |role, ty| {
-            arena_holds_entry(config.ffn, role, ty)
+            arena_holds_model_entry(&config, role, ty)
         })
         .unwrap();
     let mut passes = vec![

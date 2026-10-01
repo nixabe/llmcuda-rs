@@ -593,6 +593,11 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    let is_k2 = model.k2.is_some();
+    if is_k2 && args.no_jinja {
+        error!("K2-Horizon requires its IFM chat template; --no-jinja is unsupported");
+        return std::process::ExitCode::FAILURE;
+    }
     gate_mtp(&mut args, mtp_available);
     let (draft_tokens, speculation) = match resolve_speculation(&args) {
         Ok(resolved) => resolved,
@@ -982,10 +987,11 @@ fn main() -> std::process::ExitCode {
     // process. On the default it is a preference: the hand-written ChatML
     // serves instead, and the reason is said out loud rather than left to be
     // inferred from the output.
+    let jinja_required = args.jinja || is_k2;
     let chat_template = if args.no_jinja {
         None
     } else {
-        let required = args.jinja;
+        let required = jinja_required;
         match tokenizer::chat_template_from_gguf(&model_path) {
             Ok(Some(template)) => Some(template),
             Ok(None) if required => {
@@ -1038,7 +1044,7 @@ fn main() -> std::process::ExitCode {
         }),
         grammar_vocab,
         chat_template,
-        jinja_required: args.jinja,
+        jinja_required,
     };
     match runtime.block_on(http::serve(engine, tokenizer, &address, server)) {
         Ok(()) => std::process::ExitCode::SUCCESS,

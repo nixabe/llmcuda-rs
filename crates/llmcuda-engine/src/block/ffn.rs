@@ -29,6 +29,8 @@ pub enum FfnBlock {
     Moe(MoeBlock),
     /// `qwen35`: one dense SwiGLU MLP.
     Dense(DenseFfnBlock),
+    /// K2-Horizon: dense leading layers followed by sigmoid-routed MoE.
+    K2(super::k2::K2FfnBlock),
 }
 
 /// One layer's feed-forward weights, resident on the device.
@@ -44,6 +46,8 @@ pub enum FfnLayerWeights {
     Moe(MoeLayerWeights),
     /// See [`DenseFfnLayerWeights`].
     Dense(DenseFfnLayerWeights),
+    /// Dense or MoE weights from K2-Horizon.
+    K2(super::k2::K2FfnWeights),
 }
 
 impl FfnLayerWeights {
@@ -56,6 +60,11 @@ impl FfnLayerWeights {
         config: &ModelConfig,
         geometry: &MoeGeometry,
     ) -> Result<Self, MoeBlockError> {
+        if config.k2.is_some() {
+            return Ok(Self::K2(super::k2::K2FfnWeights::upload(
+                stream, file, directory, config, layer,
+            )?));
+        }
         Ok(match config.ffn {
             FfnConfig::Moe(_) => Self::Moe(MoeLayerWeights::upload(
                 stream, file, directory, layer, geometry,
@@ -76,6 +85,7 @@ impl FfnLayerWeights {
         match self {
             Self::Moe(w) => w.layer(),
             Self::Dense(w) => w.layer(),
+            Self::K2(w) => w.layer(),
         }
     }
 
@@ -84,6 +94,7 @@ impl FfnLayerWeights {
         match self {
             Self::Moe(w) => w.bytes(),
             Self::Dense(w) => w.bytes(),
+            Self::K2(w) => w.bytes(),
         }
     }
 }
@@ -114,6 +125,11 @@ impl FfnBlock {
         geometry: MoeGeometry,
         eps: f32,
     ) -> Result<Self, MoeBlockError> {
+        if config.k2.is_some() {
+            return Ok(Self::K2(super::k2::K2FfnBlock::new(
+                ctx, stream, config, geometry, eps,
+            )?));
+        }
         Ok(match config.ffn {
             FfnConfig::Moe(_) => Self::Moe(MoeBlock::new(ctx, stream, geometry, eps)?),
             FfnConfig::Dense(_) => Self::Dense(DenseFfnBlock::new(
@@ -131,6 +147,7 @@ impl FfnBlock {
         match self {
             Self::Moe(b) => b.disable_tensor_cores(),
             Self::Dense(b) => b.disable_tensor_cores(),
+            Self::K2(_) => {}
         }
     }
 
@@ -139,6 +156,7 @@ impl FfnBlock {
         match self {
             Self::Moe(b) => b.tensor_cores_enabled(),
             Self::Dense(b) => b.tensor_cores_enabled(),
+            Self::K2(_) => false,
         }
     }
 
@@ -156,6 +174,7 @@ impl FfnBlock {
         match self {
             Self::Moe(b) => b.geometry(),
             Self::Dense(b) => b.geometry(),
+            Self::K2(b) => b.geometry(),
         }
     }
 
@@ -164,6 +183,7 @@ impl FfnBlock {
         match self {
             Self::Moe(b) => b.normed(),
             Self::Dense(b) => b.normed(),
+            Self::K2(b) => b.normed(),
         }
     }
 
@@ -173,7 +193,7 @@ impl FfnBlock {
     pub fn as_moe(&self) -> Option<&MoeBlock> {
         match self {
             Self::Moe(b) => Some(b),
-            Self::Dense(_) => None,
+            Self::Dense(_) | Self::K2(_) => None,
         }
     }
 
@@ -187,6 +207,7 @@ impl FfnBlock {
         match self {
             Self::Moe(b) => b.publish_tokens(stream, tokens),
             Self::Dense(b) => b.publish_tokens(stream, tokens),
+            Self::K2(b) => b.publish_tokens(stream, tokens),
         }
     }
 
@@ -212,6 +233,9 @@ impl FfnBlock {
             (Self::Dense(b), FfnLayerWeights::Dense(w)) => {
                 b.forward(stream, w, residual, tokens, ffn_out, l_out)
             }
+            (Self::K2(b), FfnLayerWeights::K2(w)) => {
+                b.forward(stream, w, residual, tokens, ffn_out, l_out)
+            }
             (block, w) => Err(MoeBlockError::FfnKindMismatch {
                 block: block.kind_name(),
                 weights: w.kind_name(),
@@ -223,6 +247,7 @@ impl FfnBlock {
         match self {
             Self::Moe(_) => "moe",
             Self::Dense(_) => "dense",
+            Self::K2(_) => "k2-horizon",
         }
     }
 }
@@ -232,6 +257,7 @@ impl FfnLayerWeights {
         match self {
             Self::Moe(_) => "moe",
             Self::Dense(_) => "dense",
+            Self::K2(_) => "k2-horizon",
         }
     }
 }

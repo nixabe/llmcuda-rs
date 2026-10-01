@@ -353,6 +353,7 @@ pub async fn serve(
 ) -> Result<(), String> {
     let think_close_token = tokenizer
         .token_to_id(THINK_CLOSE)
+        .or_else(|| tokenizer.token_to_id("</ifm|think>"))
         .and_then(|id| i32::try_from(id).ok());
     if think_close_token.is_none() {
         // Without it, everything the model emits is reported as answer text,

@@ -107,10 +107,7 @@ use llmcuda_gguf::{GgmlType, GgufFile};
 use llmcuda_model::config::{FfnConfig, LayerKind, ModelConfig};
 use llmcuda_model::weights::{Directory, Role};
 
-use crate::block::attention::{
-    AttentionBlockError, AttentionKernelSet, AttentionLayerWeights, AttnScratch,
-    GatedAttentionBlock, KvCache,
-};
+use crate::block::attention::{AttentionBlockError, AttnScratch, KvCache};
 use crate::block::ffn::{FfnBlock, FfnLayerWeights};
 use crate::block::gdn::{
     GateProjection, GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights, GdnState,
@@ -119,6 +116,10 @@ use crate::block::gdn::{
 use crate::block::gdn_verify::{
     GdnSnapshotRing, GdnVerifyError, GdnVerifyScratch, run_layer_with_snapshots,
     run_layer_with_snapshots_batch,
+};
+use crate::block::mixer::{
+    MixerBlock as GatedAttentionBlock, MixerKernelSet as AttentionKernelSet,
+    MixerLayerWeights as AttentionLayerWeights,
 };
 use crate::block::moe::MoeBlockError;
 use crate::state::{SequenceState, StateError};
@@ -590,7 +591,7 @@ from_error!(AttentionError, Mixer);
 pub struct ForwardReport {
     /// Bytes in the weight arena — everything read by alias, zero-copy.
     pub arena_bytes: u64,
-    /// Bytes of MoE weights held outside the arena, across all 40 layers.
+    /// Bytes of FFN weights held outside the arena, plus K2 mixer weights.
     ///
     /// Not a duplicate: these roles are filtered out of the arena, so this is
     /// the model's only copy of them.
@@ -671,6 +672,16 @@ pub fn arena_holds_for(ffn: FfnConfig, role: Role) -> bool {
     match ffn {
         FfnConfig::Moe(_) => !MOE_OWNED_ROLES.contains(&role),
         FfnConfig::Dense(_) => !DENSE_FFN_OWNED_ROLES.contains(&role),
+    }
+}
+
+/// Architecture-aware residency filter: K2 owns all layer tensors outside the
+/// global arena and shares them across fixed-token shapes.
+pub fn arena_holds_model_entry(config: &ModelConfig, role: Role, ty: GgmlType) -> bool {
+    if config.k2.is_some() {
+        role.is_global()
+    } else {
+        arena_holds_entry(config.ffn, role, ty)
     }
 }
 
@@ -869,6 +880,7 @@ pub struct Forward {
     /// the specialized Q8_0 gather, which takes no such argument.
     embed_code: i32,
     layer_ops: LayerOpsKernels,
+    k2_ops: Option<Arc<llmcuda_cuda::kernels::k2::K2Kernels>>,
     gdn: GdnBlock,
     attention: Vec<GatedAttentionBlock>,
     /// Shape-independent attention weights and lazy split-layout repacks.
@@ -1265,6 +1277,7 @@ impl Forward {
 
         // --- the 10 Gated Attention layers, shared across shapes ----------
         let attn_kernels = Arc::new(AttentionKernelSet::new(ctx, &config, tokens)?);
+        let k2_ops = attn_kernels.k2_ops();
         let mut attention = Vec::new();
         let mut shared_index = 0;
         for layer in 0..config.num_layers {
@@ -1329,7 +1342,7 @@ impl Forward {
             },
         )?;
         let moe = FfnBlock::new(ctx, stream, &config, moe_geometry, rms_eps)?;
-        let (moe_weights, moe_bytes) = match shared_moe {
+        let (moe_weights, mut moe_bytes) = match shared_moe {
             // Already on the card, uploaded by the pass this one was reshaped
             // from. Reported as zero bytes because they are not this pass's to
             // account for — see `reshape`.
@@ -1353,6 +1366,12 @@ impl Forward {
             }
         };
 
+        if owns_attention_weights {
+            moe_bytes += attention
+                .iter()
+                .map(|b| b.owned_k2_bytes() as u64)
+                .sum::<u64>();
+        }
         let lm_head = LmHeadKernels::new(
             ctx,
             LmHeadGeometry {
@@ -1382,6 +1401,7 @@ impl Forward {
             embed_fn,
             embed_code,
             layer_ops,
+            k2_ops,
             gdn,
             attention,
             attention_weights,
@@ -2067,15 +2087,28 @@ impl Forward {
             on_waypoint(Some(layer), WaypointStage::Moe, &self.hidden_state);
         }
 
-        self.layer_ops.rms_norm(
-            stream,
-            &self.hidden_state,
-            &self.w_output_norm,
-            &mut self.final_norm,
-            self.tokens,
-            self.hidden,
-            self.rms_eps,
-        )?;
+        if let Some(ops) = &self.k2_ops {
+            ops.norm(
+                stream,
+                &self.hidden_state,
+                &self.w_output_norm,
+                &mut self.final_norm,
+                self.hidden,
+                self.config.k2.unwrap().norm_groups as usize,
+                self.rms_eps,
+            )
+            .map_err(MoeBlockError::from)?;
+        } else {
+            self.layer_ops.rms_norm(
+                stream,
+                &self.hidden_state,
+                &self.w_output_norm,
+                &mut self.final_norm,
+                self.tokens,
+                self.hidden,
+                self.rms_eps,
+            )?;
+        }
         for seq in 0..n {
             let source = unsafe {
                 crate::viewslice::subslice(
@@ -2528,15 +2561,28 @@ impl Forward {
             on_waypoint(Some(layer), WaypointStage::Moe, &self.hidden_state);
         }
 
-        self.layer_ops.rms_norm(
-            stream,
-            &self.hidden_state,
-            &self.w_output_norm,
-            &mut self.final_norm,
-            n,
-            self.hidden,
-            self.rms_eps,
-        )?;
+        if let Some(ops) = &self.k2_ops {
+            ops.norm(
+                stream,
+                &self.hidden_state,
+                &self.w_output_norm,
+                &mut self.final_norm,
+                self.hidden,
+                self.config.k2.unwrap().norm_groups as usize,
+                self.rms_eps,
+            )
+            .map_err(MoeBlockError::from)?;
+        } else {
+            self.layer_ops.rms_norm(
+                stream,
+                &self.hidden_state,
+                &self.w_output_norm,
+                &mut self.final_norm,
+                n,
+                self.hidden,
+                self.rms_eps,
+            )?;
+        }
 
         let vocab = self.vocab;
         {
@@ -2860,15 +2906,28 @@ impl Forward {
         }
         self.verify_scratch = Some(scratch);
 
-        self.layer_ops.rms_norm(
-            stream,
-            &self.hidden_state,
-            &self.w_output_norm,
-            &mut self.final_norm,
-            self.tokens,
-            self.hidden,
-            self.rms_eps,
-        )?;
+        if let Some(ops) = &self.k2_ops {
+            ops.norm(
+                stream,
+                &self.hidden_state,
+                &self.w_output_norm,
+                &mut self.final_norm,
+                self.hidden,
+                self.config.k2.unwrap().norm_groups as usize,
+                self.rms_eps,
+            )
+            .map_err(MoeBlockError::from)?;
+        } else {
+            self.layer_ops.rms_norm(
+                stream,
+                &self.hidden_state,
+                &self.w_output_norm,
+                &mut self.final_norm,
+                self.tokens,
+                self.hidden,
+                self.rms_eps,
+            )?;
+        }
 
         let vocab = self.vocab;
         let n = self.tokens;
@@ -3163,15 +3222,28 @@ impl Forward {
         }
         self.verify_scratch = Some(scratch);
 
-        self.layer_ops.rms_norm(
-            stream,
-            &self.hidden_state,
-            &self.w_output_norm,
-            &mut self.final_norm,
-            self.tokens,
-            self.hidden,
-            self.rms_eps,
-        )?;
+        if let Some(ops) = &self.k2_ops {
+            ops.norm(
+                stream,
+                &self.hidden_state,
+                &self.w_output_norm,
+                &mut self.final_norm,
+                self.hidden,
+                self.config.k2.unwrap().norm_groups as usize,
+                self.rms_eps,
+            )
+            .map_err(MoeBlockError::from)?;
+        } else {
+            self.layer_ops.rms_norm(
+                stream,
+                &self.hidden_state,
+                &self.w_output_norm,
+                &mut self.final_norm,
+                self.tokens,
+                self.hidden,
+                self.rms_eps,
+            )?;
+        }
 
         let vocab = self.vocab;
         let rows = self.tokens;
@@ -3591,15 +3663,28 @@ impl Forward {
         }
 
         // 3. `h_nextn`: the final norm, all positions.
-        self.layer_ops.rms_norm(
-            stream,
-            &self.hidden_state,
-            &self.w_output_norm,
-            &mut self.final_norm,
-            self.tokens,
-            self.hidden,
-            self.rms_eps,
-        )?;
+        if let Some(ops) = &self.k2_ops {
+            ops.norm(
+                stream,
+                &self.hidden_state,
+                &self.w_output_norm,
+                &mut self.final_norm,
+                self.hidden,
+                self.config.k2.unwrap().norm_groups as usize,
+                self.rms_eps,
+            )
+            .map_err(MoeBlockError::from)?;
+        } else {
+            self.layer_ops.rms_norm(
+                stream,
+                &self.hidden_state,
+                &self.w_output_norm,
+                &mut self.final_norm,
+                self.tokens,
+                self.hidden,
+                self.rms_eps,
+            )?;
+        }
         self.mark(stream, Stage::FinalNorm)?;
 
         // 4. `result_output`: llama.cpp's `get_rows(cur, inp_out_ids)` keeps
@@ -3819,6 +3904,7 @@ fn alias_projection(
         GgmlType::Q8_0 => HeadFormat::Q8_0,
         GgmlType::Bf16 => HeadFormat::Bf16,
         GgmlType::Q6K => HeadFormat::Q6K,
+        GgmlType::Q4K => HeadFormat::Q4K,
         GgmlType::F16 => HeadFormat::F16,
         found => {
             return Err(ForwardError::WrongQuant {

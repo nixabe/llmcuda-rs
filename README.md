@@ -37,6 +37,12 @@ RTX 8000, written in Rust.
 > standing above is about it — and the dense model's own first measurements
 > are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
+The engine also serves [IFM/K2-Horizon-MoVA-36B-A4B-GGUF](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B-GGUF)
+in **Q4_K_M** and **Q6_K**, selected by `general.architecture = k2-horizon`.
+Its routed attention values, grouped normalization and IFM chat template are
+described in [docs/MODEL.md](docs/MODEL.md#k2-horizon).
+Qwen3.6 remains the performance target; K2 has no published performance standing.
+
 ## Why this exists
 
 The obvious way to serve this model on three GPUs is three `llama-server`

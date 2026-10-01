@@ -422,7 +422,12 @@ enum ParserState {
     Text,
     /// Between an opener and `</tool_call>`; `raw` holds everything consumed
     /// since the opener so an unparseable block can be returned verbatim.
-    InCall { raw: String, wrapped: bool },
+    InCall {
+        raw: String,
+        prefix: &'static str,
+        close: &'static str,
+        ifm: bool,
+    },
 }
 
 /// Incremental scanner over the answer span's text.
@@ -443,7 +448,12 @@ pub(crate) struct ToolCallParser {
 
 impl ToolCallParser {
     pub(crate) fn new(tools: &[ToolDefinition]) -> Self {
-        let mut openers = vec![CALL_OPEN.to_owned()];
+        let mut openers = vec![
+            CALL_OPEN.to_owned(),
+            "<ifm|tool_call>".to_owned(),
+            "<ifm|tool_calls>".to_owned(),
+            "</ifm|tool_calls>".to_owned(),
+        ];
         openers.extend(tools.iter().map(|tool| format!("<function={}>", tool.name)));
         Self {
             openers,
@@ -478,9 +488,30 @@ impl ToolCallParser {
                             self.pending.drain(..opener.len());
                             // A bare `<function=...>` opener is part of the
                             // call body; the `<tool_call>` line is markup.
-                            let wrapped = opener == CALL_OPEN;
-                            let raw = if wrapped { String::new() } else { opener };
-                            self.state = ParserState::InCall { raw, wrapped };
+                            if opener == "<ifm|tool_calls>" || opener == "</ifm|tool_calls>" {
+                                self.swallow_whitespace = true;
+                                continue;
+                            }
+                            let ifm = opener == "<ifm|tool_call>";
+                            let prefix = if ifm {
+                                "<ifm|tool_call>"
+                            } else if opener == CALL_OPEN {
+                                CALL_OPEN
+                            } else {
+                                ""
+                            };
+                            let close = if ifm { "</ifm|tool_call>" } else { CALL_CLOSE };
+                            let raw = if prefix.is_empty() {
+                                opener
+                            } else {
+                                String::new()
+                            };
+                            self.state = ParserState::InCall {
+                                raw,
+                                prefix,
+                                close,
+                                ifm,
+                            };
                         }
                         None => {
                             let held = held_back_len(&self.pending, &self.openers);
@@ -493,15 +524,24 @@ impl ToolCallParser {
                         }
                     }
                 }
-                ParserState::InCall { raw, wrapped } => {
-                    let prefix = if *wrapped { CALL_OPEN } else { "" };
-                    match self.pending.find(CALL_CLOSE) {
+                ParserState::InCall {
+                    raw,
+                    prefix,
+                    close,
+                    ifm,
+                } => {
+                    let (prefix, close, ifm) = (*prefix, *close, *ifm);
+                    match self.pending.find(close) {
                         Some(at) => {
                             raw.push_str(&self.pending[..at]);
-                            self.pending.drain(..at + CALL_CLOSE.len());
+                            self.pending.drain(..at + close.len());
                             let raw = std::mem::take(raw);
                             self.state = ParserState::Text;
-                            match parse_call(&raw, &self.schemas) {
+                            match if ifm {
+                                parse_ifm_call(&raw, &self.schemas)
+                            } else {
+                                parse_call(&raw, &self.schemas)
+                            } {
                                 Some(call) => {
                                     events.push(ToolEvent::Call(call));
                                     self.swallow_whitespace = true;
@@ -509,14 +549,14 @@ impl ToolCallParser {
                                 None => {
                                     // Reassemble what was consumed so the
                                     // caller sees the model's actual output.
-                                    self.emit_text(format!("{prefix}{raw}{CALL_CLOSE}"), events);
+                                    self.emit_text(format!("{prefix}{raw}{close}"), events);
                                 }
                             }
                         }
                         None => {
                             // No closer yet: move everything but a possible
                             // closer prefix into the call buffer and wait.
-                            let held = held_back_len(&self.pending, &[CALL_CLOSE.to_owned()]);
+                            let held = held_back_len(&self.pending, &[close.to_owned()]);
                             let take = self.pending.len() - held;
                             raw.push_str(&self.pending[..take]);
                             self.pending.drain(..take);
@@ -537,8 +577,7 @@ impl ToolCallParser {
     pub(crate) fn finish(&mut self, events: &mut Vec<ToolEvent>) {
         let tail = match std::mem::replace(&mut self.state, ParserState::Text) {
             ParserState::Text => std::mem::take(&mut self.pending),
-            ParserState::InCall { raw, wrapped } => {
-                let prefix = if wrapped { CALL_OPEN } else { "" };
+            ParserState::InCall { raw, prefix, .. } => {
                 format!("{prefix}{raw}{}", std::mem::take(&mut self.pending))
             }
         };
@@ -644,9 +683,72 @@ fn parse_call(
     }
 }
 
+/// IFM's default XML tool-call format (and its JSON alternative).
+fn parse_ifm_call(
+    raw: &str,
+    schemas: &HashMap<String, HashMap<String, bool>>,
+) -> Option<ParsedToolCall> {
+    let raw = raw.trim();
+    if raw.starts_with('{') {
+        let value: Value = serde_json::from_str(raw).ok()?;
+        let name = value.get("name")?.as_str()?;
+        schemas.get(name)?;
+        return Some(ParsedToolCall {
+            name: name.to_owned(),
+            arguments: value.get("arguments")?.as_object()?.clone(),
+        });
+    }
+    let end = raw.find('<').unwrap_or(raw.len());
+    let name = raw[..end].trim();
+    let types = schemas.get(name)?;
+    let mut rest = &raw[end..];
+    let mut arguments = Map::new();
+    while !rest.trim().is_empty() {
+        rest = rest.trim_start().strip_prefix("<ifm|arg_key>")?;
+        let end = rest.find("</ifm|arg_key>")?;
+        let key = rest[..end].trim().to_owned();
+        if key.is_empty() {
+            return None;
+        }
+        rest = rest[end + "</ifm|arg_key>".len()..].trim_start();
+        if let Some(after) = rest.strip_prefix("<ifm|arg_type>") {
+            rest = &after[after.find("</ifm|arg_type>")? + "</ifm|arg_type>".len()..];
+        }
+        rest = rest.trim_start().strip_prefix("<ifm|arg_value>")?;
+        let end = rest.find("</ifm|arg_value>")?;
+        let value = &rest[..end];
+        let value = if types.get(&key) == Some(&true) {
+            Value::String(value.to_owned())
+        } else {
+            serde_json::from_str(value.trim()).unwrap_or_else(|_| Value::String(value.to_owned()))
+        };
+        if arguments.insert(key, value).is_some() {
+            return None;
+        }
+        rest = &rest[end + "</ifm|arg_value>".len()..];
+    }
+    Some(ParsedToolCall {
+        name: name.to_owned(),
+        arguments,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ifm_calls_survive_every_stream_split() {
+        let raw = "<ifm|tool_calls>\n<ifm|tool_call>get_weather\n<ifm|arg_key>city</ifm|arg_key>\n<ifm|arg_value>台北</ifm|arg_value>\n<ifm|arg_key>days</ifm|arg_key><ifm|arg_value>3</ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls>";
+        for split in (0..=raw.len()).filter(|&at| raw.is_char_boundary(at)) {
+            let mut parser = ToolCallParser::new(&[weather_tool()]);
+            assert_eq!(
+                events(&mut parser, &[&raw[..split], &raw[split..]]),
+                vec![call("get_weather", json!({"city":"台北","days":3}))],
+                "split {split}"
+            );
+        }
+    }
 
     #[test]
     fn sandbox_arguments_survive_every_stream_split() {

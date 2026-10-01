@@ -463,7 +463,7 @@ impl QuantTensor<'_> {
     }
 }
 
-const MOE_SRC: &str = r#"
+pub(crate) const MOE_SRC: &str = r#"
 // Tile shape. Mirrored by `TILE_M` / `TILE_K` / `TILE_ROWS` on the Rust side,
 // which size the shared memory and the grid; `tile_shape_is_mirrored_in_rust`
 // asserts the two never drift.
@@ -4778,6 +4778,11 @@ impl MoeBuffers {
         }
     }
 
+    /// Mutable routing outputs for architecture-specific device routers.
+    pub fn routing_mut(&mut self) -> (&mut CudaSlice<i32>, &mut CudaSlice<f32>) {
+        (&mut self.topk_ids, &mut self.topk_weights)
+    }
+
     /// Selected expert ids, `[max_tokens][experts_per_token]`.
     pub fn topk_ids(&self) -> &CudaSlice<i32> {
         &self.topk_ids
@@ -5788,8 +5793,14 @@ impl MoeKernels {
         // threshold, where almost every dispatch bucket the batch touches
         // still holds exactly one live token. See `MOE_NARROW_DECODE_MAX`'s
         // own comment.
-        let narrow =
-            !gemv && !use_mma && (g.max_tokens <= MOE_NARROW_DECODE_MAX || self.exact_regime);
+        // Community kernels write/read bucket order. Flat slot order is valid
+        // only when both stages use the flat kernels; Q4_K_M mixes Q4_K
+        // gate/up with Q6_K down and otherwise silently reads the wrong slots.
+        let narrow = !gemv
+            && !use_mma
+            && !ffn_community
+            && !down_community
+            && (g.max_tokens <= MOE_NARROW_DECODE_MAX || self.exact_regime);
 
         if ffn_community {
             let cfg = LaunchConfig {

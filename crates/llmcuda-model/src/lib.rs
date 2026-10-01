@@ -1,10 +1,12 @@
-//! Structural description of the Qwen3.5-family models this engine serves,
+//! Structural description of the Qwen and K2-Horizon models this engine serves,
 //! and the resource budgets that follow from it.
 //!
-//! Two architectures are described: `qwen35moe` (Qwen3.6-35B-A3B, a routed
+//! The Qwen architectures are `qwen35moe` (Qwen3.6-35B-A3B, a routed
 //! 256-expert MoE) and `qwen35` (Qwen3.8-27B, the dense sibling). They share
 //! the hybrid Gated-DeltaNet/Gated-Attention layer pattern and differ in the
 //! feed-forward block and in every width; see [`FfnConfig`].
+//! `k2-horizon` adds full attention with routed values, grouped RMS norms,
+//! leading dense FFNs and sigmoid MoE routing; see [`K2Config`].
 //!
 //! This crate holds no state and touches no device. It answers questions of
 //! the form "given this architecture, how many bytes does X cost" — VRAM
@@ -24,8 +26,8 @@ pub mod vision;
 pub mod weights;
 
 pub use config::{
-    AttentionConfig, DenseFfnConfig, FfnConfig, GdnConfig, LayerKind, ModelConfig, MoeConfig,
-    UnknownArchitecture,
+    AttentionConfig, DenseFfnConfig, FfnConfig, GdnConfig, K2Config, LayerKind, ModelConfig,
+    MoeConfig, UnknownArchitecture,
 };
 pub use dflash::DFlashConfig;
 pub use vision::VisionConfig;

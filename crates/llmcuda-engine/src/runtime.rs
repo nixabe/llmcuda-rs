@@ -26,7 +26,9 @@ use crate::block::attention::KvCache;
 use crate::block::gdn_verify::GdnSnapshotRing;
 use crate::block::mtp::{MtpBlock, MtpBlockError};
 use crate::dflash::{DFlashDraftCache, DFlashError, DFlashForward, load_dflash_weights};
-use crate::forward::{BatchStepGraph, Forward, ForwardError, WaypointStage, arena_holds_entry};
+use crate::forward::{
+    BatchStepGraph, Forward, ForwardError, WaypointStage, arena_holds_model_entry,
+};
 use crate::image::{
     ImagePlacement, SequenceImage, chunk_overlaps_images, fill_mrope_triples, rope_delta_at,
     validate_placements,
@@ -500,7 +502,7 @@ pub struct DeviceRuntime {
     /// sampling path allocates nothing per token (AGENTS.md rule 6).
     host_logits: Vec<f32>,
     sample_scratch: Vec<(f32, u32)>,
-    eos_token: Option<i32>,
+    eos_tokens: SmallVec<[i32; 2]>,
     /// The vision tower, present iff an mmproj was configured.
     vision: Option<VisionForward>,
     /// Reused host buffer for per-chunk `(t, h, w)` rotary triples
@@ -738,10 +740,21 @@ impl DeviceRuntime {
         } else {
             mtp_drafts
         };
-        let eos_token = stop_on_eos
-            .then(|| file.get_u32("tokenizer.ggml.eos_token_id"))
-            .flatten()
-            .map(|token| token as i32);
+        let mut eos_tokens: SmallVec<[i32; 2]> = SmallVec::new();
+        if stop_on_eos {
+            if let Some(token) = file.get_u32("tokenizer.ggml.eos_token_id") {
+                eos_tokens.push(token as i32);
+            }
+            if config.k2.is_some()
+                && let Some(tokens) = file.get_string_array("tokenizer.ggml.tokens")
+                && let Some(id) = tokens.iter().position(|t| t == "<|ifm|im_end|>")
+            {
+                let id = id as i32;
+                if !eos_tokens.contains(&id) {
+                    eos_tokens.push(id);
+                }
+            }
+        }
         // MTP serving needs the last block's tensors in the directory; its
         // feed-forward weights stay out of the arena either way
         // (`arena_holds_for`) and are uploaded exactly once by the first
@@ -754,10 +767,9 @@ impl DeviceRuntime {
         let directory = schema
             .resolve(&file)
             .map_err(|errors| RuntimeError::Schema(format!("{errors:?}")))?;
-        let ffn = config.ffn;
         let (weights, _) =
             DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |role, ty| {
-                arena_holds_entry(ffn, role, ty)
+                arena_holds_model_entry(&config, role, ty)
             })?;
         debug!(
             device = device_ordinal,
@@ -1065,7 +1077,7 @@ impl DeviceRuntime {
             sampled: Vec::with_capacity(max_batch),
             host_logits: Vec::with_capacity(config.vocab_size as usize),
             sample_scratch: Vec::with_capacity(config.vocab_size as usize),
-            eos_token,
+            eos_tokens,
             vision,
             mrope_host: Vec::new(),
         };
@@ -1581,7 +1593,7 @@ impl DeviceRuntime {
                     }
                 }
                 seq.next_token = Some(output);
-                if self.eos_token == Some(output) {
+                if self.eos_tokens.contains(&output) {
                     seq.emitted = seq.max_output;
                     stopped.push(*id);
                     continue;
@@ -1925,8 +1937,9 @@ impl DeviceRuntime {
             // tokens before it are real inputs, the eos itself ends the
             // sequence exactly as it does on the plain decode path.
             let mut hit_eos = false;
-            if let Some(eos) = self.eos_token
-                && let Some(at) = emit.iter().position(|&token| token == eos)
+            if let Some(at) = emit
+                .iter()
+                .position(|token| self.eos_tokens.contains(token))
             {
                 emit.truncate(at + 1);
                 hit_eos = true;
@@ -2436,7 +2449,7 @@ impl DeviceRuntime {
             // constraint has seen no output yet, so it cannot be armed — but
             // this is where it starts watching for its trigger.
             seq.observe(next);
-            if self.eos_token == Some(next) {
+            if self.eos_tokens.contains(&next) {
                 seq.emitted = seq.max_output;
                 stopped.push(id);
             } else {

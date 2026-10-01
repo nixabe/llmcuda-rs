@@ -134,6 +134,8 @@ pub enum AttentionBlockError {
     LayerOps(LayerOpsError),
     /// A projection rejected a launch.
     Projection(LmHeadError),
+    /// K2-Horizon loading or routing rejected a tensor.
+    K2(super::moe::MoeBlockError),
     /// The device weights do not carry a tensor this block needs.
     ///
     /// A missing projection is not recoverable by falling back to something
@@ -182,6 +184,7 @@ impl std::fmt::Display for AttentionBlockError {
             Self::Mma(e) => write!(f, "{e}"),
             Self::LayerOps(e) => write!(f, "{e}"),
             Self::Projection(e) => write!(f, "{e}"),
+            Self::K2(e) => write!(f, "{e}"),
             Self::MissingWeight { role, layer } => {
                 write!(f, "block {layer} has no resident `{role}` tensor")
             }
@@ -362,10 +365,10 @@ impl AttentionKernelSet {
 /// [`GdnState`](crate::block::gdn::GdnState) holds and why this model's cache does not grow the way a
 /// forty-layer dense model's would.
 pub struct KvCache {
-    k: CudaSlice<u16>,
-    v: CudaSlice<u16>,
+    pub(crate) k: CudaSlice<u16>,
+    pub(crate) v: CudaSlice<u16>,
     kv_dim: usize,
-    max_seq: usize,
+    pub(crate) max_seq: usize,
 }
 
 /// Capacity for one attention layer's retention-interval delta. A snapshot
@@ -629,20 +632,20 @@ const ROW_DECODE_MAX_QUERY: usize = 16;
 
 pub struct AttnScratch {
     tokens: usize,
-    normed: CudaSlice<f32>,
+    pub(crate) normed: CudaSlice<f32>,
     packed: CudaSlice<f32>,
-    query: CudaSlice<f32>,
-    gate: CudaSlice<f32>,
+    pub(crate) query: CudaSlice<f32>,
+    pub(crate) gate: CudaSlice<f32>,
     query_normed: CudaSlice<f32>,
-    query_roped: CudaSlice<f32>,
-    key: CudaSlice<f32>,
+    pub(crate) query_roped: CudaSlice<f32>,
+    pub(crate) key: CudaSlice<f32>,
     key_normed: CudaSlice<f32>,
-    key_roped: CudaSlice<f32>,
-    value: CudaSlice<f32>,
-    pregate: CudaSlice<f32>,
+    pub(crate) key_roped: CudaSlice<f32>,
+    pub(crate) value: CudaSlice<f32>,
+    pub(crate) pregate: CudaSlice<f32>,
     gate_sigmoid: CudaSlice<f32>,
-    gated: CudaSlice<f32>,
-    projected: CudaSlice<f32>,
+    pub(crate) gated: CudaSlice<f32>,
+    pub(crate) projected: CudaSlice<f32>,
     /// Activations quantized once per contraction width and reused by every
     /// projection that shares it. Allocated on first use, then kept.
     xq: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
@@ -650,9 +653,10 @@ pub struct AttnScratch {
     /// geometry rather than by `tokens`, and used only at `n_query == 1`, but
     /// held here because this is the struct with a stream to allocate from and
     /// the one already shared by all ten attention layers.
-    decode: Vec<AttnDecodeScratch>,
+    pub(crate) decode: Vec<AttnDecodeScratch>,
     /// One absolute position per row, for [`ROW_DECODE_MAX_QUERY`].
     row_positions: CudaSlice<i32>,
+    pub(crate) k2: Option<super::k2::K2ValueScratch>,
 }
 
 impl AttnScratch {
@@ -667,6 +671,11 @@ impl AttnScratch {
         let q_dim = a.q_heads as usize * a.head_dim as usize;
         let kv_dim = a.kv_heads as usize * a.head_dim as usize;
         Ok(Self {
+            k2: if config.k2.is_some() {
+                Some(super::k2::K2ValueScratch::new(stream, config, tokens)?)
+            } else {
+                None
+            },
             tokens,
             normed: stream.alloc_zeros::<f32>(tokens * hidden)?,
             packed: stream.alloc_zeros::<f32>(tokens * 2 * q_dim)?,
@@ -2351,6 +2360,17 @@ fn f32_weight(
 /// leave a hardcoded list behind. For Qwen3.6 this is 3, 7, ... 39.
 pub fn attention_layers(config: &ModelConfig) -> impl Iterator<Item = u32> + '_ {
     (0..config.num_layers).filter(move |&l| l % config.pattern_period == config.attention_offset)
+}
+
+impl From<super::moe::MoeBlockError> for AttentionBlockError {
+    fn from(e: super::moe::MoeBlockError) -> Self {
+        Self::K2(e)
+    }
+}
+impl From<llmcuda_cuda::kernels::moe::MoeError> for AttentionBlockError {
+    fn from(e: llmcuda_cuda::kernels::moe::MoeError) -> Self {
+        Self::K2(e.into())
+    }
 }
 
 #[cfg(test)]

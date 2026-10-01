@@ -29,6 +29,7 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
     let architecture = match file.get_str("general.architecture") {
         Some("qwen35moe") => "qwen35moe",
         Some("qwen35") => "qwen35",
+        Some("k2-horizon") => "k2-horizon",
         declared => {
             return Err(ConfigLoadError(
                 crate::UnknownArchitecture {
@@ -66,7 +67,11 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
         ));
     }
     // Same family default as llama.cpp; never a model-size preset.
-    let period = optional("full_attention_interval")?.unwrap_or(4);
+    let period = if architecture == "k2-horizon" {
+        1
+    } else {
+        optional("full_attention_interval")?.unwrap_or(4)
+    };
     if period == 0 {
         return Err(invalid(&key("full_attention_interval"), "must be non-zero"));
     }
@@ -77,14 +82,20 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
             "unequal key/value head dimensions are unsupported",
         ));
     }
-    let gdn = GdnConfig {
-        value_heads: required("ssm.time_step_rank")?,
-        qk_heads: required("ssm.group_count")?,
-        head_dim: required("ssm.state_size")?,
-        conv_kernel: required("ssm.conv_kernel")?,
-        chunk_len: 64,
+    let gdn = if architecture == "k2-horizon" {
+        ModelConfig::k2_horizon_36b_a4b().gdn
+    } else {
+        GdnConfig {
+            value_heads: required("ssm.time_step_rank")?,
+            qk_heads: required("ssm.group_count")?,
+            head_dim: required("ssm.state_size")?,
+            conv_kernel: required("ssm.conv_kernel")?,
+            chunk_len: 64,
+        }
     };
-    if gdn.value_heads.checked_mul(gdn.head_dim) != Some(required("ssm.inner_size")?) {
+    if architecture != "k2-horizon"
+        && gdn.value_heads.checked_mul(gdn.head_dim) != Some(required("ssm.inner_size")?)
+    {
         return Err(invalid(
             &key("ssm.inner_size"),
             "must equal time_step_rank * state_size",
@@ -96,7 +107,7 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
             "must be a multiple of group_count",
         ));
     }
-    let ffn = if architecture == "qwen35moe" {
+    let ffn = if architecture != "qwen35" {
         let intermediate = required("expert_feed_forward_length")?;
         if required("expert_shared_feed_forward_length")? != intermediate {
             return Err(invalid(
@@ -114,6 +125,57 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
         FfnConfig::Dense(DenseFfnConfig {
             intermediate: required("feed_forward_length")?,
         })
+    };
+    let k2 = if architecture == "k2-horizon" {
+        let scale = file.get_f32(&key("expert_weights_scale")).ok_or_else(|| {
+            invalid(
+                &key("expert_weights_scale"),
+                "required fp32 metadata is missing",
+            )
+        })?;
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(invalid(
+                &key("expert_weights_scale"),
+                "must be finite and positive",
+            ));
+        }
+        if required("expert_gating_func")? != 2
+            || file.get(&key("expert_weights_norm")) != Some(&GgufValue::Bool(true))
+        {
+            return Err(invalid(
+                &key("expert_gating_func"),
+                "K2 requires sigmoid routing and normalized selected weights",
+            ));
+        }
+        if required("expert_shared_count")? != 1 || required("moe_every_n_layers")? != 1 || mtp != 0
+        {
+            return Err(invalid(
+                &key("expert_shared_count"),
+                "only one shared expert, consecutive MoE layers and no MTP are supported",
+            ));
+        }
+        let k = crate::K2Config {
+            leading_dense_layers: optional("leading_dense_block_count")?.unwrap_or(0),
+            dense_intermediate: required("feed_forward_length")?,
+            norm_groups: required("attention.group_norm_groups")?,
+            value_experts: required("attention.value_expert_count")?,
+            values_per_token: required("attention.value_expert_used_count")?,
+            route_scale_bits: scale.to_bits(),
+        };
+        if k.leading_dense_layers >= blocks
+            || k.value_experts > 512
+            || ffn.moe().is_none_or(|m| m.num_experts > 512)
+            || k.values_per_token > k.value_experts
+            || !required("embedding_length")?.is_multiple_of(k.norm_groups)
+        {
+            return Err(invalid(
+                &key("attention.value_expert_count"),
+                "invalid dense-layer, normalization-group or value-router geometry",
+            ));
+        }
+        Some(k)
+    } else {
+        None
     };
     let tokens = file
         .get_string_array("tokenizer.ggml.tokens")
@@ -155,6 +217,7 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
         native_context,
         yarn_context: native_context,
         has_mtp: mtp == 1,
+        k2,
     };
     let recurrent_key = key("attention.recurrent_layers");
     if file.get(&recurrent_key).is_some() {

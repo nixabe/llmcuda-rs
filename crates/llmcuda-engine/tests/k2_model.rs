@@ -285,6 +285,44 @@ fn k2_full_model() {
             agreement(row, &reference, "deep batch decode graph", 0.02, 0.99999);
         }
     }
+    // Cross the production tensor-core decode threshold with real weights.
+    // Identical serial prefills isolate the batched attention and graph path.
+    {
+        let prefix: Vec<_> = tokens.iter().copied().cycle().take(512).collect();
+        let mut prefill = pass
+            .reshape(&ctx, &stream, &file, &directory, &weights, prefix.len())
+            .unwrap();
+        let mut serial_state = pass.new_state(&stream, 520).unwrap();
+        let mut batch_states = (0..3)
+            .map(|_| pass.new_state(&stream, 520).unwrap())
+            .collect::<Vec<_>>();
+        prefill
+            .run(&stream, &mut serial_state, &prefix, |_, _| {})
+            .unwrap();
+        for state in &mut batch_states {
+            prefill.run(&stream, state, &prefix, |_, _| {}).unwrap();
+        }
+        single
+            .run(&stream, &mut serial_state, &[next], |_, _| {})
+            .unwrap();
+        let reference = stream.clone_dtoh(single.logits()).unwrap();
+        let graph = bd.capture_batch_step(&stream, &mut batch_states).unwrap();
+        bd.replay_batch_step(&stream, &mut batch_states, &graph, &[next; 3])
+            .unwrap();
+        for row in stream
+            .clone_dtoh(bd.batch_logits().unwrap())
+            .unwrap()
+            .chunks(reference.len())
+        {
+            agreement(
+                row,
+                &reference,
+                "512-token batch tensor-core decode graph",
+                0.02,
+                0.99999,
+            );
+        }
+    }
     // Defer gates until the whole curve is printed, making a failed audit
     // useful without dropping any layer's numerical checks.
     for (layer, c, rms) in block_checks {

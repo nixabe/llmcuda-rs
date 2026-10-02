@@ -158,8 +158,11 @@ __device__ __forceinline__ int weight_sum(const unsigned char* row,unsigned i){
 }
 template<int IR> __device__ __forceinline__ float q6_subscale(const unsigned char* row,int i){const unsigned char* b=row+(i/256)*224*IR;int off=194+(i%256)/16;return (float)((const signed char*)b)[(off/4)*(4*IR)+(off%4)];}
 template<int IR> __device__ __forceinline__ float q6_delta(const unsigned char* row,int i){return k2_half_bits(*(const unsigned short*)(row+(i/256)*224*IR+192*IR));}
-template<int Q,int NT,bool ROUTED>
-__device__ void raw_gemv(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* ids,float* out,int inner,int rows,int pairs,int topk,int mode) {
+// Fixed hidden width removes dynamic address and tail arithmetic only.
+// Every scale group and the fp32 accumulation tree stay in the same order.
+template<int Q,int NT,bool ROUTED,int INNER=0>
+__device__ __forceinline__ void raw_gemv(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* ids,float* out,int inner,int rows,int pairs,int topk,int mode) {
+    if(INNER)inner=INNER;
     constexpr int IR=ROUTED ? 4 : 1;
     constexpr int RW=ROUTED ? K2_ROUTED_GEMV_ROWS : 4,LANES=32/RW;
     if(blockIdx.x*4*RW>=rows)return;
@@ -318,8 +321,9 @@ __device__ __forceinline__ float raw_full_term(float scale,int dot,float minimum
     asm("mul.rn.f32 %0,%1,%2;":"=f"(result):"f"(coefficient),"f"((float)dot));
     asm("fma.rn.f32 %0,%1,%2,%3;":"=f"(result):"f"(-minimum),"f"(sum),"f"(result));return result;
 }
-template<int BT,int MF,int IR>
-__device__ void raw_gemm_q4_nibbles(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* xsum,const int* sorted,const int* owners,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {
+template<int BT,int MF,int IR,int INNER=0>
+__device__ __forceinline__ void raw_gemm_q4_nibbles(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* xsum,const int* sorted,const int* owners,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {
+    if(INNER)inner=INNER;
     constexpr int RN=BT==64 ? 128 : 64,NF=RN/8,NP=K2_ACTIVATION_BITS/4;
     if(blockIdx.x*RN>=rows)return;
     int expert=mode ? owners[blockIdx.y] : 0;if(expert<0)return;
@@ -357,10 +361,15 @@ __device__ void raw_gemm_q4_nibbles(const unsigned char* w,const signed char* x,
                     #pragma unroll
                     for(int n=0;n<4;++n)weight[n]=wn[(nb+n)*8+(lane>>2)][pos];
                     #pragma unroll
-                    for(int ni=0;ni<NP;++ni) {
-                        int tmp[4][2]={};unsigned act=an[ni][(warp*MF+a)*8+(lane>>2)][pos];
+                    // Horner reconstruction uses the MMA accumulator directly:
+                    // each signed/unsigned nibble dot is exact in int32.
+                    for(int ni=NP-1;ni>=0;--ni) {
+                        unsigned act=an[ni][(warp*MF+a)*8+(lane>>2)][pos];
                         #pragma unroll
-                        for(int n=0;n<4;++n){if(ni==NP-1)raw_imma4(tmp[n],act,weight[n]);else raw_imma4u(tmp[n],act,weight[n]);total[n][0]+=tmp[n][0]*(1<<(4*ni));total[n][1]+=tmp[n][1]*(1<<(4*ni));}
+                        for(int n=0;n<4;++n){
+                            if(ni!=NP-1){total[n][0]*=16;total[n][1]*=16;}
+                            if(ni==NP-1)raw_imma4(total[n],act,weight[n]);else raw_imma4u(total[n],act,weight[n]);
+                        }
                     }
                     #pragma unroll
                     for(int n=0;n<4;++n) {
@@ -379,16 +388,18 @@ __device__ void raw_gemm_q4_nibbles(const unsigned char* w,const signed char* x,
 }
 
 extern "C" {
-#define GEMV_ENTRY(NAME,Q,NT,ROUTED) __global__ void NAME(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* ids,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {raw_gemv<Q,NT,ROUTED>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);}
-#define GEMM_ENTRY(NAME,Q,BT,MF,IR) __global__ __launch_bounds__(256,2) void NAME(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* sorted,const int* owners,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {if(Q==3 && K2_ACTIVATION_BITS>=12)raw_gemm_q4_nibbles<BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode,nib);else raw_gemm_fallback<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);}
+#define GEMV_ENTRY(NAME,Q,NT,ROUTED) __global__ void NAME(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* ids,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {if(Q==3 && !ROUTED && inner==2560)raw_gemv<Q,NT,ROUTED,2560>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);else raw_gemv<Q,NT,ROUTED>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);}
+#define GEMM_ENTRY(NAME,Q,BT,MF,IR,INNER) __global__ __launch_bounds__(256,2) void NAME(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* sorted,const int* owners,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {if(Q==3 && K2_ACTIVATION_BITS>=12)raw_gemm_q4_nibbles<BT,MF,IR,INNER>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode,nib);else raw_gemm_fallback<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);}
 GEMV_ENTRY(k2_gemv_q4,3,1,true)
 GEMV_ENTRY(k2_gemv_dense_q4,3,K2_DENSE_TOKENS,false)
 GEMV_ENTRY(k2_gemv_q6,0,1,true)
 GEMV_ENTRY(k2_gemv_dense_q6,0,K2_DENSE_TOKENS,false)
-GEMM_ENTRY(k2_gemm_q4,3,K2_ROUTED_TILE,1,4)
-GEMM_ENTRY(k2_gemm_dense_q4,3,64,1,1)
-GEMM_ENTRY(k2_gemm_q6,0,K2_ROUTED_TILE,1,4)
-GEMM_ENTRY(k2_gemm_dense_q6,0,64,1,1)
+GEMM_ENTRY(k2_gemm_q4,3,K2_ROUTED_TILE,1,4,0)
+GEMM_ENTRY(k2_gemm_dense_q4,3,64,1,1,0)
+GEMM_ENTRY(k2_gemm_q6,0,K2_ROUTED_TILE,1,4,0)
+GEMM_ENTRY(k2_gemm_dense_q6,0,64,1,1,0)
+GEMM_ENTRY(k2_gemm_hidden_q4,3,K2_ROUTED_TILE,1,4,2560)
+GEMM_ENTRY(k2_gemm_hidden_dense_q4,3,64,1,1,2560)
 }
 "#;
 
@@ -410,6 +421,8 @@ pub struct K2Gemm {
     prepared: Option<K2Prepared>,
     activation_bits: usize,
     routed_gemv_rows: usize,
+    hidden_q4: CudaFunction,
+    hidden_dense_q4: CudaFunction,
     functions: [CudaFunction; 2],
     gemv: [CudaFunction; 2],
     gemv_dense: [CudaFunction; 2],
@@ -573,6 +586,8 @@ impl K2Gemm {
             prepared: None,
             activation_bits,
             routed_gemv_rows,
+            hidden_q4: module.load_function("k2_gemm_hidden_q4")?,
+            hidden_dense_q4: module.load_function("k2_gemm_hidden_dense_q4")?,
             functions: [
                 module.load_function("k2_gemm_q4")?,
                 module.load_function("k2_gemm_q6")?,
@@ -764,6 +779,12 @@ impl K2Gemm {
                 &self.gemv_dense[usize::from(quant == ExpertQuant::Q6K)]
             } else if small {
                 &self.gemv[usize::from(quant == ExpertQuant::Q6K)]
+            } else if quant == ExpertQuant::Q4K && self.activation_bits >= 12 && inner == 2560 {
+                if wide {
+                    &self.hidden_dense_q4
+                } else {
+                    &self.hidden_q4
+                }
             } else if wide {
                 &self.dense[usize::from(quant == ExpertQuant::Q6K)]
             } else {

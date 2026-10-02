@@ -689,7 +689,29 @@ impl K2AttentionBlock {
                     self.config.attention.kv_heads as usize,
                 )
             }?;
-            if offsets.iter().all(|o| a.k2_batch_uses_warp(o + 1)) {
+            let mma = a.k2_decode_mma_wpo(offsets[0] + 1).filter(|wpo| {
+                offsets
+                    .iter()
+                    .all(|o| a.k2_decode_mma_wpo(o + 1) == Some(*wpo))
+            });
+            if let Some(wpo) = mma
+                && n > 1
+            {
+                // SAFETY: checked independent cache slots and fixed batch scratch
+                // remain live through the launch, just as for scalar attention.
+                unsafe {
+                    a.decode_batch_k2_mma_raw(
+                        stream,
+                        sc.k2.as_mut().unwrap().batch_decode.as_mut().unwrap(),
+                        &sc.query_roped,
+                        &mut sc.pregate,
+                        &ap[..n],
+                        &kc[..n],
+                        &vc[..n],
+                        wpo,
+                    )
+                }?;
+            } else if offsets.iter().all(|o| a.k2_batch_uses_warp(o + 1)) {
                 // SAFETY: the same checked slots, with one independent window
                 // per sequence; scratch was allocated for this physical width.
                 unsafe {

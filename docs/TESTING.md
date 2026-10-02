@@ -515,13 +515,16 @@ The K2 integer projection gate separately compares eight-, twelve- and
 sixteen-bit activation references, including Q4 affine correction. It requires
 identical bits across one/three-token GEMV and eight/eleven/32/65-token GEMM,
 normal and flat routed inputs, dense matrices, inactive experts and a 135-row
-tail that crosses both row-tile sizes. Explicit activation reuse must preserve
+tail that crosses both row-tile sizes. A separate 2,560-wide dense case checks
+the specialized address path against the CPU and exact GEMV/GEMM results.
+Explicit activation reuse must preserve
 those results, and stale generations must be rejected. Rotary reuse is checked
 against the CPU and direct GPU kernel, including tails, independent sequence
 positions up to 524,280, coefficient refresh and f16 cache writes. Production
 uses sixteen bits. K2 attention has CPU gates for compensated prefill and
-decode; batched warp
-attention must match serial calls exactly over independent windows up to 32K.
+decode; batched scalar and compensated tensor-core attention must match
+serial calls exactly over independent windows up to 32K, at both tensor-core
+warp counts and with one, three and eight independent cache slots.
 
 The mixed Q4_K/Q6_K FFN cases in `moe_quant_formats_differential` check both
 format orders against the scalar reference. Dispatch pads the end of each run;
@@ -533,7 +536,9 @@ For both real K2 quants, `k2_model` with `LLMCUDA_K2_MODEL` and
 logits and argmax against the publisher's capture. It also checks chunking,
 batched prefill and decode, and graph replay, including a repeated prefix
 beyond the tiny-context attention path and a full-width versus chunked
-prefill comparison that exercises the tensor-core query tiles. The predicted
+prefill comparison that exercises the tensor-core query tiles. A 512-token
+prefix checks the production tensor-core decode selection and batched graph
+replay against serial decode. The predicted
 packed-weight residency must equal the runtime weight report. See
 [MODEL.md](MODEL.md#k2-horizon) for capture and invocation instructions. These publisher thresholds were
 calibrated on that six-token prompt; they are not a broader quality evaluation.
@@ -545,3 +550,8 @@ including device dispatch in the grouped timing. Run it with `LLMCUDA_MODEL`
 and optional `LLMCUDA_K2_N=1,3,128,512`. Its repeated reads have a different
 cache state from a full pass; accept changes only after alternating
 `bench_forward` and `bench_decode_batch` runs confirm them in the model.
+
+`bench_k2_attention` compares scalar batch, serial tensor-core and batched
+tensor-core decode at 512, 2K, 8K and 32K, using independent caches and
+CUDA events. Each case alternates the paths for three rounds.
+`LLMCUDA_DEC_MMA_SPLITS` overrides the fixed tensor-core split count.

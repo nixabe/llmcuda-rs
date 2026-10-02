@@ -870,3 +870,91 @@ fn rotary_reuse_matches_cpu_direct_and_cache_append() {
         }
     }
 }
+
+#[test]
+fn k2_dense_hidden_width_specialization_keeps_the_integer_tree() {
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver");
+        return;
+    }
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let (inner, rows) = (2560, 135);
+    let source: Vec<_> = (0..inner * rows)
+        .map(|i| (i as f32 * 0.071).sin() * 0.03)
+        .collect();
+    let (bytes, back) = pack(ExpertQuant::Q4K, &source);
+    let minima: Vec<_> = bytes
+        .as_chunks::<144>()
+        .0
+        .iter()
+        .flat_map(|b| q4_k_minima(&BlockQ4K::from_bytes(b).unwrap()))
+        .collect();
+    let dw = stream.clone_htod(&bytes).unwrap();
+    let dw = llmcuda_cuda::kernels::k2_gemm::K2Gemm::repack(
+        &ctx,
+        &stream,
+        &dw,
+        ExpertQuant::Q4K,
+        inner,
+        rows,
+        1,
+    )
+    .unwrap();
+    let mut first = Vec::new();
+    for tokens in [1, 3, 8] {
+        let input: Vec<_> = (0..tokens * inner)
+            .map(|i| (i as f32 * 0.043).cos())
+            .collect();
+        let dx = stream.clone_htod(&input).unwrap();
+        let mut out = stream.alloc_zeros::<f32>(tokens * rows).unwrap();
+        let mut gemm = llmcuda_cuda::kernels::k2_gemm::K2Gemm::new(
+            &ctx,
+            &stream,
+            tokens,
+            1,
+            1,
+            inner * rows,
+            inner,
+            rows,
+        )
+        .unwrap();
+        gemm.project(
+            &stream,
+            &dw,
+            ExpertQuant::Q4K,
+            &dx,
+            &mut out,
+            inner,
+            rows,
+            1,
+            None,
+            false,
+        )
+        .unwrap();
+        let reference = k2::quantized_project_grouped(
+            &back,
+            &input,
+            None,
+            inner,
+            rows,
+            tokens,
+            1,
+            false,
+            Some(&minima),
+            16,
+            32,
+        );
+        let actual = stream.clone_dtoh(&out).unwrap();
+        check(&actual, &reference, "hidden-width dense projection CPU");
+        if tokens == 1 {
+            first = actual.clone();
+        } else {
+            same_bits(
+                &actual[..rows],
+                &first,
+                "specialized GEMV versus shared-input GEMM",
+            );
+        }
+    }
+}

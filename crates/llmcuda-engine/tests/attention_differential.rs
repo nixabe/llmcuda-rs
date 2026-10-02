@@ -1460,10 +1460,12 @@ fn k2_batch_decode_keeps_each_sequences_window_and_split_order() {
     kernels.disable_decode_mma();
     let mut rng = Xorshift64Star::new(0x4b32_0396);
     for positions in [
+        vec![511],
         vec![33, 61, 511],
         vec![2047, 8191, 32767],
         vec![33, 61, 127, 255, 511, 1023, 1535, 2047],
     ] {
+        kernels.disable_decode_mma();
         let n = positions.len();
         let queries = rng.vec_f32(n * heads * hd, -1.0, 1.0);
         let dq = stream.clone_htod(&queries).unwrap();
@@ -1545,5 +1547,54 @@ fn k2_batch_decode_keeps_each_sequences_window_and_split_order() {
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
             "batch split arithmetic changed"
         );
+        for wpo in [2, 4] {
+            kernels.set_decode_mma_wpo(wpo);
+            let mut serial_mma = Vec::new();
+            for (i, &position) in positions.iter().enumerate() {
+                let single_q = stream
+                    .clone_htod(&queries[i * heads * hd..(i + 1) * heads * hd])
+                    .unwrap();
+                let mut single_out = stream.alloc_zeros::<f32>(heads * hd).unwrap();
+                let mut single_dec = AttnDecodeScratch::new(&stream, heads, hd).unwrap();
+                kernels
+                    .forward_k2(
+                        &stream,
+                        &mut single_dec,
+                        &single_q,
+                        &dk[i],
+                        &dv[i],
+                        &mut single_out,
+                        1,
+                        position + 7,
+                        position + 1,
+                        &dp[i],
+                    )
+                    .unwrap();
+                serial_mma.extend(stream.clone_dtoh(&single_out).unwrap());
+            }
+            // SAFETY: the independent cache slots remain live and initialized.
+            unsafe {
+                kernels.decode_batch_k2_mma_raw(
+                    &stream,
+                    &mut dec,
+                    &dq,
+                    &mut output,
+                    &p,
+                    &k,
+                    &v,
+                    wpo,
+                )
+            }
+            .unwrap();
+            let actual = stream.clone_dtoh(&output).unwrap();
+            assert_matches(&actual, &expected, &GATE);
+            assert!(
+                actual
+                    .iter()
+                    .zip(&serial_mma)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "batch MMA wpo={wpo} changed serial arithmetic at {positions:?}"
+            );
+        }
     }
 }

@@ -151,9 +151,9 @@ measurement; the serving target here remains N=3 on one instance.
 
 ### K2-Horizon on one card
 
-Measured on GPU 0, Quadro RTX 8000 (sm_75), using IFM's Q4_K_M and Q6_K
-files. Three serial alternating process pairs per cell; no concurrent builds,
-tests or work on another card. The publisher reference is
+Measured on GPU 0, Quadro RTX 8000 (sm_75), driver 595.91.07, using IFM's
+Q4_K_M and Q6_K files. Three serial alternating process pairs per cell; no
+concurrent builds, tests or work on another card. The publisher reference is
 [MBZUAI-IFM/llama.cpp `42adf019`](https://github.com/MBZUAI-IFM/llama.cpp/tree/42adf019f76013dac873b5b43950d54d5ab27216),
 branch `model/K2Horizon`, built for CUDA sm_75. The reference column takes the
 faster mean of `-ub 2048` and `-ub 4096` per cell, with full GPU offload,
@@ -168,10 +168,10 @@ quality scores.
 
 | quant | prompt tokens | engine tok/s | publisher tok/s | publisher ubatch |
 | --- | ---: | ---: | ---: | ---: |
-| Q4_K_M | 512 | 1290.82 ± 1.10 | 1775.47 ± 1.38 | 2048 |
-| Q4_K_M | 2,048 | 1541.99 ± 1.18 | 2549.59 ± 1.21 | 2048 |
-| Q6_K | 512 | 1096.46 ± 0.37 | 1627.00 ± 4.43 | 2048 |
-| Q6_K | 2,048 | 1247.14 ± 0.31 | 2396.13 ± 2.43 | 2048 |
+| Q4_K_M | 512 | 1295.52 ± 2.67 | 1773.20 ± 4.31 | 2048 |
+| Q4_K_M | 2,048 | 1534.31 ± 0.66 | 2542.45 ± 0.85 | 2048 |
+| Q6_K | 512 | 1092.51 ± 0.39 | 1615.73 ± 5.12 | 2048 |
+| Q6_K | 2,048 | 1239.66 ± 0.76 | 2389.17 ± 7.77 | 2048 |
 
 Decode uses greedy sampling with token readback, four warmup steps and 64 timed
 steps per process. The engine replays its CUDA graph. The reference harness
@@ -184,27 +184,27 @@ cover each process's 64 steps.
 
 | quant | starting context | N | engine tok/s | publisher tok/s | publisher ubatch |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Q4_K_M | 512 | 1 | 52.7 | 76.9 | 2048 |
-| Q4_K_M | 512 | 3 | 97.7 | 144.3 | 2048 |
-| Q4_K_M | 2,048 | 1 | 46.2 | 73.3 | 4096 |
-| Q4_K_M | 2,048 | 3 | 81.5 | 133.9 | 4096 |
-| Q6_K | 512 | 1 | 51.2 | 65.1 | 4096 |
-| Q6_K | 512 | 3 | 88.8 | 125.0 | 4096 |
-| Q6_K | 2,048 | 1 | 45.0 | 62.5 | 4096 |
-| Q6_K | 2,048 | 3 | 74.9 | 114.6 | 4096 |
+| Q4_K_M | 512 | 1 | 55.2 | 76.7 | 4096 |
+| Q4_K_M | 512 | 3 | 103.0 | 143.9 | 4096 |
+| Q4_K_M | 2,048 | 1 | 53.3 | 73.3 | 2048 |
+| Q4_K_M | 2,048 | 3 | 95.1 | 133.4 | 2048 |
+| Q6_K | 512 | 1 | 52.8 | 64.9 | 4096 |
+| Q6_K | 512 | 3 | 91.3 | 124.5 | 4096 |
+| Q6_K | 2,048 | 1 | 50.8 | 62.4 | 4096 |
+| Q6_K | 2,048 | 3 | 85.0 | 114.2 | 2048 |
 
 Latency in milliseconds:
 
 | quant | starting context | N | engine mean (range) | engine p95 range | publisher mean (range) | publisher p95 range |
 | --- | ---: | ---: | --- | --- | --- | --- |
-| Q4_K_M | 512 | 1 | 18.97 (18.94–19.00) | 19.02–19.14 | 13.00 (12.99–13.02) | 13.04–13.06 |
-| Q4_K_M | 512 | 3 | 30.72 (30.71–30.74) | 30.99–31.03 | 20.80 (20.76–20.83) | 21.05–21.17 |
-| Q4_K_M | 2,048 | 1 | 21.63 (21.58–21.67) | 21.68–21.83 | 13.63 (13.63–13.64) | 13.63–13.67 |
-| Q4_K_M | 2,048 | 3 | 36.82 (36.75–36.93) | 37.01–37.21 | 22.41 (22.40–22.44) | 22.65–22.72 |
-| Q6_K | 512 | 1 | 19.52 (19.50–19.53) | 19.74–19.96 | 15.37 (15.35–15.38) | 15.43–15.54 |
-| Q6_K | 512 | 3 | 33.80 (33.78–33.83) | 34.05–34.24 | 24.00 (23.98–24.03) | 24.38–24.41 |
-| Q6_K | 2,048 | 1 | 22.21 (22.20–22.22) | 22.30–22.66 | 15.99 (15.98–16.00) | 16.03–16.14 |
-| Q6_K | 2,048 | 3 | 40.08 (39.96–40.27) | 40.23–40.67 | 26.18 (26.17–26.20) | 26.38–26.43 |
+| Q4_K_M | 512 | 1 | 18.13 (18.12–18.14) | 18.17–18.19 | 13.04 (13.04–13.06) | 13.07–13.09 |
+| Q4_K_M | 512 | 3 | 29.13 (29.11–29.15) | 29.22–29.26 | 20.84 (20.81–20.90) | 21.09–21.18 |
+| Q4_K_M | 2,048 | 1 | 18.75 (18.74–18.76) | 18.86–18.87 | 13.65 (13.63–13.66) | 13.67–13.71 |
+| Q4_K_M | 2,048 | 3 | 31.55 (31.50–31.58) | 31.63–31.65 | 22.49 (22.45–22.51) | 22.72–22.81 |
+| Q6_K | 512 | 1 | 18.94 (18.93–18.95) | 19.14–19.23 | 15.41 (15.40–15.42) | 15.49–15.55 |
+| Q6_K | 512 | 3 | 32.85 (32.83–32.86) | 33.02–33.06 | 24.09 (24.05–24.11) | 24.44–24.53 |
+| Q6_K | 2,048 | 1 | 19.69 (19.67–19.70) | 19.89–20.03 | 16.02 (16.00–16.03) | 16.08–16.11 |
+| Q6_K | 2,048 | 3 | 35.29 (35.28–35.29) | 35.53–35.57 | 26.26 (26.24–26.28) | 26.45–26.51 |
 
 The publisher is faster in every measured K2 cell. K2 contractions here use
 sixteen-bit activation codes and fp32 scaled accumulation; these measurements
@@ -219,7 +219,9 @@ three-card serving and deeper real-model K2 contexts were not measured. Both
 quants pass the six-token publisher capture's gates at all 48 block boundaries
 and final logits. Integer GEMV/GEMM contractions match bit for bit across tested
 shapes; a 42-token repeated prefix also checks full-width versus chunked prefill.
-These checks do not certify numerical agreement on broader prompts. See
+A 512-token repeated prefix checks serial versus batched graph decode at the
+tensor-core attention threshold. These checks do not certify numerical
+agreement on broader prompts. See
 [TESTING.md](TESTING.md#k2-projection-and-routing-gates).
 
 ## A second `qwen35moe` checkpoint
@@ -807,6 +809,12 @@ one 32-bit word and Q6's `d` as one 16-bit halfword. Hardware half widening
 retains their original bit patterns while avoiding byte assembly on the
 integer projection path.
 
+Q4's 2,560-wide input projections specialize address and tail arithmetic at
+the actual hidden width. Prefill reconstructs the sixteen-bit activation dot
+from its nibble planes with an integer Horner sum in the tensor-core
+accumulator. The reconstruction is exact in int32; scales and the fp32
+reduction tree remain unchanged.
+
 Q4's affine minimum multiplies the original activation sum, retaining the
 warp's summation tree. Q6 combines its two sixteen-value subscale dots before
 applying the common activation scale. Both paths add four 32-value terms as
@@ -835,10 +843,14 @@ lowest expert id and retains the ordered normalization floor and bias rule.
 K2 prefill attention retains fp32 query and softmax-weight residuals around
 its half tensor-core operands. All prefill widths use the same compensated query tile,
 including masked short chunks. Single-token attention avoids split reduction
-at tiny contexts; the warp decode path uses 32 fixed splits. Batched decode
-appends rotated keys/values and attends to independent caches with fixed
-pointer slots, keeping the serial arithmetic. Qwen uses its existing kernels
-and split geometry. Deep-window CPU and batch/serial checks gate the K2 path.
+at tiny contexts. At 512 visible keys and above, the 128-dimensional decode
+path uses compensated tensor-core attention with two warps and 32 fixed
+splits. The shorter-window scalar kernel specializes K2's four query heads
+per KV head and four dimensions per lane, bounding its register arrays.
+Batched decode appends rotated keys/values and attends to independent caches
+with fixed pointer slots, keeping the serial arithmetic in both paths. Qwen
+uses its existing kernels and split geometry. Deep-window CPU and
+batch/serial checks gate the K2 path.
 
 `bench_k2` measures real query and value-expert tensors with CUDA events,
 including device dispatch. Full-model results and limits are in
@@ -1881,6 +1893,12 @@ proposed twice.
 
 | Attempt | Result |
 | --- | --- |
+| K2 Q6 low-nibble and high-two-bit planes | Three alternating GPU 0 resident-tensor pairs, sixteen-bit activations, N=3: query means **54.17 / 54.27 / 54.10 us** against packed six-bit **50.87 / 50.90 / 51.10 us**; routed values **66.37 / 66.57 / 67.67 us** against **62.47 / 62.70 / 62.53 us**. Keeping the publisher’s separate bit planes reduces field assembly but requires two distant word loads for each four-value group. The CPU and exact-shape gates pass; every decode pair loses. Rejected before model integration. |
+| K2 Q4 records in consecutive eight-nibble words | Three alternating GPU 0 resident-tensor pairs at N=3: query means **49.37 / 49.50 / 49.40 us** against **45.77 / 45.80 / 45.80 us**; routed values **58.13 / 52.67 / 52.90 us** against **48.67 / 48.70 / 50.70 us**. Direct tensor-core staging removes packing instructions, but decode loses its group-contiguous word loads. A four-lane-per-group decode calibration is slower again (**95.2–96.5 us** for routed values). Rejected on timing before numerical and model gates; the native layout stays. |
+| Q4 sixteen-bit dots using exact half digits | A 64-row/64-token HMMA prototype stages raw Q4 codes and the existing high/low activation bytes as half operands, preserving sixteen-bit codes. At 512 tokens on GPU 0, query calibration takes **1.109–1.208 ms** and routed values **1.955–2.014 ms**, against integer-path calibration **0.620–0.647 / 0.898–0.913 ms**. Two half products avoid integer digit reconstruction but move more shared-memory data and use lower-throughput tensor instructions. Rejected on timing before numerical and model gates; no precision or production-path change. |
+| Interleaved high/low activation words in K2 GEMV | GPU 0 resident Q4 calibration, N=3: explicit `ld.global.v2.u32` loads take **63.3–63.4 us** for the query and **72.3–72.7 us** for routed values. The separate-byte-plane control calibrates at **42.9–43.8 / 53.9–54.5 us**. Packing the two parts reduces load instruction count but doubles the address stride seen by neighbouring scale groups, and adds packing work. Rejected at the narrow calibration; no numerical or model-level claim. |
+| K2 Q6 prefill row tile 128 | GPU 0 resident-tensor calibration at 512 tokens, sixteen-bit activations: the 128-row tile takes **0.997–1.083 ms** for query and **1.458–1.545 ms** for routed values, versus the 64-row control calibration **0.860–0.935 / 1.096–1.130 ms**. The wider tile uses **39,168 shared bytes and 177 registers**, limiting it to one block per SM; relaxing the launch bound does not recover the loss. Rejected before numerical and full-model gates. |
+| Fully scaled f16 operands for K2 projections | A separate HMMA prototype dequantizes weights and rounds activations to half before the dot, removing per-group scaled accumulation from the tensor-core loop. GPU 0 calibration tests four/eight/sixteen-row decode tiles and 64/128-value K tiles. With four rows and K=64, Q4/Q6 query means at N=1 are **81.5 / 75.3 us**, versus integer calibration **29.1–29.4 / 33.8–33.9 us**. The best routed N=3 cells (eight rows, K=128) take **166.6 / 218.4 us**, versus **49.3–50.0 / 62.4–62.7 us**. At 512-token prefill the dense query improves to **0.547 / 0.618 ms**, but routed values take **1.031 / 1.128 ms** against integer **0.898–0.925 / 1.135–1.141 ms**. All tested decode tiles remain slower. Shared half staging does not pay for itself at decode width. Rejected on timing before CPU or publisher gates; production rounding is unchanged. |
 | Reusing K2 decode rows across matching routes in one CTA | Resident Q4 MoVA at three tokens, identical expert ids across all token rows: the candidate takes **77.9 / 77.8 / 77.8 us** in three CUDA-event rounds. The ordinary direct path's distinct-route calibration takes **53.1–53.6 us**. Collapsing three grids into one larger per-thread token accumulator loses more execution parallelism than it saves unpacking. Rejected at the narrow gate; the input cases differ, so this is not an end-to-end A/B claim. |
 | Asymmetric eight-bit K2 activation projections | Calibration, not a standing comparison: Q4_K_M with all attention/value and routed FFN projections at eight bits fails the six-token publisher final-norm gate (**cosine 0.999169**, required **0.9995**). Keeping attention at sixteen bits passes the same capture. Q6_K all-eight passes that capture but GPU 1 calibration gives **20.83 / 37.90 ms** at N=1/3, context 512, and **887.15 ± 1.57 tok/s** at 512-token prefill. A passing low-precision capture is insufficient evidence of a speed benefit. Sixteen bits remain the production path. |
 | Zero-centered Q8_1 arithmetic for K2 projections | The six-token captures and CPU/shape checks pass for both quants, but the 26-token science capture does not. With half activation scales and quantized sums, Q4 logits have **max-abs 0.9601** (gate **0.75**) and Q6 block 28 has **max-abs/RMS 0.4033** (gate **0.3**). Matching MMQ's float4 original-sum tree, Q4 half sum and Q6 fp32 scale still fails: Q4 logit **max-abs 0.9264** and Q6 final-norm **cosine 0.9992134** (gate **0.9995**). A larger 128-row byte tile calibrates at **1,295.10 ± 9.91 / 1,211.54 ± 3.97 tok/s** for Q4/Q6 at 512 tokens on GPU 0; those are candidate timings, not a validated model result. Rounding Q4 weight coefficients to half as well fails even the six-token Q4 block-0 gate (**max-abs/RMS 0.4350**); at 26 tokens Q4 logit max-abs is **0.9212** and Q6 final-norm cosine **0.9991633**. Rejected as the production precision. |

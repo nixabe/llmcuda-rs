@@ -81,7 +81,7 @@ const SRC: &str = r#"#ifndef K2_ROUTED_GEMV_ROWS
 #define K2_ACTIVATION_BITS 16
 #endif
 
-extern "C" __global__ void k2_quantize(const float* x,signed char* q,signed char* ql,float* scales,float* sl,float* sums,int inner,int count,unsigned* nib,int pack_nibbles) {
+extern "C" __global__ void k2_quantize(const float* __restrict__ x,signed char* q,signed char* ql,float* __restrict__ scales,float* __restrict__ sl,float* __restrict__ sums,int inner,int count,unsigned* nib,int pack_nibbles) {
     int b=blockIdx.x*4+(threadIdx.x>>5),lane=threadIdx.x&31;if(b>=count)return;
     float v=x[(long long)b*32+lane],a=fabsf(v);
     for(int d=16;d>0;d>>=1)a=fmaxf(a,__shfl_xor_sync(0xffffffff,a,d));
@@ -110,12 +110,12 @@ extern "C" __global__ void k2_quantize(const float* x,signed char* q,signed char
 }
 
 template<int Q,int IR=4>
-__device__ __forceinline__ const unsigned char* weight_row(const unsigned char* w,int e,int r,int inner,int rows){return w+((long long)e*((rows+IR-1)/IR)+r/IR)*IR*(inner/256)*(Q==3 ? 160 : 224)+(r%IR)*4;}
+__device__ __forceinline__ const unsigned char* weight_row(const unsigned char* __restrict__ w,int e,int r,int inner,int rows){return w+((long long)e*((rows+IR-1)/IR)+r/IR)*IR*(inner/256)*(Q==3 ? 160 : 224)+(r%IR)*4;}
 // Native records interleave aligned words across rows. Load d/dmin as one
 // word and Q6 d as one halfword without changing the float conversion.
 __device__ __forceinline__ float k2_half_bits(unsigned short bits){float f;asm("cvt.f32.f16 %0,%1;":"=f"(f):"h"(bits));return f;}
 template<int Q,int IR=4>
-__device__ __forceinline__ unsigned raw_pack4(const unsigned char* w,unsigned i,float* scale,float* minimum) {
+__device__ __forceinline__ unsigned raw_pack4(const unsigned char* __restrict__ w,unsigned i,float* __restrict__ scale,float* __restrict__ minimum) {
     int r=i&255,g=r>>5,z=(r&31)>>2;const unsigned char* b=w+(i>>8)*(Q==3 ? 160 : 224)*IR;
     if(Q==3){unsigned dm=*(const unsigned*)(b+128*IR);*scale=k2_half_bits((unsigned short)dm)*(float)b[((132+g)>>2)*(4*IR)+((132+g)&3)];*minimum=k2_half_bits((unsigned short)(dm>>16))*(float)b[((140+g)>>2)*(4*IR)+((140+g)&3)];unsigned code=*(const unsigned*)(b+((z%4)*32+g*4)*IR);return (z<4 ? code : code>>4)&0x0f0f0f0f;}
     *scale=k2_half_bits(*(const unsigned short*)(b+192*IR))*(float)((const signed char*)b)[((194+r/16)>>2)*(4*IR)+((194+r/16)&3)];*minimum=0;
@@ -142,26 +142,27 @@ __device__ __forceinline__ void raw_imma(int* d,unsigned a,unsigned b) {
     asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};":"+r"(d[0]),"+r"(d[1]):"r"(a),"r"(b));
 }
 __device__ __forceinline__ unsigned raw_nibbles(unsigned a,unsigned b) {
-    unsigned lo=(a&0x0f)|((a>>4)&0xf0)|((a>>8)&0xf00)|((a>>12)&0xf000);
-    unsigned hi=(b&0x0f)|((b>>4)&0xf0)|((b>>8)&0xf00)|((b>>12)&0xf000);
-    return lo|(hi<<16);
+    // Pair even and odd bytes, then select their low nibbles. The masks
+    // also preserve signed low activation digits in the twelve-bit path.
+    unsigned even=__byte_perm(a,b,0x6420),odd=__byte_perm(a,b,0x7531);
+    return (even&0x0f0f0f0f)|((odd<<4)&0xf0f0f0f0);
 }
 __device__ __forceinline__ void raw_imma4(int* d,unsigned a,unsigned b) {
     asm volatile("mma.sync.aligned.m8n8k32.row.col.s32.s4.u4.s32 {%0,%1},{%2},{%3},{%0,%1};":"+r"(d[0]),"+r"(d[1]):"r"(a),"r"(b));
 }
 
 template<int Q,int IR=4>
-__device__ __forceinline__ int weight_sum(const unsigned char* row,unsigned i){
+__device__ __forceinline__ int weight_sum(const unsigned char* __restrict__ row,unsigned i){
     if(Q==0){int sum=0;float sc,m;for(int z=0;z<4;++z)sum=raw_dp4a(raw_pack4<Q,IR>(row,i+z*4,&sc,&m),0x01010101,sum);return sum;}
     const unsigned char* b=row+(i/256)*160*IR;unsigned bit=((i&255)/32)*9,pos=bit>>5,shift=bit&31;
     const unsigned* p=(const unsigned*)(b+148*IR);unsigned code=p[pos*IR]>>shift;if(shift>23)code|=p[(pos+1)*IR]<<(32-shift);return (int)(code&511);
 }
-template<int IR> __device__ __forceinline__ float q6_subscale(const unsigned char* row,int i){const unsigned char* b=row+(i/256)*224*IR;int off=194+(i%256)/16;return (float)((const signed char*)b)[(off/4)*(4*IR)+(off%4)];}
-template<int IR> __device__ __forceinline__ float q6_delta(const unsigned char* row,int i){return k2_half_bits(*(const unsigned short*)(row+(i/256)*224*IR+192*IR));}
+template<int IR> __device__ __forceinline__ float q6_subscale(const unsigned char* __restrict__ row,int i){const unsigned char* b=row+(i/256)*224*IR;int off=194+(i%256)/16;return (float)((const signed char*)b)[(off/4)*(4*IR)+(off%4)];}
+template<int IR> __device__ __forceinline__ float q6_delta(const unsigned char* __restrict__ row,int i){return k2_half_bits(*(const unsigned short*)(row+(i/256)*224*IR+192*IR));}
 // Fixed hidden width removes dynamic address and tail arithmetic only.
 // Every scale group and the fp32 accumulation tree stay in the same order.
 template<int Q,int NT,bool ROUTED,int INNER=0>
-__device__ __forceinline__ void raw_gemv(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* ids,float* out,int inner,int rows,int pairs,int topk,int mode) {
+__device__ __forceinline__ void raw_gemv(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ sums,const int* __restrict__ ids,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode) {
     if(INNER)inner=INNER;
     constexpr int IR=ROUTED ? 4 : 1;
     constexpr int RW=ROUTED ? K2_ROUTED_GEMV_ROWS : 4,LANES=32/RW;
@@ -232,7 +233,7 @@ __device__ __forceinline__ void raw_gemv(const unsigned char* w,const signed cha
     }
 }
 template<int Q,int BT,int MF,int IR>
-__device__ void raw_gemm_fallback(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* xsum,const int* sorted,const int* owners,float* out,int inner,int rows,int pairs,int topk,int mode) {
+__device__ void raw_gemm_fallback(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ xsum,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode) {
     constexpr int RN=64,NF=RN/8,NG=Q==3 ? 4 : 8,CS=NG+1;
     constexpr bool S4=Q==3 && K2_ACTIVATION_BITS==12;
     int expert=mode ? owners[blockIdx.y] : 0;if(expert<0)return;
@@ -312,6 +313,79 @@ __device__ void raw_gemm_fallback(const unsigned char* w,const signed char* x,co
     for(int a=0;a<MF;++a)for(int n=0;n<NF;++n)for(int z=0;z<2;++z){int r=r0+n*8+(lane&3)*2+z,t=(warp*MF+a)*8+(lane>>2),f=flats[t];if(r<rows && f<pairs)out[(long long)f*rows+r]=acc[a][n][z];}
 }
 
+// Operand ownership follows llama.cpp's Turing MMQ register tiles:
+// ggml-cuda/mmq-vec-dot.cuh, ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma.
+// A warp retains one weight row fragment and its scales while visiting token
+// columns. The sixteen-bit dot and 128-value fp32 tree are unchanged.
+template<int Q,int BT,int MF,int IR>
+__device__ void raw_gemm_reuse(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ xsum,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode) {
+    constexpr int RN=64,NG=Q==3 ? 4 : 8,CS=NG+1;
+    constexpr bool S4=Q==3 && K2_ACTIVATION_BITS==12;
+    int expert=mode ? owners[blockIdx.y] : 0;if(expert<0)return;
+    __shared__ unsigned ws[RN][32],xs[BT][32],xlow[BT][S4 ? 16 : 32],wlow[S4 ? RN : 1][S4 ? 16 : 1];
+    __shared__ float scales[RN][CS],mins[Q==3 ? RN : 1][Q==3 ? CS : 1],xscale[BT][4],xscalel[BT][4];
+    __shared__ float sums[BT][4];__shared__ int flats[BT];__shared__ float delta[Q==0 ? RN : 1];__shared__ int wsum[RN][CS];
+    int tid=threadIdx.x,lane=tid&31,warp=tid>>5,warps=BT/(8*MF),r0=blockIdx.x*RN,blocks=inner/32;
+    for(int t=tid;t<BT;t+=blockDim.x)flats[t]=mode ? sorted[blockIdx.y*BT+t] : blockIdx.y*BT+t;
+    constexpr int WR=RN/(BT/(8*MF))/8,TF=BT/8;
+    __syncthreads();float acc[TF][WR][2];
+    #pragma unroll
+    for(int a=0;a<TF;++a)for(int n=0;n<WR;++n)acc[a][n][0]=acc[a][n][1]=0;
+    for(int j=0;j<inner;j+=128) {
+
+        for(int rb=warp*4;rb<RN;rb+=warps*4){int r=rb+lane/8;
+            #pragma unroll
+            for(int z=0;z<4;++z){int pos=(lane%4)*8+(lane/4%2)*4+z;float sc=0,mn=0;unsigned v=0;const unsigned char* row=weight_row<Q,IR>(w,expert,r0+r,inner,rows);if(r0+r<rows)v=raw_pack4<Q,IR>(row,j+pos*4,&sc,&mn);
+                ws[r][pos^((r&7)*4)]=v;
+                if(S4 && (pos&1)==0){float s1,m1;unsigned next=0;if(r0+r<rows)next=raw_pack4<Q,IR>(row,j+pos*4+4,&s1,&m1);wlow[r][(pos/2)^(((r>>1)&3)*4)]=raw_nibbles(v,next);}
+                if(pos%(Q==3 ? 8 : 4)==0){int g=pos/(Q==3 ? 8 : 4);scales[r][g]=Q==0 && r0+r<rows ? q6_subscale<IR>(row,j+pos*4) : sc;if(Q==0 && pos==0)delta[r]=r0+r<rows ? q6_delta<IR>(row,j) : 0;if(Q==3)mins[r][g]=mn;if(K2_ACTIVATION_BITS==8)wsum[r][g]=r0+r<rows ? weight_sum<Q,IR>(row,j+pos*4) : 0;}
+            }
+        }
+        for(int t=warp;t<BT;t+=warps) {
+            int f=flats[t],input=mode==1 ? f/topk : f;
+            xs[t][lane^((t&7)*4)]=f<pairs ? *(const unsigned*)(x+(long long)input*inner+j+lane*4) : 0;
+            if(S4){if(lane<16){unsigned lo=0,hi=0;if(f<pairs){const unsigned* p=(const unsigned*)(xl+(long long)input*inner+j+lane*8);lo=p[0];hi=p[1];}xlow[t][lane^(((t>>1)&3)*4)]=raw_nibbles(lo,hi);}}
+            else xlow[t][lane^((t&7)*4)]=f<pairs ? *(const unsigned*)(xl+(long long)input*inner+j+lane*4) : 0;
+            if(lane<4){xscalel[t][lane]=f<pairs ? sl[(long long)input*blocks+j/32+lane] : 0;xscale[t][lane]=f<pairs ? sx[(long long)input*blocks+j/32+lane] : 0;sums[t][lane]=f<pairs ? xsum[(long long)input*blocks+j/32+lane] : 0;}
+        }
+        __syncthreads();
+        unsigned weights[WR][8];float sc[WR][8],ds[WR];
+        #pragma unroll
+        for(int n=0;n<WR;++n) {
+            int r=(warp*WR+n)*8+(lane>>2);ds[n]=delta[r];
+            #pragma unroll
+            for(int g=0;g<8;++g) {
+                int pos=(g*4+(lane&3))^((lane>>2)*4);
+                weights[n][g]=ws[r][pos];sc[n][g]=scales[r][g];
+            }
+        }
+        #pragma unroll
+        for(int a=0;a<TF;++a)if(flats[a*8]<pairs) {
+            float partial[2][WR][2]={},first[WR][2]={};
+            #pragma unroll
+            for(int g=0;g<8;++g) {
+                int total[WR][2]={},low[WR][2]={};int pos=(g*4+(lane&3))^((lane>>2)*4);
+                unsigned act=xs[a*8+(lane>>2)][pos],actl=xlow[a*8+(lane>>2)][pos];
+                #pragma unroll
+                for(int n=0;n<WR;++n) {
+                    raw_imma(total[n],weights[n][g],act);raw_imma(low[n],weights[n][g],actl);
+                    int t=a*8+(lane&3)*2;
+                    #pragma unroll
+                    for(int z=0;z<2;++z) {
+                        int v=total[n][z]*(K2_ACTIVATION_BITS==12 ? 16 : 256)+low[n][z];
+                        if((g&1)==0)first[n][z]=__fmul_rn((float)v,sc[n][g]);
+                        else partial[(g/2)%2][n][z]+=__fmul_rn(__fmul_rn(ds[n],xscale[t+z][g/2]),__fmaf_rn((float)v,sc[n][g],first[n][z]));
+                    }
+                }
+            }
+            #pragma unroll
+            for(int n=0;n<WR;++n)for(int z=0;z<2;++z)acc[a][n][z]+=partial[0][n][z]+partial[1][n][z];
+        }
+        __syncthreads();
+    }
+    for(int a=0;a<TF;++a)for(int n=0;n<WR;++n)for(int z=0;z<2;++z){int r=r0+(warp*WR+n)*8+(lane>>2),t=a*8+(lane&3)*2+z,f=flats[t];if(r<rows && f<pairs)out[(long long)f*rows+r]=acc[a][n][z];}
+}
+
 __device__ __forceinline__ void raw_imma4u(int* d,unsigned a,unsigned b) {
     asm volatile("mma.sync.aligned.m8n8k32.row.col.s32.u4.u4.s32 {%0,%1},{%2},{%3},{%0,%1};":"+r"(d[0]),"+r"(d[1]):"r"(a),"r"(b));
 }
@@ -321,10 +395,13 @@ __device__ __forceinline__ float raw_full_term(float scale,int dot,float minimum
     asm("mul.rn.f32 %0,%1,%2;":"=f"(result):"f"(coefficient),"f"((float)dot));
     asm("fma.rn.f32 %0,%1,%2,%3;":"=f"(result):"f"(-minimum),"f"(sum),"f"(result));return result;
 }
+__device__ __forceinline__ void raw_imma4us(int* d,unsigned a,unsigned b) {
+    asm volatile("mma.sync.aligned.m8n8k32.row.col.s32.u4.s4.s32 {%0,%1},{%2},{%3},{%0,%1};":"+r"(d[0]),"+r"(d[1]):"r"(a),"r"(b));
+}
 template<int BT,int MF,int IR,int INNER=0>
-__device__ __forceinline__ void raw_gemm_q4_nibbles(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* xsum,const int* sorted,const int* owners,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {
+__device__ __forceinline__ void raw_gemm_q4_nibbles(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ xsum,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned* __restrict__ nib) {
     if(INNER)inner=INNER;
-    constexpr int RN=BT==64 ? 128 : 64,NF=RN/8,NP=K2_ACTIVATION_BITS/4;
+    constexpr int RN=BT==64 ? 128 : 64,NP=K2_ACTIVATION_BITS/4;
     if(blockIdx.x*RN>=rows)return;
     int expert=mode ? owners[blockIdx.y] : 0;if(expert<0)return;
     __shared__ unsigned wn[RN][16],an[NP][BT][16];
@@ -332,7 +409,8 @@ __device__ __forceinline__ void raw_gemm_q4_nibbles(const unsigned char* w,const
     __shared__ int flats[BT];
     int tid=threadIdx.x,lane=tid&31,warp=tid>>5,warps=BT/(8*MF),r0=blockIdx.x*RN,blocks=inner/32;
     for(int t=tid;t<BT;t+=blockDim.x)flats[t]=mode ? sorted[blockIdx.y*BT+t] : blockIdx.y*BT+t;
-    __syncthreads();float acc[MF][NF][2]={};
+    constexpr int WR=RN/(BT/(8*MF))/8, TF=BT/8;
+    __syncthreads();float acc[TF][WR][2]={};
     for(int j=0;j<inner;j+=128) {
 
         for(int rb=warp*4;rb<RN;rb+=warps*4){int r=rb+lane/8;
@@ -349,56 +427,129 @@ __device__ __forceinline__ void raw_gemm_q4_nibbles(const unsigned char* w,const
             if(lane<4){xscale[t][lane]=f<pairs ? sx[(long long)input*blocks+j/32+lane] : 0;sums[t][lane]=f<pairs ? xsum[(long long)input*blocks+j/32+lane] : 0;}
         }
         __syncthreads();
+        // Two weight row fragments per warp, reused over all token columns.
+        unsigned weights[WR][4];float sc[WR][4],mn[WR][4];
         #pragma unroll
-        for(int a=0;a<MF;++a)if(flats[(warp*MF+a)*8]<pairs) {
+        for(int n=0;n<WR;++n) {
+            int r=(warp*WR+n)*8+(lane>>2);
             #pragma unroll
-            for(int nb=0;nb<NF;nb+=4) {
-                float partial[2][4][2]={};
+            for(int g=0;g<4;++g) {
+                int pos=(g*4+(lane&3))^(((lane>>3)&3)*4);
+                weights[n][g]=wn[r][pos];sc[n][g]=scales[r][g];mn[n][g]=mins[r][g];
+            }
+        }
+        #pragma unroll
+        for(int a=0;a<TF;++a)if(flats[a*8]<pairs) {
+            float partial[2][WR][2]={};
+            #pragma unroll
+            for(int g=0;g<4;++g) {
+                int total[WR][2]={};int pos=(g*4+(lane&3))^(((lane>>3)&3)*4);
                 #pragma unroll
-                for(int g=0;g<4;++g) {
-                    int total[4][2]={};int pos=(g*4+(lane&3))^(((lane>>3)&3)*4);
-                    unsigned weight[4];
+                for(int ni=NP-1;ni>=0;--ni) {
+                    unsigned act=an[ni][a*8+(lane>>2)][pos];
                     #pragma unroll
-                    for(int n=0;n<4;++n)weight[n]=wn[(nb+n)*8+(lane>>2)][pos];
-                    #pragma unroll
-                    // Horner reconstruction uses the MMA accumulator directly:
-                    // each signed/unsigned nibble dot is exact in int32.
-                    for(int ni=NP-1;ni>=0;--ni) {
-                        unsigned act=an[ni][(warp*MF+a)*8+(lane>>2)][pos];
-                        #pragma unroll
-                        for(int n=0;n<4;++n){
-                            if(ni!=NP-1){total[n][0]*=16;total[n][1]*=16;}
-                            if(ni==NP-1)raw_imma4(total[n],act,weight[n]);else raw_imma4u(total[n],act,weight[n]);
-                        }
-                    }
-                    #pragma unroll
-                    for(int n=0;n<4;++n) {
-                        int t=(warp*MF+a)*8+(lane>>2),r=(nb+n)*8+(lane&3)*2;
-                        partial[g%2][n][0]+=raw_full_term(scales[r][g],total[n][0],mins[r][g],sums[t][g],xscale[t][g]);
-                        partial[g%2][n][1]+=raw_full_term(scales[r+1][g],total[n][1],mins[r+1][g],sums[t][g],xscale[t][g]);
+                    for(int n=0;n<WR;++n) {
+                        if(ni!=NP-1){total[n][0]*=16;total[n][1]*=16;}
+                        if(ni==NP-1)raw_imma4us(total[n],weights[n][g],act);else raw_imma4u(total[n],weights[n][g],act);
                     }
                 }
+                int t=a*8+(lane&3)*2;
                 #pragma unroll
-                for(int n=0;n<4;++n)for(int z=0;z<2;++z)acc[a][nb+n][z]+=partial[0][n][z]+partial[1][n][z];
+                for(int n=0;n<WR;++n) {
+                    partial[g%2][n][0]+=raw_full_term(sc[n][g],total[n][0],mn[n][g],sums[t][g],xscale[t][g]);
+                    partial[g%2][n][1]+=raw_full_term(sc[n][g],total[n][1],mn[n][g],sums[t+1][g],xscale[t+1][g]);
+                }
             }
+            #pragma unroll
+            for(int n=0;n<WR;++n)for(int z=0;z<2;++z)acc[a][n][z]+=partial[0][n][z]+partial[1][n][z];
         }
         __syncthreads();
     }
-    for(int a=0;a<MF;++a)for(int n=0;n<NF;++n)for(int z=0;z<2;++z){int r=r0+n*8+(lane&3)*2+z,t=(warp*MF+a)*8+(lane>>2),f=flats[t];if(r<rows && f<pairs)out[(long long)f*rows+r]=acc[a][n][z];}
+    for(int a=0;a<TF;++a)for(int n=0;n<WR;++n)for(int z=0;z<2;++z){int r=r0+(warp*WR+n)*8+(lane>>2),t=a*8+(lane&3)*2+z,f=flats[t];if(r<rows && f<pairs)out[(long long)f*rows+r]=acc[a][n][z];}
+}
+
+// Each fixed 64-slot dispatch run becomes two 32-token CTAs. Put the
+// subtile in grid.x so dispatch capacity does not consume more grid.y.
+// Unlike the dense tile, every warp reads its own weight fragments directly.
+template<int INNER=0>
+__device__ __forceinline__ void raw_gemm_q4_registers(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ xsum,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned* __restrict__ nib) {
+    if(INNER)inner=INNER;
+    constexpr int RN=128,BT=32,IR=4,NP=K2_ACTIVATION_BITS/4;
+    int row_tile=blockIdx.x/2,token_base=blockIdx.y*64+(blockIdx.x%2)*BT;
+    if(row_tile*RN>=rows)return;
+    int expert=owners[blockIdx.y];if(expert<0)return;
+    __shared__ unsigned an[NP][BT][16];
+    __shared__ float xscale[BT][4],sums[BT][4];
+    __shared__ int flats[BT];
+    int tid=threadIdx.x,lane=tid&31,warp=tid>>5,warps=8,r0=row_tile*RN,blocks=inner/32;
+    for(int t=tid;t<BT;t+=blockDim.x)flats[t]=sorted[token_base+t];
+    constexpr int WR=RN/8/8, TF=BT/8;
+    __syncthreads();if(flats[0]>=pairs)return;float acc[TF][WR][2]={};
+    for(int j=0;j<inner;j+=128) {
+
+        unsigned weights[WR][4];float sc[WR][4],mn[WR][4];
+        #pragma unroll
+        for(int n=0;n<WR;++n) {
+            int r=r0+(warp*WR+n)*8+(lane>>2);
+            const unsigned char* row=weight_row<3,IR>(w,expert,r,inner,rows);
+            #pragma unroll
+            for(int g=0;g<4;++g) {
+                int pos=j+g*32+(lane&3)*8;float scale=0,minimum=0,s1,m1;unsigned a=0,b=0;
+                if(r<rows){a=raw_pack4<3,IR>(row,pos,&scale,&minimum);b=raw_pack4<3,IR>(row,pos+4,&s1,&m1);}
+                weights[n][g]=raw_nibbles(a,b);sc[n][g]=scale;mn[n][g]=minimum;
+            }
+        }
+        for(int t=warp;t<BT;t+=warps)if(lane<16) {
+            int f=flats[t],input=mode==1 ? f/topk : f;
+            int pos=lane^(((t>>1)&3)*4);
+            uint4 packed=make_uint4(0u,0u,0u,0u);if(f<pairs)packed=((const uint4*)nib)[(long long)input*blocks*4+j/8+lane];
+            an[0][t][pos]=packed.x;an[1][t][pos]=packed.y;an[2][t][pos]=packed.z;if(NP==4)an[3][t][pos]=packed.w;
+            if(lane<4){xscale[t][lane]=f<pairs ? sx[(long long)input*blocks+j/32+lane] : 0;sums[t][lane]=f<pairs ? xsum[(long long)input*blocks+j/32+lane] : 0;}
+        }
+        __syncthreads();
+        #pragma unroll
+        for(int a=0;a<TF;++a)if(flats[a*8]<pairs) {
+            float partial[2][WR][2]={};
+            #pragma unroll
+            for(int g=0;g<4;++g) {
+                int total[WR][2]={};int pos=(g*4+(lane&3))^(((lane>>3)&3)*4);
+                #pragma unroll
+                for(int ni=NP-1;ni>=0;--ni) {
+                    unsigned act=an[ni][a*8+(lane>>2)][pos];
+                    #pragma unroll
+                    for(int n=0;n<WR;++n) {
+                        if(ni!=NP-1){total[n][0]*=16;total[n][1]*=16;}
+                        if(ni==NP-1)raw_imma4us(total[n],weights[n][g],act);else raw_imma4u(total[n],weights[n][g],act);
+                    }
+                }
+                int t=a*8+(lane&3)*2;
+                #pragma unroll
+                for(int n=0;n<WR;++n) {
+                    partial[g%2][n][0]+=raw_full_term(sc[n][g],total[n][0],mn[n][g],sums[t][g],xscale[t][g]);
+                    partial[g%2][n][1]+=raw_full_term(sc[n][g],total[n][1],mn[n][g],sums[t+1][g],xscale[t+1][g]);
+                }
+            }
+            #pragma unroll
+            for(int n=0;n<WR;++n)for(int z=0;z<2;++z)acc[a][n][z]+=partial[0][n][z]+partial[1][n][z];
+        }
+        __syncthreads();
+    }
+    for(int a=0;a<TF;++a)for(int n=0;n<WR;++n)for(int z=0;z<2;++z){int r=r0+(warp*WR+n)*8+(lane>>2),t=a*8+(lane&3)*2+z,f=flats[t];if(r<rows && f<pairs)out[(long long)f*rows+r]=acc[a][n][z];}
 }
 
 extern "C" {
-#define GEMV_ENTRY(NAME,Q,NT,ROUTED) __global__ void NAME(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* ids,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {if(Q==3 && !ROUTED && inner==2560)raw_gemv<Q,NT,ROUTED,2560>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);else raw_gemv<Q,NT,ROUTED>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);}
-#define GEMM_ENTRY(NAME,Q,BT,MF,IR,INNER) __global__ __launch_bounds__(256,2) void NAME(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* sorted,const int* owners,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {if(Q==3 && K2_ACTIVATION_BITS>=12)raw_gemm_q4_nibbles<BT,MF,IR,INNER>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode,nib);else raw_gemm_fallback<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);}
+#define GEMV_ENTRY(NAME,Q,NT,ROUTED) __global__ void NAME(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ sums,const int* __restrict__ ids,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned* __restrict__ nib) {if(!ROUTED && inner==2560)raw_gemv<Q,NT,ROUTED,2560>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);else raw_gemv<Q,NT,ROUTED>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);}
+#define GEMM_ENTRY(NAME,Q,BT,MF,IR,INNER) __global__ __launch_bounds__(256,2) void NAME(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ sums,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned* __restrict__ nib) {if(Q==3 && K2_ACTIVATION_BITS>=12)raw_gemm_q4_nibbles<BT,MF,IR,INNER>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode,nib);else if(Q==0 && K2_ACTIVATION_BITS>=12)raw_gemm_reuse<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);else raw_gemm_fallback<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);}
+#define GEMM_REG_ENTRY(NAME,INNER) __global__ __launch_bounds__(256,(K2_ACTIVATION_BITS>=12 ? 3 : 2)) void NAME(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* sorted,const int* owners,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {if(K2_ACTIVATION_BITS>=12)raw_gemm_q4_registers<INNER>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode,nib);else raw_gemm_fallback<3,64,1,4>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);}
 GEMV_ENTRY(k2_gemv_q4,3,1,true)
 GEMV_ENTRY(k2_gemv_dense_q4,3,K2_DENSE_TOKENS,false)
 GEMV_ENTRY(k2_gemv_q6,0,1,true)
 GEMV_ENTRY(k2_gemv_dense_q6,0,K2_DENSE_TOKENS,false)
-GEMM_ENTRY(k2_gemm_q4,3,K2_ROUTED_TILE,1,4,0)
+GEMM_REG_ENTRY(k2_gemm_q4,0)
 GEMM_ENTRY(k2_gemm_dense_q4,3,64,1,1,0)
 GEMM_ENTRY(k2_gemm_q6,0,K2_ROUTED_TILE,1,4,0)
 GEMM_ENTRY(k2_gemm_dense_q6,0,64,1,1,0)
-GEMM_ENTRY(k2_gemm_hidden_q4,3,K2_ROUTED_TILE,1,4,2560)
+GEMM_REG_ENTRY(k2_gemm_hidden_q4,2560)
 GEMM_ENTRY(k2_gemm_hidden_dense_q4,3,64,1,1,2560)
 }
 "#;
@@ -827,7 +978,15 @@ impl K2Gemm {
                             128
                         } else {
                             64
-                        }),
+                        }) * if !small
+                            && d.is_some()
+                            && quant == ExpertQuant::Q4K
+                            && self.activation_bits >= 12
+                        {
+                            2
+                        } else {
+                            1
+                        },
                         if small {
                             if d.is_none() {
                                 (pairs as u32).div_ceil(4)

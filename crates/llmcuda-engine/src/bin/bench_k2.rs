@@ -1,6 +1,8 @@
 //! K2 dense and routed value projections in isolation, with real GGUF weights.
 //! Use LLMCUDA_MODEL and optionally LLMCUDA_K2_N (default 1,3,128,512).
 //! LLMCUDA_K2_SHARED_ROUTES selects identical experts across token rows.
+//! LLMCUDA_K2_INTEGER_ONLY skips the scalar controls; LLMCUDA_K2_TENSORS
+//! selects a comma-separated list of GGUF tensor names.
 //! CUDA events include dispatch for the grouped value path. Each round
 //! alternates scalar and tiled kernels; full-model benches remain the gate.
 use std::sync::Arc;
@@ -51,7 +53,10 @@ fn run() -> Result<()> {
         .split(',')
         .map(str::parse)
         .collect::<std::result::Result<_, _>>()?;
-    for name in ["blk.3.attn_q.weight", "blk.3.attn_v_exps.weight"] {
+    let names = std::env::var("LLMCUDA_K2_TENSORS")
+        .unwrap_or_else(|_| "blk.3.attn_q.weight,blk.3.attn_v_exps.weight".into());
+    let integer_only = std::env::var_os("LLMCUDA_K2_INTEGER_ONLY").is_some();
+    for name in names.split(',') {
         let tensor = file
             .tensors()
             .iter()
@@ -106,7 +111,9 @@ fn run() -> Result<()> {
                     .unwrap_or(16),
             )?;
             for round in 1..=3 {
-                let mut tiles = if experts == 1 {
+                let mut tiles = if integer_only {
+                    vec![0]
+                } else if experts == 1 {
                     vec![1, 4, 8, 0]
                 } else {
                     vec![1, 8, 0]

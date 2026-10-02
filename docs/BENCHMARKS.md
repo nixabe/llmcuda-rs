@@ -168,10 +168,10 @@ quality scores.
 
 | quant | prompt tokens | engine tok/s | publisher tok/s | publisher ubatch |
 | --- | ---: | ---: | ---: | ---: |
-| Q4_K_M | 512 | 1295.52 ± 2.67 | 1773.20 ± 4.31 | 2048 |
-| Q4_K_M | 2,048 | 1534.31 ± 0.66 | 2542.45 ± 0.85 | 2048 |
-| Q6_K | 512 | 1092.51 ± 0.39 | 1615.73 ± 5.12 | 2048 |
-| Q6_K | 2,048 | 1239.66 ± 0.76 | 2389.17 ± 7.77 | 2048 |
+| Q4_K_M | 512 | 1437.67 ± 1.24 | 1778.92 ± 5.91 | 2048 |
+| Q4_K_M | 2,048 | 1620.34 ± 1.87 | 2553.14 ± 1.15 | 2048 |
+| Q6_K | 512 | 1132.10 ± 1.62 | 1622.00 ± 0.56 | 2048 |
+| Q6_K | 2,048 | 1282.10 ± 1.67 | 2399.10 ± 4.70 | 2048 |
 
 Decode uses greedy sampling with token readback, four warmup steps and 64 timed
 steps per process. The engine replays its CUDA graph. The reference harness
@@ -184,27 +184,27 @@ cover each process's 64 steps.
 
 | quant | starting context | N | engine tok/s | publisher tok/s | publisher ubatch |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Q4_K_M | 512 | 1 | 55.2 | 76.7 | 4096 |
-| Q4_K_M | 512 | 3 | 103.0 | 143.9 | 4096 |
-| Q4_K_M | 2,048 | 1 | 53.3 | 73.3 | 2048 |
-| Q4_K_M | 2,048 | 3 | 95.1 | 133.4 | 2048 |
-| Q6_K | 512 | 1 | 52.8 | 64.9 | 4096 |
-| Q6_K | 512 | 3 | 91.3 | 124.5 | 4096 |
-| Q6_K | 2,048 | 1 | 50.8 | 62.4 | 4096 |
-| Q6_K | 2,048 | 3 | 85.0 | 114.2 | 2048 |
+| Q4_K_M | 512 | 1 | 55.3 | 76.8 | 2048 |
+| Q4_K_M | 512 | 3 | 103.4 | 144.3 | 2048 |
+| Q4_K_M | 2,048 | 1 | 53.5 | 73.4 | 4096 |
+| Q4_K_M | 2,048 | 3 | 95.7 | 133.8 | 4096 |
+| Q6_K | 512 | 1 | 54.1 | 65.0 | 2048 |
+| Q6_K | 512 | 3 | 93.9 | 124.9 | 4096 |
+| Q6_K | 2,048 | 1 | 52.1 | 62.5 | 2048 |
+| Q6_K | 2,048 | 3 | 87.3 | 114.5 | 4096 |
 
 Latency in milliseconds:
 
 | quant | starting context | N | engine mean (range) | engine p95 range | publisher mean (range) | publisher p95 range |
 | --- | ---: | ---: | --- | --- | --- | --- |
-| Q4_K_M | 512 | 1 | 18.13 (18.12–18.14) | 18.17–18.19 | 13.04 (13.04–13.06) | 13.07–13.09 |
-| Q4_K_M | 512 | 3 | 29.13 (29.11–29.15) | 29.22–29.26 | 20.84 (20.81–20.90) | 21.09–21.18 |
-| Q4_K_M | 2,048 | 1 | 18.75 (18.74–18.76) | 18.86–18.87 | 13.65 (13.63–13.66) | 13.67–13.71 |
-| Q4_K_M | 2,048 | 3 | 31.55 (31.50–31.58) | 31.63–31.65 | 22.49 (22.45–22.51) | 22.72–22.81 |
-| Q6_K | 512 | 1 | 18.94 (18.93–18.95) | 19.14–19.23 | 15.41 (15.40–15.42) | 15.49–15.55 |
-| Q6_K | 512 | 3 | 32.85 (32.83–32.86) | 33.02–33.06 | 24.09 (24.05–24.11) | 24.44–24.53 |
-| Q6_K | 2,048 | 1 | 19.69 (19.67–19.70) | 19.89–20.03 | 16.02 (16.00–16.03) | 16.08–16.11 |
-| Q6_K | 2,048 | 3 | 35.29 (35.28–35.29) | 35.53–35.57 | 26.26 (26.24–26.28) | 26.45–26.51 |
+| Q4_K_M | 512 | 1 | 18.09 (18.06–18.13) | 18.09–18.23 | 13.02 (13.01–13.04) | 13.04–13.07 |
+| Q4_K_M | 512 | 3 | 29.02 (29.00–29.04) | 29.11–29.22 | 20.79 (20.78–20.82) | 21.07–21.10 |
+| Q4_K_M | 2,048 | 1 | 18.70 (18.69–18.72) | 18.76–18.80 | 13.63 (13.62–13.64) | 13.66–13.68 |
+| Q4_K_M | 2,048 | 3 | 31.36 (31.30–31.41) | 31.43–31.46 | 22.42 (22.39–22.43) | 22.69–22.78 |
+| Q6_K | 512 | 1 | 18.48 (18.46–18.50) | 18.70–18.80 | 15.38 (15.36–15.40) | 15.51–15.55 |
+| Q6_K | 512 | 3 | 31.96 (31.92–32.03) | 32.06–32.22 | 24.03 (24.00–24.06) | 24.39–24.47 |
+| Q6_K | 2,048 | 1 | 19.20 (19.19–19.22) | 19.38–19.48 | 15.99 (15.98–16.00) | 16.02–16.09 |
+| Q6_K | 2,048 | 3 | 34.35 (34.33–34.37) | 34.38–34.41 | 26.20 (26.19–26.20) | 26.41–26.46 |
 
 The publisher is faster in every measured K2 cell. K2 contractions here use
 sixteen-bit activation codes and fp32 scaled accumulation; these measurements
@@ -809,11 +809,25 @@ one 32-bit word and Q6's `d` as one 16-bit halfword. Hardware half widening
 retains their original bit patterns while avoiding byte assembly on the
 integer projection path.
 
-Q4's 2,560-wide input projections specialize address and tail arithmetic at
-the actual hidden width. Prefill reconstructs the sixteen-bit activation dot
-from its nibble planes with an integer Horner sum in the tensor-core
-accumulator. The reconstruction is exact in int32; scales and the fp32
-reduction tree remain unchanged.
+Dense Q4 and Q6 decode specialize address and tail arithmetic at the
+2,560-wide hidden dimension. Prefill assigns weight row fragments to warps,
+keeping their codes and scales in registers while visiting token columns.
+This follows the operand reuse in llama.cpp's
+`ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma`; the quantization and contraction order
+remain this engine's. Q4 staging pairs even and odd bytes with `PRMT` before
+selecting their low nibbles. Its tensor-core accumulator reconstructs the
+sixteen-bit activation dot with an integer Horner sum. The reconstruction is
+exact in int32; scales and the fp32 reduction tree remain unchanged.
+
+Q4 experts split each fixed 64-slot dispatch run into two 32-token tiles.
+Each warp loads its own weight fragments straight into registers; only
+activation planes and their metadata pass through shared memory. The smaller
+accumulator tile permits a three-block launch bound and avoids staging an
+unused half-run. The split lives in grid.x, preserving the dispatch grid.y
+capacity. Dense Q4 keeps 64 token columns, and Q6 keeps shared weight staging
+and 64-column tiles: the corresponding direct-load and smaller-tile experiments
+did not pay in those paths. No dispatch allocation or live-count readback is
+added to the hot path.
 
 Q4's affine minimum multiplies the original activation sum, retaining the
 warp's summation tree. Q6 combines its two sixteen-value subscale dots before
@@ -1893,6 +1907,18 @@ proposed twice.
 
 | Attempt | Result |
 | --- | --- |
+| Dense K2 cuBLAS with materialized half operands | GPU 0, Q4 six-token publisher input and the unchanged full-model gates. Rounding dense weights and inputs to half fails three-sequence batch prefill at **0.31854** logit max-abs (limit **0.02**). Three GEMMs with high/low half operands and sixteen-bit quantized inputs reduce the shallow error, but the 42-token full-width/chunked comparison still fails at **0.30180**. Both use preallocated buffers. Rejected on correctness before throughput claims; a fast library contraction cannot replace the serving-width numerical contract. |
+| Exact twelve-bit K2 dots on half tensor cores | Integral half operands keep each Q4 32-value and Q6 16-value dot exact in fp32; the 256-thread version passes CPU and bitwise cross-shape tests. The 128-row/64-token prototype needs **96–112-byte stack frames** and reports **276–324 bytes of spill stores**, at a two-block launch bound. Splitting its token columns over 512 threads improves routed calibration, but at 512 tokens query/value means remain **1.332/1.428 ms** for Q4 and **1.401/1.793 ms** for Q6, above compact integer calibration. Rejected on timing; no production precision change or publisher-quality claim. |
+| Direct register staging for dense Q4 and Q6 | GPU 0 resident query/value calibration, sixteen-bit activations and 64 token columns. Q4 query at 512 tokens takes **0.748 ms**, against shared-staged candidate calibration near **0.681 ms**; Q6 query/value take **1.008/1.412–1.433 ms**, against roughly **0.945/1.05 ms**. Q4 routed values improve, so direct staging is restricted to that path. Reducing dense Q4 to 32 columns makes it slower again (**0.967–0.971 ms**). Rejected before numerical and model gates for the dense/Q6 variants. |
+| Smaller Q4 register tiles in both dimensions | GPU 0 routed-value calibration at 512 tokens: 128 rows × 16 tokens takes **0.683–0.715 ms**, 64 × 32 takes **0.728–0.774 ms**, and 64 × 16 takes **0.835–0.922 ms**, against **0.590–0.594 ms** for 128 × 32. At 2K the smaller alternatives are also slower. Keep the wider row tile; reducing live accumulators indefinitely does not compensate for repeated weight traffic. Rejected at calibration, before numerical and model gates. |
+| Smaller Q6 expert tiles based only on the value benchmark | A 32-column, 64-row tile gives 512-token routed-value calibration **0.919–0.974 ms**, but 2K costs **3.264–3.610 ms**. A serial full-model Q6 calibration at 512 tokens measures **1,096.91 ± 2.48 tok/s** against **1,144.49 ± 0.43** for 64 columns, each with three timed passes. The value-only uniform-route gain does not survive the FFN and real routing. Rejected before further numerical gates; keep 64 columns. |
+| Reusing both Q4 nibble halves inside routed decode | Reordering each group to consume both halves of a packed word helps N=1 value calibration (**22.9–23.0 us**) but costs **72.2–72.4 us** at N=3, above the original ordering's calibration near **47–54 us**. Integer dots permit this reordering, but the resulting N=3 kernel calibrates slower. Rejected before numerical and model gates. |
+| Explicit block-residency bounds on K2 decode | GPU 0 resident query/value calibration with a 128-thread, eight-block launch bound: N=3 Q4 query/value take **42.8–43.0/60.8–60.9 us**, and Q6 **49.9–50.1/75.2–75.5 us**. The unrestricted candidate calibrates near **43/47–54** and **47/62 us**. Four- and sixteen-block bounds also fail to improve the routed path. A register ceiling alone does not establish a useful occupancy gain; rejected before numerical and full-model gates. |
+| Four lanes per K2 decode scale group | GPU 0 resident query/value calibration, three CUDA-event rounds, sixteen-bit activations. At N=3, Q4 query/value take **55.4/79.8 us** and Q6 **68.9/106.8 us**, against compact-control calibration near **43/47** and **51/62 us**. Sharing each integer dot needs extra intra-group reductions before the fixed fp32 tree. Q4 N=1 query alone improves to **27.4 us**, which does not justify the losses elsewhere. Rejected before numerical and model gates. |
+| Precomputed Q4 scale products and byte-expanded Q6 records | A 192-byte Q4 record and 276-byte Q6 record move unpacking work to upload. GPU 0 resident calibration at N=3: query/value **43.7/54.9 us** for Q4, **53.0/71.0 us** for Q6. Q4 routed prefill improves in calibration, but decode does not repay the additional residency. No model capacity or throughput claim was made; rejected before full-model and numerical gates. |
+| 128-token dense K2 nibble tiles | With 128 weight rows, eight warps and register-held weights, a dense 128-column Q4 tile uses **48 KiB shared memory**. At 512 tokens its three CUDA-event rounds take **0.9602/0.9599/0.9618 ms**, versus the 64-column candidate calibration near **0.681 ms**. More reuse does not offset the larger tile's resource cost. Rejected before numerical and model gates. |
+| Unrolling fixed-width K2 decode loops | GPU 0 resident query/value calibration at N=3. Unroll factors two/five/ten give Q4 query **44.9/46.0/282.4 us**, against **43.0 us** at factor one; Q6 query **51.6/56.3/65.0 us**, against **47.1 us**. Statically specializing routed Q6 at factor one also loses: N=1 **41.8 us**, versus generic calibration near **33 us**. Keep dense specialization without forced loop unrolling and keep routed widths dynamic. Rejected at the narrow gate. |
+| Staging the whole dense K2 activation once | One shared-memory copy and barrier per block, restricted to the 2,560-wide dense path. GPU 0 N=3 query calibration takes **63.5–63.7 us** for Q4 and **50.0 us** for Q6, against unstaged candidate calibration near **43/47 us**. Moving all input codes and metadata into shared memory does not repay its staging and residency cost. Rejected before numerical and full-model gates. |
 | K2 Q6 low-nibble and high-two-bit planes | Three alternating GPU 0 resident-tensor pairs, sixteen-bit activations, N=3: query means **54.17 / 54.27 / 54.10 us** against packed six-bit **50.87 / 50.90 / 51.10 us**; routed values **66.37 / 66.57 / 67.67 us** against **62.47 / 62.70 / 62.53 us**. Keeping the publisher’s separate bit planes reduces field assembly but requires two distant word loads for each four-value group. The CPU and exact-shape gates pass; every decode pair loses. Rejected before model integration. |
 | K2 Q4 records in consecutive eight-nibble words | Three alternating GPU 0 resident-tensor pairs at N=3: query means **49.37 / 49.50 / 49.40 us** against **45.77 / 45.80 / 45.80 us**; routed values **58.13 / 52.67 / 52.90 us** against **48.67 / 48.70 / 50.70 us**. Direct tensor-core staging removes packing instructions, but decode loses its group-contiguous word loads. A four-lane-per-group decode calibration is slower again (**95.2–96.5 us** for routed values). Rejected on timing before numerical and model gates; the native layout stays. |
 | Q4 sixteen-bit dots using exact half digits | A 64-row/64-token HMMA prototype stages raw Q4 codes and the existing high/low activation bytes as half operands, preserving sixteen-bit codes. At 512 tokens on GPU 0, query calibration takes **1.109–1.208 ms** and routed values **1.955–2.014 ms**, against integer-path calibration **0.620–0.647 / 0.898–0.913 ms**. Two half products avoid integer digit reconstruction but move more shared-memory data and use lower-throughput tensor instructions. Rejected on timing before numerical and model gates; no precision or production-path change. |

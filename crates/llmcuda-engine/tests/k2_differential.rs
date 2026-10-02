@@ -883,78 +883,68 @@ fn k2_dense_hidden_width_specialization_keeps_the_integer_tree() {
     let source: Vec<_> = (0..inner * rows)
         .map(|i| (i as f32 * 0.071).sin() * 0.03)
         .collect();
-    let (bytes, back) = pack(ExpertQuant::Q4K, &source);
-    let minima: Vec<_> = bytes
-        .as_chunks::<144>()
-        .0
-        .iter()
-        .flat_map(|b| q4_k_minima(&BlockQ4K::from_bytes(b).unwrap()))
-        .collect();
-    let dw = stream.clone_htod(&bytes).unwrap();
-    let dw = llmcuda_cuda::kernels::k2_gemm::K2Gemm::repack(
-        &ctx,
-        &stream,
-        &dw,
-        ExpertQuant::Q4K,
-        inner,
-        rows,
-        1,
-    )
-    .unwrap();
-    let mut first = Vec::new();
-    for tokens in [1, 3, 8] {
-        let input: Vec<_> = (0..tokens * inner)
-            .map(|i| (i as f32 * 0.043).cos())
-            .collect();
-        let dx = stream.clone_htod(&input).unwrap();
-        let mut out = stream.alloc_zeros::<f32>(tokens * rows).unwrap();
-        let mut gemm = llmcuda_cuda::kernels::k2_gemm::K2Gemm::new(
-            &ctx,
-            &stream,
-            tokens,
-            1,
-            1,
-            inner * rows,
-            inner,
-            rows,
-        )
-        .unwrap();
-        gemm.project(
-            &stream,
-            &dw,
-            ExpertQuant::Q4K,
-            &dx,
-            &mut out,
-            inner,
-            rows,
-            1,
-            None,
-            false,
-        )
-        .unwrap();
-        let reference = k2::quantized_project_grouped(
-            &back,
-            &input,
-            None,
-            inner,
-            rows,
-            tokens,
-            1,
-            false,
-            Some(&minima),
-            16,
-            32,
-        );
-        let actual = stream.clone_dtoh(&out).unwrap();
-        check(&actual, &reference, "hidden-width dense projection CPU");
-        if tokens == 1 {
-            first = actual.clone();
-        } else {
-            same_bits(
-                &actual[..rows],
-                &first,
-                "specialized GEMV versus shared-input GEMM",
+    for q in [ExpertQuant::Q4K, ExpertQuant::Q6K] {
+        let (bytes, back) = pack(q, &source);
+        let minima = (q == ExpertQuant::Q4K).then(|| {
+            bytes
+                .as_chunks::<144>()
+                .0
+                .iter()
+                .flat_map(|b| q4_k_minima(&BlockQ4K::from_bytes(b).unwrap()))
+                .collect::<Vec<_>>()
+        });
+        let dw = stream.clone_htod(&*to_device_layout(q, &bytes)).unwrap();
+        let dw =
+            llmcuda_cuda::kernels::k2_gemm::K2Gemm::repack(&ctx, &stream, &dw, q, inner, rows, 1)
+                .unwrap();
+        let mut first = Vec::new();
+        for tokens in [1, 3, 8] {
+            let input: Vec<_> = (0..tokens * inner)
+                .map(|i| (i as f32 * 0.043).cos())
+                .collect();
+            let dx = stream.clone_htod(&input).unwrap();
+            let mut out = stream.alloc_zeros::<f32>(tokens * rows).unwrap();
+            let mut gemm = llmcuda_cuda::kernels::k2_gemm::K2Gemm::new(
+                &ctx,
+                &stream,
+                tokens,
+                1,
+                1,
+                inner * rows,
+                inner,
+                rows,
+            )
+            .unwrap();
+            gemm.project(&stream, &dw, q, &dx, &mut out, inner, rows, 1, None, false)
+                .unwrap();
+            let reference = k2::quantized_project_grouped(
+                &back,
+                &input,
+                None,
+                inner,
+                rows,
+                tokens,
+                1,
+                false,
+                minima.as_deref(),
+                16,
+                32,
             );
+            let actual = stream.clone_dtoh(&out).unwrap();
+            check(
+                &actual,
+                &reference,
+                &format!("{q:?} hidden-width dense projection CPU"),
+            );
+            if tokens == 1 {
+                first = actual.clone();
+            } else {
+                same_bits(
+                    &actual[..rows],
+                    &first,
+                    "specialized GEMV versus shared-input GEMM",
+                );
+            }
         }
     }
 }

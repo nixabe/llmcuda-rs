@@ -516,7 +516,8 @@ sixteen-bit activation references, including Q4 affine correction. It requires
 identical bits across one/three-token GEMV and eight/eleven/32/65-token GEMM,
 normal and flat routed inputs, dense matrices, inactive experts and a 135-row
 tail that crosses both row-tile sizes. A separate 2,560-wide dense case checks
-the specialized address path against the CPU and exact GEMV/GEMM results.
+both Q4 and Q6 specialized address paths against the CPU and exact GEMV/GEMM results. The
+routed cases cross both 32-token subtiles of each fixed 64-slot dispatch run.
 Explicit activation reuse must preserve
 those results, and stale generations must be rejected. Rotary reuse is checked
 against the CPU and direct GPU kernel, including tails, independent sequence
@@ -547,8 +548,11 @@ eighteen physical rows.
 
 `bench_k2` measures actual GGUF query and value-expert tensors using CUDA events,
 including device dispatch in the grouped timing. Run it with `LLMCUDA_MODEL`
-and optional `LLMCUDA_K2_N=1,3,128,512`. Its repeated reads have a different
-cache state from a full pass; accept changes only after alternating
+and optional `LLMCUDA_K2_N=1,3,128,512`. `LLMCUDA_K2_INTEGER_ONLY=1` skips
+the scalar controls; use the same setting in both alternating binaries.
+`LLMCUDA_K2_TENSORS` selects comma-separated tensor names; expert measurements
+use deterministic top-4 routes. Its repeated reads have a different cache
+state from a full pass; accept changes only after alternating
 `bench_forward` and `bench_decode_batch` runs confirm them in the model.
 
 `bench_k2_attention` compares scalar batch, serial tensor-core and batched

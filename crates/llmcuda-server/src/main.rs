@@ -120,6 +120,12 @@ struct Args {
     #[arg(long, default_value_t = 1024)]
     image_max_tokens: u32,
 
+    /// Decision models only: the longest `/v1/systemone` prompt, in tokens.
+    /// A longer state is truncated to fit, as the model's reference encoder
+    /// does; the decision head's workspace is sized for this many positions.
+    #[arg(long, default_value_t = 16_384)]
+    decision_max_tokens: u32,
+
     /// Host the HTTP server binds
     #[arg(long, env = "LLMCUDA_HOST", default_value = "127.0.0.1")]
     host: String,
@@ -606,6 +612,11 @@ fn main() -> std::process::ExitCode {
         }
     };
     let is_k2 = model.k2.is_some();
+    let decisions = model.decision.is_some();
+    if decisions && args.decision_max_tokens == 0 {
+        error!("--decision-max-tokens must be positive");
+        return std::process::ExitCode::FAILURE;
+    }
     if is_k2 && args.no_jinja {
         error!("K2-Horizon requires its IFM chat template; --no-jinja is unsupported");
         return std::process::ExitCode::FAILURE;
@@ -968,7 +979,7 @@ fn main() -> std::process::ExitCode {
         max_image_patches: vision_config.map_or(0, |c| {
             args.image_max_tokens as usize * c.merge_factor() as usize
         }),
-        decision_max_positions: llmcuda_engine::runtime::DEFAULT_DECISION_MAX_POSITIONS,
+        decision_max_positions: args.decision_max_tokens as usize,
     };
     if let Err((worker, failure)) = engine.bind_devices(&model_path, model, serving) {
         error!("worker {worker} failed to load: {failure}");
@@ -1058,6 +1069,8 @@ fn main() -> std::process::ExitCode {
         grammar_vocab,
         chat_template,
         jinja_required,
+        decisions,
+        decision_max_length: args.decision_max_tokens as usize,
     };
     match runtime.block_on(http::serve(engine, tokenizer, &address, server)) {
         Ok(()) => std::process::ExitCode::SUCCESS,

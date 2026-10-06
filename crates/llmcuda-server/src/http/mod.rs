@@ -18,12 +18,14 @@
 mod anthropic;
 mod auth;
 mod chat;
+mod decide;
 mod error;
 mod generate;
 mod jinja;
 mod mcp;
 mod openai;
 mod responses;
+mod systemone;
 mod tools;
 mod vision;
 
@@ -85,6 +87,12 @@ pub struct ServerConfig {
     /// this engine cannot compile falls back to the hand-written ChatML with
     /// a warning; asked for by name, it fails startup.
     pub jinja_required: bool,
+    /// The model is a decision model (`clef`): it serves `/v1/systemone`
+    /// and nothing that generates text.
+    pub decisions: bool,
+    /// Longest prompt a decision request is built to; longer states are
+    /// truncated, as the model's reference encoder truncates them.
+    pub decision_max_length: usize,
 }
 
 #[derive(Clone)]
@@ -115,6 +123,10 @@ struct AppState {
     /// and would otherwise reacquire it immediately; this is how it learns
     /// to stand aside. See `worker_loop`.
     submit_waiters: Arc<AtomicUsize>,
+    /// Whether this model answers `/v1/systemone` instead of generating.
+    decisions: bool,
+    /// See [`ServerConfig::decision_max_length`].
+    decision_max_length: usize,
 }
 
 impl AppState {
@@ -204,6 +216,16 @@ struct ModelCard {
     object: &'static str,
     created: u64,
     owned_by: &'static str,
+    architecture: ModelArchitecture,
+}
+
+/// What a model reads and what it produces. A decision model produces
+/// `decisions` and no text, which is how a client knows to call
+/// `/v1/systemone` without probing (the convention llama.cpp's server uses).
+#[derive(Serialize)]
+struct ModelArchitecture {
+    input_modalities: Vec<&'static str>,
+    output_modalities: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -223,6 +245,18 @@ async fn models(
             object: "model",
             created: 0,
             owned_by: "llmcuda-rs",
+            architecture: ModelArchitecture {
+                input_modalities: if state.vision.is_some() {
+                    vec!["text", "image"]
+                } else {
+                    vec!["text"]
+                },
+                output_modalities: if state.decisions {
+                    vec!["decisions"]
+                } else {
+                    vec!["text"]
+                },
+            },
         }],
     })
 }
@@ -304,6 +338,11 @@ fn worker_loop(state: AppState, worker: WorkerId) {
                     if disconnected {
                         clients.remove(&id);
                         disconnected_ids.push(id);
+                    }
+                }
+                for (id, scores) in step.decisions {
+                    if let Some(client) = clients.get(&id) {
+                        let _ = client.send(ClientEvent::Decision(scores));
                     }
                 }
                 for id in step.completed {
@@ -431,6 +470,8 @@ pub async fn serve(
         vision,
         grammar_vocab: config.grammar_vocab,
         chat_template,
+        decisions: config.decisions,
+        decision_max_length: config.decision_max_length,
     };
     // One driver thread per worker. They share nothing but the client map
     // and the engine's shared prefix cache, so a card that is prefilling no
@@ -459,6 +500,7 @@ pub async fn serve(
         .route("/v1/responses", post(responses::create))
         .route("/v1/messages", post(anthropic::messages))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
+        .route("/v1/systemone", post(systemone::systemone))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_api_key,

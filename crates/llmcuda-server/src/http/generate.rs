@@ -24,6 +24,8 @@ use super::tools::{ParsedToolCall, ToolCallParser, ToolEvent};
 /// What the scheduler thread sends to a waiting client.
 pub(crate) enum ClientEvent {
     Token(i32),
+    /// A decision request's scores, one per option, sent before its `Done`.
+    Decision(Vec<f32>),
     Done(EngineFinish),
     Error(String),
 }
@@ -323,6 +325,12 @@ impl Generation {
         spec: GenerationSpec,
         dialect: Dialect,
     ) -> Result<Self, ApiError> {
+        if state.decisions {
+            return Err(ApiError::bad_request(
+                dialect,
+                "this is a decision model: it generates no text; use /v1/systemone",
+            ));
+        }
         if spec.max_tokens == 0 {
             return Err(ApiError::bad_request(
                 dialect,
@@ -535,6 +543,13 @@ impl Generation {
                 Some(ClientEvent::Error(message)) => {
                     self.drained = true;
                     return Err(ApiError::internal(self.dialect, message));
+                }
+                Some(ClientEvent::Decision(_)) => {
+                    self.drained = true;
+                    return Err(ApiError::internal(
+                        self.dialect,
+                        "a generation request received decision scores",
+                    ));
                 }
                 None => {
                     self.drained = true;

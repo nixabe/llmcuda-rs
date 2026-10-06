@@ -17,6 +17,7 @@ pub mod decision;
 pub mod dequant;
 pub mod gdn;
 pub mod gdn_chunked;
+pub mod hgemm;
 pub mod k2_gemm;
 pub mod k2_rope;
 pub mod layer_ops;

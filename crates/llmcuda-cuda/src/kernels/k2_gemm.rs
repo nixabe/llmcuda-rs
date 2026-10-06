@@ -4,7 +4,8 @@
 //!
 //! Q4 records retain 128 bytes of nibble codes, half d/dmin, eight scale/min
 //! bytes and packed code sums (160 bytes). Q6 records keep 192 bytes of six-bit
-//! codes, half d and sixteen signed subscales (224 bytes, padded).
+//! codes as low-nibble and high-pair words per 32 values, half d and sixteen
+//! signed subscales (224 bytes, padded).
 //! Dense and expert weights interleave each word across four rows. Repacking
 //! and activation arenas are allocated at construction.
 //!
@@ -54,19 +55,22 @@ __global__ void k2_repack_q4(const unsigned char* src,unsigned char* dst,long lo
     if(r%32==0){const unsigned char* in=src+(i/256)*144;int sc,m;moe_scale_min_k4(g,in+4,&sc,&m);out[((132+g)>>2)*(4*IR)+((132+g)&3)]=sc;out[((140+g)>>2)*(4*IR)+((140+g)&3)]=m;}
     if(r==0){unsigned words[3]={};for(int g=0;g<8;++g){int sum=0;for(int z=0;z<8;++z){float s,m;unsigned p=raw_pack4<3>(src,(i/256)*256+g*32+z*4,&s,&m);int v;asm("dp4a.s32.s32 %0,%1,%2,%3;":"=r"(v):"r"(p),"r"(0x01010101),"r"(sum));sum=v;}unsigned v=sum+0,bit=g*9,shift=bit&31;words[bit/32]|=v<<shift;if(shift>23)words[bit/32+1]|=v>>(32-shift);}for(int n=0;n<3;++n)*(unsigned*)(out+148*IR+n*(4*IR))=words[n];}
 }
+// Each 32-value group keeps six words: four of low nibbles, then two of high
+// bit pairs. Byte b of activation word k (values 4k..4k+3) takes nibble k/4 of
+// low word k%4 and bit pair k%4 of high word k/4. Codes stay biased by 32.
 __global__ void k2_repack_q6(const unsigned char* src,unsigned char* dst,long long elems,int inner,int rows,int IR) {
-    long long i=((long long)blockIdx.x*blockDim.x+threadIdx.x)*4;if(i>=elems || i%16)return;
-    int r=i%256,g=r/16;long long row=i/inner;int e=row/rows,rw=row%rows;
+    long long i=((long long)blockIdx.x*blockDim.x+threadIdx.x)*4;if(i>=elems || i%32)return;
+    int r=i%256,g=r/32;long long row=i/inner;int e=row/rows,rw=row%rows;
     unsigned char* out=dst+(((long long)e*((rows+IR-1)/IR)+rw/IR)*(inner/256)+((i%inner)/256))*224*IR+(rw%IR)*4;
-    unsigned words[3]={};int sum=0;
-    for(int z=0;z<4;++z){float sc,m;unsigned p=raw_pack4<0>(src,i+z*4,&sc,&m);
-        for(int n=0;n<4;++n){int code=(int)(signed char)(p>>(n*8));sum+=code;unsigned c=code+32,bit=(z*4+n)*6,pos=bit/32,shift=bit%32;words[pos]|=c<<shift;if(shift>26)words[pos+1]|=c>>(32-shift);}
+    unsigned low[4]={},high[2]={};
+    for(int k=0;k<8;++k){float sc,m;unsigned p=raw_pack4<0>(src,i+k*4,&sc,&m);
+        for(int b=0;b<4;++b){unsigned c=(unsigned)((int)(signed char)(p>>(b*8))+32);low[k&3]|=(c&15)<<(8*b+4*(k>>2));high[k>>2]|=(c>>4)<<(8*b+2*(k&3));}
     }
-    for(int n=0;n<3;++n)*(unsigned*)(out+(g*12+n*4)*IR)=words[n];
+    for(int n=0;n<4;++n)*(unsigned*)(out+(g*24+n*4)*IR)=low[n];
+    for(int n=0;n<2;++n)*(unsigned*)(out+(g*24+16+n*4)*IR)=high[n];
     const unsigned char* in=src+(i/256)*224;
     if(r==0){out[192*IR]=in[208];out[192*IR+1]=in[209];}
-    int off=194+g;out[(off/4)*(4*IR)+(off%4)]=in[192+g];
-
+    for(int h=0;h<2;++h){int off=194+2*g+h;out[(off/4)*(4*IR)+(off%4)]=in[192+2*g+h];}
 }
 }
 "#;
@@ -119,10 +123,9 @@ __device__ __forceinline__ unsigned raw_pack4(const unsigned char* __restrict__ 
     int r=i&255,g=r>>5,z=(r&31)>>2;const unsigned char* b=w+(i>>8)*(Q==3 ? 160 : 224)*IR;
     if(Q==3){unsigned dm=*(const unsigned*)(b+128*IR);*scale=k2_half_bits((unsigned short)dm)*(float)b[((132+g)>>2)*(4*IR)+((132+g)&3)];*minimum=k2_half_bits((unsigned short)(dm>>16))*(float)b[((140+g)>>2)*(4*IR)+((140+g)&3)];unsigned code=*(const unsigned*)(b+((z%4)*32+g*4)*IR);return (z<4 ? code : code>>4)&0x0f0f0f0f;}
     *scale=k2_half_bits(*(const unsigned short*)(b+192*IR))*(float)((const signed char*)b)[((194+r/16)>>2)*(4*IR)+((194+r/16)&3)];*minimum=0;
-    int bit=(r%16)*6,word=bit/32,shift=bit%32,base=(r/16)*12;
-    unsigned v=*(const unsigned*)(b+(base+word*4)*IR)>>shift;
-    if(shift>8)v|=*(const unsigned*)(b+(base+(word+1)*4)*IR)<<(32-shift);
-    unsigned code=(v&63)|(((v>>6)&63)<<8)|(((v>>12)&63)<<16)|(((v>>18)&63)<<24);
+    const unsigned char* group=b+g*24*IR;
+    unsigned low=*(const unsigned*)(group+(z&3)*4*IR),high=*(const unsigned*)(group+(16+(z>>2)*4)*IR);
+    unsigned code=((low>>(4*(z>>2)))&0x0f0f0f0f)|(((high>>(2*(z&3)))&0x03030303)<<4);
     return ((code|0x80808080)-0x20202020)^0x80808080;
 }
 template<int Q>
@@ -138,6 +141,7 @@ __device__ __forceinline__ float raw_term(float scale,int dot,int dotl,float min
     if(Q==3)asm("fma.rn.f32 %0,%1,%2,%3;":"=f"(result):"f"(-minimum),"f"(sum),"f"(result));return result;
 }
 __device__ __forceinline__ int raw_dp4a(unsigned a,unsigned b,int c) {int v;asm("dp4a.s32.s32 %0,%1,%2,%3;":"=r"(v):"r"(a),"r"(b),"r"(c));return v;}
+__device__ __forceinline__ int raw_dp4a_us(unsigned a,unsigned b,int c) {int v;asm("dp4a.u32.s32 %0,%1,%2,%3;":"=r"(v):"r"(a),"r"(b),"r"(c));return v;}
 __device__ __forceinline__ void raw_imma(int* d,unsigned a,unsigned b) {
     asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};":"+r"(d[0]),"+r"(d[1]):"r"(a),"r"(b));
 }
@@ -333,7 +337,29 @@ __device__ void raw_gemm_reuse(const unsigned char* __restrict__ w,const signed 
     for(int a=0;a<TF;++a)for(int n=0;n<WR;++n)acc[a][n][0]=acc[a][n][1]=0;
     for(int j=0;j<inner;j+=128) {
 
-        for(int rb=warp*4;rb<RN;rb+=warps*4){int r=rb+lane/8;
+        // Q6: one thread unpacks one row's 32-value group from its six words
+        // and both subscales; codes and scales land where the loop below puts them.
+        if(Q==0)for(int task=tid;task<RN*4;task+=blockDim.x) {
+            int r=task>>2,gg=task&3;unsigned code[8]={};float s0=0,s1=0,dl=0;
+            if(r0+r<rows) {
+                const unsigned char* row=weight_row<Q,IR>(w,expert,r0+r,inner,rows);
+                int i=j+gg*32,gi=(i&255)>>5;const unsigned char* b=row+(i>>8)*224*IR;const unsigned char* grp=b+gi*24*IR;
+                unsigned low[4],high[2];
+                #pragma unroll
+                for(int k=0;k<4;++k)low[k]=*(const unsigned*)(grp+k*4*IR);
+                #pragma unroll
+                for(int k=0;k<2;++k)high[k]=*(const unsigned*)(grp+(16+k*4)*IR);
+                #pragma unroll
+                for(int k=0;k<8;++k){unsigned c=((low[k&3]>>(4*(k>>2)))&0x0f0f0f0f)|(((high[k>>2]>>(2*(k&3)))&0x03030303)<<4);code[k]=((c|0x80808080)-0x20202020)^0x80808080;}
+                int off=194+2*gi;unsigned sv=*(const unsigned*)(b+(off>>2)*4*IR);
+                s0=(float)(signed char)(sv>>(8*(off&3)));s1=(float)(signed char)(sv>>(8*(off&3)+8));
+                if(gg==0)dl=q6_delta<IR>(row,j);
+            }
+            #pragma unroll
+            for(int k=0;k<8;++k){int pos=gg*8+k;ws[r][pos^((r&7)*4)]=code[k];}
+            scales[r][2*gg]=s0;scales[r][2*gg+1]=s1;if(gg==0)delta[r]=dl;
+        }
+        else for(int rb=warp*4;rb<RN;rb+=warps*4){int r=rb+lane/8;
             #pragma unroll
             for(int z=0;z<4;++z){int pos=(lane%4)*8+(lane/4%2)*4+z;float sc=0,mn=0;unsigned v=0;const unsigned char* row=weight_row<Q,IR>(w,expert,r0+r,inner,rows);if(r0+r<rows)v=raw_pack4<Q,IR>(row,j+pos*4,&sc,&mn);
                 ws[r][pos^((r&7)*4)]=v;
@@ -612,15 +638,7 @@ __device__ __forceinline__ void k2_gemv_quads(const unsigned char* __restrict__ 
                     unsigned sv=k2_part(sw,j);
                     s0[j]=(float)(signed char)(sv>>sh);s1[j]=(float)(signed char)(sv>>(sh+8));
                     #pragma unroll
-                    for(int h=0;h<2;++h) {
-                        unsigned a=k2_part(c[3*h],j),b=k2_part(c[3*h+1],j),e=k2_part(c[3*h+2],j);
-                        unsigned u[4]={a,(a>>24)|(b<<8),(b>>16)|(e<<16),e>>8};
-                        #pragma unroll
-                        for(int z=0;z<4;++z) {
-                            unsigned v=u[z],code=(v&63)|(((v>>6)&63)<<8)|(((v>>12)&63)<<16)|(((v>>18)&63)<<24);
-                            codes[j][h*4+z]=((code|0x80808080)-0x20202020)^0x80808080;
-                        }
-                    }
+                    for(int k=0;k<8;++k)codes[j][k]=((k2_part(c[k&3],j)>>(4*(k>>2)))&0x0f0f0f0f)|(((k2_part(c[4+(k>>2)],j)>>(2*(k&3)))&0x03030303)<<4);
                 }
                 #pragma unroll
                 for(int n=0;n<NT;++n)if(f0+n<pairs) {
@@ -628,15 +646,24 @@ __device__ __forceinline__ void k2_gemv_quads(const unsigned char* __restrict__ 
                     const uint4* xp=(const uint4*)(x+(long long)t*inner+g*32);const uint4* lp=(const uint4*)(xl+(long long)t*inner+g*32);
                     uint4 h0=xp[0],h1=xp[1],l0=lp[0],l1=lp[1];
                     float xs=sx[t*groups+g];
+                    // Codes are biased by 32: remove 32 times each subgroup's code sum.
+                    int bias[2];
+                    #pragma unroll
+                    for(int h=0;h<2;++h) {
+                        int hs=0,ls=0;
+                        #pragma unroll
+                        for(int z=0;z<4;++z){hs=raw_dp4a(0x01010101,k2_word(h0,h1,h*4+z),hs);ls=raw_dp4a(0x01010101,k2_word(l0,l1,h*4+z),ls);}
+                        bias[h]=32*(hs*256+ls);
+                    }
                     #pragma unroll
                     for(int j=0;j<4;++j) {
                         int dh0=0,dl0=0,dh1=0,dl1=0;
                         #pragma unroll
                         for(int z=0;z<4;++z) {
-                            dh0=raw_dp4a(codes[j][z],k2_word(h0,h1,z),dh0);dl0=raw_dp4a(codes[j][z],k2_word(l0,l1,z),dl0);
-                            dh1=raw_dp4a(codes[j][4+z],k2_word(h0,h1,4+z),dh1);dl1=raw_dp4a(codes[j][4+z],k2_word(l0,l1,4+z),dl1);
+                            dh0=raw_dp4a_us(codes[j][z],k2_word(h0,h1,z),dh0);dl0=raw_dp4a_us(codes[j][z],k2_word(l0,l1,z),dl0);
+                            dh1=raw_dp4a_us(codes[j][4+z],k2_word(h0,h1,4+z),dh1);dl1=raw_dp4a_us(codes[j][4+z],k2_word(l0,l1,4+z),dl1);
                         }
-                        int v0=dh0*256+dl0,v1=dh1*256+dl1;
+                        int v0=dh0*256+dl0-bias[0],v1=dh1*256+dl1-bias[1];
                         value[j][n]=__fmul_rn(__fmul_rn(d[j],xs),__fmaf_rn((float)v1,s1[j],__fmul_rn((float)v0,s0[j])));
                     }
                 }
@@ -660,6 +687,7 @@ __device__ __forceinline__ void k2_gemv_quads(const unsigned char* __restrict__ 
         out[(long long)(f0+n)*rows+r]=acc;
     }
 }
+
 extern "C" {
 #define GEMV_ENTRY(NAME,Q,NT,ROUTED) __global__ void NAME(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ sums,const int* __restrict__ ids,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned* __restrict__ nib) {if(!ROUTED && inner==2560)raw_gemv<Q,NT,ROUTED,2560>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);else raw_gemv<Q,NT,ROUTED>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);}
 #define GEMM_ENTRY(NAME,Q,BT,MF,IR,INNER) __global__ __launch_bounds__(256,2) void NAME(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ sums,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned* __restrict__ nib) {if(Q==3 && K2_ACTIVATION_BITS>=12)raw_gemm_q4_nibbles<BT,MF,IR,INNER>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode,nib);else if(Q==0 && K2_ACTIVATION_BITS>=12)raw_gemm_reuse<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);else raw_gemm_fallback<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);}

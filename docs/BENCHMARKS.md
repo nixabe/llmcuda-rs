@@ -800,8 +800,10 @@ stated so it transfers to the next kernel rather than as a changelog entry.
 
 K2 projections pack weights at upload and quantize activations into sixteen-bit
 integer codes with a separate fp32 scale for each 32 values. Narrow shapes use
-DP4A; prefill uses Turing integer tensor cores. Q4 codes remain nibbles, and Q6
-codes remain six bits. Dense and expert records both interleave each word
+DP4A; prefill uses Turing integer tensor cores. Q4 codes remain nibbles. Q6
+codes remain six bits, split into four words of low nibbles and two of high
+bit pairs inside each 32-value group, arranged so that each code word lines up
+with one activation word. Dense and expert records both interleave each word
 across four rows. These formats have their own residency calculation;
 using the Qwen weight constant in K2 preflight would misreport free memory.
 Native record boundaries preserve word alignment: Q4's `d/dmin` is loaded as
@@ -812,7 +814,10 @@ integer projection path.
 Decode widths share one kernel for dense and routed projections. With every
 record interleaved, one 16-byte load gives a lane the same word of four rows.
 The lane owns one 32-value group of that row quad and reuses the group's
-sixteen-bit activation codes across all four rows. Giving each lane its own
+sixteen-bit activation codes across all four rows. Q6 decode takes those
+codes unsigned and removes their bias of 32 with each subgroup's activation code
+sum, which is shared by the quad, instead of fixing the sign of every byte.
+Giving each lane its own
 row, as before, made L1 activation traffic about four times the weight traffic
 per token; reuse halved a 2560×4096 Q4 projection at one token. Integer dots
 are exact in any order, and the group terms, windows and ascending window sum
@@ -1926,7 +1931,7 @@ proposed twice.
 | 128-token dense K2 nibble tiles | With 128 weight rows, eight warps and register-held weights, a dense 128-column Q4 tile uses **48 KiB shared memory**. At 512 tokens its three CUDA-event rounds take **0.9602/0.9599/0.9618 ms**, versus the 64-column candidate calibration near **0.681 ms**. More reuse does not offset the larger tile's resource cost. Rejected before numerical and model gates. |
 | Unrolling fixed-width K2 decode loops | GPU 0 resident query/value calibration at N=3. Unroll factors two/five/ten give Q4 query **44.9/46.0/282.4 us**, against **43.0 us** at factor one; Q6 query **51.6/56.3/65.0 us**, against **47.1 us**. Statically specializing routed Q6 at factor one also loses: N=1 **41.8 us**, versus generic calibration near **33 us**. Keep dense specialization without forced loop unrolling and keep routed widths dynamic. Rejected at the narrow gate. |
 | Staging the whole dense K2 activation once | One shared-memory copy and barrier per block, restricted to the 2,560-wide dense path. GPU 0 N=3 query calibration takes **63.5–63.7 us** for Q4 and **50.0 us** for Q6, against unstaged candidate calibration near **43/47 us**. Moving all input codes and metadata into shared memory does not repay its staging and residency cost. Rejected before numerical and full-model gates. |
-| K2 Q6 low-nibble and high-two-bit planes | Three alternating GPU 0 resident-tensor pairs, sixteen-bit activations, N=3: query means **54.17 / 54.27 / 54.10 us** against packed six-bit **50.87 / 50.90 / 51.10 us**; routed values **66.37 / 66.57 / 67.67 us** against **62.47 / 62.70 / 62.53 us**. Keeping the publisher’s separate bit planes reduces field assembly but requires two distant word loads for each four-value group. The CPU and exact-shape gates pass; every decode pair loses. Rejected before model integration. |
+| K2 Q6 low-nibble and high-two-bit planes | Three alternating GPU 0 resident-tensor pairs, sixteen-bit activations, N=3: query means **54.17 / 54.27 / 54.10 us** against packed six-bit **50.87 / 50.90 / 51.10 us**; routed values **66.37 / 66.57 / 67.67 us** against **62.47 / 62.70 / 62.53 us**. Keeping the publisher’s separate bit planes reduces field assembly but requires two distant word loads for each four-value group. The CPU and exact-shape gates pass; every decode pair loses. Rejected before model integration. The production layout keeps both planes inside each group's six contiguous words, so a group still costs one run of loads; see WHY. |
 | K2 Q4 records in consecutive eight-nibble words | Three alternating GPU 0 resident-tensor pairs at N=3: query means **49.37 / 49.50 / 49.40 us** against **45.77 / 45.80 / 45.80 us**; routed values **58.13 / 52.67 / 52.90 us** against **48.67 / 48.70 / 50.70 us**. Direct tensor-core staging removes packing instructions, but decode loses its group-contiguous word loads. A four-lane-per-group decode calibration is slower again (**95.2–96.5 us** for routed values). Rejected on timing before numerical and model gates; the native layout stays. |
 | Q4 sixteen-bit dots using exact half digits | A 64-row/64-token HMMA prototype stages raw Q4 codes and the existing high/low activation bytes as half operands, preserving sixteen-bit codes. At 512 tokens on GPU 0, query calibration takes **1.109–1.208 ms** and routed values **1.955–2.014 ms**, against integer-path calibration **0.620–0.647 / 0.898–0.913 ms**. Two half products avoid integer digit reconstruction but move more shared-memory data and use lower-throughput tensor instructions. Rejected on timing before numerical and model gates; no precision or production-path change. |
 | Interleaved high/low activation words in K2 GEMV | GPU 0 resident Q4 calibration, N=3: explicit `ld.global.v2.u32` loads take **63.3–63.4 us** for the query and **72.3–72.7 us** for routed values. The separate-byte-plane control calibrates at **42.9–43.8 / 53.9–54.5 us**. Packing the two parts reduces load instruction count but doubles the address stride seen by neighbouring scale groups, and adds packing work. Rejected at the narrow calibration; no numerical or model-level claim. |

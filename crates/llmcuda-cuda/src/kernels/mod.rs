@@ -13,6 +13,7 @@
 //! and so a build needs no CUDA toolkit — only a driver at runtime.
 
 pub mod attention;
+pub mod decision;
 pub mod dequant;
 pub mod gdn;
 pub mod gdn_chunked;

@@ -280,6 +280,31 @@ impl K2Config {
     }
 }
 
+/// A decision head over the backbone's final hidden states (Cloudflare's
+/// `clef`): no text is generated, every answer option gets one score.
+///
+/// Read from `clef.decision.*` and `clef.attention.layer_norm_epsilon`,
+/// following llama.cpp's `llama_model_clef::load_arch_hparams`. The head's
+/// width and feed-forward width are tensor shapes, checked when it loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecisionConfig {
+    /// Leading evidence-routing blocks (option queries read the prompt).
+    pub routing_layers: u32,
+    /// Joint decoder blocks after them (questions read each other and the prompt).
+    pub joint_layers: u32,
+    /// Attention heads inside the head.
+    pub heads: u32,
+    /// IEEE fp32 bits of the head's LayerNorm epsilon (keeps config equality exact).
+    pub layer_norm_eps_bits: u32,
+}
+
+impl DecisionConfig {
+    /// The head's `torch.nn.LayerNorm` epsilon.
+    pub fn layer_norm_eps(self) -> f32 {
+        f32::from_bits(self.layer_norm_eps_bits)
+    }
+}
+
 /// Complete structural description of the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
@@ -323,6 +348,8 @@ pub struct ModelConfig {
     pub has_mtp: bool,
     /// Architecture-specific MoVA and mixed-FFN semantics.
     pub k2: Option<K2Config>,
+    /// A decision head in place of text generation (`clef`).
+    pub decision: Option<DecisionConfig>,
 }
 
 impl ModelConfig {
@@ -363,6 +390,7 @@ impl ModelConfig {
             yarn_context: 1_010_000,
             has_mtp: true,
             k2: None,
+            decision: None,
         }
     }
 
@@ -419,6 +447,7 @@ impl ModelConfig {
             yarn_context: 1_010_000,
             has_mtp: true,
             k2: None,
+            decision: None,
         }
     }
 
@@ -471,6 +500,7 @@ impl ModelConfig {
                 values_per_token: 4,
                 route_scale_bits: 2.5f32.to_bits(),
             }),
+            decision: None,
         }
     }
 

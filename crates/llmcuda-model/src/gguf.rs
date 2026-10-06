@@ -3,6 +3,9 @@
 //! Metadata interpretation follows llama.cpp `src/models/qwen35{,moe}.cpp`,
 //! `load_arch_hparams` and `load_arch_tensors`. Architecture selects semantics;
 //! widths come from metadata. Kernel tuning (GDN chunk length) stays local.
+//!
+//! `clef` (`src/models/clef.cpp`) is a `qwen35` trunk under its own key prefix
+//! plus a decision head: its trunk geometry is read exactly as `qwen35`'s.
 
 use core::fmt;
 use llmcuda_gguf::{GgufFile, GgufValue};
@@ -30,6 +33,7 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
         Some("qwen35moe") => "qwen35moe",
         Some("qwen35") => "qwen35",
         Some("k2-horizon") => "k2-horizon",
+        Some("clef") => "clef",
         declared => {
             return Err(ConfigLoadError(
                 crate::UnknownArchitecture {
@@ -107,7 +111,9 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
             "must be a multiple of group_count",
         ));
     }
-    let ffn = if architecture != "qwen35" {
+    // `clef`'s trunk is `qwen35`'s: one dense SwiGLU MLP per layer.
+    let dense = matches!(architecture, "qwen35" | "clef");
+    let ffn = if !dense {
         let intermediate = required("expert_feed_forward_length")?;
         if required("expert_shared_feed_forward_length")? != intermediate {
             return Err(invalid(
@@ -177,6 +183,42 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
     } else {
         None
     };
+    let decision = if architecture == "clef" {
+        let eps_key = key("attention.layer_norm_epsilon");
+        let eps = file
+            .get_f32(&eps_key)
+            .ok_or_else(|| invalid(&eps_key, "required fp32 metadata is missing"))?;
+        if !eps.is_finite() || eps <= 0.0 {
+            return Err(invalid(&eps_key, "must be finite and positive"));
+        }
+        if file.get_str(&key("decision.type")) != Some("clef") {
+            return Err(invalid(
+                &key("decision.type"),
+                "only the joint `clef` decision head is supported",
+            ));
+        }
+        if mtp != 0 {
+            return Err(invalid(
+                &key("nextn_predict_layers"),
+                "a decision model has no MTP block",
+            ));
+        }
+        Some(crate::DecisionConfig {
+            routing_layers: optional("decision.routing_block_count")?.ok_or_else(|| {
+                invalid(
+                    &key("decision.routing_block_count"),
+                    "required metadata is missing",
+                )
+            })?,
+            joint_layers: optional("decision.block_count")?.ok_or_else(|| {
+                invalid(&key("decision.block_count"), "required metadata is missing")
+            })?,
+            heads: required("decision.head_count")?,
+            layer_norm_eps_bits: eps.to_bits(),
+        })
+    } else {
+        None
+    };
     let tokens = file
         .get_string_array("tokenizer.ggml.tokens")
         .ok_or_else(|| {
@@ -218,6 +260,7 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
         yarn_context: native_context,
         has_mtp: mtp == 1,
         k2,
+        decision,
     };
     let recurrent_key = key("attention.recurrent_layers");
     if file.get(&recurrent_key).is_some() {

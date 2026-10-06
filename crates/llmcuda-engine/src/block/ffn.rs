@@ -24,6 +24,13 @@ use crate::block::dense_ffn::{DENSE_REPACK_INT8, DenseFfnBlock, DenseFfnLayerWei
 use crate::block::moe::{MoeBlock, MoeBlockError, MoeLayerWeights};
 
 /// The feed-forward block for one pass shape.
+///
+/// The variants differ by a couple of hundred bytes and clippy would rather
+/// the larger were boxed. It stays unboxed for the reason
+/// [`FfnLayerWeights`] does: there is one per pass shape, built at load, so
+/// the padding is paid a handful of times per worker, and boxing would add an
+/// indirection to every layer of every pass.
+#[allow(clippy::large_enum_variant)]
 pub enum FfnBlock {
     /// `qwen35moe`: 256 routed experts plus a gated shared expert.
     Moe(MoeBlock),

@@ -370,3 +370,71 @@ fn k2_rejects_unsupported_routing_and_malformed_groups() {
         assert!(ModelConfig::from_gguf(&file(&v)).is_err(), "{suffix}");
     }
 }
+
+/// Clef-Flash: a `qwen35` trunk under the `clef.` prefix plus a decision head.
+fn clef_values() -> (ModelConfig, Vec<(String, Value)>) {
+    let mut c = ModelConfig::qwen3_8_27b();
+    c.architecture = "clef";
+    c.num_layers = 32;
+    c.hidden_size = 4096;
+    c.vocab_size = 64;
+    c.has_mtp = false;
+    c.gdn.value_heads = 32;
+    c.attention.q_heads = 16;
+    c.ffn = FfnConfig::Dense(llmcuda_model::DenseFfnConfig {
+        intermediate: 12288,
+    });
+    let mut values = fixture(&c);
+    values.retain(|(k, _)| !k.ends_with("nextn_predict_layers"));
+    for (key, n) in [
+        ("decision.routing_block_count", 2),
+        ("decision.block_count", 4),
+        ("decision.head_count", 16),
+    ] {
+        values.push((c.hparam_key(key), Value::Uint(n)));
+    }
+    values.push((c.hparam_key("decision.type"), Value::Text("clef".into())));
+    values.push((
+        c.hparam_key("attention.layer_norm_epsilon"),
+        Value::Float(1e-5),
+    ));
+    c.decision = Some(llmcuda_model::DecisionConfig {
+        routing_layers: 2,
+        joint_layers: 4,
+        heads: 16,
+        layer_norm_eps_bits: 1e-5f32.to_bits(),
+    });
+    (c, values)
+}
+
+#[test]
+fn clef_reads_a_dense_trunk_and_its_decision_head() {
+    let (c, values) = clef_values();
+    let loaded = ModelConfig::from_gguf(&file(&values)).unwrap();
+    assert_eq!(loaded, expected(c));
+    assert!(
+        loaded.dense_ffn().is_some(),
+        "clef's trunk is dense, not MoE"
+    );
+    assert_eq!(loaded.decision.unwrap().layer_norm_eps(), 1e-5);
+}
+
+#[test]
+fn clef_rejects_a_missing_or_foreign_decision_head() {
+    let (c, values) = clef_values();
+    for missing in [
+        "decision.routing_block_count",
+        "decision.block_count",
+        "decision.head_count",
+        "decision.type",
+        "attention.layer_norm_epsilon",
+    ] {
+        let key = c.hparam_key(missing);
+        let v: Vec<_> = values.iter().filter(|(k, _)| k != &key).cloned().collect();
+        assert!(ModelConfig::from_gguf(&file(&v)).is_err(), "{missing}");
+    }
+    let key = c.hparam_key("decision.type");
+    let mut v: Vec<_> = values.iter().filter(|(k, _)| k != &key).cloned().collect();
+    v.push((key, Value::Text("laya".into())));
+    assert!(ModelConfig::from_gguf(&file(&v)).is_err());
+}

@@ -968,6 +968,7 @@ fn main() -> std::process::ExitCode {
         max_image_patches: vision_config.map_or(0, |c| {
             args.image_max_tokens as usize * c.merge_factor() as usize
         }),
+        decision_max_positions: llmcuda_engine::runtime::DEFAULT_DECISION_MAX_POSITIONS,
     };
     if let Err((worker, failure)) = engine.bind_devices(&model_path, model, serving) {
         error!("worker {worker} failed to load: {failure}");

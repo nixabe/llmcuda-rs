@@ -466,6 +466,44 @@ impl Engine {
         })
     }
 
+    /// Place a decision request: a prefill-only sequence whose final hidden
+    /// states the worker's decision head scores. It is routed like any
+    /// request but never matched against the prefix cache — a restored
+    /// prefix has no hidden states for the head to read — and it publishes
+    /// no snapshots of its own.
+    pub fn place_decision(
+        &self,
+        req: NewRequest,
+        prompt: Vec<i32>,
+        spans: crate::decision::DecisionSpans,
+    ) -> Result<Placement, EngineExecutionError> {
+        debug_assert_eq!(req.max_output_tokens, 0, "a decision generates nothing");
+        let budget = self
+            .workers
+            .first()
+            .map(|worker| worker.lock().scheduler().config().token_budget())
+            .unwrap_or(0);
+        let _routing = self.placement.lock();
+        let loads = self.score_workers(&req, &[]);
+        let Routed {
+            worker,
+            score,
+            matched_tokens,
+        } = route(&self.router, &loads, req.prompt_tokens, budget)
+            .map_err(|error| EngineExecutionError::Placement(self.routing_failure(error, &req)))?;
+        let request = self
+            .worker(worker)
+            .expect("router returned an existing worker")
+            .admit_decision(req, prompt, spans)
+            .map_err(|source| EngineExecutionError::Worker { worker, source })?;
+        Ok(Placement {
+            worker,
+            request,
+            reusable_prefix_tokens: matched_tokens,
+            score,
+        })
+    }
+
     /// Cancel a live request and release its scheduler, runtime, and cache
     /// bookkeeping regardless of whether it is waiting or running.
     pub fn cancel(&self, request: RequestId) -> bool {

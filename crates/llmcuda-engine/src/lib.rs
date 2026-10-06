@@ -16,6 +16,7 @@
 //! [`Worker::step_device`] executes scheduler batches on that worker's card.
 
 pub mod block;
+pub mod decision;
 pub mod dflash;
 pub mod engine;
 pub mod forward;
@@ -31,6 +32,7 @@ pub mod vision;
 pub mod weights;
 pub mod worker;
 
+pub use decision::DecisionSpans;
 pub use engine::{Engine, EngineExecutionError, Placement, PlacementError};
 pub use router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
 pub use runtime::{

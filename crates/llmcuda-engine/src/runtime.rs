@@ -25,6 +25,7 @@ use tracing::debug;
 use crate::block::attention::KvCache;
 use crate::block::gdn_verify::GdnSnapshotRing;
 use crate::block::mtp::{MtpBlock, MtpBlockError};
+use crate::decision::DecisionSpans;
 use crate::dflash::{DFlashDraftCache, DFlashError, DFlashForward, load_dflash_weights};
 use crate::forward::{
     BatchStepGraph, Forward, ForwardError, WaypointStage, arena_holds_model_entry,
@@ -52,6 +53,10 @@ pub const DEFAULT_SNAPSHOT_SLOTS_PER_WORKER: usize = 24;
 /// workspace at 4 heads × 4096² f16 = 128 MiB; `--image-max-tokens`
 /// raises it.
 pub const DEFAULT_MAX_IMAGE_PATCHES: usize = 4096;
+
+/// Longest prompt a decision request may carry when the caller does not say:
+/// Cloudflare's `encode_record` default `max_length`.
+pub const DEFAULT_DECISION_MAX_POSITIONS: usize = 16_384;
 
 /// Everything a device runtime needs beyond the model itself.
 ///
@@ -100,6 +105,9 @@ pub struct RuntimeConfig {
     /// Patch budget the vision tower is pre-allocated for (4 patches per
     /// language-model token). Ignored without `mmproj`.
     pub max_image_patches: usize,
+    /// Longest prompt a decision request may carry; sizes the decision
+    /// head's workspace. Ignored for a model without a decision head.
+    pub decision_max_positions: usize,
 }
 
 /// What `Speculation::DFlash` needs beyond the draft count.
@@ -152,6 +160,8 @@ pub enum RuntimeError {
     Vision(String),
     /// A request's image placements are inconsistent with its prompt.
     ImagePlacement(String),
+    /// A decision request is malformed, or the decision head failed.
+    Decision(String),
 }
 
 impl core::fmt::Display for RuntimeError {
@@ -163,6 +173,7 @@ impl core::fmt::Display for RuntimeError {
             }
             Self::Vision(e) => write!(f, "vision tower: {e}"),
             Self::ImagePlacement(e) => write!(f, "image placement: {e}"),
+            Self::Decision(e) => write!(f, "decision: {e}"),
             Self::Gguf(e) => write!(f, "GGUF error: {e}"),
             Self::Schema(e) => write!(f, "model schema mismatch: {e}"),
             Self::Load(e) => write!(f, "weight load failed: {e}"),
@@ -325,6 +336,17 @@ struct RuntimeSequence {
     /// Projected image embeddings, all images concatenated in placement
     /// order, `sum(tokens) * hidden` f32. Encoded once at admission.
     image_embeds: Option<cudarc::driver::CudaSlice<f32>>,
+    /// Present for a decision request: its spans and the final hidden state
+    /// of every prompt position, collected chunk by chunk.
+    decision: Option<DecisionSequence>,
+}
+
+/// A decision request's device-side state: the spans its head reads and
+/// `[prompt][hidden]` f32 of final RMS-normed hidden states. Allocated at
+/// admission like image embeddings — never on the per-step path.
+struct DecisionSequence {
+    spans: DecisionSpans,
+    hidden: cudarc::driver::CudaSlice<f32>,
 }
 
 impl RuntimeSequence {
@@ -449,6 +471,10 @@ pub struct DeviceStep {
     pub completed: SmallVec<[RequestId; 3]>,
     pub stopped: SmallVec<[RequestId; 3]>,
     pub retained: SmallVec<[(RequestId, Arc<SequenceSnapshot>); 8]>,
+    /// Decision requests that finished this step, with one score per option
+    /// in the order of their [`DecisionSpans::options`]. Each is also in
+    /// `completed`.
+    pub decisions: SmallVec<[(RequestId, Vec<f32>); 2]>,
 }
 
 pub(crate) struct RuntimeStep {
@@ -457,6 +483,7 @@ pub(crate) struct RuntimeStep {
     pub completed: SmallVec<[RequestId; 3]>,
     pub stopped: SmallVec<[RequestId; 3]>,
     pub retained: SmallVec<[(RequestId, Arc<SequenceSnapshot>); 8]>,
+    pub decisions: SmallVec<[(RequestId, Vec<f32>); 2]>,
 }
 
 /// One card's context, stream, weights, prebuilt shapes, and sequence states.
@@ -508,7 +535,16 @@ pub struct DeviceRuntime {
     /// Reused host buffer for per-chunk `(t, h, w)` rotary triples
     /// (AGENTS.md rule 6: no per-chunk allocation).
     mrope_host: Vec<i32>,
+    /// Residual stream width.
+    hidden: usize,
+    /// The decision head, present iff the model declares one (`clef`).
+    decision_head: Option<crate::block::decision::DecisionHead>,
 }
+
+/// Questions a decision request may carry.
+pub const DECISION_MAX_QUESTIONS: usize = 256;
+/// Options across all questions of a decision request.
+pub const DECISION_MAX_OPTIONS: usize = 4096;
 
 enum RuntimeCommand {
     Admit {
@@ -518,6 +554,7 @@ enum RuntimeCommand {
         snapshot: Option<Arc<SequenceSnapshot>>,
         sampling: SamplingParams,
         constraint: Option<Box<ToolConstraint>>,
+        decision: Option<DecisionSpans>,
         reply: SyncSender<Result<(), RuntimeError>>,
     },
     Remove {
@@ -569,13 +606,17 @@ impl DeviceRuntimeHandle {
                                     snapshot,
                                     sampling,
                                     constraint,
+                                    decision,
                                     reply,
                                 } => {
-                                    let result = match snapshot {
-                                        Some(snapshot) => runtime.admit_restored(
+                                    let result = match (snapshot, decision) {
+                                        (_, Some(spans)) => {
+                                            runtime.admit_decision(req, prompt, spans)
+                                        }
+                                        (Some(snapshot), None) => runtime.admit_restored(
                                             req, prompt, images, snapshot, sampling, constraint,
                                         ),
-                                        None => {
+                                        (None, None) => {
                                             runtime.admit(req, prompt, images, sampling, constraint)
                                         }
                                     };
@@ -641,6 +682,26 @@ impl DeviceRuntimeHandle {
             snapshot: None,
             sampling,
             constraint,
+            decision: None,
+            reply,
+        })?
+    }
+
+    /// Admit a decision request: prefill only, scored by the decision head.
+    pub fn admit_decision(
+        &self,
+        req: NewRequest,
+        prompt: Vec<i32>,
+        spans: DecisionSpans,
+    ) -> Result<(), RuntimeError> {
+        self.request(|reply| RuntimeCommand::Admit {
+            req,
+            prompt,
+            images: Vec::new(),
+            snapshot: None,
+            sampling: SamplingParams::GREEDY,
+            constraint: None,
+            decision: Some(spans),
             reply,
         })?
     }
@@ -661,6 +722,7 @@ impl DeviceRuntimeHandle {
             snapshot: Some(snapshot),
             sampling,
             constraint,
+            decision: None,
             reply,
         })?
     }
@@ -707,6 +769,7 @@ impl DeviceRuntime {
             stop_on_eos,
             mmproj,
             max_image_patches,
+            decision_max_positions,
         } = runtime;
         let load_started = Instant::now();
         if prefill_chunk == 0 {
@@ -1051,6 +1114,30 @@ impl DeviceRuntime {
             None => None,
         };
 
+        let decision_head = if config.decision.is_some() {
+            let head = crate::block::decision::DecisionHead::load(
+                &ctx,
+                &stream,
+                &file,
+                &config,
+                crate::block::decision::DecisionLimits {
+                    max_positions: decision_max_positions,
+                    max_questions: DECISION_MAX_QUESTIONS,
+                    max_options: DECISION_MAX_OPTIONS,
+                },
+            )
+            .map_err(|e| RuntimeError::Decision(e.to_string()))?;
+            debug!(
+                device = device_ordinal,
+                elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,
+                max_positions = decision_max_positions,
+                "decision head resident"
+            );
+            Some(head)
+        } else {
+            None
+        };
+
         let mut this = Self {
             ctx,
             stream,
@@ -1080,6 +1167,8 @@ impl DeviceRuntime {
             eos_tokens,
             vision,
             mrope_host: Vec::new(),
+            hidden: config.hidden_size as usize,
+            decision_head,
         };
         if this.vision.is_some() {
             let stream = Arc::clone(&this.stream);
@@ -1192,8 +1281,47 @@ impl DeviceRuntime {
                 constraint,
                 images: placements,
                 image_embeds,
+                decision: None,
             },
         );
+        Ok(())
+    }
+
+    /// Admit a decision request: the prompt is prefilled with retention off,
+    /// every position's final hidden state is kept, and the decision head
+    /// scores the spans once the last chunk lands. Never decodes.
+    pub fn admit_decision(
+        &mut self,
+        req: NewRequest,
+        prompt: Vec<i32>,
+        spans: DecisionSpans,
+    ) -> Result<(), RuntimeError> {
+        if req.max_output_tokens != 0 {
+            return Err(RuntimeError::Decision(
+                "a decision request generates no tokens".into(),
+            ));
+        }
+        if self.decision_head.is_none() {
+            return Err(RuntimeError::Decision(
+                "this model has no decision head".into(),
+            ));
+        }
+        spans
+            .validate(prompt.len())
+            .map_err(RuntimeError::Decision)?;
+        let hidden = self.stream.alloc_zeros::<f32>(prompt.len() * self.hidden)?;
+        self.admit(req, prompt, Vec::new(), SamplingParams::GREEDY, None)?;
+        let seq = self
+            .sequences
+            .get_mut(&req.id)
+            .expect("admit inserted the request");
+        seq.retention_disabled = true;
+        // Neither drafter has anything to draft for a sequence that never
+        // decodes, and both would cost a catch-up pass per chunk.
+        seq.mtp = None;
+        seq.dflash = None;
+        seq.spec = None;
+        seq.decision = Some(DecisionSequence { spans, hidden });
         Ok(())
     }
 
@@ -1303,6 +1431,31 @@ impl DeviceRuntime {
         Ok(())
     }
 
+    /// Score a fully prefilled decision request.
+    fn run_decision_head(
+        &mut self,
+        prompt: &[i32],
+        decision: &DecisionSequence,
+    ) -> Result<Vec<f32>, RuntimeError> {
+        let head = self
+            .decision_head
+            .as_mut()
+            .expect("admit_decision checked the head");
+        let mut scores = Vec::with_capacity(decision.spans.options.len());
+        head.forward(
+            &self.stream,
+            &decision.hidden,
+            prompt.len(),
+            prompt,
+            &decision.spans.questions,
+            &decision.spans.options,
+            self.prefill.lm_head_tensor(),
+            &mut scores,
+        )
+        .map_err(|e| RuntimeError::Decision(e.to_string()))?;
+        Ok(scores)
+    }
+
     /// Capture a currently resident request at its exact computed position.
     pub fn snapshot(&self, id: RequestId) -> Result<Arc<SequenceSnapshot>, RuntimeError> {
         let seq = self
@@ -1341,6 +1494,7 @@ impl DeviceRuntime {
         let mut generated = SmallVec::new();
         let mut retained = SmallVec::new();
         let mut stopped = SmallVec::new();
+        let mut decisions = SmallVec::new();
         self.execute_decodes(&scheduled, &mut generated, &mut retained, &mut stopped)?;
         for item in &scheduled.prefills {
             self.execute_prefill(
@@ -1349,12 +1503,18 @@ impl DeviceRuntime {
                 &mut generated,
                 &mut retained,
                 &mut stopped,
+                &mut decisions,
             )?;
         }
+        // A generating sequence only reaches its output cap after its prompt
+        // is in, so the prefill clause changes nothing for it; it is what
+        // keeps a zero-output decision request alive until its last chunk.
         let completed: SmallVec<[RequestId; 3]> = self
             .sequences
             .iter()
-            .filter_map(|(&id, seq)| (seq.emitted >= seq.max_output).then_some(id))
+            .filter_map(|(&id, seq)| {
+                (seq.prefilled == seq.prompt.len() && seq.emitted >= seq.max_output).then_some(id)
+            })
             .collect();
         for id in &completed {
             self.sequences.remove(id);
@@ -1365,6 +1525,7 @@ impl DeviceRuntime {
             completed,
             stopped,
             retained,
+            decisions,
         })
     }
 
@@ -2260,6 +2421,7 @@ impl DeviceRuntime {
         generated: &mut SmallVec<[(RequestId, i32); 16]>,
         retained: &mut SmallVec<[(RequestId, Arc<SequenceSnapshot>); 8]>,
         stopped: &mut SmallVec<[RequestId; 3]>,
+        decisions: &mut SmallVec<[(RequestId, Vec<f32>); 2]>,
     ) -> Result<(), RuntimeError> {
         let mut seq = self
             .sequences
@@ -2336,6 +2498,19 @@ impl DeviceRuntime {
                 fwd.clear_staged_image_rows();
             }
             run_result?;
+            // A decision request keeps this chunk's final hidden states: the
+            // pass's `final_norm` holds exactly these positions until the
+            // next chunk overwrites it.
+            if let Some(decision) = seq.decision.as_mut() {
+                let hidden = self.hidden;
+                let rows = width * hidden;
+                let stream = Arc::clone(&self.stream);
+                let src = self.prefill_pass(width).final_norm().slice(0..rows);
+                let mut dst = decision
+                    .hidden
+                    .slice_mut(position * hidden..position * hidden + rows);
+                stream.memcpy_dtod(&src, &mut dst)?;
+            }
             // Draft-head catch-up rides each chunk: the target's hidden
             // states for exactly these positions are sitting in the pass's
             // `final_norm` right now, and they are gone once the next chunk
@@ -2419,6 +2594,12 @@ impl DeviceRuntime {
             .set_rope_delta(rope_delta_at(&seq.images, seq.prefilled));
         if let Some(spec) = &mut seq.spec {
             spec.observe_all(work);
+        }
+        if seq.prefilled == seq.prompt.len()
+            && let Some(decision) = seq.decision.as_ref()
+        {
+            let scores = self.run_decision_head(&seq.prompt, decision)?;
+            decisions.push((id, scores));
         }
         if seq.prefilled == seq.prompt.len() && seq.max_output > 0 {
             let at_retained_boundary = seq

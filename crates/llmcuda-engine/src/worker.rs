@@ -128,6 +128,8 @@ pub struct ServingConfig {
     pub mmproj: Option<std::path::PathBuf>,
     /// Patch budget the vision tower is pre-allocated for.
     pub max_image_patches: usize,
+    /// Longest prompt a decision request may carry (decision models only).
+    pub decision_max_positions: usize,
 }
 
 impl ServingConfig {
@@ -142,6 +144,7 @@ impl ServingConfig {
             draft_p_min: 0.0,
             mmproj: None,
             max_image_patches: crate::runtime::DEFAULT_MAX_IMAGE_PATCHES,
+            decision_max_positions: crate::runtime::DEFAULT_DECISION_MAX_POSITIONS,
         }
     }
 }
@@ -218,6 +221,7 @@ struct PendingSequence {
     snapshot: Option<Arc<SequenceSnapshot>>,
     sampling: SamplingParams,
     constraint: Option<Box<ToolConstraint>>,
+    decision: Option<crate::decision::DecisionSpans>,
 }
 
 impl Worker {
@@ -445,6 +449,7 @@ impl Worker {
                 stop_on_eos,
                 mmproj: serving.mmproj.clone(),
                 max_image_patches: serving.max_image_patches,
+                decision_max_positions: serving.decision_max_positions,
             },
         )?);
         self.vocab = Some(vocab);
@@ -489,6 +494,34 @@ impl Worker {
                 snapshot: None,
                 sampling,
                 constraint,
+                decision: None,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Admit a decision request: prefill only, never restored from a prefix.
+    pub fn admit_decision(
+        &mut self,
+        req: NewRequest,
+        prompt: Vec<i32>,
+        spans: crate::decision::DecisionSpans,
+    ) -> Result<RequestId, WorkerExecutionError> {
+        self.validate_pending(req, &prompt, None)?;
+        let id = self
+            .scheduler
+            .admit(req)
+            .map_err(WorkerExecutionError::Admission)?;
+        self.pending.insert(
+            id,
+            PendingSequence {
+                request: req,
+                prompt,
+                images: Vec::new(),
+                snapshot: None,
+                sampling: SamplingParams::GREEDY,
+                constraint: None,
+                decision: Some(spans),
             },
         );
         Ok(id)
@@ -518,6 +551,7 @@ impl Worker {
                 snapshot: Some(snapshot),
                 sampling,
                 constraint,
+                decision: None,
             },
         );
         Ok(id)
@@ -552,6 +586,11 @@ impl Worker {
                     .expect("pending request was checked above");
                 let runtime = self.runtime.as_ref().expect("runtime was checked above");
                 match pending.snapshot {
+                    _ if pending.decision.is_some() => runtime.admit_decision(
+                        pending.request,
+                        pending.prompt,
+                        pending.decision.expect("guarded by the arm"),
+                    )?,
                     Some(snapshot) => runtime.admit_restored(
                         pending.request,
                         pending.prompt,
@@ -627,6 +666,7 @@ impl Worker {
             completed: step.completed,
             stopped: step.stopped,
             retained: step.retained,
+            decisions: step.decisions,
         })
     }
 

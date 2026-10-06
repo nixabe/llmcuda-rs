@@ -1510,6 +1510,15 @@ impl Forward {
         &self.final_norm
     }
 
+    /// The untied output embedding as the file stores it — what a decision
+    /// head gathers its lexical option vectors from.
+    pub fn lm_head_tensor(&self) -> HeadTensor<'_> {
+        HeadTensor {
+            bytes: &self.w_lm_head,
+            format: self.lm_head_format,
+        }
+    }
+
     /// `result_output`: the logits for the last position, `[vocab]`.
     pub fn logits(&self) -> &CudaSlice<f32> {
         &self.logits
@@ -3691,19 +3700,25 @@ impl Forward {
         //    only the positions it was asked for, which for a prefill is the
         //    last. Selecting it here rather than running the 540 MB head over
         //    all 19 is the same arithmetic and 19x less bandwidth.
-        let last = (self.tokens - 1) * self.hidden;
-        let row = self.final_norm.slice(last..last + self.hidden);
-        stream.memcpy_dtod(&row, &mut self.last_hidden)?;
-        self.lm_head.forward(
-            stream,
-            HeadTensor {
-                bytes: &self.w_lm_head,
-                format: self.lm_head_format,
-            },
-            &self.last_hidden,
-            1,
-            &mut self.logits,
-        )?;
+        //
+        //    A decision model has no use for logits — its head reads
+        //    `final_norm` — and llama.cpp's `clef` graph computes none, so the
+        //    head's full read of the output matrix is skipped there.
+        if self.config.decision.is_none() {
+            let last = (self.tokens - 1) * self.hidden;
+            let row = self.final_norm.slice(last..last + self.hidden);
+            stream.memcpy_dtod(&row, &mut self.last_hidden)?;
+            self.lm_head.forward(
+                stream,
+                HeadTensor {
+                    bytes: &self.w_lm_head,
+                    format: self.lm_head_format,
+                },
+                &self.last_hidden,
+                1,
+                &mut self.logits,
+            )?;
+        }
         self.mark(stream, Stage::LmHead)?;
         Ok(())
     }

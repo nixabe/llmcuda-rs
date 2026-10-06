@@ -35,6 +35,7 @@
 //! at fault, and its captured internals say which step inside it.
 
 pub mod attention;
+pub mod decision;
 pub mod dense_ffn;
 pub mod ffn;
 pub mod gdn;

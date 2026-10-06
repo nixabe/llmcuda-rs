@@ -5,8 +5,8 @@
 //! Q4 records retain 128 bytes of nibble codes, half d/dmin, eight scale/min
 //! bytes and packed code sums (160 bytes). Q6 records keep 192 bytes of six-bit
 //! codes, half d and sixteen signed subscales (224 bytes, padded).
-//! Expert weights interleave each word across four rows; dense rows stay
-//! contiguous. Repacking and activation arenas are allocated at construction.
+//! Dense and expert weights interleave each word across four rows. Repacking
+//! and activation arenas are allocated at construction.
 //!
 //! Activation codes use 32-value scales. The production path retains 16 bits,
 //! split into signed high/low bytes for DP4A or four nibble planes for IMMA.
@@ -164,7 +164,7 @@ template<int IR> __device__ __forceinline__ float q6_delta(const unsigned char* 
 template<int Q,int NT,bool ROUTED,int INNER=0>
 __device__ __forceinline__ void raw_gemv(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ sums,const int* __restrict__ ids,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode) {
     if(INNER)inner=INNER;
-    constexpr int IR=ROUTED ? 4 : 1;
+    constexpr int IR=4;
     constexpr int RW=ROUTED ? K2_ROUTED_GEMV_ROWS : 4,LANES=32/RW;
     if(blockIdx.x*4*RW>=rows)return;
     int lane=threadIdx.x&31,within=lane%LANES;
@@ -537,20 +537,148 @@ __device__ __forceinline__ void raw_gemm_q4_registers(const unsigned char* __res
     for(int a=0;a<TF;++a)for(int n=0;n<WR;++n)for(int z=0;z<2;++z){int r=r0+(warp*WR+n)*8+(lane>>2),t=a*8+(lane&3)*2+z,f=flats[t];if(r<rows && f<pairs)out[(long long)f*rows+r]=acc[a][n][z];}
 }
 
+
+__device__ __forceinline__ unsigned k2_part(uint4 v,int j){return j==0 ? v.x : j==1 ? v.y : j==2 ? v.z : v.w;}
+__device__ __forceinline__ unsigned k2_word(uint4 a,uint4 b,int k){return k<4 ? k2_part(a,k) : k2_part(b,k-4);}
+// Sixteen-bit decode GEMV. Records interleave each word across four rows, so
+// one 16-byte load gives a lane that word of a whole row quad. A lane owns one
+// 32-value group of a quad and reuses its activation codes across the four
+// rows; integer dots are exact in any order. Group terms are raw_term's,
+// windows add (t0+t2)+(t1+t3) by raw_gemv's shuffles, and windows are summed
+// in ascending order, so results match raw_gemv and the tensor-core tiles.
+template<int Q,int NT,bool ROUTED>
+__device__ __forceinline__ void k2_gemv_quads(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sums,const int* __restrict__ ids,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,int rq) {
+    extern __shared__ float k2_windows[];
+    constexpr int REC=(Q==3 ? 160 : 224)*4;
+    int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    int groups=inner>>5,nwin=groups>>2,records=inner>>8,quads=(rows+3)>>2;
+    int quad0=(blockIdx.x*(blockDim.x>>5)+warp)*rq;
+    if(quad0>=quads)return;
+    int f0=blockIdx.y*NT,expert=ROUTED ? ids[f0] : 0;
+    float* win=k2_windows+warp*rq*groups*NT;
+    int items=rq*groups;
+    for(int base=0;base<items;base+=32) {
+        int item=base+lane,q=item/groups,g=item-q*groups;
+        bool live=item<items && quad0+q<quads;
+        float value[4][NT];
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            #pragma unroll
+            for(int n=0;n<NT;++n)value[j][n]=0;
+        if(live) {
+            const unsigned char* rec=w+(((long long)expert*quads+quad0+q)*records+(g>>3))*REC;
+            int gi=g&7;
+            if(Q==3) {
+                uint4 c[4];
+                #pragma unroll
+                for(int zz=0;zz<4;++zz)c[zz]=*(const uint4*)(rec+(zz*8+gi)*16);
+                uint4 dm=*(const uint4*)(rec+32*16),sw=*(const uint4*)(rec+(33+(gi>>2))*16),mw=*(const uint4*)(rec+(35+(gi>>2))*16);
+                float scale[4],minimum[4];
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    unsigned d=k2_part(dm,j);int sh=8*(gi&3);
+                    scale[j]=k2_half_bits((unsigned short)d)*(float)((k2_part(sw,j)>>sh)&255);
+                    minimum[j]=k2_half_bits((unsigned short)(d>>16))*(float)((k2_part(mw,j)>>sh)&255);
+                }
+                #pragma unroll
+                for(int n=0;n<NT;++n)if(f0+n<pairs) {
+                    int t=ROUTED ? (mode==1 ? f0/topk : f0) : f0+n;
+                    const uint4* xp=(const uint4*)(x+(long long)t*inner+g*32);const uint4* lp=(const uint4*)(xl+(long long)t*inner+g*32);
+                    uint4 h0=xp[0],h1=xp[1],l0=lp[0],l1=lp[1];
+                    float s=sums[t*groups+g],xs=sx[t*groups+g];
+                    #pragma unroll
+                    for(int j=0;j<4;++j) {
+                        int dot=0,dotl=0;
+                        #pragma unroll
+                        for(int zz=0;zz<4;++zz) {
+                            unsigned wd=k2_part(c[zz],j),lo=wd&0x0f0f0f0f,hi=(wd>>4)&0x0f0f0f0f;
+                            dot=raw_dp4a(lo,k2_word(h0,h1,zz),dot);dot=raw_dp4a(hi,k2_word(h0,h1,zz+4),dot);
+                            dotl=raw_dp4a(lo,k2_word(l0,l1,zz),dotl);dotl=raw_dp4a(hi,k2_word(l0,l1,zz+4),dotl);
+                        }
+                        value[j][n]=raw_term<3>(scale[j],dot,dotl,minimum[j],s,xs,0.0f);
+                    }
+                }
+            } else {
+                uint4 c[6];
+                #pragma unroll
+                for(int k=0;k<6;++k)c[k]=*(const uint4*)(rec+(gi*6+k)*16);
+                uint4 dw=*(const uint4*)(rec+48*16),sw=*(const uint4*)(rec+(48+((2+2*gi)>>2))*16);
+                int sh=8*((2+2*gi)&3);
+                unsigned codes[4][8];
+                float d[4],s0[4],s1[4];
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    d[j]=k2_half_bits((unsigned short)k2_part(dw,j));
+                    unsigned sv=k2_part(sw,j);
+                    s0[j]=(float)(signed char)(sv>>sh);s1[j]=(float)(signed char)(sv>>(sh+8));
+                    #pragma unroll
+                    for(int h=0;h<2;++h) {
+                        unsigned a=k2_part(c[3*h],j),b=k2_part(c[3*h+1],j),e=k2_part(c[3*h+2],j);
+                        unsigned u[4]={a,(a>>24)|(b<<8),(b>>16)|(e<<16),e>>8};
+                        #pragma unroll
+                        for(int z=0;z<4;++z) {
+                            unsigned v=u[z],code=(v&63)|(((v>>6)&63)<<8)|(((v>>12)&63)<<16)|(((v>>18)&63)<<24);
+                            codes[j][h*4+z]=((code|0x80808080)-0x20202020)^0x80808080;
+                        }
+                    }
+                }
+                #pragma unroll
+                for(int n=0;n<NT;++n)if(f0+n<pairs) {
+                    int t=ROUTED ? (mode==1 ? f0/topk : f0) : f0+n;
+                    const uint4* xp=(const uint4*)(x+(long long)t*inner+g*32);const uint4* lp=(const uint4*)(xl+(long long)t*inner+g*32);
+                    uint4 h0=xp[0],h1=xp[1],l0=lp[0],l1=lp[1];
+                    float xs=sx[t*groups+g];
+                    #pragma unroll
+                    for(int j=0;j<4;++j) {
+                        int dh0=0,dl0=0,dh1=0,dl1=0;
+                        #pragma unroll
+                        for(int z=0;z<4;++z) {
+                            dh0=raw_dp4a(codes[j][z],k2_word(h0,h1,z),dh0);dl0=raw_dp4a(codes[j][z],k2_word(l0,l1,z),dl0);
+                            dh1=raw_dp4a(codes[j][4+z],k2_word(h0,h1,4+z),dh1);dl1=raw_dp4a(codes[j][4+z],k2_word(l0,l1,4+z),dl1);
+                        }
+                        int v0=dh0*256+dl0,v1=dh1*256+dl1;
+                        value[j][n]=__fmul_rn(__fmul_rn(d[j],xs),__fmaf_rn((float)v1,s1[j],__fmul_rn((float)v0,s0[j])));
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            #pragma unroll
+            for(int n=0;n<NT;++n) {
+                float v=value[j][n];
+                v+=__shfl_xor_sync(0xffffffff,v,2);v+=__shfl_xor_sync(0xffffffff,v,1);
+                if(live && (lane&3)==0)win[(q*(groups>>2)+(g>>2))*4*NT+j*NT+n]=v;
+            }
+    }
+    __syncwarp();
+    for(int o=lane;o<rq*4*NT;o+=32) {
+        int q=o/(4*NT),j=(o/NT)&3,n=o%NT,r=(quad0+q)*4+j;
+        if(quad0+q>=quads || r>=rows || f0+n>=pairs)continue;
+        float acc=0;
+        for(int k=0;k<nwin;++k)acc+=win[(q*nwin+k)*4*NT+j*NT+n];
+        out[(long long)(f0+n)*rows+r]=acc;
+    }
+}
 extern "C" {
 #define GEMV_ENTRY(NAME,Q,NT,ROUTED) __global__ void NAME(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ sums,const int* __restrict__ ids,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned* __restrict__ nib) {if(!ROUTED && inner==2560)raw_gemv<Q,NT,ROUTED,2560>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);else raw_gemv<Q,NT,ROUTED>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);}
 #define GEMM_ENTRY(NAME,Q,BT,MF,IR,INNER) __global__ __launch_bounds__(256,2) void NAME(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ sums,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned* __restrict__ nib) {if(Q==3 && K2_ACTIVATION_BITS>=12)raw_gemm_q4_nibbles<BT,MF,IR,INNER>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode,nib);else if(Q==0 && K2_ACTIVATION_BITS>=12)raw_gemm_reuse<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);else raw_gemm_fallback<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);}
 #define GEMM_REG_ENTRY(NAME,INNER) __global__ __launch_bounds__(256,(K2_ACTIVATION_BITS>=12 ? 3 : 2)) void NAME(const unsigned char* w,const signed char* x,const signed char* xl,const float* sx,const float* sl,const float* sums,const int* sorted,const int* owners,float* out,int inner,int rows,int pairs,int topk,int mode,const unsigned* nib) {if(K2_ACTIVATION_BITS>=12)raw_gemm_q4_registers<INNER>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode,nib);else raw_gemm_fallback<3,64,1,4>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);}
+#define GEMV16_ENTRY(NAME,Q,NT,ROUTED) __global__ void NAME(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sums,const int* __restrict__ ids,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,int rq) {k2_gemv_quads<Q,NT,ROUTED>(w,x,xl,sx,sums,ids,out,inner,rows,pairs,topk,mode,rq);}
+GEMV16_ENTRY(k2_gemv16_q4,3,1,true)
+GEMV16_ENTRY(k2_gemv16_q6,0,1,true)
+GEMV16_ENTRY(k2_gemv16_dense_q4,3,K2_DENSE_TOKENS,false)
+GEMV16_ENTRY(k2_gemv16_dense_q6,0,K2_DENSE_TOKENS,false)
 GEMV_ENTRY(k2_gemv_q4,3,1,true)
 GEMV_ENTRY(k2_gemv_dense_q4,3,K2_DENSE_TOKENS,false)
 GEMV_ENTRY(k2_gemv_q6,0,1,true)
 GEMV_ENTRY(k2_gemv_dense_q6,0,K2_DENSE_TOKENS,false)
 GEMM_REG_ENTRY(k2_gemm_q4,0)
-GEMM_ENTRY(k2_gemm_dense_q4,3,64,1,1,0)
+GEMM_ENTRY(k2_gemm_dense_q4,3,64,1,4,0)
 GEMM_ENTRY(k2_gemm_q6,0,K2_ROUTED_TILE,1,4,0)
-GEMM_ENTRY(k2_gemm_dense_q6,0,64,1,1,0)
+GEMM_ENTRY(k2_gemm_dense_q6,0,64,1,4,0)
 GEMM_REG_ENTRY(k2_gemm_hidden_q4,2560)
-GEMM_ENTRY(k2_gemm_hidden_dense_q4,3,64,1,1,2560)
+GEMM_ENTRY(k2_gemm_hidden_dense_q4,3,64,1,4,2560)
 }
 "#;
 
@@ -577,6 +705,8 @@ pub struct K2Gemm {
     functions: [CudaFunction; 2],
     gemv: [CudaFunction; 2],
     gemv_dense: [CudaFunction; 2],
+    gemv16: [CudaFunction; 2],
+    gemv16_dense: [CudaFunction; 2],
     dense: [CudaFunction; 2],
     quantize: CudaFunction,
     q: CudaSlice<i8>,
@@ -592,14 +722,10 @@ pub struct K2Gemm {
     max_weight_elements: usize,
 }
 impl K2Gemm {
-    /// Resident bytes after packing, including four-row padding for experts.
+    /// Resident bytes after packing, including four-row padding.
     pub fn weight_bytes(quant: ExpertQuant, inner: usize, rows: usize, experts: usize) -> usize {
-        let rows = if experts > 1 {
-            rows.div_ceil(4) * 4
-        } else {
-            rows
-        };
-        inner * rows * experts / 256 * if quant == ExpertQuant::Q4K { 160 } else { 224 }
+        inner * rows.div_ceil(4) * 4 * experts / 256
+            * if quant == ExpertQuant::Q4K { 160 } else { 224 }
     }
     /// Repack once at upload. Both formats retain their original scales;
     /// Q6 codes stay at six bits with their half delta and signed subscales.
@@ -613,7 +739,6 @@ impl K2Gemm {
         experts: usize,
     ) -> Result<CudaSlice<u8>, MoeError> {
         let elems = inner * rows * experts;
-        let interleaved = experts > 1;
         if !inner.is_multiple_of(256)
             || inner == 0
             || rows == 0
@@ -646,7 +771,8 @@ impl K2Gemm {
             "k2_repack_q6"
         })?;
         let mut out = stream.alloc_zeros::<u8>(Self::weight_bytes(quant, inner, rows, experts))?;
-        let ir = if interleaved { 4i32 } else { 1 };
+        // Dense and expert records both interleave each word across four rows.
+        let ir = 4i32;
         let (elems, inner, rows) = (elems as i64, inner as i32, rows as i32);
         // SAFETY: four source elements per thread, masked at elems; every
         // destination record is 160/224 bytes and header writers are disjoint.
@@ -754,6 +880,14 @@ impl K2Gemm {
             gemv_dense: [
                 module.load_function("k2_gemv_dense_q4")?,
                 module.load_function("k2_gemv_dense_q6")?,
+            ],
+            gemv16: [
+                module.load_function("k2_gemv16_q4")?,
+                module.load_function("k2_gemv16_q6")?,
+            ],
+            gemv16_dense: [
+                module.load_function("k2_gemv16_dense_q4")?,
+                module.load_function("k2_gemv16_dense_q6")?,
             ],
             quantize: module.load_function("k2_quantize")?,
             q: stream.alloc_zeros::<i8>(tokens * topk * max_inner)?,
@@ -921,6 +1055,9 @@ impl K2Gemm {
             (self.tokens * topk) as i32,
             topk as i32,
         );
+        if self.tokens < 8 && self.activation_bits == 16 {
+            return self.gemv16(stream, w, quant, out, inner, rows, pairs, topk, mode, d);
+        }
         // SAFETY: fixed workspace and geometry checks cover all indices;
         // rows and dispatch padding are masked, and dense ignores route pointers.
         unsafe {
@@ -1017,6 +1154,70 @@ impl K2Gemm {
 
         Ok(())
     }
+    /// Decode widths at sixteen bits: one warp per run of row quads. Each
+    /// warp's quad count makes its group items a whole number of passes.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv16(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: &CudaSlice<u8>,
+        quant: ExpertQuant,
+        out: &mut CudaSlice<f32>,
+        inner: i32,
+        rows: i32,
+        pairs: i32,
+        topk: i32,
+        mode: i32,
+        d: Option<&K2Dispatch>,
+    ) -> Result<(), MoeError> {
+        const WARPS: u32 = 4;
+        let groups = inner as u32 / 32;
+        let rq = 32 / gcd(groups, 32);
+        let quads = (rows as u32).div_ceil(4);
+        let nt = if d.is_some() {
+            1
+        } else {
+            self.tokens.min(4) as u32
+        };
+        let index = usize::from(quant == ExpertQuant::Q6K);
+        let f = if d.is_some() {
+            &self.gemv16[index]
+        } else {
+            &self.gemv16_dense[index]
+        };
+        let rq_arg = rq as i32;
+        // SAFETY: geometry was checked by the caller; quads past `rows` and
+        // pairs past the live width are masked, and dense ignores route ids.
+        unsafe {
+            let mut b = stream.launch_builder(f);
+            b.arg(w)
+                .arg(&self.q)
+                .arg(&self.ql)
+                .arg(&self.scales)
+                .arg(&self.sums);
+            if let Some(d) = d {
+                b.arg(&d.direct);
+            } else {
+                b.arg(w);
+            }
+            b.arg(out)
+                .arg(&inner)
+                .arg(&rows)
+                .arg(&pairs)
+                .arg(&topk)
+                .arg(&mode)
+                .arg(&rq_arg)
+                .launch(LaunchConfig {
+                    grid_dim: (quads.div_ceil(rq * WARPS), (pairs as u32).div_ceil(nt), 1),
+                    block_dim: (32 * WARPS, 1, 1),
+                    shared_mem_bytes: WARPS * rq * groups * nt * 4,
+                })?;
+        }
+        Ok(())
+    }
+}
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 fn check(which: &'static str, expected: usize, found: usize) -> Result<(), MoeError> {
     if expected != found {

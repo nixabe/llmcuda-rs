@@ -801,16 +801,23 @@ stated so it transfers to the next kernel rather than as a changelog entry.
 K2 projections pack weights at upload and quantize activations into sixteen-bit
 integer codes with a separate fp32 scale for each 32 values. Narrow shapes use
 DP4A; prefill uses Turing integer tensor cores. Q4 codes remain nibbles, and Q6
-codes remain six bits. Dense rows are contiguous; expert records interleave
-words across four rows. These formats have their own residency calculation;
+codes remain six bits. Dense and expert records both interleave each word
+across four rows. These formats have their own residency calculation;
 using the Qwen weight constant in K2 preflight would misreport free memory.
 Native record boundaries preserve word alignment: Q4's `d/dmin` is loaded as
 one 32-bit word and Q6's `d` as one 16-bit halfword. Hardware half widening
 retains their original bit patterns while avoiding byte assembly on the
 integer projection path.
 
-Dense Q4 and Q6 decode specialize address and tail arithmetic at the
-2,560-wide hidden dimension. Prefill assigns weight row fragments to warps,
+Decode widths share one kernel for dense and routed projections. With every
+record interleaved, one 16-byte load gives a lane the same word of four rows.
+The lane owns one 32-value group of that row quad and reuses the group's
+sixteen-bit activation codes across all four rows. Giving each lane its own
+row, as before, made L1 activation traffic about four times the weight traffic
+per token; reuse halved a 2560×4096 Q4 projection at one token. Integer dots
+are exact in any order, and the group terms, windows and ascending window sum
+are the same fp32 operations, so outputs stay bit-identical to the tensor-core
+tiles. Prefill assigns weight row fragments to warps,
 keeping their codes and scales in registers while visiting token columns.
 This follows the operand reuse in llama.cpp's
 `ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma`; the quantization and contraction order

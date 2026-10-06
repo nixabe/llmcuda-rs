@@ -1642,7 +1642,7 @@ impl Forward {
     /// on the legacy default stream is rejected by the driver — so build the
     /// engine with `CudaContext::new_stream`.
     ///
-    /// The bounds check that [`GatedAttentionBlock::forward`] makes against
+    /// The bounds check that `GatedAttentionBlock::forward` makes against
     /// `max_seq` happens here, at the captured position, and cannot happen
     /// again inside a replay. [`Self::replay_step`] makes it itself.
     pub fn capture_step(
@@ -1932,7 +1932,7 @@ impl Forward {
     /// of once per sequence.
     ///
     /// Gated Attention batches the same way, through
-    /// [`GatedAttentionBlock::forward_batch_decode`]: its four Q8_0
+    /// `GatedAttentionBlock::forward_batch_decode`: its four Q8_0
     /// projections, its norms and its output gate run once over the whole
     /// batch, and only rotary, the key/value append and the causal read loop
     /// per sequence — those three read a position or a sequence's own cache,
@@ -3029,7 +3029,7 @@ impl Forward {
     /// Weight-bound stages — the embedding gather, the Gated DeltaNet
     /// projections (via [`run_layer_with_snapshots_batch`]), Gated
     /// Attention's four projections (via
-    /// [`GatedAttentionBlock::forward_batch_prefill`]), the MoE, the final
+    /// `GatedAttentionBlock::forward_batch_prefill`), the MoE, the final
     /// norm and the LM head — each run once over all `states.len() *
     /// window` rows. That is the point: one pass's weight traffic verifies
     /// every sequence's whole window, where the serving decode loop paid

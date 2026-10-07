@@ -948,3 +948,96 @@ fn k2_dense_hidden_width_specialization_keeps_the_integer_tree() {
         }
     }
 }
+
+/// The down projections quantize `silu(gate) * up` straight from the gate and
+/// up outputs. Against `LayerOpsKernels::swiglu` followed by the ordinary
+/// projection, outputs must match bit for bit on both the GEMV and the
+/// tensor-core widths. Under `rust-kernels` that SwiGLU is the cuda-oxide
+/// kernel rather than this NVRTC expression, so the default build is the
+/// oracle.
+#[cfg(not(feature = "rust-kernels"))]
+#[test]
+fn fused_swiglu_quantization_matches_a_separate_swiglu() {
+    use llmcuda_cuda::kernels::{k2_gemm::K2Gemm, layer_ops::LayerOpsKernels};
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver");
+        return;
+    }
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let ops = K2Kernels::new(&ctx).unwrap();
+    let layer = LayerOpsKernels::new(&ctx).unwrap();
+    let (inner, rows, experts, topk) = (512, 135, 5, 2);
+    let source: Vec<f32> = (0..inner * rows * experts)
+        .map(|i| (i as f32 * 0.071).sin() * 0.03)
+        .collect();
+    for q in [ExpertQuant::Q4K, ExpertQuant::Q6K] {
+        let (bytes, _) = pack(q, &source);
+        let dw = stream.clone_htod(&*to_device_layout(q, &bytes)).unwrap();
+        let packed = K2Gemm::repack(&ctx, &stream, &dw, q, inner, rows, experts).unwrap();
+        for tokens in [1, 3, 11, 65] {
+            let ids: Vec<i32> = (0..tokens)
+                .flat_map(|t| [if t % 3 == 0 { 4 } else { 1 }, 0])
+                .collect();
+            let di = stream.clone_htod(&ids).unwrap();
+            let mut d = K2Dispatch::new_gemm(&stream, tokens, topk, experts).unwrap();
+            ops.dispatch_gemm(&stream, &di, &mut d).unwrap();
+            let mut blas = K2Gemm::new_with_activation_bits(
+                &ctx,
+                &stream,
+                tokens,
+                topk,
+                experts,
+                inner * rows * experts,
+                inner,
+                rows,
+                16,
+            )
+            .unwrap();
+            let n = tokens * topk * inner;
+            // Gates reach both saturated tails of the sigmoid as well as its middle.
+            let gate: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin() * 12.0).collect();
+            let up: Vec<f32> = (0..n).map(|i| (i as f32 * 0.043).cos()).collect();
+            let dg = stream.clone_htod(&gate).unwrap();
+            let du = stream.clone_htod(&up).unwrap();
+            let mut inter = stream.alloc_zeros::<f32>(n).unwrap();
+            layer.swiglu(&stream, &dg, &du, &mut inter, n).unwrap();
+            let mut separate = stream.alloc_zeros::<f32>(tokens * topk * rows).unwrap();
+            blas.project(
+                &stream,
+                &packed,
+                q,
+                &inter,
+                &mut separate,
+                inner,
+                rows,
+                experts,
+                Some(&d),
+                true,
+            )
+            .unwrap();
+            let prepared = blas
+                .prepare_swiglu(&stream, &dg, &du, inner, q == ExpertQuant::Q4K)
+                .unwrap();
+            let mut fused = stream.alloc_zeros::<f32>(tokens * topk * rows).unwrap();
+            blas.project_prepared(
+                &stream,
+                &packed,
+                q,
+                prepared,
+                &mut fused,
+                inner,
+                rows,
+                experts,
+                Some(&d),
+                true,
+            )
+            .unwrap();
+            same_bits(
+                &stream.clone_dtoh(&fused).unwrap(),
+                &stream.clone_dtoh(&separate).unwrap(),
+                "fused SwiGLU quantization",
+            );
+        }
+    }
+}

@@ -85,9 +85,14 @@ const SRC: &str = r#"#ifndef K2_ROUTED_GEMV_ROWS
 #define K2_ACTIVATION_BITS 16
 #endif
 
-extern "C" __global__ void k2_quantize(const float* __restrict__ x,signed char* q,signed char* ql,float* __restrict__ scales,float* __restrict__ sl,float* __restrict__ sums,int inner,int count,unsigned* nib,int pack_nibbles,unsigned* mq,float2* mm,int mma_layout) {
+// With `gated`, x is the gate and the quantized value is LayerOpsKernels'
+// swiglu_mul product, written the same way; __fmul_rn keeps the product
+// from being contracted into the activation sum below.
+extern "C" __global__ void k2_quantize(const float* __restrict__ x,signed char* q,signed char* ql,float* __restrict__ scales,float* __restrict__ sl,float* __restrict__ sums,int inner,int count,unsigned* nib,int pack_nibbles,unsigned* mq,float2* mm,int mma_layout,const float* __restrict__ up,int gated) {
     int b=blockIdx.x*4+(threadIdx.x>>5),lane=threadIdx.x&31;if(b>=count)return;
-    float v=x[(long long)b*32+lane],a=fabsf(v);
+    float v=x[(long long)b*32+lane];
+    if(gated){float g=v;v=__fmul_rn(g/(1.0f+expf(-g)),up[(long long)b*32+lane]);}
+    float a=fabsf(v);
     for(int d=16;d>0;d>>=1)a=fmaxf(a,__shfl_xor_sync(0xffffffff,a,d));
     constexpr float LIMIT=K2_ACTIVATION_BITS==8 ? 127.0f : (K2_ACTIVATION_BITS==12 ? 2039.0f : 32639.0f);
     float lower=v,upper=v;
@@ -129,12 +134,17 @@ extern "C" __global__ void k2_quantize(const float* __restrict__ x,signed char* 
 // activation sum is a butterfly pairing value i with i^16, i^8, i^4, i^2 and
 // i^1 in turn: here lanes xor 4, 2 and 1 hold i^16, i^8 and i^4, and the last
 // two levels are in-lane, so the sum is the same tree.
-extern "C" __global__ void k2_quantize16(const float* __restrict__ x,int count,int mma_layout,signed char* q,signed char* ql,float* __restrict__ scales,float* __restrict__ sl,float* __restrict__ sums,uint4* mq,float2* mm) {
+extern "C" __global__ void k2_quantize16(const float* __restrict__ x,const float* __restrict__ up,int gated,int count,int mma_layout,signed char* q,signed char* ql,float* __restrict__ scales,float* __restrict__ sl,float* __restrict__ sums,uint4* mq,float2* mm) {
     int b=blockIdx.x*16+(threadIdx.x>>3),l=threadIdx.x&7;
     bool live=b<count;if(!live)b=count-1;
     long long base=(long long)b*32+4*l;
     float4 x4=*(const float4*)(x+base);
     float v[4]={x4.x,x4.y,x4.z,x4.w};
+    if(gated) {
+        float4 u4=*(const float4*)(up+base);float u[4]={u4.x,u4.y,u4.z,u4.w};
+        #pragma unroll
+        for(int k=0;k<4;++k){float g=v[k];v[k]=__fmul_rn(g/(1.0f+expf(-g)),u[k]);}
+    }
     float a=fmaxf(fmaxf(fabsf(v[0]),fabsf(v[1])),fmaxf(fabsf(v[2]),fabsf(v[3])));
     for(int d=4;d>0;d>>=1)a=fmaxf(a,__shfl_xor_sync(0xffffffff,a,d));
     constexpr float LIMIT=32639.0f;
@@ -1218,6 +1228,29 @@ impl K2Gemm {
         inner: usize,
         q4_nibbles: bool,
     ) -> Result<K2Prepared, MoeError> {
+        self.prepare_input(stream, x, None, inner, q4_nibbles)
+    }
+    /// `prepare` of `silu(gate) * up`, bit for bit as after
+    /// `LayerOpsKernels::swiglu`, without materializing the product.
+    pub fn prepare_swiglu(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        gate: &CudaSlice<f32>,
+        up: &CudaSlice<f32>,
+        inner: usize,
+        q4_nibbles: bool,
+    ) -> Result<K2Prepared, MoeError> {
+        check("K2 SwiGLU up input", gate.len(), up.len())?;
+        self.prepare_input(stream, gate, Some(up), inner, q4_nibbles)
+    }
+    fn prepare_input(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        up: Option<&CudaSlice<f32>>,
+        inner: usize,
+        q4_nibbles: bool,
+    ) -> Result<K2Prepared, MoeError> {
         if inner == 0
             || !inner.is_multiple_of(256)
             || inner > self.max_inner
@@ -1242,12 +1275,16 @@ impl K2Gemm {
         let inner_i32 = inner as i32;
         let mma_layout = i32::from(self.tokens >= 8 && self.activation_bits == 16);
         let pack_nibbles = i32::from(q4_nibbles && self.tokens >= 8 && self.activation_bits == 12);
+        let gated = i32::from(up.is_some());
         if self.activation_bits == 16 {
-            // SAFETY: all arenas cover the checked token and inner dimensions.
+            // SAFETY: all arenas cover the checked token and inner dimensions;
+            // `up`, when present, was checked to match `x`.
             unsafe {
                 stream
                     .launch_builder(&self.quantize16)
                     .arg(x)
+                    .arg(up.unwrap_or(x))
+                    .arg(&gated)
                     .arg(&count)
                     .arg(&mma_layout)
                     .arg(&mut self.q)
@@ -1266,7 +1303,8 @@ impl K2Gemm {
             self.prepared = Some(prepared);
             return Ok(prepared);
         }
-        // SAFETY: all arenas cover the checked token and inner dimensions.
+        // SAFETY: all arenas cover the checked token and inner dimensions;
+        // `up`, when present, was checked to match `x`.
         unsafe {
             stream
                 .launch_builder(&self.quantize)
@@ -1283,6 +1321,8 @@ impl K2Gemm {
                 .arg(&mut self.mq)
                 .arg(&mut self.mm)
                 .arg(&mma_layout)
+                .arg(up.unwrap_or(x))
+                .arg(&gated)
                 .launch(LaunchConfig {
                     grid_dim: ((count as u32).div_ceil(4), 1, 1),
                     block_dim: (128, 1, 1),

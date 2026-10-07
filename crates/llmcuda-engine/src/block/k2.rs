@@ -123,6 +123,43 @@ impl Projection {
         }
         Ok(())
     }
+    /// `prefill` of `silu(gate) * up`. Quantized weights quantize the product
+    /// straight from `gate` and `up`, bit for bit as after a separate SwiGLU;
+    /// F32 weights materialize it in `inter`.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_swiglu(
+        &self,
+        ops: &K2Kernels,
+        layer_ops: &LayerOpsKernels,
+        stream: &Arc<CudaStream>,
+        gate: &CudaSlice<f32>,
+        up: &CudaSlice<f32>,
+        inter: &mut CudaSlice<f32>,
+        ids: &CudaSlice<i32>,
+        out: &mut CudaSlice<f32>,
+        gemm: &mut K2Gemm,
+    ) -> Result<(), MoeBlockError> {
+        if let Some(q) = self.quant {
+            let prepared =
+                gemm.prepare_swiglu(stream, gate, up, self.inner, q == ExpertQuant::Q4K)?;
+            gemm.project_prepared(
+                stream,
+                &self.bytes,
+                q,
+                prepared,
+                out,
+                self.inner,
+                self.rows,
+                self.experts,
+                None,
+                false,
+            )?;
+        } else {
+            layer_ops.swiglu(stream, gate, up, inter, gate.len())?;
+            self.forward(ops, stream, inter, ids, out, 1, false)?;
+        }
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -886,7 +923,6 @@ struct K2FfnGemmScratch {
     dense_gemm: K2Gemm,
     gate: CudaSlice<f32>,
     up: CudaSlice<f32>,
-    inter: CudaSlice<f32>,
     partial: CudaSlice<f32>,
     shared_gate: CudaSlice<f32>,
     shared_up: CudaSlice<f32>,
@@ -955,8 +991,6 @@ impl K2FfnBlock {
                 gate: stream
                     .alloc_zeros::<f32>(g.max_tokens * g.experts_per_token * g.intermediate)?,
                 up: stream
-                    .alloc_zeros::<f32>(g.max_tokens * g.experts_per_token * g.intermediate)?,
-                inter: stream
                     .alloc_zeros::<f32>(g.max_tokens * g.experts_per_token * g.intermediate)?,
                 shared_gate: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
                 shared_up: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
@@ -1078,13 +1112,18 @@ impl K2FfnBlock {
                     Some(&sc.dispatch),
                     false,
                 )?;
-                self.layer_ops
-                    .swiglu(stream, &sc.gate, &sc.up, &mut sc.inter, sc.gate.len())?;
-                sc.gemm.project(
+                let prepared = sc.gemm.prepare_swiglu(
+                    stream,
+                    &sc.gate,
+                    &sc.up,
+                    g.intermediate,
+                    w.down.quant == Some(ExpertQuant::Q4K),
+                )?;
+                sc.gemm.project_prepared(
                     stream,
                     &w.down.bytes,
                     w.down.quant.unwrap(),
-                    &sc.inter,
+                    prepared,
                     &mut sc.partial,
                     g.intermediate,
                     g.hidden,
@@ -1127,17 +1166,13 @@ impl K2FfnBlock {
                 &mut sc.dense_gemm,
                 prepared,
             )?;
-            self.layer_ops.swiglu(
+            sd.prefill_swiglu(
+                &self.ops,
+                &self.layer_ops,
                 stream,
                 &sc.shared_gate,
                 &sc.shared_up,
                 &mut sc.shared_inter,
-                sc.shared_gate.len(),
-            )?;
-            sd.prefill(
-                &self.ops,
-                stream,
-                &sc.shared_inter,
                 &self.ids,
                 &mut self.shared,
                 &mut sc.dense_gemm,
@@ -1169,17 +1204,13 @@ impl K2FfnBlock {
                 &mut self.gemm.dense_gemm,
                 prepared,
             )?;
-            self.layer_ops.swiglu(
+            w.down.prefill_swiglu(
+                &self.ops,
+                &self.layer_ops,
                 stream,
                 &self.dense_gate,
                 &self.dense_up,
                 &mut self.dense_inter,
-                self.dense_gate.len(),
-            )?;
-            w.down.prefill(
-                &self.ops,
-                stream,
-                &self.dense_inter,
                 &self.ids,
                 ffn,
                 &mut self.gemm.dense_gemm,

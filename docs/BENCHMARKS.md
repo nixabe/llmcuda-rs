@@ -290,42 +290,49 @@ The dense model is the smaller file and reads **15× the feed-forward weight
 per token** (17.11 B parameters against 35B-A3B's 1.13 B) and 3.2× the KV. No
 expectation carries across from the table above — and none of it did.
 
-**Read the file column before the margin column.** On this model the
-quantization of the *file* moves the result more than anything either engine
-does, and a margin quoted without it is meaningless. Two files, both measured
-same-card, three interleaved reps, llmcuda-rs's spread under 0.2% and
-llama.cpp's up to 3% at N=3:
+**Every cell is clear of llama.cpp or level with it, on both files, and the
+file no longer decides the prefill result.** Two files, same card (GPU 1),
+alternating processes, three interleaved reps; llmcuda-rs's spread is under
+1.2% in every cell:
 
 | cell | file | llmcuda-rs agg | per slot | llama.cpp agg | per slot | margin |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| prefill 512, N=1 | UD-Q8_K_XL | 361.6 | 361.6 | 681.8 | 681.8 | −47.0% |
-| prefill 512, N=1 | all-Q8_0 | 666.2 | 666.2 | 769.3 | 769.3 | **−13.4%** |
-| prefill 512, N=3 | UD-Q8_K_XL | 370.0 | 123.3 | 756.4 | 252.1 | −51.1% |
-| prefill 512, N=3 | all-Q8_0 | 704.2 | 234.7 | 853.1 | 284.4 | **−17.5%** |
-| decode, N=1 | UD-Q8_K_XL | 18.0 | 18.0 | 18.05 | 18.05 | −0.3% |
-| decode, N=1 | all-Q8_0 | 19.2 | 19.2 | 19.40 | 19.40 | **−1.0%** |
-| decode, N=3 | UD-Q8_K_XL | 46.7 | 15.6 | 43.36 | 14.45 | **+7.7%** |
-| decode, N=3 | all-Q8_0 | 49.1 | 16.4 | 48.15 | 16.05 | **+2.0%** |
-| decode, N=1, `draft-mtp` | all-Q8_0 | 35.1 | 35.1 | 19.40 | 19.40 | **+81%** |
-| decode, N=3, `draft-mtp` | all-Q8_0 | 50.0 | 16.7 | 48.15 | 16.05 | **+3.8%** |
+| prefill 512, N=1 | UD-Q8_K_XL | 846.2 | 846.2 | 674.1 | 674.1 | **+25.5%** |
+| prefill 512, N=1 | Q8_0 | 841.7 | 841.7 | 760.7 | 760.7 | **+10.6%** |
+| prefill 512, N=3 | UD-Q8_K_XL | 889.9 | 296.6 | 749.7 | 249.9 | **+18.7%** |
+| prefill 512, N=3 | Q8_0 | 892.4 | 297.5 | 851.5 | 283.8 | **+4.8%** |
+| decode, N=1 | UD-Q8_K_XL | 18.11 | 18.11 | 18.12 | 18.12 | parity |
+| decode, N=1 | Q8_0 | 19.37 | 19.37 | 19.34 | 19.34 | +0.2% |
+| decode, N=3 | UD-Q8_K_XL | 47.82 | 15.94 | 43.58 | 14.53 | **+9.8%** |
+| decode, N=3 | Q8_0 | 50.31 | 16.77 | 48.20 | 16.07 | **+4.4%** |
+| decode, N=1, `draft-mtp` | Q8_0 | 35.1 | 35.1 | 19.40 | 19.40 | **+81%** |
+| decode, N=3, `draft-mtp` | Q8_0 | 50.0 | 16.7 | 48.15 | 16.05 | **+3.8%** |
 
-The two `draft-mtp` rows are **not the default** and are not a like-for-like
-kernel comparison: they are this engine running the file's own trained
-next-token-prediction head as a drafter, with a bit-exact verify, against
-llama.cpp running the same file the only way it can. Upstream discards that
-head — `model has unused tensor blk.64.nextn.eh_proj.weight -- ignoring`, on
-every load — so there is no setting that gives it the same option. What the
-rows are for is the size of the gap between a decode step that reads 27 GB
-for one token and one that reads it for 2.86. See the speculative section
-for why it stays opt-in.
+Two cells needed more than the three reps. llama.cpp's N=1 prefill on the
+shipped file read 612.6 / 541.6 / 655.0 across them, an 18.8% spread no other
+cell came near; three more alternating pairs read 682.1 / 674.8 / 665.4
+against our 849.5 / 845.1 / 844.1, and that re-run is the row. The same
+re-run's llama.cpp decode came out at 18.09–18.14 against the reps'
+17.74–18.05, which turns a +1.1% into parity — so parity is what the row says.
+
+The two `draft-mtp` rows were not re-run with the rest; they are the latest
+measurement of those cells, against llama.cpp's numbers of the same hour.
+They are **not the default** and are not a like-for-like kernel comparison:
+they are this engine running the file's own trained next-token-prediction head
+as a drafter, with a bit-exact verify, against llama.cpp running the same file
+the only way it can. Upstream discards that head — `model has unused tensor
+blk.64.nextn.eh_proj.weight -- ignoring`, on every load — so there is no
+setting that gives it the same option. What the rows are for is the size of
+the gap between a decode step that reads 27 GB for one token and one that
+reads it for 2.86. See the speculative section for why it stays opt-in.
 
 `UD-Q8_K_XL` is the shipped Unsloth file: Q8_0 everywhere except
-`output.weight` and every `attn_q`/`attn_k`/`attn_v`, which are bf16.
-`all-Q8_0` is that file requantized with `llama-quantize --allow-requantize
-... q8_0`, which is the same weights with the bf16 tensors folded down —
-29.30 GiB becomes 27.05. **Its numerics are unverified**: the greedy-agreement
-table below was run on the shipped file, and no differential or agreement
-check has been run on the requant. It is a speed measurement only.
+`output.weight` and every `attn_q`/`attn_k`/`attn_v`, which are bf16. `Q8_0` is
+Unsloth's plain Q8_0 file from the same repository, 27.05 GiB — the bf16
+tensors folded down, which is what an earlier revision of this table
+approximated with a local `llama-quantize --allow-requantize` of the shipped
+file. Its last-token logits have not been compared against llama.cpp's; the
+shipped file's have (see "Arithmetic: on a dense projection" in WHY).
 
 **Per slot is uniform by construction on both sides**, not three separately
 observed rates: a batched step advances all N sequences through one set of
@@ -334,42 +341,38 @@ answer "what does one user see while N are served", not "do the slots differ".
 The second question needs a running server under mixed arrival, which is the
 serving section below and is not comparable to this table.
 
-What the two rows of each pair say together:
+What the rows say together:
 
-- **Decode wins at N=3 and is at parity at N=1; prefill is not.** Both N=3
-  cells are clear of llama.cpp, by 2.0% and 7.7%. Both N=1 cells sit just
-  under it, by 1.0% and 0.3% — the second is inside llama.cpp's own spread
-  across the three reps, the first is not. Every prefill cell loses, by 13%
-  on the file both engines read best and by half on the shipped one. Prefill
-  is where this model's remaining gap lives, and it is an arithmetic gap
-  rather than a bandwidth one — see "Where the dense decode step goes" below
-  for why the N=1 decode cell is not going to be closed by a faster kernel.
-- **The bf16 tensors still cost prefill, and no longer cost decode.** Folding
-  them to Q8_0 moves prefill 360 → 661 at N=1; the per-tensor int8 gate
-  recovered part of that in the engine, and the rest is `attn_q`/`k`/`v`
-  having no integer tensor-core path at bf16 at all. At decode the same
-  tensors cost 6.5%, which is the extra bytes and nothing else.
-- **The decode margins have moved several points across two revisions of
-  this table, and llama.cpp has not moved.** Every point of it is on this
-  side: the split int8 layout stopped widening the file's fp16 scales to
-  fp32 (WHY, "Layout"), the GEMV's row tile is chosen per token width, its
-  activations are read as halves, and the block's fp16 narrowing and residual
-  add were folded into launches that were already running. llama.cpp's column
-  is a same-hour alternating re-run in every row, three reps, and its spread
-  is 0.4% at N=1 and under 0.6% at N=3 on both files.
+- **Prefill went from the gap to the margin.** It lost every cell, by 13% on
+  the Q8_0 file and by half on the shipped one; it now wins every cell, by
+  the most on the shipped file. The whole change is one kernel family: every
+  dense prefill projection runs on the fp16 tensor cores over weights
+  dequantized per staged tile, instead of the int8 ones — see "Arithmetic: on
+  a dense projection, the fp16 tensor cores beat the integer ones" in WHY.
+  llama.cpp runs its Q8_0 weights through int8 `mmq` on Turing and its bf16
+  tensors through fp32, which is why its two files differ by 13% at N=1 and
+  ours by 0.5%.
+- **The bf16 tensors no longer cost prefill.** They take the same fp16
+  tensor cores as the Q8_0 ones, at a per-tensor scale that makes the
+  conversion exact. At decode they still cost what their extra bytes cost:
+  18.11 against 19.37 tok/s, 6.5%.
+- **N=3 decode wins on both files and N=1 decode is level.** N=1 decode
+  reads 30 GB per token against a measured streaming ceiling both engines
+  are close to (see "Where the dense decode step goes" below); its margin is
+  inside one rep's spread and is parity to be kept, not headroom. llama.cpp's
+  column is a same-hour alternating re-run in every row.
 
 And llama.cpp's outright best on this model is neither file: see "What the
 quantization is worth" below. Do not quote any row here as a claim about the
 engine as a whole, and do not let them soften the MoE standing above.
 
-llama.cpp at `-b 2048 -ub 2048 -fa on -ctk f16 -ctv f16 -sm none`, `-npl 1`
-or `-npl 3`, `-npp 512 -ntg 64`. Ours is `bench_forward`'s 512-token column (a
-cold full forward, comparable to `pp`), `bench_decode` at N=1 and
-`bench_decode_batch`'s `batch 3` row — which carries its own `single_stream`
-baseline in the same process, and it agrees with `bench_decode` to 0.3%. Peak
-VRAM 39.39 GiB of 47.27 at N=3 prefill on the shipped file, 37.39 on the
-requant — 1.4 GiB below the earlier revision of this table, because the split
-int8 layout no longer widens the file's scales.
+llama.cpp (`/tmp`-built upstream `abeada3`, sm_75 release) at `-b 2048 -ub 2048
+-fa on -ctk f16 -ctv f16 -sm none`, `-npl 1` or `-npl 3`, `-npp 512 -ntg 64`.
+Ours is `bench_forward`'s 512-token column (a cold full forward, comparable to
+`pp`), `bench_forward` with `LLMCUDA_PREFILL_SEQUENCES=3` for N=3 prefill, and
+`bench_decode_batch 512 64`'s `batch 1` and `batch 3` rows — which carry their
+own `single_stream` baseline in the same process. Peak VRAM 31.42 GiB of 47.27
+at N=3 prefill on the shipped file, 30.42 on Q8_0.
 
 ### `-ub` is not a knob on this workload
 
@@ -608,29 +611,44 @@ exactly these widths, and it is the form this project measured as the fastest
 at one token. The dense block runs a copy of it.
 
 That copy also made decode the *accurate* path rather than the fast-and-loose
-one: the GEMV dequantizes the weights and multiplies in fp32, where the GEMM
-quantizes activations to int8. Against the CPU reference, `max_abs` 3.36e-4
-and cosine 1.000000 for the GEMV against 6.45e-2 and 0.999997 for the GEMM.
+one: the GEMV rounds activations to fp16, where the int8 GEMM quantizes them
+to int8. Against the CPU reference, `max_abs` 4.18e-3 and cosine 1.000000 for
+the GEMV against 6.45e-2 and 0.999997 for the int8 GEMM — and 4.62e-3 for the
+fp16 one prefill takes now.
 
-### What int8 activations cost in the generated text
+### Greedy agreement with llama.cpp
 
-Stated because it is the one place the dense port trades exactness for speed,
-and because "it produced plausible text" is not a result.
+Stated because "it produced plausible text" is not a result. Greedy
+(`--temp 0 --top-k 1`) against `llama-completion` on the same file, 160
+tokens of raw completion, no chat template. The prompts are "The capital of
+France is" (5 tokens); "Explain how a B-tree stays balanced when keys are
+inserted and deleted, and why databases use B-trees for indexes." (25); and a
+917-token operations log ending in a request to summarize it — the only one
+with prefill pieces wide enough for the fp16 GEMM:
 
-Greedy (`--temp 0 --top-k 1`) against `llama-completion` on the same file, 160
-tokens:
-
-| prompt | Q8_0 residency | shipped residency |
+| prompt | UD-Q8_K_XL | Q8_0 |
 | :--- | :--- | :--- |
-| "The capital of France is" | identical, 717/717 chars | identical, 690/690 chars |
-| a B-tree explanation | identical, 717/717 chars | diverges at char 596 of 710 |
+| capital, 5 tokens | identical, 690/690 chars | identical, 690/690 chars |
+| B-tree, 25 tokens | diverges at char 190 of 711 | diverges at the first token |
+| operations log, 917 tokens | identical, 690/690 chars | diverges at char 82 of 707 |
 
-So the fp32 path reproduces llama.cpp character for character on both, and the
-shipped one flips a near-tie about 135 tokens in on one of them — the two
-continuations at that point are both correct English about B-trees. The
-divergence comes from the *prefill* pass, which is the only one that quantizes
-activations; it is one constant (`DENSE_REPACK_INT8`) away, at a quarter of
-the prefill.
+Every divergence is a near-tie in llama.cpp's *own* logits, read at that
+position by a one-ubatch prefill of the common prefix:
+
+| divergence | llama.cpp's top two | gap | we chose |
+| :--- | :--- | ---: | :--- |
+| UD, B-tree, char 190 | " standard" 19.938, " backbone" 19.921 | 0.017 | " backbone" |
+| Q8_0, B-tree, first token | "Here" 14.115, "\n\n" 13.728 | 0.387 | "\n\n" |
+| Q8_0, operations log, char 82 | "," 23.6089, " and" 23.6085 | 0.0004 | "," |
+
+The two engines' last-token logits differ by 0.13–0.43 max-abs on the same
+ids, so a gap under that is a coin the rounding flips. The third is a tie
+llama.cpp breaks both ways itself: its decode chose " and", its prefill of
+the same prefix ",". Recomputed as one pass over each common prefix, our int8
+prefill path (`LLMCUDA_HALF_GEMM=0`) takes llama.cpp's token in all three
+and the fp16 path in the third only. That is agreement in rounding — llama.cpp
+rounds its activations to int8 as that path does — not in accuracy: against
+the CPU reference the fp16 path's error is 14× smaller (TESTING.md).
 
 ## Clef-Flash (`clef`)
 
@@ -1302,7 +1320,7 @@ heuristic and made `_t4` and `_t8` worse than leaving the attribute off. And a
 register count is not an outcome: it is only evidence once turned into blocks
 per SM, which needs the granularity (8 on Turing) and the warp ceiling.
 
-## Arithmetic: integer tensor cores are the only way to win prefill
+## Arithmetic: the tensor cores are the only way to win prefill
 
 llama.cpp runs the same 2,491 GFLOP of a 512-token pass at ~61% of this card's
 16.31 TFLOP/s fp32 peak, which no dequantize-then-FMA pipeline reaches. It is
@@ -1313,7 +1331,9 @@ lands ~3.9× behind; the ceiling is arithmetic, not tuning.
 
 Q6_K and Q8_0 weights are *already integers*, so using the integer tensor cores
 is not a precision downgrade imposed on float weights — it is declining to
-convert integers into floats in order to multiply them more slowly.
+convert integers into floats in order to multiply them more slowly *on fp32*.
+Against fp16 tensor cores that argument does not hold for a dense projection;
+see the next section.
 
 Two ways to reach a tensor core from a quantized weight, and the choice is
 VRAM, not preference:
@@ -1347,7 +1367,8 @@ its own weight is Q8_0. On the shipped `qwen35` file that means `attn_output`
 alone, and it is worth **+13.7%** of prefill (316.0 → 359.3 tok/s, three
 interleaved pairs, won 3/3) — not the 2x, because `attn_output` is ~30% of a
 layer's projection elements and only 16 of the 64 layers are attention layers.
-The other 70% needs the file to change, not the engine.
+The other 70% needed the file to change, this section concluded; it did not
+(next section).
 
 (The current numbers for that same comparison are 360.4 → 660.7 and
 368.8 → 700.3, a 1.83× and 1.90×: the engine collected the part of the gap
@@ -1364,6 +1385,83 @@ prefill 2452.4 → 2446.3 (spreads overlap), decode 100.87 → 100.83 at N=1 and
 204.73 → 204.73 at N=3, peak VRAM byte-identical.
 `LLMCUDA_ATTN_INT8_ALL_OR_NOTHING=1` restores the old predicate in the same
 binary, which is how those two rows were measured rather than asserted.
+
+## Arithmetic: on a dense projection, the fp16 tensor cores beat the integer ones
+
+The section above is right that prefill belongs on the tensor cores and wrong
+about which ones, for every projection that is not a routed expert. It
+compared int8 against fp32; nobody had compared it against fp16.
+
+Measured on the dense model's own shapes, the int8 split path
+(`mma_q8_0_proj_split`) reaches **~44 TOP/s** — 22% of the 198 TOP/s its
+instruction peaks at — and cuBLASLt's fp16 GEMM over the same shapes sustains
+**62–83 TFLOP/s**, 64–85% of fp16's 97.6. The int8 kernel is not badly
+written; its arithmetic is. Q8_0 carries a scale per 32 weights and the int8
+activation another per 32 values, so every 8×8 accumulator is converted to
+float, rescaled and added back after every two `m8n8k16` instructions. The
+scale is *inside* the contraction, and on Turing that epilogue runs on the
+same issue slots as the MMAs.
+
+`hgemm` moves it out. Each staged weight tile is dequantized to fp16 once in
+shared memory — `q * d` for Q8_0, the stored value times a per-tensor power of
+two for bf16 — and every token in the 128-row tile reuses it; the `m16n8k8`
+fp16 MMA then accumulates a whole K in fp32 with no epilogue until the end. It
+reaches 50–58 TFLOP/s at the 27B's 512-token shapes, about three quarters of
+sustained cuBLAS with dequantization included. The rest of the gap is load
+latency, measured by ablation on an earlier revision of the kernel: removing
+its global loads took it from 38–62 to 86–89 TFLOP/s, removing everything but
+the MMAs to 111–116.
+
+It is also the more precise path by construction: activations keep fp16's
+11-bit significand instead of an int8 code against a 32-value absmax, at the
+price of one rounding of each Q8_0 weight to the fp16 nearest `q * d` (a bf16
+weight converts exactly) — 2^-11 relative, against an int8 code's up to 1/254
+of its block's max. What that is *not* is closer to
+llama.cpp, which rounds its own activations to int8 the same way the int8 path
+does. Last-token logits on one 512-token prompt, against llama.cpp's on the
+same file:
+
+| file | path | max-abs | 1 − cos | argmax, top-10 |
+| :--- | :--- | ---: | ---: | :--- |
+| UD-Q8_K_XL | fp16 | 0.2399 | 8.69e-5 | agree |
+| UD-Q8_K_XL | int8 | 0.2461 | 7.29e-5 | agree |
+| Q8_0 | fp16 | 0.3080 | 1.26e-4 | agree |
+| Q8_0 | int8 | 0.2669 | 1.00e-4 | agree |
+
+Neither is uniformly nearer, and nearness to an engine that quantizes its
+activations is not the measure; the kernel's own differential test
+(`tests/hgemm_differential.rs`) holds it to its rounding contract, computed in
+f64.
+
+And bf16, which "has no integer tensor-core path at all", has an fp16 one. A
+bf16 value converts to fp16 exactly whenever it lands in fp16's normal range;
+a per-tensor power of two chosen from the tensor's max-abs
+(`bf16_half_exponent`) puts it there, and `alpha` undoes it in the epilogue.
+On the shipped `UD-Q8_K_XL` that is exact for all but **12 of 2.57e9** bf16
+values, each subnormal-tiny and under 1e-12 off. "The other 70% needs the file
+to change, not the engine" was wrong: it needed the engine to stop insisting on
+integers.
+
+What it is worth, in the model — `bench_forward`'s in-process A/B
+(`LLMCUDA_BENCH_AB=LLMCUDA_HALF_GEMM`), the int8 path against this one, six
+alternating pairs each, GPU 1:
+
+| file | tokens | int8 path | fp16 path | pairs |
+| :--- | ---: | ---: | ---: | :--- |
+| UD-Q8_K_XL | 512 | 365.1 | **849.1** | 2.31–2.34× |
+| UD-Q8_K_XL | 1,536 | 359.4 | **817.8** | 2.27–2.29× |
+| Q8_0 | 512 | 653.2 | **839.9** | 1.28–1.29× |
+| Q8_0 | 1,536 | 649.8 | **817.9** | 1.26× |
+
+The shipped file gains the most because three of its projections had no
+tensor-core path at all; the plain Q8_0 file gains 28% on arithmetic alone.
+The standing table above has both against llama.cpp.
+
+What this does not cover: `qwen35moe`. Its routed experts stay staged through
+shared memory as integers, and its projections keep the int8 path by default;
+`LLMCUDA_HALF_GEMM=1` moves those projections to this path, and that has not
+been measured. So the section above still stands for the target model, and
+this one replaces it for the dense ones only.
 
 ## Memory: find the index the operand does not depend on
 
@@ -2191,6 +2289,11 @@ proposed twice.
 | Narrowing the router's expert tile at decode width (`ET` 8 → 4) | **Nothing — and the sweep that motivated it cannot resolve anything it claimed.** This host drifts **−0.8% at N=3 over ten minutes**, monotonically and in one direction, which is larger than every effect the `ET` sweep reported; a sequential sweep crossing that drift produces exactly the ragged curve that invites an occupancy-knee story, so **neither the sweep's shape nor its knee is evidence of anything until it is re-run interleaved**. Nor can a sweep be corrected for order after the fact: drift favours the first position and cold caches, first-touch faults and the NVRTC compile penalise it, so the sign of the bias is not even known without measuring it. Re-measured against a baseline built from the pinned commit rather than a stale binary: three interleaved reversed pairs at 2K read +0.24 / −0.19 / −0.05% at N=3, +0.30 / +0.18 / −0.12% at N=2 and +0.49 / +0.29 / 0.00% at N=1 — the sign flips inside every set. The +1.31% recorded here before came from pairs against a stale pinned binary, and a control A/B of that binary against current main read +0.53 / −0.05% at N=3, so the baseline gap does not explain it; the original sweep's run order was not kept, so it cannot be checked against the drift either. The grid arithmetic is not wrong — `grid.y` is 1 at decode, so `ET = 8` is 32 blocks and 256 warps against the 2,304 this part holds — it is just not what binds. `ptxas -v` either side: the prefill kernel unmoved at 96 registers, so nothing was traded for the non-result. Prefill cannot be hiding a win (it selects that unmoved kernel) and depth cannot be (router cost is independent of KV depth, so the tile is a *smaller* fraction of a deeper step). |
 | Reading the Ornith fork's 32K result at all | Three interleaved pairs gave −0.31%, +2.62% and +1.39% while the *baseline* arm ranged 1.85% across its own three runs. The prediction on record was +0.55–0.6%, from a fixed per-layer saving over a step that grows 14.5 → 18.9 ms. The set can neither confirm nor refute that, so no 32K figure is quoted for this change. Recorded because the temptation was to take the mean and call it +1.2%. |
 | Inferring scheduler behaviour from client-side timings | Wrong three times: a lock-starvation fault was read as a scheduler refusing to share, an admission-pacing artefact as a race, and a 2x throughput collapse as a kernel concurrency limit (the kernel charges 5%, not 50%). All three fell out immediately once a step logged its own grants. Instrument the component before theorising about it. |
+| Single-buffered fp16 weight-only GEMM for dense projections | The first W8A16 kernel dequantized one Q8_0 tile into shared memory per k-step behind two barriers, with no register stage. `bench_w8a16` (now `bench_hgemm`) on GPU 2, 27B and Clef shapes, best of three CUDA-event rounds: **0.46–1.07×** the int8 split path (27B FFN gate/up at 2,048 tokens **22.6 TFLOP/s** against int8 **43.4 TOP/s**; cuBLASLt fp16 on the same shape **100.2**). Every global load stalls the MMAs it feeds. The double-buffered rewrite that replaced it measured **1.02–1.33×** on the same shapes the same hour, and is what `hgemm` grew from. |
+| Explicit `prefetch.global.L2` ahead of the `hgemm` stage | Standalone harness over the production source, GPU 1, clocks warmed, 512 and 2,048 tokens, seven 27B/Clef shapes on the 256-row Q8_0 tile. Prefetching 128/256/512 bytes ahead was slower than the `L2::128B` control on **6/7, 7/7 and 7/7** shapes (GDN qkv 10,240×5,120: **52.9 → 50.0 / 48.6 / 45.9 TFLOP/s**; FFN gate at 2,048 tokens **61.6 → 57.6 / 55.8 / 52.8**). One shape improved at 128 bytes (FFN gate at 512, 50.7 → 57.4) and lost it at 256. The prefetch instructions compete with the loads they are meant to hide for the same issue slots. The control is the preceding sweep, minutes earlier, not an interleaved pair; rejected on the consistency of the sign. |
+| A second register stage in `hgemm` | Holding two stages in flight instead of one: **255 registers, 24 bytes of spill stores**, and 50.7 → 50.2 / 41.7 → 40.0 TFLOP/s on the FFN gate and down shapes at 512 tokens. The extra stage buys latency hiding the kernel cannot keep resident. |
+| Tile-contiguous activation layout for `hgemm` | `[M/128][K/32][128][32]` fp16 so a stage's activation tile is one contiguous 8 KiB run (four full lines per warp load instead of eight half-used ones). Against the preceding control: equal or slower on **13 of 14** shape/tile cells (256-row tile at 512 tokens 63.3 / 42.7 / 52.4 → 62.9 / 42.4 / 52.1 TFLOP/s). Activations are 1/2 to 1/8 of a stage's bytes and already L2-resident across the column group; the weight stream is what the loads wait on. Measured while another bench ran on a different card; rejected for no gain, not for a measured loss. |
+| Split-K wherever wave arithmetic said it pays | The first `HgemmPlan` priced the partials' round trip at 2% of a round and split any grid with a ragged last wave, so the 27B's 10,240- and 12,288-row projections ran split four and three ways. Harness, warmed: 10,240×5,120 split 2/3/4 **1.02 / 1.11 / 1.15 ms** against **0.98** unsplit; 12,288×5,120 split 3 **1.26** against **1.11**. In the model, retuning to split only under 1.25 waves and price a split at 8% won every one of six interleaved pairs on GPU 1: 512 tokens **834.0 → 845.0 tok/s** (pairs 0.980–0.990), 1,536 tokens **774.3 → 821.8** (0.938–0.947), last-token logits within 0.0064 of each other. A ragged last wave is cheaper than the model's tail term says once two blocks share an SM. |
 
 ## Rejected on arithmetic, before building
 

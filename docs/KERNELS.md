@@ -310,12 +310,15 @@ is the expensive half of this format difference. The gate is per tensor:
 `ProjectionFormats::any_q8_0()` builds the repack, and each of the four
 projections takes the integer path only if *it* is Q8_0. It used to be `all`,
 and on this file — three bf16 tensors and one Q8_0 per layer — that one word
-put the entire attention block on the fp32 path at prefill width. What is
-still unreachable is the bf16 tensors themselves, and no gating fixes that:
-prefill on the shipped file is 362 tok/s against 666 on the same weights
-requantized to Q8_0. An int8 repack of a bf16 tensor would be a *requantization*
-of the model, which is a different thing from a re-layout and is not on the
-table. See [BENCHMARKS.md](BENCHMARKS.md).
+put the entire attention block on the fp32 path at prefill width. The bf16
+tensors themselves stayed unreachable to the integer path, and no gating could
+fix that — an int8 repack of a bf16 tensor would be a *requantization* of the
+model, which is a different thing from a re-layout and is not on the table.
+What fixed it was a different tensor core: on the dense models every prefill
+projection now runs on the fp16 ones (`HgemmKernels`), and a bf16 tensor reaches
+them exactly, at a per-tensor power-of-two scale. The shipped file used to
+prefill at 362 tok/s against 666 for the same weights requantized to Q8_0; the
+two are now within 1% of each other. See [BENCHMARKS.md](BENCHMARKS.md).
 
 `ssm_alpha` / `ssm_beta` are the other format difference: f32 in Qwen3.6, Q8_0
 here. Those get a second instantiation of the fused gate kernel rather than a

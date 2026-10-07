@@ -220,6 +220,7 @@ given GGUF loads.
 | GDN alpha/beta gates (`GateProjection`) | f32, Q8_0, Q6_K | Q4_K, Q5_K, Q4_0, f16, bf16 |
 | The GDN block's own projections (`Projection`: `attn_qkv`, `attn_gate`, `ssm_out`) | f32, Q8_0, Q6_K, Q4_K, Q5_K, Q4_0, f16, bf16 | — |
 | The split int8 tensor-core repack (`MmaKernels::repack`) | Q8_0 | everything else |
+| Dense-model prefill projections on fp16 tensor cores (`HgemmKernels`; `qwen35`, `clef`) | Q8_0 (through the split repack), bf16 | everything else |
 
 **A uniformly Q6_K file now has a reader at every row.** That was the case
 this work set out to close and it is closed — but read the table rather than
@@ -305,13 +306,20 @@ see "Compile-time formats free registers that ptxas then spends" in
 [BENCHMARKS.md](BENCHMARKS.md)'s WHY.
 
 **Adding the readers did not make any of these a good format to store a
-projection in**, and the repack row is why: the engine's prefill advantage comes from
-repacking Q8_0 projections into the split int8 layout the integer tensor cores
-can load, and **Q6_K has no path there**. A Q6_K projection falls back to the
-fp32 GEMV — the same fate as `qwen35`'s bf16 `attn_q`/`k`/`v`, which costs that
-model 47% of its prefill. The Q6_K body is also the plainest of the three: no
-staging pass, no row tile, no prefetch, because a 210-byte superblock stride
-defeats the alignment trick the Q8_0 body is built around.
+projection in**, and the last two rows are why: the engine's prefill comes from
+repacking Q8_0 projections into the split layout its tensor-core kernels load —
+int8 MMAs on `qwen35moe`, fp16 MMAs over a per-tile dequantize on the dense
+models — and **Q6_K has no path there**. A Q6_K projection falls back to the
+fp32 GEMV. The Q6_K body is also the plainest of the three: no staging pass,
+no row tile, no prefetch, because a 210-byte superblock stride defeats the
+alignment trick the Q8_0 body is built around.
+
+bf16 used to share that fate: `qwen35`'s shipped `attn_q`/`k`/`v` are bf16,
+and the GEMV they fell back to cost that model 47% of its prefill. On the
+dense models they now reach the fp16 tensor cores directly, scaled by a
+per-tensor power of two that makes the conversion exact for all but a dozen
+subnormal-tiny values of the shipped file — see "Arithmetic" in
+[BENCHMARKS.md](BENCHMARKS.md)'s WHY.
 
 So the mixed recipe the shipped files use (Q8_0 projections, Q6_K experts) is
 still what a file should be requantized *to* rather than away from. What
@@ -587,13 +595,13 @@ Two of those rows cost kernel work rather than a config field:
   [KERNELS.md](KERNELS.md). Widening those on the host was rejected on
   arithmetic: it would put 5.1 GiB on the card for the head alone and double
   the per-token read of the most bandwidth-expensive tensor in the model.
-  Reading them where they are is correct, but it is not free: bf16 has no
-  integer tensor-core path, so those three projections stay on the fp32 GEMV
-  at prefill width. The repack is gated per tensor rather than per block, so
-  `attn_output` still reaches the tensor cores beside them; what remains is
-  the format itself. Requantizing the file to plain Q8_0 takes prefill from
-  362 to 666 tok/s with no engine change, and costs 6.5% of decode besides —
-  measured, in [BENCHMARKS.md](BENCHMARKS.md).
+  Reading them where they are is correct, and at prefill it is no longer a
+  cost: bf16 has no integer tensor-core path but it has an fp16 one, and the
+  dense prefill projections run there (`HgemmKernels`), each bf16 tensor at a
+  power-of-two scale that makes its conversion exact. The shipped file and
+  Unsloth's plain Q8_0 one now prefill within 1% of each other, where
+  requantizing used to buy 1.84×; at decode the bf16 tensors still cost what
+  their extra bytes cost, 6.5% — measured, in [BENCHMARKS.md](BENCHMARKS.md).
 - `ssm_alpha` / `ssm_beta` are f32 in Qwen3.6 and Q8_0 here. The fused gate
   kernel has a Q8_0 instantiation rather than a host-side widening, because
   the forward path *aliases* the weight arena and an owned widened copy inside

@@ -200,13 +200,14 @@ that scalar positions collapse to `rope::apply_rope` — the same reduction
 ## The dense architecture (`qwen35`)
 
 Qwen3.8-27B shares every kernel with Qwen3.6-35B-A3B except the feed-forward
-block, and the shared ones are gated by the tests above at Qwen3.6's widths.
-What is new is gated by two files:
+block and the prefill projections, and the shared ones are gated by the tests
+above at Qwen3.6's widths. What is new is gated by these:
 
 | Test | What it asserts | Needs |
 | --- | --- | --- |
 | `llmcuda-model/tests/real_dense_model_weights.rs` | `WeightSchema` resolves against all 866 tensors of the real file with none left unclaimed; every derived hyperparameter (the GDN head split above all) agrees with the file's own metadata; the file carries no routed tensor; and the *routed* schema refuses it by architecture rather than by a wall of shapes | the file |
-| `llmcuda-engine/tests/dense_ffn_differential.rs` | The whole dense block against `expert_mlp` + `rms_norm` on real Q8_0 weights, at all three of its kernel paths | the file, a device |
+| `llmcuda-engine/tests/dense_ffn_differential.rs` | The whole dense block against `expert_mlp` + `rms_norm` on real Q8_0 weights, at all four of its kernel paths | the file, a device |
+| `llmcuda-engine/tests/hgemm_differential.rs` | The fp16 weight-only GEMM every dense prefill projection runs on, against an f64 oracle that rounds exactly where the kernel says it rounds (activations to fp16 once, each weight to the fp16 of its stored value, nothing else but the fp32 sum): Q8_0 and bf16 weights, both tiles, unsplit and split-K two to four ways, tails on both axes, a wide output stride, accumulation into a residual | a device |
 | `llmcuda-engine/tests/prefix_pass.rs` | A prompt piece run as the prefix of a wider pass is the pass of its own width **to the bit** — final hidden states and last-row logits — cold and continued through a carried state, at and above the tensor-core tile; below it, the documented cross-kernel difference only | a dense file, a device |
 
 The differential is the interesting one, because the dense block runs on the
@@ -216,19 +217,21 @@ own, and that the residual added back is the block's input rather than its
 normalized form. Each of those three has a wrong version that still generates
 fluent text.
 
-It also gates all three residency/width combinations against one reference,
-which is what says they are the same computation rather than three:
+It also gates all four kernel paths against one reference, in one process
+(`DenseFfnBlock::with_prefill_path` picks the prefill one), which is what says
+they are the same computation rather than four:
 
 | Path | `max_tokens` | `max_abs` | cosine |
 | --- | ---: | ---: | ---: |
 | Q8_0, fp32 `moe_shared_ffn` | 16 | 3.20e-4 | 1.000000 |
-| split int8, `shared_expert_mma` | 128 | 6.45e-2 | 0.999997 |
-| split int8, `dense_proj_split_t3` | 3 | 3.36e-4 | 1.000000 |
+| split int8, fp16 `HgemmKernels` — prefill, the default | 128 | 4.62e-3 | 1.000000 |
+| split int8, `shared_expert_mma` — prefill, `LLMCUDA_HALF_GEMM=0` | 128 | 6.45e-2 | 0.999997 |
+| split int8, `dense_proj_split_t3` — decode | 3 | 4.18e-3 | 1.000000 |
 
-On a tensor whose own max magnitude is 82.3. The middle row is looser because
-it is the only one that quantizes *activations* to int8; the GEMV dequantizes
-the weights and multiplies in fp32, which is why the decode path is the
-accurate one and the prefill path is the fast one.
+On a tensor whose own max magnitude is 82.3. The int8 GEMM is 14x looser than
+the rest because it is the only path that quantizes *activations* to int8,
+against a 32-value absmax; the fp16 GEMM and the decode GEMV both round them
+to fp16 instead, and land within 10% of each other.
 
 `max_rel_error` is excluded from both gates for the floor reason the routed
 MoE differential records, and the test asserts the element driving it really
@@ -239,19 +242,19 @@ stops being justified.
 
 The `forward_pass` golden is a Qwen3.6 capture and there is no dense
 equivalent, so the end-to-end check is greedy agreement with
-`llama-completion` at `--temp 0 --top-k 1` on the same file. Measured:
+`llama-completion` at `--temp 0 --top-k 1` on the same file: three prompts,
+160 tokens each, both files. Three of the six runs match character for
+character. Each of the other three diverges at a token where llama.cpp's own
+top two logits are 0.0004–0.387 apart, against 0.13–0.43 max-abs between the
+engines' logits on the same ids. These are near-ties flipped, not trajectories
+drifting, and one of them llama.cpp breaks both ways itself. The prompts,
+positions and logits are in [BENCHMARKS.md](BENCHMARKS.md) ("Greedy agreement
+with llama.cpp").
 
-| Prompt | Q8_0 residency | int8 residency (shipped) |
-| --- | --- | --- |
-| "The capital of France is", 160 tokens | identical, 717/717 chars | identical, 690/690 chars |
-| B-tree explanation, 160 tokens | identical, 717/717 chars | diverges at char 596 of 710 |
-
-The divergence is the price of int8 activations in prefill and is stated
-rather than smoothed over: with the fp32 residency the same prompt matches
-llama.cpp character for character, and it is one constant
-(`DENSE_REPACK_INT8`) away. What it buys is in [BENCHMARKS.md](BENCHMARKS.md).
-The two continuations at the divergence are both correct English about
-B-trees, i.e. a near-tie flipped, not a trajectory drifting.
+A divergence is not, by itself, evidence about accuracy. Where they split,
+our int8 prefill path tends to land on llama.cpp's token, because both round
+activations to int8 the same way. The fp16 path is the one with 14× less error
+against the CPU reference.
 
 ## The decision model (`clef`)
 

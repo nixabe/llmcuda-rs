@@ -817,29 +817,29 @@ The lane owns one 32-value group of that row quad and reuses the group's
 sixteen-bit activation codes across all four rows. Q6 decode takes those
 codes unsigned and removes their bias of 32 with each subgroup's activation code
 sum, which is shared by the quad, instead of fixing the sign of every byte.
-Giving each lane its own
-row, as before, made L1 activation traffic about four times the weight traffic
-per token; reuse halved a 2560×4096 Q4 projection at one token. Integer dots
+Giving each lane its own row, as before, made L1 activation traffic about four
+times the weight traffic per token; reuse halved a 2560×4096 Q4 projection at
+one token. Integer dots
 are exact in any order, and the group terms, windows and ascending window sum
 are the same fp32 operations, so outputs stay bit-identical to the tensor-core
-tiles. Prefill assigns weight row fragments to warps,
-keeping their codes and scales in registers while visiting token columns.
-This follows the operand reuse in llama.cpp's
-`ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma`; the quantization and contraction order
-remain this engine's. Q4 staging pairs even and odd bytes with `PRMT` before
-selecting their low nibbles. Its tensor-core accumulator reconstructs the
-sixteen-bit activation dot with an integer Horner sum. The reconstruction is
-exact in int32; scales and the fp32 reduction tree remain unchanged.
+tiles.
 
-Q4 experts split each fixed 64-slot dispatch run into two 32-token tiles.
-Each warp loads its own weight fragments straight into registers; only
-activation planes and their metadata pass through shared memory. The smaller
-accumulator tile permits a three-block launch bound and avoids staging an
-unused half-run. The split lives in grid.x, preserving the dispatch grid.y
-capacity. Dense Q4 keeps 64 token columns, and Q6 keeps shared weight staging
-and 64-column tiles: the corresponding direct-load and smaller-tile experiments
-did not pay in those paths. No dispatch allocation or live-count readback is
-added to the hot path.
+Sixteen-bit prefill is one int8 tensor-core kernel for Q4 and Q6, dense and
+routed. The quantizer writes activations in fragment order: sixteen bytes per
+32-value group and k chunk carry the high and low words for both k16 halves,
+so staging is a straight copy. The high and low planes each take one
+m8n8k16 pair, combined exactly as high×256+low in int32. Q4 weights enter
+the MMA as unsigned nibbles; Q6 codes are unpacked once while staging. A
+block covers 128 rows by one 64-slot dispatch run, or 64 tokens when dense.
+Each warp keeps a 128-value window's weight fragments and scales in
+registers across four 8-token subtiles, while the next window's global loads
+are already in flight in registers. Fully padded runs and subtiles are
+skipped. The nibble-plane kernels this replaced needed four int4 MMAs and an
+integer Horner sum per 32 values, and staged weights one load per four
+codes; the change raised cold Q4 prefill about 40% at 512 tokens. Group
+terms, windows and the ascending window sum stay the GEMV's fp32
+operations. No dispatch allocation or live-count readback is added to the hot
+path.
 
 Q4's affine minimum multiplies the original activation sum, retaining the
 warp's summation tree. Q6 combines its two sixteen-value subscale dots before

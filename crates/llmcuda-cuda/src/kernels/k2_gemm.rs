@@ -85,7 +85,7 @@ const SRC: &str = r#"#ifndef K2_ROUTED_GEMV_ROWS
 #define K2_ACTIVATION_BITS 16
 #endif
 
-extern "C" __global__ void k2_quantize(const float* __restrict__ x,signed char* q,signed char* ql,float* __restrict__ scales,float* __restrict__ sl,float* __restrict__ sums,int inner,int count,unsigned* nib,int pack_nibbles) {
+extern "C" __global__ void k2_quantize(const float* __restrict__ x,signed char* q,signed char* ql,float* __restrict__ scales,float* __restrict__ sl,float* __restrict__ sums,int inner,int count,unsigned* nib,int pack_nibbles,unsigned* mq,float2* mm,int mma_layout) {
     int b=blockIdx.x*4+(threadIdx.x>>5),lane=threadIdx.x&31;if(b>=count)return;
     float v=x[(long long)b*32+lane],a=fabsf(v);
     for(int d=16;d>0;d>>=1)a=fmaxf(a,__shfl_xor_sync(0xffffffff,a,d));
@@ -99,6 +99,17 @@ extern "C" __global__ void k2_quantize(const float* __restrict__ x,signed char* 
     int hi=K2_ACTIVATION_BITS==8 ? code : (code+RADIX/2)/(RADIX);
     if(K2_ACTIVATION_BITS!=8)hi=(code+RADIX/2)>>(K2_ACTIVATION_BITS==12 ? 4 : 8);
     int lo=K2_ACTIVATION_BITS==8 ? 0 : code-hi*RADIX;
+    if(mma_layout && K2_ACTIVATION_BITS==16) {
+        // Tensor-core fragments only: 16 bytes per (group, k chunk c) hold the
+        // high and low words of values 4c..4c+3 and 16+4c..16+4c+3, in order.
+        unsigned hb=((unsigned)hi&255u)<<(8*(lane&3)),lb=((unsigned)lo&255u)<<(8*(lane&3));
+        hb|=__shfl_xor_sync(0xffffffff,hb,1);hb|=__shfl_xor_sync(0xffffffff,hb,2);
+        lb|=__shfl_xor_sync(0xffffffff,lb,1);lb|=__shfl_xor_sync(0xffffffff,lb,2);
+        if((lane&3)==0){unsigned* o=mq+(long long)b*16+((lane>>2)&3)*4;o[lane>>4]=hb;o[2+(lane>>4)]=lb;}
+        float sum=v;for(int d=16;d>0;d>>=1)sum+=__shfl_xor_sync(0xffffffff,sum,d);
+        if(lane==0)mm[b]=make_float2(scale,sum);
+        return;
+    }
     q[(long long)b*32+lane]=(signed char)hi;ql[(long long)b*32+lane]=(signed char)lo;
     if(pack_nibbles && K2_ACTIVATION_BITS>=12){
         #pragma unroll
@@ -688,6 +699,168 @@ __device__ __forceinline__ void k2_gemv_quads(const unsigned char* __restrict__ 
     }
 }
 
+__device__ __forceinline__ void k2_mma_u8(int* d,unsigned a,unsigned b){asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};":"+r"(d[0]),"+r"(d[1]):"r"(a),"r"(b));}
+__device__ __forceinline__ void k2_mma_s8(int* d,unsigned a,unsigned b){asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};":"+r"(d[0]),"+r"(d[1]):"r"(a),"r"(b));}
+// Sixteen-bit tensor-core projection on int8 m8n8k16. Activations arrive in
+// fragment order (k2_quantize's MMA layout); high and low planes take one MMA
+// pair each, and their int32 results combine exactly as high*256+low. Weight
+// fragments and scales stay in registers across a warp's token subtiles.
+// The next 128-value window is loaded into registers while this one is
+// computed. Group terms, (t0+t2)+(t1+t3) windows and the ascending window sum
+// are the fp32 operations of raw_gemm_q4_nibbles and raw_gemm_reuse.
+template<int Q,int BR,bool ROUTED>
+__device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,const uint4* __restrict__ mq,const float2* __restrict__ mm,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode) {
+    constexpr int BT=64,AW=Q==3 ? 4 : 8,WRS=BR/32,TFS=4,REC=(Q==3 ? 160 : 224)*4;
+    constexpr int WT=BR/64>0 ? BR/64 : 1;           // weight tasks per thread (Q4 code chunks: 4*BR)
+    __shared__ __align__(16) unsigned sa[4][BR][AW];
+    __shared__ float2 sw[4][BR];
+    __shared__ float sd[Q==0 ? BR : 1];
+    __shared__ uint4 sb[4][BT][4];
+    __shared__ float4 sm[4][BT/2];
+    __shared__ int flats[BT];
+    int tid=threadIdx.x,lane=tid&31,warp=tid>>5,wr=warp&3,wt=warp>>2;
+    int expert=ROUTED ? owners[blockIdx.y] : 0;
+    if(expert<0)return;
+    int rq0=blockIdx.x*(BR/4),quads=(rows+3)>>2,groups=inner>>5,records=inner>>8;
+    if(tid<BT)flats[tid]=ROUTED ? sorted[blockIdx.y*BT+tid] : blockIdx.y*BT+tid;
+    __syncthreads();
+    if(flats[0]>=pairs)return;
+    const unsigned char* wb=w+((long long)expert*quads+rq0)*records*REC;
+    // Register staging for one window.
+    uint4 pw[Q==3 ? WT : 8];uint4 ps[3];uint4 pb[4];float2 pm;
+    auto load=[&](int j) {
+        int rec=j>>8,gw=(j>>7)&1,g0=j>>5;
+        if(Q==3) {
+            #pragma unroll
+            for(int i=0;i<WT;++i) {
+                int task=tid+256*i,quad=task>>4,chunk=task&15;
+                pw[i]=make_uint4(0u,0u,0u,0u);
+                if(quad<BR/4 && rq0+quad<quads)pw[i]=*(const uint4*)(wb+((long long)quad*records+rec)*REC+((chunk>>2)*8+gw*4+(chunk&3))*16);
+            }
+            if(tid<BR) {
+                int quad=tid>>2;const unsigned char* rp=wb+((long long)quad*records+rec)*REC;
+                ps[0]=ps[1]=ps[2]=make_uint4(0u,0u,0u,0u);
+                if(rq0+quad<quads){ps[0]=*(const uint4*)(rp+32*16);ps[1]=*(const uint4*)(rp+(33+gw)*16);ps[2]=*(const uint4*)(rp+(35+gw)*16);}
+            }
+        } else if(tid<BR) {
+            int quad=tid>>2,gi=gw*4+(tid&3);const unsigned char* rp=wb+((long long)quad*records+rec)*REC;
+            #pragma unroll
+            for(int k=0;k<8;++k)pw[k]=make_uint4(0u,0u,0u,0u);
+            if(rq0+quad<quads) {
+                #pragma unroll
+                for(int k=0;k<6;++k)pw[k]=*(const uint4*)(rp+(gi*6+k)*16);
+                pw[6]=*(const uint4*)(rp+((194+2*gi)>>2)*16);pw[7]=*(const uint4*)(rp+48*16);
+            }
+        }
+        #pragma unroll
+        for(int i=0;i<4;++i) {
+            int task=tid+256*i,t=task>>4,f=flats[t];
+            pb[i]=make_uint4(0u,0u,0u,0u);
+            if(f<pairs){int input=mode==1 ? f/topk : f;pb[i]=mq[((long long)input*groups+g0+((task>>2)&3))*4+(task&3)];}
+        }
+        {int t=tid>>2,f=flats[t];pm=make_float2(0.f,0.f);if(f<pairs){int input=mode==1 ? f/topk : f;pm=mm[(long long)input*groups+g0+(tid&3)];}}
+    };
+    auto store=[&](int j) {
+        if(Q==3) {
+            #pragma unroll
+            for(int i=0;i<WT;++i) {
+                int task=tid+256*i,quad=task>>4,chunk=task&15;
+                if(quad<BR/4) {
+                    #pragma unroll
+                    for(int rr=0;rr<4;++rr)sa[chunk&3][quad*4+rr][chunk>>2]=k2_part(pw[i],rr);
+                }
+            }
+            if(tid<BR) {
+                int quad=tid>>2,gl=tid&3,sh=8*gl;
+                #pragma unroll
+                for(int rr=0;rr<4;++rr) {
+                    unsigned d=k2_part(ps[0],rr);
+                    sw[gl][quad*4+rr]=make_float2(k2_half_bits((unsigned short)d)*(float)((k2_part(ps[1],rr)>>sh)&255),k2_half_bits((unsigned short)(d>>16))*(float)((k2_part(ps[2],rr)>>sh)&255));
+                }
+            }
+        } else if(tid<BR) {
+            int quad=tid>>2,gl=tid&3,off=194+2*(((j>>7)&1)*4+gl);
+            #pragma unroll
+            for(int rr=0;rr<4;++rr) {
+                #pragma unroll
+                for(int k=0;k<8;++k) {
+                    unsigned c=((k2_part(pw[k&3],rr)>>(4*(k>>2)))&0x0f0f0f0f)|(((k2_part(pw[4+(k>>2)],rr)>>(2*(k&3)))&0x03030303)<<4);
+                    sa[gl][quad*4+rr][(k&3)*2+(k>>2)]=((c|0x80808080)-0x20202020)^0x80808080;
+                }
+                unsigned sv=k2_part(pw[6],rr);int sh=8*(off&3);
+                sw[gl][quad*4+rr]=make_float2((float)(signed char)(sv>>sh),(float)(signed char)(sv>>(sh+8)));
+                if(gl==0)sd[quad*4+rr]=k2_half_bits((unsigned short)k2_part(pw[7],rr));
+            }
+        }
+        #pragma unroll
+        for(int i=0;i<4;++i){int task=tid+256*i;sb[(task>>2)&3][task>>4][task&3]=pb[i];}
+        {int t=tid>>2,g=tid&3;float* m=(float*)&sm[g][t>>1];m[t&1]=pm.x;m[2+(t&1)]=pm.y;}
+    };
+    float acc[WRS][TFS][2];
+    #pragma unroll
+    for(int a=0;a<WRS;++a)
+        #pragma unroll
+        for(int b=0;b<TFS;++b)acc[a][b][0]=acc[a][b][1]=0;
+    load(0);
+    for(int j=0;j<inner;j+=128) {
+        store(j);
+        __syncthreads();
+        if(j+128<inner)load(j+128);
+        unsigned a0[WRS][4],a1[WRS][4];float sc0[WRS][4],sc1[WRS][4],dl[WRS];
+        #pragma unroll
+        for(int rs=0;rs<WRS;++rs) {
+            int row=wr*(BR/4)+rs*8+(lane>>2);
+            if(Q==0)dl[rs]=sd[row];
+            #pragma unroll
+            for(int g=0;g<4;++g) {
+                if(Q==3){unsigned word=sa[g][row][lane&3];a0[rs][g]=word&0x0f0f0f0f;a1[rs][g]=(word>>4)&0x0f0f0f0f;}
+                else{uint2 pr=*(const uint2*)&sa[g][row][(lane&3)*2];a0[rs][g]=pr.x;a1[rs][g]=pr.y;}
+                float2 s2=sw[g][row];sc0[rs][g]=s2.x;sc1[rs][g]=s2.y;
+            }
+        }
+        #pragma unroll
+        for(int ts=0;ts<TFS;++ts) {
+            int tb=wt*32+ts*8;
+            if(flats[tb]>=pairs)continue;
+            uint4 b[4];float4 m[4];
+            #pragma unroll
+            for(int g=0;g<4;++g){b[g]=sb[g][tb+(lane>>2)][lane&3];m[g]=sm[g][(tb>>1)+(lane&3)];}
+            #pragma unroll
+            for(int rs=0;rs<WRS;++rs) {
+                float p0[2]={0.f,0.f},p1[2]={0.f,0.f};
+                #pragma unroll
+                for(int g=0;g<4;++g) {
+                    float t0,t1;
+                    if(Q==3) {
+                        int hi[2]={0,0},lo[2]={0,0};
+                        k2_mma_u8(hi,a0[rs][g],b[g].x);k2_mma_u8(hi,a1[rs][g],b[g].y);
+                        k2_mma_u8(lo,a0[rs][g],b[g].z);k2_mma_u8(lo,a1[rs][g],b[g].w);
+                        t0=raw_full_term(sc0[rs][g],hi[0]*256+lo[0],sc1[rs][g],m[g].z,m[g].x);
+                        t1=raw_full_term(sc0[rs][g],hi[1]*256+lo[1],sc1[rs][g],m[g].w,m[g].y);
+                    } else {
+                        int h0[2]={0,0},h1[2]={0,0},l0[2]={0,0},l1[2]={0,0};
+                        k2_mma_s8(h0,a0[rs][g],b[g].x);k2_mma_s8(h1,a1[rs][g],b[g].y);
+                        k2_mma_s8(l0,a0[rs][g],b[g].z);k2_mma_s8(l1,a1[rs][g],b[g].w);
+                        int v00=h0[0]*256+l0[0],v10=h1[0]*256+l1[0],v01=h0[1]*256+l0[1],v11=h1[1]*256+l1[1];
+                        t0=__fmul_rn(__fmul_rn(dl[rs],m[g].x),__fmaf_rn((float)v10,sc1[rs][g],__fmul_rn((float)v00,sc0[rs][g])));
+                        t1=__fmul_rn(__fmul_rn(dl[rs],m[g].y),__fmaf_rn((float)v11,sc1[rs][g],__fmul_rn((float)v01,sc0[rs][g])));
+                    }
+                    if(g&1){p1[0]+=t0;p1[1]+=t1;}else{p0[0]+=t0;p0[1]+=t1;}
+                }
+                acc[rs][ts][0]+=p0[0]+p1[0];acc[rs][ts][1]+=p0[1]+p1[1];
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(int rs=0;rs<WRS;++rs) {
+        int row=rq0*4+wr*(BR/4)+rs*8+(lane>>2);
+        #pragma unroll
+        for(int ts=0;ts<TFS;++ts)
+            #pragma unroll
+            for(int z=0;z<2;++z){int f=flats[wt*32+ts*8+(lane&3)*2+z];if(row<rows && f<pairs)out[(long long)f*rows+row]=acc[rs][ts][z];}
+    }
+}
 extern "C" {
 #define GEMV_ENTRY(NAME,Q,NT,ROUTED) __global__ void NAME(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ sums,const int* __restrict__ ids,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned* __restrict__ nib) {if(!ROUTED && inner==2560)raw_gemv<Q,NT,ROUTED,2560>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);else raw_gemv<Q,NT,ROUTED>(w,x,xl,sx,sl,sums,ids,out,inner,rows,pairs,topk,mode);}
 #define GEMM_ENTRY(NAME,Q,BT,MF,IR,INNER) __global__ __launch_bounds__(256,2) void NAME(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sl,const float* __restrict__ sums,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned* __restrict__ nib) {if(Q==3 && K2_ACTIVATION_BITS>=12)raw_gemm_q4_nibbles<BT,MF,IR,INNER>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode,nib);else if(Q==0 && K2_ACTIVATION_BITS>=12)raw_gemm_reuse<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);else raw_gemm_fallback<Q,BT,MF,IR>(w,x,xl,sx,sl,sums,sorted,owners,out,inner,rows,pairs,topk,mode);}
@@ -701,6 +874,11 @@ GEMV_ENTRY(k2_gemv_q4,3,1,true)
 GEMV_ENTRY(k2_gemv_dense_q4,3,K2_DENSE_TOKENS,false)
 GEMV_ENTRY(k2_gemv_q6,0,1,true)
 GEMV_ENTRY(k2_gemv_dense_q6,0,K2_DENSE_TOKENS,false)
+#define MMQ16_ENTRY(NAME,Q,BR,ROUTED) __global__ __launch_bounds__(256,1) void NAME(const unsigned char* __restrict__ w,const uint4* __restrict__ mq,const float2* __restrict__ mm,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode) {k2_mmq16<Q,BR,ROUTED>(w,mq,mm,sorted,owners,out,inner,rows,pairs,topk,mode);}
+MMQ16_ENTRY(k2_mmq16_q4,3,128,true)
+MMQ16_ENTRY(k2_mmq16_dense_q4,3,128,false)
+MMQ16_ENTRY(k2_mmq16_q6,0,128,true)
+MMQ16_ENTRY(k2_mmq16_dense_q6,0,128,false)
 GEMM_REG_ENTRY(k2_gemm_q4,0)
 GEMM_ENTRY(k2_gemm_dense_q4,3,64,1,4,0)
 GEMM_ENTRY(k2_gemm_q6,0,K2_ROUTED_TILE,1,4,0)
@@ -737,6 +915,10 @@ pub struct K2Gemm {
     gemv16_dense: [CudaFunction; 2],
     dense: [CudaFunction; 2],
     quantize: CudaFunction,
+    mmq16: [CudaFunction; 2],
+    mmq16_dense: [CudaFunction; 2],
+    mq: CudaSlice<u32>,
+    mm: CudaSlice<f32>,
     q: CudaSlice<i8>,
     ql: CudaSlice<i8>,
     nibbles: CudaSlice<u32>,
@@ -744,6 +926,7 @@ pub struct K2Gemm {
     scales: CudaSlice<f32>,
     sums: CudaSlice<f32>,
     tokens: usize,
+    input_rows: usize,
     capacity: usize,
     max_inner: usize,
     max_rows: usize,
@@ -884,6 +1067,8 @@ impl K2Gemm {
             .next()
             .unwrap();
         let dense_tokens = tokens.min(4);
+        let input = tokens * topk * max_inner;
+        let tensor = tokens >= 8 && activation_bits == 16;
         let ptx = compile(&format!("#define K2_DENSE_TOKENS {dense_tokens}\n#define K2_ROUTED_GEMV_ROWS {routed_gemv_rows}\n#define K2_ACTIVATION_BITS {activation_bits}\n#define K2_ROUTED_TILE {route_tile}\n{prologue}\n{SRC}"), "k2_gemm").map_err(MoeError::Compile)?;
         let module = ctx.load_module(ptx)?;
         Ok(Self {
@@ -918,13 +1103,30 @@ impl K2Gemm {
                 module.load_function("k2_gemv16_dense_q6")?,
             ],
             quantize: module.load_function("k2_quantize")?,
-            q: stream.alloc_zeros::<i8>(tokens * topk * max_inner)?,
-            ql: stream.alloc_zeros::<i8>(tokens * topk * max_inner)?,
-            nibbles: stream.alloc_zeros::<u32>(tokens * topk * max_inner / 32 * 16)?,
-            sl: stream.alloc_zeros::<f32>(tokens * topk * max_inner / 32)?,
-            scales: stream.alloc_zeros::<f32>(tokens * topk * max_inner / 32)?,
-            sums: stream.alloc_zeros::<f32>(tokens * topk * max_inner / 32)?,
+            mmq16: [
+                module.load_function("k2_mmq16_q4")?,
+                module.load_function("k2_mmq16_q6")?,
+            ],
+            mmq16_dense: [
+                module.load_function("k2_mmq16_dense_q4")?,
+                module.load_function("k2_mmq16_dense_q6")?,
+            ],
+            // Sixteen-bit prefill reads only fragment-ordered activations;
+            // decode and the 8/12-bit experiments read the separate planes.
+            mq: stream.alloc_zeros::<u32>(if tensor { input / 2 } else { 4 })?,
+            mm: stream.alloc_zeros::<f32>(if tensor { input / 16 } else { 2 })?,
+            q: stream.alloc_zeros::<i8>(if tensor { 32 } else { input })?,
+            ql: stream.alloc_zeros::<i8>(if tensor { 32 } else { input })?,
+            nibbles: stream.alloc_zeros::<u32>(if tokens >= 8 && activation_bits == 12 {
+                input / 2
+            } else {
+                16
+            })?,
+            sl: stream.alloc_zeros::<f32>(if tensor { 1 } else { input / 32 })?,
+            scales: stream.alloc_zeros::<f32>(if tensor { 1 } else { input / 32 })?,
+            sums: stream.alloc_zeros::<f32>(if tensor { 1 } else { input / 32 })?,
             tokens,
+            input_rows: tokens * topk,
             capacity: (tokens * topk).div_ceil(route_tile) + experts,
             max_inner,
             max_rows,
@@ -956,7 +1158,7 @@ impl K2Gemm {
             || inner > self.max_inner
             || x.is_empty()
             || !x.len().is_multiple_of(inner)
-            || x.len() / inner > self.q.len() / self.max_inner
+            || x.len() / inner > self.input_rows
         {
             return Err(MoeError::WrongElementCount {
                 which: "K2 prepared input",
@@ -973,7 +1175,8 @@ impl K2Gemm {
         };
         let count = (x.len() / 32) as i32;
         let inner_i32 = inner as i32;
-        let pack_nibbles = i32::from(q4_nibbles && self.tokens >= 8);
+        let mma_layout = i32::from(self.tokens >= 8 && self.activation_bits == 16);
+        let pack_nibbles = i32::from(q4_nibbles && self.tokens >= 8 && self.activation_bits == 12);
         // SAFETY: all arenas cover the checked token and inner dimensions.
         unsafe {
             stream
@@ -988,6 +1191,9 @@ impl K2Gemm {
                 .arg(&count)
                 .arg(&mut self.nibbles)
                 .arg(&pack_nibbles)
+                .arg(&mut self.mq)
+                .arg(&mut self.mm)
+                .arg(&mma_layout)
                 .launch(LaunchConfig {
                     grid_dim: ((count as u32).div_ceil(4), 1, 1),
                     block_dim: (128, 1, 1),
@@ -1085,6 +1291,11 @@ impl K2Gemm {
         );
         if self.tokens < 8 && self.activation_bits == 16 {
             return self.gemv16(stream, w, quant, out, inner, rows, pairs, topk, mode, d);
+        }
+        if self.activation_bits == 16 {
+            return self.mmq16(
+                stream, w, quant, out, inner, rows, pairs, topk, mode, d, batches,
+            );
         }
         // SAFETY: fixed workspace and geometry checks cover all indices;
         // rows and dispatch padding are masked, and dense ignores route pointers.
@@ -1239,6 +1450,55 @@ impl K2Gemm {
                     grid_dim: (quads.div_ceil(rq * WARPS), (pairs as u32).div_ceil(nt), 1),
                     block_dim: (32 * WARPS, 1, 1),
                     shared_mem_bytes: WARPS * rq * groups * nt * 4,
+                })?;
+        }
+        Ok(())
+    }
+}
+impl K2Gemm {
+    /// Prefill widths at sixteen bits: 128-row by 64-token int8 tensor-core
+    /// tiles, one per dispatch run for experts.
+    #[allow(clippy::too_many_arguments)]
+    fn mmq16(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: &CudaSlice<u8>,
+        quant: ExpertQuant,
+        out: &mut CudaSlice<f32>,
+        inner: i32,
+        rows: i32,
+        pairs: i32,
+        topk: i32,
+        mode: i32,
+        d: Option<&K2Dispatch>,
+        batches: usize,
+    ) -> Result<(), MoeError> {
+        let index = usize::from(quant == ExpertQuant::Q6K);
+        let f = if d.is_some() {
+            &self.mmq16[index]
+        } else {
+            &self.mmq16_dense[index]
+        };
+        // SAFETY: geometry was checked by the caller; rows past `rows`, padded
+        // dispatch slots and dense tails are masked inside the kernel.
+        unsafe {
+            let mut b = stream.launch_builder(f);
+            b.arg(w).arg(&self.mq).arg(&self.mm);
+            if let Some(d) = d {
+                b.arg(&d.sorted).arg(&d.owners);
+            } else {
+                b.arg(w).arg(w);
+            }
+            b.arg(out)
+                .arg(&inner)
+                .arg(&rows)
+                .arg(&pairs)
+                .arg(&topk)
+                .arg(&mode)
+                .launch(LaunchConfig {
+                    grid_dim: ((rows as u32).div_ceil(128), batches as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
                 })?;
         }
         Ok(())

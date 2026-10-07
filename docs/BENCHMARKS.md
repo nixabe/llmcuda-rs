@@ -799,7 +799,10 @@ stated so it transfers to the next kernel rather than as a changelog entry.
 ## K2 integer projections keep one contraction order across shapes
 
 K2 projections pack weights at upload and quantize activations into sixteen-bit
-integer codes with a separate fp32 scale for each 32 values. Narrow shapes use
+integer codes with a separate fp32 scale for each 32 values. The quantizer
+gives each lane four consecutive values and eight lanes a group; its
+activation sum reproduces the warp-per-group butterfly's pairing, with the
+first three levels across lanes and the last two in-lane. Narrow shapes use
 DP4A; prefill uses Turing integer tensor cores. Q4 codes remain nibbles. Q6
 codes remain six bits, split into four words of low nibbles and two of high
 bit pairs inside each 32-value group, arranged so that each code word lines up

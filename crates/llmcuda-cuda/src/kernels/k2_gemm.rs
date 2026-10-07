@@ -124,6 +124,48 @@ extern "C" __global__ void k2_quantize(const float* __restrict__ x,signed char* 
     if(lane==0){scales[b]=scale;sl[b]=K2_ACTIVATION_BITS==8 ? center : scale;sums[b]=sum;}
 }
 
+// Sixteen-bit activations with four consecutive values per lane and eight
+// lanes per 32-value group. Values, scales and codes are k2_quantize's. Its
+// activation sum is a butterfly pairing value i with i^16, i^8, i^4, i^2 and
+// i^1 in turn: here lanes xor 4, 2 and 1 hold i^16, i^8 and i^4, and the last
+// two levels are in-lane, so the sum is the same tree.
+extern "C" __global__ void k2_quantize16(const float* __restrict__ x,int count,int mma_layout,signed char* q,signed char* ql,float* __restrict__ scales,float* __restrict__ sl,float* __restrict__ sums,uint4* mq,float2* mm) {
+    int b=blockIdx.x*16+(threadIdx.x>>3),l=threadIdx.x&7;
+    bool live=b<count;if(!live)b=count-1;
+    long long base=(long long)b*32+4*l;
+    float4 x4=*(const float4*)(x+base);
+    float v[4]={x4.x,x4.y,x4.z,x4.w};
+    float a=fmaxf(fmaxf(fabsf(v[0]),fabsf(v[1])),fmaxf(fabsf(v[2]),fabsf(v[3])));
+    for(int d=4;d>0;d>>=1)a=fmaxf(a,__shfl_xor_sync(0xffffffff,a,d));
+    constexpr float LIMIT=32639.0f;
+    float scale=a>0 ? a/LIMIT : 1.0f;
+    unsigned hb=0,lb=0;
+    #pragma unroll
+    for(int k=0;k<4;++k) {
+        int code=a>0 ? (int)rintf(v[k]*(LIMIT/a)) : 0;code=max(-(int)LIMIT,min((int)LIMIT,code));
+        int hi=(code+128)>>8,lo=code-hi*256;
+        hb|=((unsigned)hi&255u)<<(8*k);lb|=((unsigned)lo&255u)<<(8*k);
+    }
+    float t[4];
+    #pragma unroll
+    for(int k=0;k<4;++k) {
+        t[k]=v[k]+__shfl_xor_sync(0xffffffff,v[k],4);
+        t[k]+=__shfl_xor_sync(0xffffffff,t[k],2);
+        t[k]+=__shfl_xor_sync(0xffffffff,t[k],1);
+    }
+    float sum=(t[0]+t[2])+(t[1]+t[3]);
+    if(mma_layout) {
+        // 16 bytes per k chunk c: high words of values 4c..4c+3 and
+        // 16+4c..16+4c+3, then their low words, as k2_quantize writes them.
+        unsigned hp=__shfl_xor_sync(0xffffffff,hb,4),lp=__shfl_xor_sync(0xffffffff,lb,4);
+        if(live && l<4)mq[(long long)b*4+l]=make_uint4(hb,hp,lb,lp);
+        if(live && l==0)mm[b]=make_float2(scale,sum);
+        return;
+    }
+    if(live){*(unsigned*)(q+base)=hb;*(unsigned*)(ql+base)=lb;}
+    if(live && l==0){scales[b]=scale;sl[b]=scale;sums[b]=sum;}
+}
+
 template<int Q,int IR=4>
 __device__ __forceinline__ const unsigned char* weight_row(const unsigned char* __restrict__ w,int e,int r,int inner,int rows){return w+((long long)e*((rows+IR-1)/IR)+r/IR)*IR*(inner/256)*(Q==3 ? 160 : 224)+(r%IR)*4;}
 // Native records interleave aligned words across rows. Load d/dmin as one
@@ -936,6 +978,7 @@ pub struct K2Gemm {
     gemv16_dense: [CudaFunction; 2],
     dense: [CudaFunction; 2],
     quantize: CudaFunction,
+    quantize16: CudaFunction,
     mmq16: [CudaFunction; 2],
     mmq16_dense: [CudaFunction; 2],
     mq: CudaSlice<u32>,
@@ -1124,6 +1167,7 @@ impl K2Gemm {
                 module.load_function("k2_gemv16_dense_q6")?,
             ],
             quantize: module.load_function("k2_quantize")?,
+            quantize16: module.load_function("k2_quantize16")?,
             mmq16: [
                 module.load_function("k2_mmq16_q4")?,
                 module.load_function("k2_mmq16_q6")?,
@@ -1198,6 +1242,30 @@ impl K2Gemm {
         let inner_i32 = inner as i32;
         let mma_layout = i32::from(self.tokens >= 8 && self.activation_bits == 16);
         let pack_nibbles = i32::from(q4_nibbles && self.tokens >= 8 && self.activation_bits == 12);
+        if self.activation_bits == 16 {
+            // SAFETY: all arenas cover the checked token and inner dimensions.
+            unsafe {
+                stream
+                    .launch_builder(&self.quantize16)
+                    .arg(x)
+                    .arg(&count)
+                    .arg(&mma_layout)
+                    .arg(&mut self.q)
+                    .arg(&mut self.ql)
+                    .arg(&mut self.scales)
+                    .arg(&mut self.sl)
+                    .arg(&mut self.sums)
+                    .arg(&mut self.mq)
+                    .arg(&mut self.mm)
+                    .launch(LaunchConfig {
+                        grid_dim: ((count as u32).div_ceil(16), 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            self.prepared = Some(prepared);
+            return Ok(prepared);
+        }
         // SAFETY: all arenas cover the checked token and inner dimensions.
         unsafe {
             stream

@@ -870,7 +870,10 @@ projection. CPU differentials and real-model oracle gates cover that change.
 Projections sharing an unchanged input explicitly prepare its activation codes
 once. The FFN down projections quantize `silu(gate)·up` straight from the
 gate and up outputs, with `swiglu_mul`'s expression inside the quantizer, so
-the product is never stored and SwiGLU is not a separate launch. A workspace generation prevents reuse after another input is prepared;
+the product is never stored and SwiGLU is not a separate launch. The routed and
+shared-expert gate/up projections share one quantization of the normed
+input, and one pass forms routed plus shared and then adds the residual,
+rounding each add as the separate element-wise launches did. A workspace generation prevents reuse after another input is prepared;
 Q4 consumers declare their need for packed nibble planes. Attention projections
 and gate/up pairs reuse that generation, including during graph capture.
 Rotary coefficients are evaluated in double precision at layer zero, stored

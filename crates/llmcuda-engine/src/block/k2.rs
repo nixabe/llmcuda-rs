@@ -939,7 +939,6 @@ pub struct K2FfnBlock {
     eps: f32,
     normed: CudaSlice<f32>,
     logits: CudaSlice<f32>,
-    routed: CudaSlice<f32>,
     shared: CudaSlice<f32>,
     dense_gate: CudaSlice<f32>,
     dense_up: CudaSlice<f32>,
@@ -1003,7 +1002,6 @@ impl K2FfnBlock {
             eps,
             normed: stream.alloc_zeros::<f32>(g.max_tokens * g.hidden)?,
             logits: stream.alloc_zeros::<f32>(g.max_tokens * g.num_experts)?,
-            routed: stream.alloc_zeros::<f32>(g.max_tokens * g.hidden)?,
             shared: stream.alloc_zeros::<f32>(g.max_tokens * g.hidden)?,
             dense_gate: stream.alloc_zeros::<f32>(g.max_tokens * dense)?,
             dense_up: stream.alloc_zeros::<f32>(g.max_tokens * dense)?,
@@ -1078,75 +1076,41 @@ impl K2FfnBlock {
                 g.experts_per_token,
                 k.route_scale(),
             )?;
-            {
-                let sc = &mut self.gemm;
-                self.ops
-                    .dispatch_gemm(stream, &self.ids, &mut sc.dispatch)?;
-                let prepared = sc.gemm.prepare(
-                    stream,
-                    &self.normed,
-                    g.hidden,
-                    w.gate.quant == Some(ExpertQuant::Q4K) || w.up.quant == Some(ExpertQuant::Q4K),
-                )?;
-                sc.gemm.project_prepared(
-                    stream,
-                    &w.gate.bytes,
-                    w.gate.quant.unwrap(),
-                    prepared,
-                    &mut sc.gate,
-                    g.hidden,
-                    g.intermediate,
-                    g.num_experts,
-                    Some(&sc.dispatch),
-                    false,
-                )?;
-                sc.gemm.project_prepared(
-                    stream,
-                    &w.up.bytes,
-                    w.up.quant.unwrap(),
-                    prepared,
-                    &mut sc.up,
-                    g.hidden,
-                    g.intermediate,
-                    g.num_experts,
-                    Some(&sc.dispatch),
-                    false,
-                )?;
-                let prepared = sc.gemm.prepare_swiglu(
-                    stream,
-                    &sc.gate,
-                    &sc.up,
-                    g.intermediate,
-                    w.down.quant == Some(ExpertQuant::Q4K),
-                )?;
-                sc.gemm.project_prepared(
-                    stream,
-                    &w.down.bytes,
-                    w.down.quant.unwrap(),
-                    prepared,
-                    &mut sc.partial,
-                    g.intermediate,
-                    g.hidden,
-                    g.num_experts,
-                    Some(&sc.dispatch),
-                    true,
-                )?;
-                self.ops.combine(
-                    stream,
-                    &sc.partial,
-                    &self.weights,
-                    &mut self.routed,
-                    g.hidden,
-                    g.experts_per_token,
-                )?;
-            }
             let (sg, su, sd) = w.shared.as_ref().unwrap();
             let sc = &mut self.gemm;
-            let prepared = sc.dense_gemm.prepare(
+            self.ops
+                .dispatch_gemm(stream, &self.ids, &mut sc.dispatch)?;
+            // The routed and shared gate/up projections share one
+            // quantization of the normed input.
+            let prepared = sc.gemm.prepare(
                 stream,
                 &self.normed,
                 g.hidden,
-                sg.quant == Some(ExpertQuant::Q4K) || su.quant == Some(ExpertQuant::Q4K),
+                [w.gate.quant, w.up.quant, sg.quant, su.quant].contains(&Some(ExpertQuant::Q4K)),
+            )?;
+            sc.gemm.project_prepared(
+                stream,
+                &w.gate.bytes,
+                w.gate.quant.unwrap(),
+                prepared,
+                &mut sc.gate,
+                g.hidden,
+                g.intermediate,
+                g.num_experts,
+                Some(&sc.dispatch),
+                false,
+            )?;
+            sc.gemm.project_prepared(
+                stream,
+                &w.up.bytes,
+                w.up.quant.unwrap(),
+                prepared,
+                &mut sc.up,
+                g.hidden,
+                g.intermediate,
+                g.num_experts,
+                Some(&sc.dispatch),
+                false,
             )?;
             sg.prefill_prepared(
                 &self.ops,
@@ -1154,7 +1118,7 @@ impl K2FfnBlock {
                 &self.normed,
                 &self.ids,
                 &mut sc.shared_gate,
-                &mut sc.dense_gemm,
+                &mut sc.gemm,
                 prepared,
             )?;
             su.prefill_prepared(
@@ -1163,8 +1127,27 @@ impl K2FfnBlock {
                 &self.normed,
                 &self.ids,
                 &mut sc.shared_up,
-                &mut sc.dense_gemm,
+                &mut sc.gemm,
                 prepared,
+            )?;
+            let prepared = sc.gemm.prepare_swiglu(
+                stream,
+                &sc.gate,
+                &sc.up,
+                g.intermediate,
+                w.down.quant == Some(ExpertQuant::Q4K),
+            )?;
+            sc.gemm.project_prepared(
+                stream,
+                &w.down.bytes,
+                w.down.quant.unwrap(),
+                prepared,
+                &mut sc.partial,
+                g.intermediate,
+                g.hidden,
+                g.num_experts,
+                Some(&sc.dispatch),
+                true,
             )?;
             sd.prefill_swiglu(
                 &self.ops,
@@ -1177,8 +1160,19 @@ impl K2FfnBlock {
                 &mut self.shared,
                 &mut sc.dense_gemm,
             )?;
-            self.layer_ops
-                .add(stream, &self.routed, &self.shared, ffn, ffn.len())?;
+            // Routed plus shared, then the residual: one pass over the
+            // outputs instead of a combine and two adds.
+            self.ops.combine_residual(
+                stream,
+                &sc.partial,
+                &self.weights,
+                &self.shared,
+                x,
+                ffn,
+                out,
+                g.hidden,
+                g.experts_per_token,
+            )?;
         } else {
             let prepared = self.gemm.dense_gemm.prepare(
                 stream,
@@ -1215,8 +1209,8 @@ impl K2FfnBlock {
                 ffn,
                 &mut self.gemm.dense_gemm,
             )?;
+            self.layer_ops.add(stream, x, ffn, out, out.len())?;
         }
-        self.layer_ops.add(stream, x, ffn, out, out.len())?;
         Ok(())
     }
 }

@@ -253,6 +253,15 @@ __global__ void k2_combine(const float* p,const float* w,float* out,int rows,int
     float a=0;for(int k=0;k<topk;++k) a+=p[((long long)t*topk+k)*rows+j]*w[t*topk+k];
     out[(long long)t*rows+j]=a;
 }
+// k2_combine followed by the two adds it used to feed: ffn = routed + shared,
+// then out = x + ffn, each rounded as the separate tensor_add launches did.
+__global__ void k2_combine_residual(const float* p,const float* w,const float* shared,const float* x,float* ffn,float* out,int rows,int topk) {
+    int j=blockIdx.x*blockDim.x+threadIdx.x,t=blockIdx.y;if(j>=rows)return;
+    float a=0;for(int k=0;k<topk;++k) a+=p[((long long)t*topk+k)*rows+j]*w[t*topk+k];
+    long long i=(long long)t*rows+j;
+    float f=__fadd_rn(a,shared[i]);
+    ffn[i]=f;out[i]=__fadd_rn(x[i],f);
+}
 __global__ void k2_values(const float* projections, const float* weights, float* out, int rows, int topk) {
     int j=blockIdx.x*blockDim.x+threadIdx.x, token=blockIdx.y;
     if (j>=rows) return;
@@ -358,6 +367,7 @@ pub struct K2Kernels {
     project_grouped: CudaFunction,
     values: CudaFunction,
     combine: CudaFunction,
+    combine_residual: CudaFunction,
     gate: CudaFunction,
 }
 impl K2Kernels {
@@ -384,6 +394,7 @@ impl K2Kernels {
             project_grouped: module.load_function("k2_project_grouped")?,
             values: module.load_function("k2_values")?,
             combine: module.load_function("k2_combine")?,
+            combine_residual: module.load_function("k2_combine_residual")?,
             gate: module.load_function("k2_gate")?,
         })
     }
@@ -792,6 +803,56 @@ impl K2Kernels {
                 .launch_builder(&self.combine)
                 .arg(p)
                 .arg(weights)
+                .arg(out)
+                .arg(&rows)
+                .arg(&topk)
+                .launch(LaunchConfig {
+                    grid_dim: ((rows as u32).div_ceil(256), tokens as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+    /// `combine` into `ffn = routed + shared` and the block output
+    /// `out = x + ffn`, bit for bit as `combine` and two element-wise adds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn combine_residual(
+        &self,
+        stream: &Arc<CudaStream>,
+        p: &CudaSlice<f32>,
+        weights: &CudaSlice<f32>,
+        shared: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        ffn: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        rows: usize,
+        topk: usize,
+    ) -> Result<(), MoeError> {
+        if rows == 0 || topk == 0 {
+            return Err(MoeError::WrongElementCount {
+                which: "K2 combine geometry",
+                expected: 1,
+                found: 0,
+            });
+        }
+        let tokens = out.len() / rows;
+        check("K2 combine output", tokens * rows, out.len())?;
+        check("K2 combine FFN output", out.len(), ffn.len())?;
+        check("K2 combine shared input", out.len(), shared.len())?;
+        check("K2 combine residual", out.len(), x.len())?;
+        check("K2 combine partial", tokens * topk * rows, p.len())?;
+        check("K2 combine weights", tokens * topk, weights.len())?;
+        let (rows, topk) = (rows as i32, topk as i32);
+        // SAFETY: every buffer was checked against the output geometry.
+        unsafe {
+            stream
+                .launch_builder(&self.combine_residual)
+                .arg(p)
+                .arg(weights)
+                .arg(shared)
+                .arg(x)
+                .arg(ffn)
                 .arg(out)
                 .arg(&rows)
                 .arg(&topk)

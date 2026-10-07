@@ -923,6 +923,10 @@ fn main() -> std::process::ExitCode {
         args.slots_per_worker as usize * per_slot_context.div_ceil(retention_interval.max(1));
 
     let slots_per_worker = match args.cache_ram {
+        // A decision model scores a prompt and is done, and its requests never
+        // resume from a prefix (a restored prefix has no final hidden states
+        // for the head to read), so an arena would pin host RAM nothing reads.
+        _ if decisions => 0,
         Some(size::FULL_COVERAGE) => full_coverage_slots,
         Some(budget) => (budget / workers / bytes_per_slot.max(1)) as usize,
         // Default to full coverage, bounded by a share of what the host can
@@ -958,7 +962,12 @@ fn main() -> std::process::ExitCode {
         per_slot_context,
         100.0 * coverage_per_slot as f64 / per_slot_context.max(1) as f64,
     );
-    if slots_per_worker == 0 {
+    if decisions {
+        info!("                 none kept — a decision model scores each prompt whole");
+        if args.cache_ram.is_some() {
+            warn!("                 --cache-ram is ignored for a decision model");
+        }
+    } else if slots_per_worker == 0 {
         warn!("                 no snapshots retained — prefix sharing is off");
     } else if slots_per_worker < full_coverage_slots {
         let full_bytes = full_coverage_slots as u64 * bytes_per_slot * workers;
@@ -972,7 +981,7 @@ fn main() -> std::process::ExitCode {
             size::gib(full_bytes),
         );
     }
-    if slots_per_worker < args.slots_per_worker as usize {
+    if !decisions && slots_per_worker < args.slots_per_worker as usize {
         // The engine keeps one slot per concurrent sequence free before it
         // will publish anything, so below that line it publishes nothing at
         // all — and whichever sequence loses the race for the remaining slots

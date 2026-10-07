@@ -516,8 +516,15 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|error| error.to_string())?;
-    info!("serving OpenAI and Anthropic endpoints at http://{address}");
-    info!("                 /v1/completions  /v1/chat/completions  /v1/responses  /v1/messages");
+    if state.decisions {
+        info!("serving decisions at http://{address}");
+        info!("                 /v1/systemone  (a decision model: text generation is refused)");
+    } else {
+        info!("serving OpenAI and Anthropic endpoints at http://{address}");
+        info!(
+            "                 /v1/completions  /v1/chat/completions  /v1/responses  /v1/messages"
+        );
+    }
     if state.api_key.is_some() {
         info!("                 API key required (Authorization: Bearer, or x-api-key)");
     } else {

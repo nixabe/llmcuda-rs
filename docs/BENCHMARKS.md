@@ -152,8 +152,9 @@ measurement; the serving target here remains N=3 on one instance.
 ### K2-Horizon on one card
 
 Measured on GPU 0, Quadro RTX 8000 (sm_75), driver 595.91.07, using IFM's
-Q4_K_M and Q6_K files. Three serial alternating process pairs per cell; no
-concurrent builds, tests or work on another card. The publisher reference is
+Q4_K_M and Q6_K files, engine at `90b2a35`. Three serial alternating process
+pairs per cell in one sitting; no concurrent builds, tests or work on another
+card. The publisher reference is
 [MBZUAI-IFM/llama.cpp `42adf019`](https://github.com/MBZUAI-IFM/llama.cpp/tree/42adf019f76013dac873b5b43950d54d5ab27216),
 branch `model/K2Horizon`, built for CUDA sm_75. The reference column takes the
 faster mean of `-ub 2048` and `-ub 4096` per cell, with full GPU offload,
@@ -166,12 +167,12 @@ microbatch. Reported ± values are sample SDs of the three process means.
 Synthetic token streams exercise routing; these are inference timings, not
 quality scores.
 
-| quant | prompt tokens | engine tok/s | publisher tok/s | publisher ubatch |
-| --- | ---: | ---: | ---: | ---: |
-| Q4_K_M | 512 | 1437.67 ± 1.24 | 1778.92 ± 5.91 | 2048 |
-| Q4_K_M | 2,048 | 1620.34 ± 1.87 | 2553.14 ± 1.15 | 2048 |
-| Q6_K | 512 | 1132.10 ± 1.62 | 1622.00 ± 0.56 | 2048 |
-| Q6_K | 2,048 | 1282.10 ± 1.67 | 2399.10 ± 4.70 | 2048 |
+| quant | prompt tokens | engine tok/s | publisher tok/s | publisher ubatch | margin |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q4_K_M | 512 | 2663.20 ± 11.47 | 1783.62 ± 10.36 | 2048 | **+49.3%** |
+| Q4_K_M | 2,048 | 2953.03 ± 4.86 | 2565.55 ± 14.19 | 2048 | **+15.1%** |
+| Q6_K | 512 | 2137.19 ± 20.70 | 1627.75 ± 5.53 | 2048 | **+31.3%** |
+| Q6_K | 2,048 | 2439.53 ± 19.25 | 2405.35 ± 10.80 | 2048 | **+1.4%** |
 
 Decode uses greedy sampling with token readback, four warmup steps and 64 timed
 steps per process. The engine replays its CUDA graph. The reference harness
@@ -182,36 +183,38 @@ Throughput is aggregate across N sequences; a step produces one token per
 sequence. Mean latency ranges cover the three process means, and p95 ranges
 cover each process's 64 steps.
 
-| quant | starting context | N | engine tok/s | publisher tok/s | publisher ubatch |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Q4_K_M | 512 | 1 | 55.3 | 76.8 | 2048 |
-| Q4_K_M | 512 | 3 | 103.4 | 144.3 | 2048 |
-| Q4_K_M | 2,048 | 1 | 53.5 | 73.4 | 4096 |
-| Q4_K_M | 2,048 | 3 | 95.7 | 133.8 | 4096 |
-| Q6_K | 512 | 1 | 54.1 | 65.0 | 2048 |
-| Q6_K | 512 | 3 | 93.9 | 124.9 | 4096 |
-| Q6_K | 2,048 | 1 | 52.1 | 62.5 | 2048 |
-| Q6_K | 2,048 | 3 | 87.3 | 114.5 | 4096 |
+| quant | starting context | N | engine tok/s | publisher tok/s | publisher ubatch | margin |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Q4_K_M | 512 | 1 | 85.8 | 76.9 | 4096 | **+11.6%** |
+| Q4_K_M | 512 | 3 | 169.5 | 144.4 | 2048 | **+17.4%** |
+| Q4_K_M | 2,048 | 1 | 81.9 | 73.4 | 2048 | **+11.7%** |
+| Q4_K_M | 2,048 | 3 | 142.0 | 133.9 | 4096 | **+6.1%** |
+| Q6_K | 512 | 1 | 72.0 | 65.2 | 2048 | **+10.4%** |
+| Q6_K | 512 | 3 | 135.7 | 125.0 | 2048 | **+8.6%** |
+| Q6_K | 2,048 | 1 | 69.1 | 62.7 | 2048 | **+10.2%** |
+| Q6_K | 2,048 | 3 | 119.7 | 114.7 | 4096 | **+4.4%** |
 
 Latency in milliseconds:
 
 | quant | starting context | N | engine mean (range) | engine p95 range | publisher mean (range) | publisher p95 range |
 | --- | ---: | ---: | --- | --- | --- | --- |
-| Q4_K_M | 512 | 1 | 18.09 (18.06–18.13) | 18.09–18.23 | 13.02 (13.01–13.04) | 13.04–13.07 |
-| Q4_K_M | 512 | 3 | 29.02 (29.00–29.04) | 29.11–29.22 | 20.79 (20.78–20.82) | 21.07–21.10 |
-| Q4_K_M | 2,048 | 1 | 18.70 (18.69–18.72) | 18.76–18.80 | 13.63 (13.62–13.64) | 13.66–13.68 |
-| Q4_K_M | 2,048 | 3 | 31.36 (31.30–31.41) | 31.43–31.46 | 22.42 (22.39–22.43) | 22.69–22.78 |
-| Q6_K | 512 | 1 | 18.48 (18.46–18.50) | 18.70–18.80 | 15.38 (15.36–15.40) | 15.51–15.55 |
-| Q6_K | 512 | 3 | 31.96 (31.92–32.03) | 32.06–32.22 | 24.03 (24.00–24.06) | 24.39–24.47 |
-| Q6_K | 2,048 | 1 | 19.20 (19.19–19.22) | 19.38–19.48 | 15.99 (15.98–16.00) | 16.02–16.09 |
-| Q6_K | 2,048 | 3 | 34.35 (34.33–34.37) | 34.38–34.41 | 26.20 (26.19–26.20) | 26.41–26.46 |
+| Q4_K_M | 512 | 1 | 11.66 (11.62–11.68) | 11.65–12.06 | 13.01 (13.00–13.02) | 13.04–13.07 |
+| Q4_K_M | 512 | 3 | 17.69 (17.69–17.70) | 18.07–18.11 | 20.77 (20.73–20.83) | 20.98–21.10 |
+| Q4_K_M | 2,048 | 1 | 12.21 (12.18–12.23) | 12.23–12.48 | 13.63 (13.62–13.64) | 13.64–13.68 |
+| Q4_K_M | 2,048 | 3 | 21.13 (21.09–21.19) | 21.59–21.62 | 22.40 (22.37–22.43) | 22.71–22.75 |
+| Q6_K | 512 | 1 | 13.89 (13.87–13.92) | 13.90–13.97 | 15.35 (15.32–15.37) | 15.50–15.57 |
+| Q6_K | 512 | 3 | 22.10 (22.06–22.13) | 22.43–22.56 | 23.99 (23.97–24.02) | 24.40–24.46 |
+| Q6_K | 2,048 | 1 | 14.48 (14.45–14.50) | 14.49–14.54 | 15.96 (15.95–15.96) | 15.98–16.12 |
+| Q6_K | 2,048 | 3 | 25.06 (25.02–25.08) | 25.33–25.48 | 26.16 (26.15–26.17) | 26.35–26.41 |
 
-The publisher is faster in every measured K2 cell. K2 contractions here use
-sixteen-bit activation codes and fp32 scaled accumulation; these measurements
-do not establish parity with the publisher's native CUDA implementation.
-Engine N=3 decode peaks at **26.77 GiB for Q4_K_M** and
-**34.90 GiB for Q6_K** at 2K, including resident prefill and
-decode workspaces.
+The engine is faster in every measured K2 cell. The thinnest margin, Q6_K
+prefill at 2,048 tokens, won its three pairs by +2.1%, +1.5% and +0.7%: treat
+it as parity to keep, not headroom. K2 contractions here use sixteen-bit
+activation codes and fp32 scaled accumulation, where the publisher's
+quantized matrix multiplications use eight-bit `q8_1` activations; these are
+timings, not quality comparisons. Engine N=3 decode peaks at
+**26.90 GiB for Q4_K_M** and **34.90 GiB for Q6_K** at 2K, including resident
+prefill and decode workspaces.
 
 The measurements cover N=1 prefill and N=1/3 decode on one card at 512 and
 2,048-token contexts. HTTP time to first token, mixed prefill/decode contention,

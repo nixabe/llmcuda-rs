@@ -632,6 +632,74 @@ divergence comes from the *prefill* pass, which is the only one that quantizes
 activations; it is one constant (`DENSE_REPACK_INT8`) away, at a quarter of
 the prefill.
 
+## Clef-Flash (`clef`)
+
+Clef-Flash is a decision model: a 9.1B `qwen35` trunk read by a head that
+scores the options of each question in a prompt, served on `/v1/systemone`.
+A request is one prefill and no decode, so **nothing in this section is
+comparable to the tables above**. Its baselines are the other two ways to
+serve it: llama.cpp's `llama-server` (the same build as the 27B's, on its own
+`/v1/systemone`) and Cloudflare's PyTorch reference
+(`joint_schema_model.py`, with `fla` and `causal-conv1d` installed).
+
+**Every cell is clear of both.** Same card (GPU 1), the same requests, prompt
+tokens per second over the whole set (median latency in brackets);
+`Clef-Flash-Q8_0.gguf` for both servers, the HF safetensors for PyTorch:
+
+| set | conc. | llmcuda-rs | llama-server | PyTorch fp16 | vs llama-server | vs PyTorch |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| short, 16 × 658–1,094 tokens | 1 | **2,552** (342 ms) | 1,884 (377 ms) | 1,809 (482 ms) | **+35%** | **+41%** |
+| short | 4 | **2,550** | 2,345 | 1,638 | **+8.7%** | **+56%** |
+| long, 8 × 3,012–3,512 tokens | 1 | **2,451** (1,376 ms) | 1,481 (1,409 ms) | 1,730 (1,977 ms) | **+65%** | **+42%** |
+| long | 4 | **2,446** | 2,406 | 1,791 | **+1.7%** | **+37%** |
+
+The short rows and both PyTorch columns are the median of three rounds with
+the engine order rotated; the two long rows for the servers are the median of
+three alternating pairs, each pair won. PyTorch's "conc. 4" is its batch of
+four, its own form of concurrency; at batch 1 it is the c1 column.
+
+Read the long rows by their latency and the c4 row, not by the c1 rate:
+
+- **llama-server's long c1 rate carries a warm-up.** Each prompt longer than
+  any it has served re-reserves its compute graph: on the long set the four
+  prompts that set a new length (one of them a warm-up request) took
+  3.0–3.8 s against 1.2–1.5 s for every other. A long-running server pays
+  that a few times and never again. Its median latency and its c4 rate,
+  measured after those prompts, are its steady state, and against that the
+  margin is **2.3% on latency and 1.7% on throughput** — parity to keep, not
+  headroom.
+- **llama-server serializes decisions** (a joint head reads the whole batch),
+  so it runs one slot, the whole context, the prompt in one ubatch:
+  `-ngl 99 -fa on -c 20480 -b 16384 -ub 4096 -np 1`. Its c4 rate exceeds its
+  c1 rate only by the requests queued behind the first.
+- **PyTorch's best setting on Turing is fp16.** The checkpoint is bf16, which
+  has no tensor-core path on this card: 446–460 tokens/s at batch 1 in an
+  earlier round on the same card, a quarter of fp16's.
+
+Accuracy is not traded for it. Against the PyTorch reference on the same
+requests, both servers pick the reference's option on all 99 questions, and
+our probabilities sit closer to the reference than llama-server's on every
+summary below (the servers round to four decimals, so differences under 5e-5
+are rounding; the long rows are the configuration in the table above):
+
+| set | vs | engine | median \|Δp\| | p99 | max |
+| :--- | :--- | :--- | ---: | ---: | ---: |
+| short | PyTorch fp16 | llmcuda-rs | 4.6e-4 | 1.2e-2 | 1.6e-2 |
+| short | PyTorch fp16 | llama-server | 8.1e-4 | 2.8e-2 | 3.7e-2 |
+| short | PyTorch bf16 | llmcuda-rs | 6.6e-4 | 1.5e-2 | 1.6e-2 |
+| short | PyTorch bf16 | llama-server | 7.7e-4 | 2.7e-2 | 2.8e-2 |
+| long | PyTorch fp16 | llmcuda-rs | 5.8e-4 | 6.2e-3 | 1.1e-2 |
+| long | PyTorch fp16 | llama-server | 1.4e-3 | 1.0e-2 | 2.2e-2 |
+| long | PyTorch bf16 | llmcuda-rs | 8.9e-4 | 6.1e-3 | 8.8e-3 |
+| long | PyTorch bf16 | llama-server | 1.4e-3 | 1.4e-2 | 2.5e-2 |
+
+Where a request's time goes, on the same card: the trunk alone, a cold pass
+in `bench_forward`, is 323 ms at 877 tokens and 1,321 ms at 3,350; the
+served medians are 342 and 1,376 ms. The rest — the decision head (11 ms at
+2,048 positions, measured in its own commit), the template, tokenization and
+HTTP — is 4–6% of a request. So the prefill is the request, and why it is a
+single pass is in WHY ("A decision prompt is one pass, at the width it is").
+
 ## Serving concurrent sessions
 
 The numbers above are single-sequence kernel throughput against llama.cpp.
@@ -1705,6 +1773,42 @@ carried KV and recurrent state is **not** a win at equal total ubatch — three
 any single sequence could: 6,138 rows for 2K, the whole 24,576-row prompt for
 8K, 12,288 for 32K and above. That is the shape llama.cpp's own tuning points
 at when it prefers `-ub 4096` over `-ub 2048`.
+
+## A decision prompt is one pass, at the width it is
+
+A pass's buffers and launch plans are fixed when it is built, so the engine
+prefills through prebuilt widths: the prefill chunk, the 2,048-token retention
+width, and the powers of two from 4 to 256. A generated prompt runs as the
+largest of them that fit, and has to — its pieces end where the prefix cache
+restores from. A decision prompt (`clef`) is scored once and never resumed,
+and decomposed the same way it was ruinous: an 877-token prompt was eight
+passes, 256 ×3 + 64 + 32 + 8 + 4 + 1, each reading every weight, the four
+below the tensor-core tile through the small-batch GEMVs. Served like that
+the short Clef set ran at 1,742 tokens/s against llama-server's 1,857 in the
+same round, which prefills the whole prompt as one ubatch.
+
+`Forward::run_prefix` runs a piece as the prefix of the narrowest prebuilt
+pass that holds it. Every launch is sized to the piece, and every block is
+handed exact-length views of buffers built for more rows, so each length check
+inside it still holds and nothing is padded. At and above the tensor-core tile
+the result is the pass of the piece's own width **to the bit**
+(`tests/prefix_pass.rs`, on Clef and on the 27B): not a new rounding of the
+model, only fewer passes. Below the tile it is not — a pass built that narrow
+takes the GEMVs where a wide one takes the tensor cores — so the runtime still
+decomposes those pieces.
+
+Two scheduler defaults follow from the same fact, and both were worth
+measuring separately (Clef's long set, three alternating pairs each, every
+pair the same sign):
+
+- **The per-session slice is the prefill chunk.** It stops at the retention
+  interval elsewhere because a pass may not straddle a snapshot, and a
+  decision model keeps none. A 2,048 slice ran a 3,350-token prompt as two
+  passes: 2,361 → 2,451 tokens/s at concurrency 1.
+- **The step budget holds every slot's whole prompt.** It protects a decode
+  step's latency elsewhere, and a decision model has no decodes. A 4,096
+  budget split each concurrent prompt by whatever the one before it left:
+  2,362 → 2,445 tokens/s at concurrency 4.
 
 ## Precision is a design constraint, not a tuning knob
 

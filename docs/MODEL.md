@@ -616,3 +616,59 @@ per token**. That is the entire point of an A3B mixture, seen from the other
 side, and it means no decode expectation may be carried across: a roofline
 built for 2.86 GB/token does not describe a model that reads roughly ten times
 that.
+
+# Clef-Flash (`clef`)
+
+Cloudflare's decision model: a `qwen35` trunk (Qwen3.5-9B) with its LM head
+replaced, for serving purposes, by a joint schema decision head. It generates
+no text. A request is a `state` and a schema of typed questions (`noul`,
+`choice`, `score`); the answer is a softmax over each question's allowed
+options, from one forward pass over one prompt.
+
+## Structure
+
+| Property | Value |
+| --- | --- |
+| Trunk | `qwen35`, 9.1 B: 32 layers, 8 ( 3 × GDN + 1 × attention ), no MTP |
+| Hidden / FFN | 4096 / 12,288, one dense SwiGLU MLP per layer |
+| GDN heads | 32 V, 16 QK — head dim 128 (`ssm.inner_size` 4096) |
+| Attention heads | 16 Q, 4 KV — head dim 256 |
+| Vocabulary | 248,320, the Qwen tokenizer; the untied `output.weight` is kept |
+| Head | width 1024, 16 heads, FFN 4096; 2 evidence-routing blocks + 4 joint blocks |
+| Head epsilon | LayerNorm 1e-5 (`clef.attention.layer_norm_epsilon`), the trunk's RMSNorm 1e-6 |
+
+`ModelConfig::from_gguf` reads the trunk exactly as it reads `qwen35`, under
+the `clef.` key prefix, and `DecisionConfig` from `clef.decision.*`. The
+head's widths are tensor shapes, checked when it loads.
+
+## What the head reads, and what that rules out
+
+The head reads the trunk's final RMS-normed hidden state at **every** prompt
+position — not the last one — and the output's index is a set of token spans
+in the prompt: each question's instruction span and each option's description
+span. Four serving consequences follow, and each is enforced rather than
+documented:
+
+- **No prefix reuse.** A restored prefix carries recurrent state and KV for
+  the skipped positions but not their final hidden states, so a decision
+  request is placed without a prefix match and publishes no snapshots, and
+  the server keeps no snapshot arena for a decision model at all.
+- **The prompt is built piece by piece.** Cloudflare's `encode_record`
+  tokenizes each fixed piece separately, without special-token insertion;
+  tokenizing the whole prompt at once merges tokens across piece boundaries
+  and moves the spans. `/v1/systemone` builds it the same way.
+- **No LM head.** The trunk's last-token logits are skipped (llama.cpp's
+  `clef` graph computes none). The head's lexical prior still gathers
+  `output.weight` rows by token id, from the stored bytes.
+- **One pass, not prebuilt widths.** Nothing resumes a decision prompt, so it
+  need not end its pieces where a snapshot could be restored from: each piece
+  runs whole as the prefix of a wider prebuilt pass (`Forward::run_prefix`),
+  and the server's defaults give one session the whole prefill chunk per step
+  and the step every slot's whole prompt. See "A decision prompt is one pass"
+  in [BENCHMARKS.md](BENCHMARKS.md)'s WHY.
+
+The head runs on the device in fp32 (`block::decision::DecisionHead`, weights
+dequantized at load): 464 MiB of weights, and a workspace sized by
+`--decision-max-tokens` (493 MiB at the default 16,384 positions). Its
+differential test against the scalar oracle in
+`llmcuda_kernels::decision` is `tests/decision_differential.rs`.

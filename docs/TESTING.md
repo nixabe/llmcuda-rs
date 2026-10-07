@@ -207,6 +207,7 @@ What is new is gated by two files:
 | --- | --- | --- |
 | `llmcuda-model/tests/real_dense_model_weights.rs` | `WeightSchema` resolves against all 866 tensors of the real file with none left unclaimed; every derived hyperparameter (the GDN head split above all) agrees with the file's own metadata; the file carries no routed tensor; and the *routed* schema refuses it by architecture rather than by a wall of shapes | the file |
 | `llmcuda-engine/tests/dense_ffn_differential.rs` | The whole dense block against `expert_mlp` + `rms_norm` on real Q8_0 weights, at all three of its kernel paths | the file, a device |
+| `llmcuda-engine/tests/prefix_pass.rs` | A prompt piece run as the prefix of a wider pass is the pass of its own width **to the bit** — final hidden states and last-row logits — cold and continued through a carried state, at and above the tensor-core tile; below it, the documented cross-kernel difference only | a dense file, a device |
 
 The differential is the interesting one, because the dense block runs on the
 MoE crate's shared-expert kernels and so what is genuinely new is the *block*:
@@ -251,6 +252,36 @@ llama.cpp character for character, and it is one constant
 (`DENSE_REPACK_INT8`) away. What it buys is in [BENCHMARKS.md](BENCHMARKS.md).
 The two continuations at the divergence are both correct English about
 B-trees, i.e. a near-tie flipped, not a trajectory drifting.
+
+## The decision model (`clef`)
+
+Clef-Flash is a `qwen35` trunk under a decision head, so the trunk is gated by
+everything above. The head, and the path that feeds it, are gated by these:
+
+| Test | What it asserts | Needs |
+| --- | --- | --- |
+| `llmcuda-model/tests/gguf_config.rs` (`clef_*`) | The `clef` architecture reads as a dense trunk plus its decision-head geometry; a file missing any of the head's five keys, or naming a decision type other than the one the head implements, is refused | nothing |
+| `llmcuda-kernels` `decision` unit tests | The reference's GELU is the exact erf form, not the tanh approximation, and its `erf` matches known values | nothing |
+| `llmcuda-engine/tests/decision_differential.rs` | The device head against the f64 scalar oracle (`llmcuda_kernels::decision::joint_schema_head`): a synthetic head written into an in-memory GGUF in mixed storage formats, scored on several prompt shapes and through every LM-head format the lexical gather reads, gated at 8x the worst observed error; requests outside the limits refused before anything is launched; and, behind `LLMCUDA_CLEF_MODEL`, the real head on random normed hidden states | a device; the file for the real-head case, which SKIPS without the variable |
+| `llmcuda-engine/tests/prefix_pass.rs` | The row above in the dense section. Its default model is Clef, because a decision prompt is the only thing the runtime runs as a prefix of a wider pass | a dense file, a device |
+
+### End to end, against the reference and llama.cpp
+
+There is no captured golden for Clef. The end-to-end check is the served
+answers against Cloudflare's PyTorch reference (`joint_schema_model.py`) on
+the same requests, with llama-server beside it as the other GGUF
+implementation. Over the 24 requests of the benchmark sets (99 questions):
+
+- the prompt token count matches the reference tokenizer's on every request
+  (the prompt is the GGUF's `systemone` template, tokenized piece by piece,
+  as llama.cpp's server builds it);
+- both servers pick the reference's option on every question;
+- our option probabilities are nearer the reference's than llama-server's on
+  median, p99 and max |Δp|, against both its fp16 and its bf16 runs.
+
+The figures are in [BENCHMARKS.md](BENCHMARKS.md#clef-flash-clef). The
+servers report probabilities to four decimals, so differences under 5e-5
+are rounding, not a measurement.
 
 ## Serving acceptance status
 

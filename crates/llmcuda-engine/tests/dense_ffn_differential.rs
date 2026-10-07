@@ -24,12 +24,14 @@
 //! | Residency | Width | Kernel | Gate |
 //! |---|---|---|---|
 //! | Q8_0 as stored | any | fp32 `moe_shared_ffn` | [`DENSE_FP32_GATE`] |
-//! | split int8 repack | > 4 | `shared_expert_mma` | [`DENSE_MMA_GATE`] |
-//! | split int8 repack | <= 4 | `dense_proj_split_t*` | [`DENSE_MMA_GATE`] |
+//! | split int8 repack | > 16 | fp16 `HgemmKernels` (default) | [`DENSE_HALF_GATE`] |
+//! | split int8 repack | > 16 | `shared_expert_mma` (`LLMCUDA_HALF_GEMM=0`) | [`DENSE_MMA_GATE`] |
+//! | split int8 repack | <= 16 | `dense_proj_split_t*` | [`DENSE_MMA_GATE`] |
 //!
-//! The serving path takes the second and third — see `DENSE_REPACK_INT8` —
-//! so the first is the fallback for a device with no integer tensor cores,
-//! and all three are gated because any of them can be the one that runs.
+//! The serving path takes the second and fourth — see `DENSE_REPACK_INT8` —
+//! so the first is the fallback for a device with no integer tensor cores
+//! and the third the A/B arm, and all four are gated because any of them can
+//! be the one that runs.
 //!
 //! Only one layer's FFN is loaded (about 271 MiB of the model's 29.3 GiB);
 //! the full model is never resident.
@@ -113,6 +115,23 @@ const DENSE_FP32_GATE: Tolerance = Tolerance {
     max_abs_error: 7e-4,
     max_rel_error: f32::INFINITY,
     min_cosine_similarity: 1.0 - 1e-6,
+    allow_non_finite: false,
+};
+
+/// Gate for the fp16 tensor-core path, the default at prefill widths.
+///
+/// Two roundings, each `2^-11` relative: every Q8_0 weight to the fp16
+/// nearest `q * d`, and the activations — `normed` and the SwiGLU output — to
+/// fp16, against the int8 path's code of up to `1/254` of a block's absmax.
+/// Then fp32 accumulation in the tensor core's order.
+///
+/// Measured at the same inputs, `max_tokens = 128`: `max_abs = 4.62e-3`,
+/// `cosine = 1.000000` to six places, on the same 82.3 scale — 14x under the
+/// int8 path's error. The bound is ~2x the absolute figure.
+const DENSE_HALF_GATE: Tolerance = Tolerance {
+    max_abs_error: 1e-2,
+    max_rel_error: f32::INFINITY,
+    min_cosine_similarity: 1.0 - 2e-6,
     allow_non_finite: false,
 };
 
@@ -266,10 +285,11 @@ fn the_dense_block_matches_the_cpu_reference_on_both_gemm_paths() {
     let scale = ref_l_out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     println!("reference l_out max magnitude {scale:.4}");
 
-    for (label, max_tokens, wants_int8, tolerance) in [
-        ("fp32", FP32_MAX_TOKENS, false, DENSE_FP32_GATE),
-        ("int8-mma", MMA_MAX_TOKENS, true, DENSE_MMA_GATE),
-        ("int8-gemv", GEMV_MAX_TOKENS, true, DENSE_MMA_GATE),
+    for (label, max_tokens, wants_int8, half, tolerance) in [
+        ("fp32", FP32_MAX_TOKENS, false, false, DENSE_FP32_GATE),
+        ("fp16-hgemm", MMA_MAX_TOKENS, true, true, DENSE_HALF_GATE),
+        ("int8-mma", MMA_MAX_TOKENS, true, false, DENSE_MMA_GATE),
+        ("int8-gemv", GEMV_MAX_TOKENS, true, false, DENSE_MMA_GATE),
     ] {
         // The narrow arm runs fewer tokens than the others, because that is
         // the point of it. Its reference is the same rows' prefix.
@@ -289,7 +309,8 @@ fn the_dense_block_matches_the_cpu_reference_on_both_gemm_paths() {
             "{label}: the repack replaces the Q8_0 upload rather than joining it",
         );
         let mut block =
-            DenseFfnBlock::new(&ctx, &stream, geometry, eps, wants_int8).expect("block compiles");
+            DenseFfnBlock::with_prefill_path(&ctx, &stream, geometry, eps, wants_int8, half)
+                .expect("block compiles");
         if wants_int8 && !block.tensor_cores_enabled() {
             println!("SKIPPED int8 path: integer tensor cores unavailable on this device");
             continue;

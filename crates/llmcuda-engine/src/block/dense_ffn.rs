@@ -969,12 +969,29 @@ impl DenseFfnBlock {
     /// `mma` must match the `repack_int8` the weights were uploaded with: it
     /// is what decides whether the four integer staging arrays — 613 MiB at
     /// this model's width and a 2,048-token prefill — are allocated at all.
+    /// A tensor-core-width block takes the fp16 GEMM unless
+    /// `LLMCUDA_HALF_GEMM=0` (see [`crate::block::half::enabled_for`]).
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         geometry: MoeGeometry,
         eps: f32,
         mma: bool,
+    ) -> Result<Self, MoeBlockError> {
+        Self::with_prefill_path(ctx, stream, geometry, eps, mma, dense_half_gemm())
+    }
+
+    /// [`Self::new`] with the tensor-core-width path chosen by the caller:
+    /// `half` takes the fp16 GEMM, otherwise the int8 one. Ignored below that
+    /// width, and without `mma`. For a test that must gate both paths in one
+    /// process rather than one per environment.
+    pub fn with_prefill_path(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        geometry: MoeGeometry,
+        eps: f32,
+        mma: bool,
+        half: bool,
     ) -> Result<Self, MoeBlockError> {
         let moe = MoeKernels::new(ctx, geometry)?;
         let layer_ops = LayerOpsKernels::new(ctx)?;
@@ -984,7 +1001,7 @@ impl DenseFfnBlock {
         // GEMV's scratch is small enough to be unconditional; the tensor-core
         // staging arrays are not.
         let narrow = mma && geometry.max_tokens <= SPLIT_GEMV_MAX_TOKENS;
-        let half = mma && !narrow && dense_half_gemm();
+        let half = mma && !narrow && half;
         let buffers = moe.shared_only_buffers(stream, mma && !narrow && !half)?;
         let half = if half {
             let n = geometry.max_tokens * geometry.intermediate;

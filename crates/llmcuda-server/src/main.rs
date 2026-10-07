@@ -38,6 +38,8 @@ use tracing::{error, info, warn};
 /// f16 KV cache, matching the baseline's `-ctk f16 -ctv f16`.
 const KV_ELEM_BYTES_F16: u64 = 2;
 const DEFAULT_MODEL_PATH: &str = "models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+/// `--token-budget` when it is not given, for every model but a decision one.
+const DEFAULT_TOKEN_BUDGET: u32 = 4096;
 
 /// Which speculative decoder to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -132,9 +134,11 @@ struct Args {
     #[arg(long, env = "LLMCUDA_PORT", default_value_t = 8000)]
     port: u16,
 
-    /// Per-step token budget (also -tb); must exceed block_size + max_concurrent_decodes
-    #[arg(long, default_value_t = 4096)]
-    token_budget: u32,
+    /// Per-step token budget (also -tb); must exceed block_size +
+    /// max_concurrent_decodes. Defaults to 4096, or for a decision model to
+    /// slots-per-worker x prefill chunk
+    #[arg(long)]
+    token_budget: Option<u32>,
 
     /// Concurrent slots per worker, matching the llama.cpp baseline's -np 3
     #[arg(short, long, default_value_t = 3)]
@@ -151,7 +155,8 @@ struct Args {
     /// Most prefill tokens one session may be granted per step, so several
     /// sessions share a step instead of queueing behind the first; 0 gives
     /// the whole step to one session. Defaults to the snapshot retention
-    /// interval, which is the widest pass the engine can issue.
+    /// interval, which is the widest pass the engine can issue — or for a
+    /// decision model, which keeps no snapshots, to the prefill chunk.
     #[arg(long)]
     prefill_slice: Option<u32>,
 
@@ -721,8 +726,21 @@ fn main() -> std::process::ExitCode {
     info!("                 (capacity is reported per group and never summed)");
 
     // 3. Scheduler. Construction rejects the budget-versus-block trap.
+    //
+    // A decision model serves no decodes, so its step has no decode latency
+    // to protect: the budget holds every slot's whole prompt, and no
+    // concurrent prompt is split by what another left of the step. Measured
+    // on Clef-Flash, ~3,350-token prompts at concurrency 4: 2,445 tok/s
+    // against 2,362 at the 4,096 default.
+    let token_budget = args.token_budget.unwrap_or(if decisions {
+        u32::try_from(args.prefill_chunk)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(args.slots_per_worker.max(1))
+    } else {
+        DEFAULT_TOKEN_BUDGET
+    });
     let sched = match SchedulerConfig::new(
-        args.token_budget,
+        token_budget,
         cache.attention_block_size(),
         args.slots_per_worker,
         args.watermark,
@@ -739,10 +757,18 @@ fn main() -> std::process::ExitCode {
     // may not straddle a snapshot boundary — so the cap costs no throughput,
     // and it is what stops one long prompt from owning every step while the
     // other slots sit admitted and idle.
-    let sched = sched.with_prefill_slice(
-        args.prefill_slice
-            .unwrap_or_else(|| cache.gdn_retention_interval()),
-    );
+    //
+    // A decision model keeps no snapshots, so it has no boundary: its widest
+    // pass is the prefill chunk, and a slice below that splits one prompt
+    // into two passes for nothing. Measured on Clef-Flash, ~3,350-token
+    // prompts one at a time: 2,451 tok/s against 2,361 at a 2,048 slice.
+    let sched = sched.with_prefill_slice(args.prefill_slice.unwrap_or_else(|| {
+        if decisions {
+            u32::try_from(args.prefill_chunk).unwrap_or(u32::MAX)
+        } else {
+            cache.gdn_retention_interval()
+        }
+    }));
     info!(
         "\nscheduler        token budget {} > block {} + decodes {} — accepted",
         sched.token_budget(),

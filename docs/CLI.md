@@ -39,7 +39,7 @@ the value nor the variable's contents appear in `--help` or in any log line.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `-m, --model <PATH>` | `LLMCUDA_MODEL` | `models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf`, relative to the working directory | GGUF model file to load. The architecture comes from the file's own `general.architecture`: `qwen35moe` (Qwen3.6-35B-A3B) and `qwen35` (Qwen3.8-27B) are implemented, and anything else is refused at preflight by name rather than guessed at. Other quantizations of either are fine. |
+| `-m, --model <PATH>` | `LLMCUDA_MODEL` | `models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf`, relative to the working directory | GGUF model file to load. The architecture comes from the file's own `general.architecture`: `qwen35moe` (Qwen3.6-35B-A3B), `qwen35` (Qwen3.8-27B) and `clef` (Clef-Flash, a decision model served on `/v1/systemone` only) are implemented, and anything else is refused at preflight by name rather than guessed at. Other quantizations of either are fine. |
 | `--mmproj <PATH>` | `LLMCUDA_MMPROJ` | none | Multimodal projector GGUF (the `mmproj-*.gguf` shipped beside the model). Loads the vision tower on every worker and enables image input; without it the server is text-only and image parts get a 400. See [API.md](API.md#image-input). |
 | `--image-max-tokens <N>` | — | `1024` | Most prompt tokens one image may occupy; larger images are resized down to fit. Bounded by the model's own `[8, 4096]` budget. Note this is a *ceiling*; the llama.cpp baseline's `--image-min-tokens 1024` is a floor, so at defaults the two spend image tokens differently. |
 | `--host <HOST>` | `LLMCUDA_HOST` | `127.0.0.1` | Host the HTTP server binds. |
@@ -55,10 +55,12 @@ opt-in Responses loop.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `-tb, --token-budget <N>` | — | `4096` | Per-step token budget for the scheduler. Must exceed `block_size + max_concurrent_decodes`; see below. |
+| `-tb, --token-budget <N>` | — | `4096`; a decision model: slots × prefill chunk | Per-step token budget for the scheduler. Must exceed `block_size + max_concurrent_decodes`; see below. A decision model serves no decodes, so its default holds every slot's whole prompt in one step. |
 | `-s, --slots-per-worker <N>` | — | `3` | Concurrent request slots per worker. The default matches the llama.cpp baseline's `-np 3` (see [DEVELOPMENT.md](DEVELOPMENT.md)). |
 | `-c, --total-context <N>` | — | `393216` | Total context tokens across all slots, used to size the KV pool and the VRAM budget. The default matches the baseline's `-c 393216`. |
 | `-pc, --prefill-chunk <N>` | — | `4096` | Tokens per chunked-prefill step. |
+| `--prefill-slice <N>` | — | the GDN retention interval (2048); a decision model: the prefill chunk | Most prefill tokens one session is granted per step, so several sessions share a step; `0` gives the whole step to one session. A decision model keeps no snapshots, so nothing stops its pass at the retention interval. |
+| `--decision-max-tokens <N>` | — | `16384` | Decision models only: the longest `/v1/systemone` prompt. A longer one is truncated to fit, as the model's reference encoder does; the decision head's workspace is sized for this many positions. |
 | `--cache-ram <SIZE\|full>` | `LLMCUDA_CACHE_RAM` | full coverage, capped at a quarter of host `MemAvailable` | Host RAM the prefix cache may pin for retained snapshots, across all workers. See below. |
 | `--spec-type <TYPE>` | — | `none` | Speculative decoder: `none`, `ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, or `spec-dflash`. See below. |
 | `--spec-ngram-n-max <N>` | — | `3` | `ngram`: most tokens proposed from one suffix match. |

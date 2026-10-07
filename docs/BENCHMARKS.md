@@ -899,7 +899,9 @@ including masked short chunks. A block covers two 16-query tiles of one KV
 head's four query heads and stages 32 keys per barrier pair, so each staged
 K/V element serves 32 queries; every warp still walks its keys in 8-key
 steps with the single-tile kernel's operations and stops at its own tile's
-visible keys, which a bitwise differential test checks. Staging one key
+visible keys, which a bitwise differential test checks. Blocks start
+longest causal run first, the last query block of every KV head before the
+next-to-last, so the deepest blocks do not fall into the final wave. Staging one key
 octet per barrier pair for 16 queries had cost about 6% of cold Q4 prefill at
 2,048 tokens. Single-token attention avoids split reduction
 at tiny contexts. At 512 visible keys and above, the 128-dimensional decode

@@ -1156,8 +1156,12 @@ __global__ void __launch_bounds__(256,1) attn_flash_causal_mma_k2s(const float* 
     unsigned* k_sh=(unsigned*)smem_f;
     unsigned* v_sh=k_sh+K2S_SK*K2S_KSTRIDE;
     int tid=threadIdx.x,lane=tid&31,warp=tid>>5,g=lane>>2,tg=lane&3;
-    int kvh=blockIdx.y,h=kvh*4+(warp&3);
-    long long qb=(long long)blockIdx.x*(2*K2S_QT),qi0=qb+(warp>>2)*K2S_QT;
+    // Blocks are handed out longest causal run first: the last query block of
+    // every KV head, then the next-to-last, so the deep blocks do not land in
+    // the final wave. The grid keeps its (query block, KV head) shape.
+    int id=blockIdx.x+gridDim.x*blockIdx.y;
+    int kvh=id%gridDim.y,h=kvh*4+(warp&3);
+    long long qb=(long long)(gridDim.x-1-id/gridDim.y)*(2*K2S_QT),qi0=qb+(warp>>2)*K2S_QT;
     long long off=*key_offset;
     unsigned qa0[16],qa1[16],qal0[16],qal1[16];
     {

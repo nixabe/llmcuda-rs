@@ -879,6 +879,10 @@ fixed token arena is refreshed from device positions on every graph replay;
 it does not retain a table for the model's entire context. CPU and direct-GPU
 checks cover rotary coefficients, tails, independent positions and cache writes.
 
+The F32 router projection gives each warp four rows of the eight-token
+prefill tile, so one load of a token's activations feeds four rows; every
+`(row, token)` keeps its lane-slice accumulation and shuffle-down tree.
+
 Expert dispatch counts contiguous slices in parallel, prefixes counts on the
 device, and gathers flat `(token, slot)` indices in their original order. Runs
 are padded to 64; unused owners are `-1`. Both buffers and grids are fixed at

@@ -127,6 +127,46 @@ __device__ void project_dense_tile(const unsigned char* w, int quant, const floa
         if (threadIdx.x==0 && t0+b<tokens) out[(long long)(t0+b)*rows+row]=acc[b];
     }
 }
+// Four rows per warp share each token's activation loads. Every (row, token)
+// still accumulates its lane slice in project_dense_tile's order and reduces
+// through the same shuffle-down tree.
+template<int BT,int RPW>
+__device__ void project_dense_rows(const unsigned char* w, int quant, const float* x,
+                                   float* out, int inner, int rows, int tokens) {
+    int row0 = (blockIdx.x*blockDim.y + threadIdx.y)*RPW, t0 = blockIdx.y*BT;
+    if (row0 >= rows) return;
+    float acc[RPW][BT];
+    #pragma unroll
+    for (int r=0; r<RPW; ++r)
+        #pragma unroll
+        for (int b=0; b<BT; ++b) acc[r][b]=0.0f;
+    for (int j=0; j<inner; j+=128) {
+        float v[RPW][4];
+        #pragma unroll
+        for (int r=0; r<RPW; ++r) {
+            long long start = (long long)min(row0+r, rows-1)*inner;
+            if (quant == 5) { for (int z=0; z<4; ++z) v[r][z]=((const float*)w)[start+j+threadIdx.x*4+z]; }
+            else dequant_tile_community(w, quant, start+j, threadIdx.x, v[r]);
+        }
+        #pragma unroll
+        for (int b=0; b<BT; ++b) {
+            if (t0+b >= tokens) continue;
+            float4 xv=*(const float4*)(x+(long long)(t0+b)*inner+j+threadIdx.x*4);
+            #pragma unroll
+            for (int r=0; r<RPW; ++r) {
+                acc[r][b]=fmaf(v[r][0],xv.x,acc[r][b]); acc[r][b]=fmaf(v[r][1],xv.y,acc[r][b]);
+                acc[r][b]=fmaf(v[r][2],xv.z,acc[r][b]); acc[r][b]=fmaf(v[r][3],xv.w,acc[r][b]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int r=0; r<RPW; ++r)
+        #pragma unroll
+        for (int b=0; b<BT; ++b) {
+            for (int d=16; d>0; d>>=1) acc[r][b]+=__shfl_down_sync(0xffffffff,acc[r][b],d);
+            if (threadIdx.x==0 && t0+b<tokens && row0+r<rows) out[(long long)(t0+b)*rows+row0+r]=acc[r][b];
+        }
+}
 extern "C" {
 __global__ void k2_project_b4(const unsigned char* w, int quant, const float* x,
                              float* out, int inner, int rows, int tokens) {
@@ -134,7 +174,7 @@ __global__ void k2_project_b4(const unsigned char* w, int quant, const float* x,
 }
 __global__ void k2_project_b8(const unsigned char* w, int quant, const float* x,
                              float* out, int inner, int rows, int tokens) {
-    project_dense_tile<8>(w,quant,x,out,inner,rows,tokens);
+    project_dense_rows<8,4>(w,quant,x,out,inner,rows,tokens);
 }
 // One thread per expert gathers flat (token, slot) ids in their original
 // order. Prefix offsets pack padded runs; unused runs carry expert=-1.
@@ -529,8 +569,15 @@ impl K2Kernels {
         check("K2 projection weights", bytes, w.len())?;
         let code = quant.map(quant_code).unwrap_or(5);
         if tile != 1 {
+            // Four row warps per block; the eight-token tile gives each warp
+            // four rows.
+            let per_block = if tile == 8 { 16 } else { 4 };
             let cfg = LaunchConfig {
-                grid_dim: ((rows as u32).div_ceil(4), tokens.div_ceil(tile) as u32, 1),
+                grid_dim: (
+                    (rows as u32).div_ceil(per_block),
+                    tokens.div_ceil(tile) as u32,
+                    1,
+                ),
                 block_dim: (32, 4, 1),
                 shared_mem_bytes: 0,
             };

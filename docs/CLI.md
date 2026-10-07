@@ -263,7 +263,7 @@ this engine's `ngram` default of 3), and which way that cuts depends entirely
 on batch width.
 
 **These have been measured; see
-[BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-by-construction-priced-by-the-verify-step)
+[BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-arithmetic-before-acceptance)
 for the numbers and the method.** The short version, and the qualifier
 matters more than the numbers: at **N=1 with short prompts they are the best
 drafters this engine has**, because the verify pass costs about the same at
@@ -377,7 +377,7 @@ because the draft head's own pass scales with the block while the verify
 pass does not. At three slots of ~120K it is **−90.8% on decode and −21.8%
 on prefill**, the latter because its catch-up pass runs on every prefill
 chunk; it accepts every token it drafts there and loses anyway.
-See [BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-by-construction-priced-by-the-verify-step).
+See [BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-arithmetic-before-acceptance).
 
 ### `spec-dflash`
 
@@ -421,7 +421,7 @@ of memory even at a 2-token block.
 That is the opposite of how the n-gram types behave, where a wider window is
 nearly free, and it is the thing to know before reaching for
 `--spec-draft-n-max`. See
-[BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-by-construction-priced-by-the-verify-step)
+[BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-arithmetic-before-acceptance)
 for the method and the full table.
 
 ## Validation happens at preflight, not at first request

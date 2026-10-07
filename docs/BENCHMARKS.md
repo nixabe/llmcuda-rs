@@ -883,7 +883,13 @@ lowest expert id and retains the ordered normalization floor and bias rule.
 
 K2 prefill attention retains fp32 query and softmax-weight residuals around
 its half tensor-core operands. All prefill widths use the same compensated query tile,
-including masked short chunks. Single-token attention avoids split reduction
+including masked short chunks. A block covers two 16-query tiles of one KV
+head's four query heads and stages 32 keys per barrier pair, so each staged
+K/V element serves 32 queries; every warp still walks its keys in 8-key
+steps with the single-tile kernel's operations and stops at its own tile's
+visible keys, which a bitwise differential test checks. Staging one key
+octet per barrier pair for 16 queries had cost about 6% of cold Q4 prefill at
+2,048 tokens. Single-token attention avoids split reduction
 at tiny contexts. At 512 visible keys and above, the 128-dimensional decode
 path uses compensated tensor-core attention with two warps and 32 fixed
 splits. The shorter-window scalar kernel specializes K2's four query heads

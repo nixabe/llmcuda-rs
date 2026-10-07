@@ -212,6 +212,9 @@ const MMA_SHARED_CEILING: usize = 64 * 1024;
 /// Key slices the scalar warp decode uses. Mirrors `DEC_WARP_SPLITS`.
 const WARP_DECODE_SPLITS: usize = 96;
 const K2_WARP_DECODE_SPLITS: usize = 32;
+/// Shared bytes of the staged K2 prefill kernel: 32 keys of K at a 68-word
+/// stride and 128 dimensions of V at a 20-word stride. Mirrors `K2S_*`.
+const K2_STAGED_SHARED_BYTES: usize = (32 * 68 + 128 * 20) * 4;
 
 /// Key slices the tensor-core decode uses by default.
 ///
@@ -1139,6 +1142,111 @@ __device__ void attn_flash_causal_mma_body(
 extern "C" {
 __global__ void attn_flash_causal_mma(const float* q,const unsigned short* k,const unsigned short* v,float* out,int q_heads,int kv_heads,int head_dim,const int* key_offset,float scale,int n_query){attn_flash_causal_mma_body<false,8,32>(q,k,v,out,q_heads,kv_heads,head_dim,key_offset,scale,n_query);}
 __global__ void attn_flash_causal_mma_k2(const float* q,const unsigned short* k,const unsigned short* v,float* out,int q_heads,int kv_heads,int head_dim,const int* key_offset,float scale,int n_query){attn_flash_causal_mma_body<true,4,16>(q,k,v,out,q_heads,kv_heads,head_dim,key_offset,scale,n_query);}
+// K2 prefill: two 16-query tiles of one KV head's four query heads share each
+// staged run of 32 keys, so a barrier pair covers four key octets instead of
+// one and each K/V element is staged once per 32 queries. A warp still walks
+// its keys in 8-key steps with attn_flash_causal_mma_body<true>'s operations
+// and stops at its own tile's visible keys, so its output is unchanged.
+#define K2S_QT 16
+#define K2S_SK 32
+#define K2S_KSTRIDE 68
+#define K2S_VSTRIDE 20
+__global__ void __launch_bounds__(256,1) attn_flash_causal_mma_k2s(const float* __restrict__ q,const unsigned short* __restrict__ k,const unsigned short* __restrict__ v,float* __restrict__ out,int q_heads,int kv_heads,int head_dim,const int* __restrict__ key_offset,float scale,int n_query){
+    extern __shared__ float smem_f[];
+    unsigned* k_sh=(unsigned*)smem_f;
+    unsigned* v_sh=k_sh+K2S_SK*K2S_KSTRIDE;
+    int tid=threadIdx.x,lane=tid&31,warp=tid>>5,g=lane>>2,tg=lane&3;
+    int kvh=blockIdx.y,h=kvh*4+(warp&3);
+    long long qb=(long long)blockIdx.x*(2*K2S_QT),qi0=qb+(warp>>2)*K2S_QT;
+    long long off=*key_offset;
+    unsigned qa0[16],qa1[16],qal0[16],qal1[16];
+    {
+        long long r0=qi0+g,r1=qi0+g+8;
+        const float* qp0=(r0<(long long)n_query) ? q+(r0*(long long)q_heads+h)*128LL : 0;
+        const float* qp1=(r1<(long long)n_query) ? q+(r1*(long long)q_heads+h)*128LL : 0;
+        #pragma unroll
+        for(int s=0;s<16;++s) {
+            int c=4*s+tg;
+            qa0[s]=0u;qa1[s]=0u;
+            if(qp0)qa0[s]=pack_h2(qp0[2*c],qp0[2*c+1]);
+            if(qp1)qa1[s]=pack_h2(qp1[2*c],qp1[2*c+1]);
+            qal0[s]=qp0 ? pack_h2(qp0[2*c]-h2f((unsigned short)qa0[s]),qp0[2*c+1]-h2f((unsigned short)(qa0[s]>>16))) : 0;
+            qal1[s]=qp1 ? pack_h2(qp1[2*c]-h2f((unsigned short)qa1[s]),qp1[2*c+1]-h2f((unsigned short)(qa1[s]>>16))) : 0;
+        }
+    }
+    float o[16][4];
+    #pragma unroll
+    for(int t=0;t<16;++t){o[t][0]=0.0f;o[t][1]=0.0f;o[t][2]=0.0f;o[t][3]=0.0f;}
+    float maximum0=neg_inf(),maximum1=neg_inf(),normalizer0=0.0f,normalizer1=0.0f;
+    long long qt_live=(long long)n_query-qi0;if(qt_live>K2S_QT)qt_live=K2S_QT;
+    long long n_tile=qt_live>0 ? off+qi0+qt_live : 0;
+    long long b_live=(long long)n_query-qb;if(b_live>2*K2S_QT)b_live=2*K2S_QT;
+    long long n_block=off+qb+b_live;
+    // Staging: two 16-byte K chunks and eight packed V key pairs per thread.
+    int vdim=tid&127,vslice=tid>>7;
+    const unsigned short* vd=v+(long long)kvh*128+vdim;
+    long long vrow=(long long)kv_heads*128;
+    uint4 kreg[2];unsigned vreg[8];
+    auto prefetch=[&](long long j) {
+        #pragma unroll
+        for(int i=0;i<2;++i) {
+            int t=tid+256*i,r=t>>4;long long key=j+r;
+            kreg[i]=make_uint4(0u,0u,0u,0u);
+            if(key<n_block)kreg[i]=((const uint4*)(k+(key*(long long)kv_heads+kvh)*128LL))[t&15];
+        }
+        #pragma unroll
+        for(int u=0;u<8;++u) {
+            long long k0=j+2*(vslice*8+u);
+            unsigned lo=k0<n_block ? vd[k0*vrow] : 0u,hi=k0+1<n_block ? vd[(k0+1)*vrow] : 0u;
+            vreg[u]=lo|(hi<<16);
+        }
+    };
+    prefetch(0);
+    float scale2=scale*ATTN_LOG2E;
+    for(long long j0=0;j0<n_block;j0+=K2S_SK) {
+        __syncthreads();
+        #pragma unroll
+        for(int i=0;i<2;++i){int t=tid+256*i;*(uint4*)(k_sh+(t>>4)*K2S_KSTRIDE+4*(t&15))=kreg[i];}
+        #pragma unroll
+        for(int u=0;u<8;++u)v_sh[vdim*K2S_VSTRIDE+vslice*8+u]=vreg[u];
+        __syncthreads();
+        if(j0+K2S_SK<n_block)prefetch(j0+K2S_SK);
+        #pragma unroll
+        for(int st=0;st<K2S_SK/8;++st) {
+            long long j=j0+8*st;
+            if(j>=n_tile)break;
+            float s0=0.0f,s1=0.0f,s2=0.0f,s3=0.0f;
+            #pragma unroll
+            for(int s=0;s<16;++s) {
+                unsigned b0=k_sh[(st*8+g)*K2S_KSTRIDE+4*s+tg];
+                mma_m16n8k8(s0,s1,s2,s3,qa0[s],qa1[s],b0);
+                mma_m16n8k8(s0,s1,s2,s3,qal0[s],qal1[s],b0);
+            }
+            s0=__fmul_rn(s0,scale2);s1=__fmul_rn(s1,scale2);
+            s2=__fmul_rn(s2,scale2);s3=__fmul_rn(s3,scale2);
+            long long key=j+2*tg,limit=off+qi0+g;
+            float cg=mma_softmax_pair(s0,s1,key<=limit && key<n_tile,key+1<=limit && key+1<n_tile,maximum0,normalizer0);
+            float cg8=mma_softmax_pair(s2,s3,key<=limit+8 && key<n_tile,key+1<=limit+8 && key+1<n_tile,maximum1,normalizer1);
+            unsigned a0=pack_h2(s0,s1),a1=pack_h2(s2,s3);
+            unsigned al0=pack_h2(s0-h2f((unsigned short)a0),s1-h2f((unsigned short)(a0>>16)));
+            unsigned al1=pack_h2(s2-h2f((unsigned short)a1),s3-h2f((unsigned short)(a1>>16)));
+            #pragma unroll
+            for(int t=0;t<16;++t){o[t][0]*=cg;o[t][1]*=cg;o[t][2]*=cg8;o[t][3]*=cg8;}
+            #pragma unroll
+            for(int t=0;t<16;++t) {
+                unsigned b0=v_sh[(8*t+g)*K2S_VSTRIDE+4*st+tg];
+                mma_m16n8k8(o[t][0],o[t][1],o[t][2],o[t][3],a0,a1,b0);
+                mma_m16n8k8(o[t][0],o[t][1],o[t][2],o[t][3],al0,al1,b0);
+            }
+        }
+    }
+    #pragma unroll
+    for(int t=0;t<16;++t) {
+        int d=8*t+2*tg;long long r0=qi0+g,r1=qi0+g+8;
+        if(r0<(long long)n_query){float inv=1.0f/normalizer0;float* op=out+(r0*(long long)q_heads+h)*128LL;op[d]=o[t][0]*inv;op[d+1]=o[t][1]*inv;}
+        if(r1<(long long)n_query){float inv=1.0f/normalizer1;float* op=out+(r1*(long long)q_heads+h)*128LL;op[d]=o[t][2]*inv;op[d+1]=o[t][3]*inv;}
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The same attention, with the KV head — not the query head — on the grid.
@@ -2904,6 +3012,7 @@ pub struct AttentionKernels {
     row_positions: CudaFunction,
     flash_mma: CudaFunction,
     flash_mma_k2: CudaFunction,
+    flash_mma_k2s: CudaFunction,
     decode_split: CudaFunction,
     decode_warp: CudaFunction,
     decode_warp_k2_batch: CudaFunction,
@@ -2945,6 +3054,7 @@ pub struct AttentionKernels {
     /// -- and unlike a `Cell`, this keeps `AttentionKernelSet` `Sync`, which
     /// `Arc<AttentionKernelSet>` already promises callers across threads.
     decode_mma: std::sync::atomic::AtomicU8,
+    k2_single_tile: std::sync::atomic::AtomicBool,
     /// Runtime override for the tensor-core decode's launch block count,
     /// `0` meaning "one block per split". Same atomic-behind-`Arc` shape as
     /// `decode_mma`, and set the same way: by the engine right before a
@@ -3031,6 +3141,7 @@ impl AttentionKernels {
             decode_mma_k2_wpo2: module.load_function("attn_flash_decode_mma_k2_wpo2")?,
             decode_mma_k2_wpo4: module.load_function("attn_flash_decode_mma_k2_wpo4")?,
             flash_mma_k2: module.load_function("attn_flash_causal_mma_k2")?,
+            flash_mma_k2s: module.load_function("attn_flash_causal_mma_k2s")?,
             decode_split: module.load_function("attn_flash_decode_split")?,
             decode_warp: module.load_function("attn_flash_decode_warp")?,
             decode_warp_k2_128: module.load_function("attn_flash_decode_warp_k2_128")?,
@@ -3067,6 +3178,7 @@ impl AttentionKernels {
             kv_heads,
             head_dim,
             decode_mma: std::sync::atomic::AtomicU8::new(0),
+            k2_single_tile: std::sync::atomic::AtomicBool::new(false),
             decode_mma_blocks: std::sync::atomic::AtomicUsize::new(0),
             mma_decode_splits: std::env::var("LLMCUDA_DEC_MMA_SPLITS")
                 .ok()
@@ -3112,6 +3224,14 @@ impl AttentionKernels {
             && self.head_dim.is_multiple_of(8 * wpo)
             && self.head_dim.is_multiple_of(32 * wpo)
             && Self::dmma_shared_bytes(self.head_dim, wpo) <= MMA_SHARED_CEILING
+    }
+
+    /// Run K2 prefill attention on the original one-tile kernel, which
+    /// stages eight keys per barrier pair. The staged kernel reproduces it bit
+    /// for bit; this is the oracle and A/B lever for that claim.
+    pub fn use_k2_single_tile_prefill(&self, on: bool) {
+        self.k2_single_tile
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Force decode off the tensor-core kernel and onto
@@ -3708,62 +3828,78 @@ impl AttentionKernels {
         // Above it the GQA-shared kernel is the default, because it reads K and
         // V once per KV head instead of once per query head. It cannot service
         // every geometry; `attn_flash_causal` can, and is the fallback.
-        let (f, grid, block, shared) =
-            if canonical_shallow && self.gqa_ratio() == 4 && self.head_dim == 128 {
-                // One arithmetic path for every K2 prefill width, including
-                // masked short chunks. Changing its precision at sixteen queries
-                // perturbs the recurrently reused KV inputs and can change routes.
+        let (f, grid, block, shared) = if canonical_shallow
+            && self.gqa_ratio() == 4
+            && self.head_dim == 128
+            && self
+                .k2_single_tile
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            (
+                &self.flash_mma_k2,
                 (
-                    &self.flash_mma_k2,
-                    (
-                        (n_query as u32).div_ceil(MMA_QUERY_TILE as u32),
-                        (self.q_heads / 4) as u32,
-                        1,
-                    ),
-                    128,
-                    self.shared_bytes_mma(),
-                )
-            } else if n_query < GQA_QUERY_TILE {
+                    (n_query as u32).div_ceil(MMA_QUERY_TILE as u32),
+                    (self.q_heads / 4) as u32,
+                    1,
+                ),
+                128,
+                self.shared_bytes_mma(),
+            )
+        } else if canonical_shallow && self.gqa_ratio() == 4 && self.head_dim == 128 {
+            // One arithmetic path for every K2 prefill width, including
+            // masked short chunks. Changing its precision at sixteen queries
+            // perturbs the recurrently reused KV inputs and can change routes.
+            (
+                &self.flash_mma_k2s,
                 (
-                    &self.flash_t1,
-                    (n_query as u32, self.q_heads as u32, 1),
-                    self.head_dim as u32,
-                    self.shared_bytes_t1(),
-                )
-            } else if n_query >= MMA_QUERY_TILE && self.mma_is_available() {
+                    (n_query as u32).div_ceil(2 * MMA_QUERY_TILE as u32),
+                    (self.q_heads / 4) as u32,
+                    1,
+                ),
+                256,
+                K2_STAGED_SHARED_BYTES,
+            )
+        } else if n_query < GQA_QUERY_TILE {
+            (
+                &self.flash_t1,
+                (n_query as u32, self.q_heads as u32, 1),
+                self.head_dim as u32,
+                self.shared_bytes_t1(),
+            )
+        } else if n_query >= MMA_QUERY_TILE && self.mma_is_available() {
+            (
+                &self.flash_mma,
                 (
-                    &self.flash_mma,
-                    (
-                        (n_query as u32).div_ceil(MMA_QUERY_TILE as u32),
-                        (self.q_heads / MMA_HEADS_PER_BLOCK) as u32,
-                        1,
-                    ),
-                    256,
-                    self.shared_bytes_mma(),
-                )
-            } else if self.gqa_shared_is_available() {
+                    (n_query as u32).div_ceil(MMA_QUERY_TILE as u32),
+                    (self.q_heads / MMA_HEADS_PER_BLOCK) as u32,
+                    1,
+                ),
+                256,
+                self.shared_bytes_mma(),
+            )
+        } else if self.gqa_shared_is_available() {
+            (
+                &self.flash_gqa,
                 (
-                    &self.flash_gqa,
-                    (
-                        (n_query as u32).div_ceil(GQA_QUERY_TILE as u32),
-                        self.kv_heads as u32,
-                        1,
-                    ),
-                    (self.gqa_ratio() * 32) as u32,
-                    self.shared_bytes_gqa(),
-                )
-            } else {
+                    (n_query as u32).div_ceil(GQA_QUERY_TILE as u32),
+                    self.kv_heads as u32,
+                    1,
+                ),
+                (self.gqa_ratio() * 32) as u32,
+                self.shared_bytes_gqa(),
+            )
+        } else {
+            (
+                &self.flash,
                 (
-                    &self.flash,
-                    (
-                        (n_query as u32).div_ceil(QUERY_TILE as u32),
-                        self.q_heads as u32,
-                        1,
-                    ),
-                    self.head_dim as u32,
-                    self.shared_bytes(),
-                )
-            };
+                    (n_query as u32).div_ceil(QUERY_TILE as u32),
+                    self.q_heads as u32,
+                    1,
+                ),
+                self.head_dim as u32,
+                self.shared_bytes(),
+            )
+        };
         let cfg = LaunchConfig {
             grid_dim: grid,
             block_dim: (block, 1, 1),

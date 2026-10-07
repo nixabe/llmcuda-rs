@@ -1452,6 +1452,64 @@ fn k2_compensated_attention_matches_cpu_at_prefill_and_decode_shapes() {
 }
 
 #[test]
+fn k2_staged_prefill_attention_matches_the_single_tile_kernel_bit_for_bit() {
+    let Some(ctx) = setup() else { return };
+    let stream = ctx.default_stream();
+    let (heads, kv_heads, hd) = (32, 8, 128);
+    let kernels = AttentionKernels::new(&ctx, heads, kv_heads, hd).unwrap();
+    // Widths below, at and across the 32-query block; offsets that do and do
+    // not align key steps, stages and tiles, including a deep window.
+    for (queries, offset) in [
+        (1, 0),
+        (7, 3),
+        (16, 0),
+        (19, 33),
+        (32, 5),
+        (47, 0),
+        (65, 47),
+        (100, 31),
+        (257, 1000),
+    ] {
+        let keys = offset + queries;
+        let mut rng = Xorshift64Star::new(0x5354_4147 + keys as u64 * 131 + queries as u64);
+        let q = rng.vec_f32(queries * heads * hd, -2.0, 2.0);
+        let k = rng.vec_f32(keys * kv_heads * hd, -2.0, 2.0);
+        let v = rng.vec_f32(keys * kv_heads * hd, -2.0, 2.0);
+        let dq = stream.clone_htod(&q).unwrap();
+        let dk = stream
+            .clone_htod(&k.iter().copied().map(to_f16_bits).collect::<Vec<_>>())
+            .unwrap();
+        let dv = stream
+            .clone_htod(&v.iter().copied().map(to_f16_bits).collect::<Vec<_>>())
+            .unwrap();
+        let dp = stream.clone_htod(&[offset as i32]).unwrap();
+        let mut dec = AttnDecodeScratch::new(&stream, heads, hd).unwrap();
+        let mut outputs = Vec::new();
+        for single in [true, false] {
+            kernels.use_k2_single_tile_prefill(single);
+            let mut out = stream.alloc_zeros::<f32>(queries * heads * hd).unwrap();
+            kernels
+                .forward_k2(
+                    &stream, &mut dec, &dq, &dk, &dv, &mut out, queries, keys, keys, &dp,
+                )
+                .unwrap();
+            outputs.push(stream.clone_dtoh(&out).unwrap());
+        }
+        kernels.use_k2_single_tile_prefill(false);
+        let mismatches = outputs[0]
+            .iter()
+            .zip(&outputs[1])
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "queries={queries} offset={offset}: staged kernel differs from the one-tile kernel"
+        );
+        println!("K2 staged prefill queries={queries} offset={offset}: bit-identical");
+    }
+}
+
+#[test]
 fn k2_batch_decode_keeps_each_sequences_window_and_split_order() {
     let Some(ctx) = setup() else { return };
     let stream = ctx.default_stream();

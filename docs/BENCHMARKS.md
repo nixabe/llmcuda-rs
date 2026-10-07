@@ -152,25 +152,22 @@ shipped mix ([MODEL.md](MODEL.md#serving-a-second-qwen35moe-checkpoint)),
 shows the standing belongs to the engine, not one file. Same method as
 Current standing.
 
-| cell | Ornith | sd | llama.cpp | margin | Qwen3.6 above |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| prefill 512 | 3,322.8 | 0.00% | 2,910.3 | **+14.2%** | +9.1% |
-| prefill 2K | 3,869.9 | 0.04% | 3,251.4 | **+19.0%** | +19.3% |
-| prefill 8K | 3,563.2 | 0.17% | 3,180.0 | **+12.0%** | +14.5% |
-| prefill 32K | 2,803.4 | 0.06% | 2,649.3 | **+5.8%** | +5.1% |
-| prefill 65K | 2,218.4 | 0.11% | 2,152.3 | **+3.1%** | +3.9% |
-| prefill 128K | 1,567.1 | 0.20% | 1,555.9 | **+0.7%** | +0.8% |
-| decode 2K | 207.8 | 0.05% | 187.3 | **+10.9%** | +11.4% |
-| decode 32K | 158.6 | 0.22% | 151.6 | **+4.6%** | +5.0% |
+| cell | Ornith | sd | llama.cpp | margin |
+| :--- | ---: | ---: | ---: | ---: |
+| prefill 512 | 3,322.8 | 0.00% | 2,910.3 | **+14.2%** |
+| prefill 2K | 3,869.9 | 0.04% | 3,251.4 | **+19.0%** |
+| prefill 8K | 3,563.2 | 0.17% | 3,180.0 | **+12.0%** |
+| prefill 32K | 2,803.4 | 0.06% | 2,649.3 | **+5.8%** |
+| prefill 65K | 2,218.4 | 0.11% | 2,152.3 | **+3.1%** |
+| prefill 128K | 1,567.1 | 0.20% | 1,555.9 | **+0.7%** |
+| decode 2K | 207.8 | 0.05% | 187.3 | **+10.9%** |
+| decode 32K | 158.6 | 0.22% | 151.6 | **+4.6%** |
 
 Every cell won all three pairs, including 128K prefill: 1,567.6 v 1,555.9,
-1,570.0 v 1,555.8, 1,563.7 v 1,553.0. Margins within half a point of
-Qwen3.6's on five of eight cells say the checkpoints are interchangeable; that
-column is from other days, so it does not say either model moved. The
-512 margin is llama.cpp's noise (2,770.8–2,910.3 against Ornith's steady
-3,322.8; `-c` ruled out), quoted against its best of three; against its mean
-it reads +16.6%. llama.cpp's decode 2K, re-measured on a later day, read
-186.22 tok/s against 187.3, inside spread.
+1,570.0 v 1,555.8, 1,563.7 v 1,553.0. They were measured before the current Qwen3.6
+decode re-measurement, so their decode margins are not comparable with it.
+The 512 margin is quoted against llama.cpp's best of three (2,770.8–2,910.3,
+`-c` ruled out); against its mean it reads +16.6%.
 
 ## Qwen3.8-27B (`qwen35`)
 

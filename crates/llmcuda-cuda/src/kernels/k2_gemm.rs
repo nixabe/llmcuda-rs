@@ -712,10 +712,11 @@ template<int Q,int BR,bool ROUTED>
 __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,const uint4* __restrict__ mq,const float2* __restrict__ mm,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode) {
     constexpr int BT=64,AW=Q==3 ? 4 : 8,WRS=BR/32,TFS=4,REC=(Q==3 ? 160 : 224)*4;
     constexpr int WT=BR/64>0 ? BR/64 : 1;           // weight tasks per thread (Q4 code chunks: 4*BR)
-    __shared__ __align__(16) unsigned sa[4][BR][AW];
+    // Group pitches are padded so the staging stores spread over all banks.
+    __shared__ __align__(16) unsigned sa[4][BR*AW+AW];
     __shared__ float2 sw[4][BR];
     __shared__ float sd[Q==0 ? BR : 1];
-    __shared__ uint4 sb[4][BT][4];
+    __shared__ uint4 sb[4][BT*4+4];
     __shared__ float4 sm[4][BT/2];
     __shared__ int flats[BT];
     int tid=threadIdx.x,lane=tid&31,warp=tid>>5,wr=warp&3,wt=warp>>2;
@@ -726,39 +727,41 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
     __syncthreads();
     if(flats[0]>=pairs)return;
     const unsigned char* wb=w+((long long)expert*quads+rq0)*records*REC;
+    const uint4* wq=(const uint4*)wb;
+    // Loop-invariant load offsets in uint4 units. Row quads past the matrix
+    // and padded token slots read the block's first quad or first token: their
+    // outputs are never stored, so every load is unconditional and in bounds.
+    constexpr int RW=REC/16;
+    int wo[Q==3 ? WT : 1],so=0,bo[4],mo;
+    if(Q==3) {
+        #pragma unroll
+        for(int i=0;i<WT;++i){int task=tid+256*i,quad=task>>4,chunk=task&15;wo[i]=(rq0+quad<quads ? quad : 0)*records*RW+(chunk>>2)*8+(chunk&3);}
+        so=(rq0+(tid>>2)<quads ? tid>>2 : 0)*records*RW+32;
+    } else {
+        wo[0]=(rq0+(tid>>3)<quads ? tid>>3 : 0)*records*RW;
+        so=(194+2*((tid>>1)&3))>>2;
+    }
+    #pragma unroll
+    for(int i=0;i<4;++i){int task=tid+256*i,f=flats[task>>4];if(f>=pairs)f=flats[0];bo[i]=((mode==1 ? f/topk : f)*groups+((task>>2)&3))*4+(task&3);}
+    {int f=flats[tid>>2];if(f>=pairs)f=flats[0];mo=(mode==1 ? f/topk : f)*groups+(tid&3);}
     // Register staging for one window.
-    uint4 pw[Q==3 ? WT : 8];uint4 ps[3];uint4 pb[4];float2 pm;
+    uint4 pw[Q==3 ? WT : 5];uint4 ps[3];uint4 pb[4];float2 pm;
     auto load=[&](int j) {
-        int rec=j>>8,gw=(j>>7)&1,g0=j>>5;
+        int rec=(j>>8)*RW,gw=(j>>7)&1;
         if(Q==3) {
             #pragma unroll
-            for(int i=0;i<WT;++i) {
-                int task=tid+256*i,quad=task>>4,chunk=task&15;
-                pw[i]=make_uint4(0u,0u,0u,0u);
-                if(quad<BR/4 && rq0+quad<quads)pw[i]=*(const uint4*)(wb+((long long)quad*records+rec)*REC+((chunk>>2)*8+gw*4+(chunk&3))*16);
-            }
-            if(tid<BR) {
-                int quad=tid>>2;const unsigned char* rp=wb+((long long)quad*records+rec)*REC;
-                ps[0]=ps[1]=ps[2]=make_uint4(0u,0u,0u,0u);
-                if(rq0+quad<quads){ps[0]=*(const uint4*)(rp+32*16);ps[1]=*(const uint4*)(rp+(33+gw)*16);ps[2]=*(const uint4*)(rp+(35+gw)*16);}
-            }
-        } else if(tid<BR) {
-            int quad=tid>>2,gi=gw*4+(tid&3);const unsigned char* rp=wb+((long long)quad*records+rec)*REC;
-            #pragma unroll
-            for(int k=0;k<8;++k)pw[k]=make_uint4(0u,0u,0u,0u);
-            if(rq0+quad<quads) {
-                #pragma unroll
-                for(int k=0;k<6;++k)pw[k]=*(const uint4*)(rp+(gi*6+k)*16);
-                pw[6]=*(const uint4*)(rp+((194+2*gi)>>2)*16);pw[7]=*(const uint4*)(rp+48*16);
-            }
+            for(int i=0;i<WT;++i)pw[i]=wq[wo[i]+rec+gw*4];
+            if(tid<BR){ps[0]=wq[so+rec];ps[1]=wq[so+rec+1+gw];ps[2]=wq[so+rec+3+gw];}
+        } else {
+            // Two threads per row quad and group: low-nibble words 2h and
+            // 2h+1, both high-bit words, and the subscales (h=0) or d (h=1).
+            const uint4* rp=wq+wo[0]+rec+(gw*4+((tid>>1)&3))*6;int h=tid&1;
+            pw[0]=rp[2*h];pw[1]=rp[2*h+1];pw[2]=rp[4];pw[3]=rp[5];
+            pw[4]=h ? wq[wo[0]+rec+48] : wq[wo[0]+rec+so+2*gw];
         }
         #pragma unroll
-        for(int i=0;i<4;++i) {
-            int task=tid+256*i,t=task>>4,f=flats[t];
-            pb[i]=make_uint4(0u,0u,0u,0u);
-            if(f<pairs){int input=mode==1 ? f/topk : f;pb[i]=mq[((long long)input*groups+g0+((task>>2)&3))*4+(task&3)];}
-        }
-        {int t=tid>>2,f=flats[t];pm=make_float2(0.f,0.f);if(f<pairs){int input=mode==1 ? f/topk : f;pm=mm[(long long)input*groups+g0+(tid&3)];}}
+        for(int i=0;i<4;++i)pb[i]=mq[bo[i]+(j>>3)];
+        pm=mm[mo+(j>>5)];
     };
     auto store=[&](int j) {
         if(Q==3) {
@@ -767,7 +770,7 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
                 int task=tid+256*i,quad=task>>4,chunk=task&15;
                 if(quad<BR/4) {
                     #pragma unroll
-                    for(int rr=0;rr<4;++rr)sa[chunk&3][quad*4+rr][chunk>>2]=k2_part(pw[i],rr);
+                    for(int rr=0;rr<4;++rr)sa[chunk&3][(quad*4+rr)*AW+(chunk>>2)]=k2_part(pw[i],rr);
                 }
             }
             if(tid<BR) {
@@ -778,22 +781,27 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
                     sw[gl][quad*4+rr]=make_float2(k2_half_bits((unsigned short)d)*(float)((k2_part(ps[1],rr)>>sh)&255),k2_half_bits((unsigned short)(d>>16))*(float)((k2_part(ps[2],rr)>>sh)&255));
                 }
             }
-        } else if(tid<BR) {
-            int quad=tid>>2,gl=tid&3,off=194+2*(((j>>7)&1)*4+gl);
+        } else {
+            // Code k (low word k&3, high word k>>2) lands at word (k&3)*2+(k>>2):
+            // this thread's k&3 in {2h,2h+1} fill words 4h..4h+3.
+            int quad=tid>>3,gl=(tid>>1)&3,h=tid&1,off=194+2*(((j>>7)&1)*4+gl);
             #pragma unroll
             for(int rr=0;rr<4;++rr) {
+                unsigned c[4];
                 #pragma unroll
-                for(int k=0;k<8;++k) {
-                    unsigned c=((k2_part(pw[k&3],rr)>>(4*(k>>2)))&0x0f0f0f0f)|(((k2_part(pw[4+(k>>2)],rr)>>(2*(k&3)))&0x03030303)<<4);
-                    sa[gl][quad*4+rr][(k&3)*2+(k>>2)]=((c|0x80808080)-0x20202020)^0x80808080;
+                for(int q=0;q<4;++q) {
+                    int kk=q>>1,kh=q&1;
+                    unsigned v=((k2_part(pw[kk],rr)>>(4*kh))&0x0f0f0f0f)|(((k2_part(pw[2+kh],rr)>>(2*(2*h+kk)))&0x03030303)<<4);
+                    c[q]=((v|0x80808080)-0x20202020)^0x80808080;
                 }
-                unsigned sv=k2_part(pw[6],rr);int sh=8*(off&3);
-                sw[gl][quad*4+rr]=make_float2((float)(signed char)(sv>>sh),(float)(signed char)(sv>>(sh+8)));
-                if(gl==0)sd[quad*4+rr]=k2_half_bits((unsigned short)k2_part(pw[7],rr));
+                *(uint4*)&sa[gl][(quad*4+rr)*AW+4*h]=make_uint4(c[0],c[1],c[2],c[3]);
+                unsigned sv=k2_part(pw[4],rr);int sh=8*(off&3);
+                if(!h)sw[gl][quad*4+rr]=make_float2((float)(signed char)(sv>>sh),(float)(signed char)(sv>>(sh+8)));
+                else if(gl==0)sd[quad*4+rr]=k2_half_bits((unsigned short)sv);
             }
         }
         #pragma unroll
-        for(int i=0;i<4;++i){int task=tid+256*i;sb[(task>>2)&3][task>>4][task&3]=pb[i];}
+        for(int i=0;i<4;++i){int task=tid+256*i;sb[(task>>2)&3][(task>>4)*4+(task&3)]=pb[i];}
         {int t=tid>>2,g=tid&3;float* m=(float*)&sm[g][t>>1];m[t&1]=pm.x;m[2+(t&1)]=pm.y;}
     };
     float acc[WRS][TFS][2];
@@ -813,8 +821,8 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
             if(Q==0)dl[rs]=sd[row];
             #pragma unroll
             for(int g=0;g<4;++g) {
-                if(Q==3){unsigned word=sa[g][row][lane&3];a0[rs][g]=word&0x0f0f0f0f;a1[rs][g]=(word>>4)&0x0f0f0f0f;}
-                else{uint2 pr=*(const uint2*)&sa[g][row][(lane&3)*2];a0[rs][g]=pr.x;a1[rs][g]=pr.y;}
+                if(Q==3){unsigned word=sa[g][row*AW+(lane&3)];a0[rs][g]=word&0x0f0f0f0f;a1[rs][g]=(word>>4)&0x0f0f0f0f;}
+                else{uint2 pr=*(const uint2*)&sa[g][row*AW+(lane&3)*2];a0[rs][g]=pr.x;a1[rs][g]=pr.y;}
                 float2 s2=sw[g][row];sc0[rs][g]=s2.x;sc1[rs][g]=s2.y;
             }
         }
@@ -824,10 +832,10 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
             if(flats[tb]>=pairs)continue;
             uint4 b[4];float4 m[4];
             #pragma unroll
-            for(int g=0;g<4;++g){b[g]=sb[g][tb+(lane>>2)][lane&3];m[g]=sm[g][(tb>>1)+(lane&3)];}
+            for(int g=0;g<4;++g){b[g]=sb[g][(tb+(lane>>2))*4+(lane&3)];m[g]=sm[g][(tb>>1)+(lane&3)];}
             #pragma unroll
             for(int rs=0;rs<WRS;++rs) {
-                float p0[2]={0.f,0.f},p1[2]={0.f,0.f};
+                float p[2][2];
                 #pragma unroll
                 for(int g=0;g<4;++g) {
                     float t0,t1;
@@ -845,9 +853,9 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
                         t0=__fmul_rn(__fmul_rn(dl[rs],m[g].x),__fmaf_rn((float)v10,sc1[rs][g],__fmul_rn((float)v00,sc0[rs][g])));
                         t1=__fmul_rn(__fmul_rn(dl[rs],m[g].y),__fmaf_rn((float)v11,sc1[rs][g],__fmul_rn((float)v01,sc0[rs][g])));
                     }
-                    if(g&1){p1[0]+=t0;p1[1]+=t1;}else{p0[0]+=t0;p0[1]+=t1;}
+                    if(g<2){p[g][0]=t0;p[g][1]=t1;}else{p[g&1][0]+=t0;p[g&1][1]+=t1;}
                 }
-                acc[rs][ts][0]+=p0[0]+p1[0];acc[rs][ts][1]+=p0[1]+p1[1];
+                acc[rs][ts][0]+=p[0][0]+p[1][0];acc[rs][ts][1]+=p[0][1]+p[1][1];
             }
         }
         __syncthreads();

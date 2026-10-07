@@ -833,7 +833,14 @@ the MMA as unsigned nibbles; Q6 codes are unpacked once while staging. A
 block covers 128 rows by one 64-slot dispatch run, or 64 tokens when dense.
 Each warp keeps a 128-value window's weight fragments and scales in
 registers across four 8-token subtiles, while the next window's global loads
-are already in flight in registers. Fully padded runs and subtiles are
+are already in flight in registers. Load offsets are fixed before the
+window loop: row quads past the matrix and padded token slots read the
+block's first quad or token, whose outputs are never stored, so the window
+loads carry neither address arithmetic nor predicates; recomputing them had
+been about a sixth of each window's instructions. Q6 staging spreads over all
+256 threads, two per row quad and group, each unpacking half of the group's
+code words into one 16-byte store per row, and padded shared-memory pitches
+keep the staging stores conflict-free. Fully padded runs and subtiles are
 skipped. The nibble-plane kernels this replaced needed four int4 MMAs and an
 integer Horner sum per 32 values, and staged weights one load per four
 codes; the change raised cold Q4 prefill about 40% at 512 tokens. Group

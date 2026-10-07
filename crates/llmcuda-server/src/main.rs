@@ -37,8 +37,6 @@ use tracing::{error, info, warn};
 
 /// f16 KV cache, matching the baseline's `-ctk f16 -ctv f16`.
 const KV_ELEM_BYTES_F16: u64 = 2;
-/// Measured tensor-data size of `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf`.
-const WEIGHTS_BYTES: u64 = (296 * (1024 * 1024 * 1024)) / 10;
 const DEFAULT_MODEL_PATH: &str = "models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 
 /// Which speculative decoder to run.
@@ -519,6 +517,25 @@ fn gate_mtp(args: &mut Args, available: bool) {
     }
 }
 
+/// A decision head's weights as they sit on the device: every `decision.*`,
+/// `dec.blk.*` and `token_types` tensor, dequantized to f32 at load. Its
+/// workspace scales with `--decision-max-tokens` and is reported when the
+/// head is bound. Zero for a model without a head.
+fn decision_head_bytes(file: &llmcuda_gguf::GgufFile, config: &ModelConfig) -> u64 {
+    if config.decision.is_none() {
+        return 0;
+    }
+    file.tensors()
+        .iter()
+        .filter(|t| {
+            t.name.starts_with("decision.")
+                || t.name.starts_with("dec.blk.")
+                || t.name.starts_with("token_types")
+        })
+        .map(|t| t.n_elements * 4)
+        .sum()
+}
+
 /// The transcribed configuration for whatever `path` declares itself to be.
 ///
 /// Opening the GGUF here costs an mmap and a header parse; the alternative —
@@ -539,15 +556,19 @@ fn model_config_for(
     // checkpoint of the same architecture would advertise itself as the
     // first. See the `qwen35moe` note in docs/MODEL.md.
     let mtp_available = config.mtp_available(&file);
+    // Resident weights from the file's own tensor directory. This used to be
+    // one measured constant (Qwen3.6-35B-A3B's 29.6 GiB) for every non-K2
+    // file, which over-reserved a 9 GB Clef by 20 GiB and would under-reserve
+    // any file larger than that one.
+    let schema = llmcuda_model::WeightSchema::new(&config);
+    let directory = schema
+        .resolve(&file)
+        .map_err(|e| format!("{}: {e:?}", path.display()))?;
     let weights_bytes = if config.k2.is_some() {
-        let schema = llmcuda_model::WeightSchema::new(&config);
-        let directory = schema
-            .resolve(&file)
-            .map_err(|e| format!("{}: {e:?}", path.display()))?;
         llmcuda_engine::DeviceWeights::k2_required_bytes(&directory)
     } else {
-        WEIGHTS_BYTES
-    };
+        llmcuda_engine::DeviceWeights::required_bytes(&directory)
+    } + decision_head_bytes(&file, &config);
     Ok((
         config,
         file.get_str("general.name").map(str::to_owned),

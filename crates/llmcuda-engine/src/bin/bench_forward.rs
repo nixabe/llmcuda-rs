@@ -176,6 +176,13 @@ fn main() {
         return;
     }
 
+    if let Ok(var) = std::env::var("LLMCUDA_BENCH_AB") {
+        ab_passes(
+            &ctx, &stream, &file, &directory, &weights, &config, &batches, reps, &var,
+        );
+        return;
+    }
+
     info!(
         "{:>7} | {:>9} | {:>16} | {:>14}",
         "tokens", "build s", "ms/pass", "tok/s"
@@ -279,6 +286,158 @@ fn main() {
         "NOTE: no KV cache and no carried recurrent state — every pass is a cold full \
          forward. Comparable to llama.cpp `pp`, NOT to `tg`.",
     );
+}
+
+/// `LLMCUDA_BENCH_AB=VAR`: an interleaved A/B over one weight load.
+///
+/// Pass A is built with `VAR=1` and pass B is reshaped from it with `VAR=0`,
+/// so the two share every weight and differ only in what reads `VAR` at
+/// construction. Each repetition times both, alternating which runs first —
+/// on this host the first of a pair has been measured ~0.8% fast — and the
+/// report gives each side's mean and the per-pair B/A ratios. A load of the
+/// 27B costs minutes on this machine's disk; this is what makes a three-pair
+/// A/B cost one load instead of six.
+///
+/// It also prints how far apart the two passes' last-token logits are. That
+/// is a smoke check, not an accuracy gate: the gates are the differential
+/// tests and the golden. With `LLMCUDA_BENCH_IDS` (one token id a line) the
+/// prompt is those ids instead of the synthetic ones, and with
+/// `LLMCUDA_BENCH_REF` (raw f32 logits of the last id, e.g. from llama.cpp
+/// on the same file) each side is also scored against that reference.
+#[allow(clippy::too_many_arguments)]
+fn ab_passes(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    file: &GgufFile,
+    directory: &Directory<'_>,
+    weights: &DeviceWeights,
+    config: &ModelConfig,
+    batches: &[usize],
+    reps: usize,
+    var: &str,
+) {
+    let fixed_ids: Option<Vec<i32>> = std::env::var("LLMCUDA_BENCH_IDS").ok().map(|p| {
+        std::fs::read_to_string(&p)
+            .expect("read LLMCUDA_BENCH_IDS")
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    });
+    let reference: Option<Vec<f32>> = std::env::var("LLMCUDA_BENCH_REF").ok().map(|p| {
+        std::fs::read(&p)
+            .expect("read LLMCUDA_BENCH_REF")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&b| f32::from_le_bytes(b))
+            .collect()
+    });
+    let batches: Vec<usize> = match &fixed_ids {
+        Some(ids) => vec![ids.len()],
+        None => batches.to_vec(),
+    };
+    for &n in &batches {
+        // SAFETY: single-threaded at this point — no other thread of this
+        // process reads the environment while the passes are built.
+        unsafe { std::env::set_var(var, "1") };
+        let mut a = Forward::new(ctx, stream, file, directory, weights, config.clone(), n)
+            .expect("build pass A");
+        // SAFETY: as above.
+        unsafe { std::env::set_var(var, "0") };
+        let mut b = a
+            .reshape(ctx, stream, file, directory, weights, n)
+            .expect("build pass B");
+        let ids: Vec<i32> = match &fixed_ids {
+            Some(ids) => ids.clone(),
+            None => (0..n)
+                .map(|i| ((i * 7919 + 1234) % config.vocab_size as usize) as i32)
+                .collect(),
+        };
+        let mut state = a.new_state(stream, n).expect("sequence state");
+        let mut time = |f: &mut Forward| {
+            let t = Instant::now();
+            state.reset(stream).expect("reset");
+            f.run(stream, &mut state, &ids, |_, _| {})
+                .expect("forward pass");
+            stream.synchronize().expect("sync");
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        for _ in 0..WARMUP {
+            time(&mut a);
+            time(&mut b);
+        }
+        let (mut sa, mut sb) = (Vec::new(), Vec::new());
+        for rep in 0..reps {
+            if rep % 2 == 0 {
+                sa.push(time(&mut a));
+                sb.push(time(&mut b));
+            } else {
+                sb.push(time(&mut b));
+                sa.push(time(&mut a));
+            }
+        }
+        let la = stream.clone_dtoh(a.logits()).expect("logits A");
+        let lb = stream.clone_dtoh(b.logits()).expect("logits B");
+        let argmax = |l: &[f32]| {
+            l.iter()
+                .enumerate()
+                .fold(
+                    (0, f32::NEG_INFINITY),
+                    |m, (i, &v)| if v > m.1 { (i, v) } else { m },
+                )
+                .0
+        };
+        let max_abs = la
+            .iter()
+            .zip(&lb)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let (ma, sda) = stats(&sa);
+        let (mb, sdb) = stats(&sb);
+        let ratios: Vec<String> = sa
+            .iter()
+            .zip(&sb)
+            .map(|(x, y)| format!("{:.3}", y / x))
+            .collect();
+        info!(
+            "{n:>6} tokens  A ({var}=1) {ma:8.2} ± {sda:5.2} ms ({:7.1} tok/s)   \
+             B ({var}=0) {mb:8.2} ± {sdb:5.2} ms ({:7.1} tok/s)   B/A per pair [{}]",
+            n as f64 / (ma / 1e3),
+            n as f64 / (mb / 1e3),
+            ratios.join(", "),
+        );
+        info!(
+            "        last-token logits: max_abs(A-B) {max_abs:.4}, argmax A {} B {}",
+            argmax(&la),
+            argmax(&lb),
+        );
+        if let Some(r) = &reference {
+            let top = |l: &[f32], k: usize| {
+                let mut idx: Vec<usize> = (0..l.len()).collect();
+                idx.sort_by(|&x, &y| l[y].total_cmp(&l[x]));
+                idx.truncate(k);
+                idx
+            };
+            let rt = top(r, 10);
+            for (name, l) in [("A", &la), ("B", &lb)] {
+                let (mut dot, mut nl, mut nr, mut worst) = (0f64, 0f64, 0f64, 0f32);
+                for (x, y) in l.iter().zip(r) {
+                    dot += f64::from(*x) * f64::from(*y);
+                    nl += f64::from(*x) * f64::from(*x);
+                    nr += f64::from(*y) * f64::from(*y);
+                    worst = worst.max((x - y).abs());
+                }
+                let lt = top(l, 10);
+                let shared = lt.iter().filter(|i| rt.contains(i)).count();
+                info!(
+                    "        {name} vs reference: max_abs {worst:.4}, 1-cos {:.3e}, argmax {} (ref {}), top-10 shared {shared}/10",
+                    1.0 - dot / (nl.sqrt() * nr.sqrt()),
+                    lt[0],
+                    rt[0],
+                );
+            }
+        }
+    }
 }
 
 fn env_usize(key: &str) -> Option<usize> {

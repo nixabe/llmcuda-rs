@@ -1224,7 +1224,13 @@ impl Forward {
 
         // --- the 30 Gated DeltaNet layers, by alias -----------------------
         let gdn_geometry = GdnGeometry::from_config(&config, tokens, rms_eps);
-        let gdn = GdnBlock::new(ctx, gdn_geometry)?;
+        let mut gdn = GdnBlock::new(ctx, gdn_geometry)?;
+        // The dense models' prefill projections run on the fp16 tensor cores;
+        // see `crate::block::half` for why the MoE target does not, yet.
+        let half_gemm = crate::block::half::enabled_for(config.dense_ffn().is_some());
+        if half_gemm {
+            gdn.enable_half_gemm(ctx)?;
+        }
         let mut gdn_weights = Vec::new();
         let mut gdn_layers = Vec::new();
         for layer in 0..config.num_layers {
@@ -1333,7 +1339,10 @@ impl Forward {
         // One scratch for all ten of them: they run in sequence and nothing
         // crosses a layer boundary. Ten private copies cost 1.68 MB of VRAM
         // per token of context against this one's 0.17 MB.
-        let attn_scratch = AttnScratch::new(stream, &config, tokens)?;
+        let mut attn_scratch = AttnScratch::new(stream, &config, tokens)?;
+        if half_gemm {
+            attn_scratch.enable_half_gemm(ctx, &config)?;
+        }
 
         // --- the feed-forward block, on every block -------------------------
         let moe_geometry = FfnBlock::geometry_for(&config, moe_block_size(tokens), tokens).ok_or(

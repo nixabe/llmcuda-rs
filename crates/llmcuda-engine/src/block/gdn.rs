@@ -1621,6 +1621,8 @@ GDN_PROJ_SPLIT_ADD_ENTRY(gdn_proj_split_t16_add, 16, 1)
 pub enum GdnBlockError {
     /// The integer tensor-core kernels failed to build or launch.
     Mma(MmaError),
+    /// The fp16 tensor-core GEMM failed to build or launch.
+    Half(llmcuda_cuda::kernels::hgemm::HgemmError),
     /// NVRTC rejected this module's source, or the module failed to load.
     Compile(String),
     /// The driver failed.
@@ -1665,6 +1667,7 @@ impl std::fmt::Display for GdnBlockError {
         match self {
             Self::Compile(m) => write!(f, "kernel compilation failed: {m}"),
             Self::Mma(e) => write!(f, "integer tensor cores: {e}"),
+            Self::Half(e) => write!(f, "fp16 tensor cores: {e}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::LayerOps(e) => write!(f, "{e}"),
             Self::Recurrent(e) => write!(f, "{e}"),
@@ -2388,6 +2391,9 @@ pub struct GdnBlock {
     mma: MmaKernels,
     /// Quantized activations and their scales, reused every projection.
     xq: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
+    /// The fp16 tensor-core path for the same projections, when enabled; it
+    /// replaces `xq` and `mma` at prefill widths. See [`crate::block::half`].
+    half: Option<crate::block::half::HalfStage>,
     layer_ops: LayerOpsKernels,
     recurrent: GdnKernels,
     chunked: GdnChunkedKernels,
@@ -2596,7 +2602,78 @@ impl GdnBlock {
             geometry,
             mma: MmaKernels::new(ctx).map_err(GdnBlockError::Mma)?,
             xq: None,
+            half: None,
         })
+    }
+
+    /// Run the prefill-width projections on the fp16 tensor cores instead of
+    /// the integer ones. Same weights, an fp16 activation operand instead of
+    /// an int8 one; see [`crate::block::half`].
+    pub fn enable_half_gemm(&mut self, ctx: &Arc<CudaContext>) -> Result<(), GdnBlockError> {
+        let g = self.geometry;
+        let stream = ctx.default_stream();
+        let mut half = crate::block::half::HalfStage::new(ctx).map_err(GdnBlockError::Half)?;
+        for (n, k) in [
+            (g.conv_dim(), g.hidden),
+            (g.value_dim(), g.hidden),
+            (g.hidden, g.value_dim()),
+        ] {
+            half.reserve(&stream, g.max_tokens, n, k)
+                .map_err(GdnBlockError::Half)?;
+        }
+        self.half = Some(half);
+        Ok(())
+    }
+
+    /// Stage `x` (`tokens x k_dim`) as the activation operand of the
+    /// tensor-core projections that follow: rounded to fp16 on the half path,
+    /// quantized to int8 on the integer one.
+    fn stage_activations(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        tokens: usize,
+        k_dim: usize,
+    ) -> Result<(), GdnBlockError> {
+        match self.half.as_mut() {
+            Some(h) => h
+                .stage(stream, x, tokens * k_dim)
+                .map_err(GdnBlockError::Half),
+            None => self.quantize_activations(stream, x, tokens, k_dim),
+        }
+    }
+
+    /// One tensor-core projection of the activations [`Self::stage_activations`]
+    /// staged: `out[t][n] = sum_k x[t][k] * dequant(wq, ws)[n][k]`.
+    #[allow(clippy::too_many_arguments)]
+    fn project_staged(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        wq: &CudaSlice<i8>,
+        ws: &CudaSlice<u16>,
+        out: &mut CudaSlice<f32>,
+        k_dim: usize,
+        n_rows: usize,
+        tokens: usize,
+    ) -> Result<(), GdnBlockError> {
+        match self.half.as_mut() {
+            Some(h) => h
+                .project(
+                    stream,
+                    llmcuda_cuda::kernels::hgemm::HalfWeight::Q8_0 { q: wq, scales: ws },
+                    out,
+                    k_dim,
+                    n_rows,
+                    tokens,
+                )
+                .map_err(GdnBlockError::Half),
+            None => {
+                let (xq, xs) = self.xq.as_ref().expect("quantized above");
+                self.mma
+                    .q8_0_proj_split_half(stream, wq, ws, xq, xs, out, k_dim, n_rows, tokens)
+                    .map_err(GdnBlockError::Mma)
+            }
+        }
     }
 
     /// Repack one layer's Q8_0 projections for the integer tensor cores, from
@@ -2981,34 +3058,25 @@ impl GdnBlock {
 
         let gates_ready = self.normalize_input(stream, hidden, w, s, tokens)?;
         if let Some(i8w) = tc {
-            self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
-            let (xq, xs) = self.xq.as_ref().expect("quantized above");
-            self.mma
-                .q8_0_proj_split_half(
-                    stream,
-                    &i8w.qkv_q,
-                    &i8w.qkv_s,
-                    xq,
-                    xs,
-                    &mut s.qkv,
-                    g.hidden,
-                    g.conv_dim(),
-                    tokens,
-                )
-                .map_err(GdnBlockError::Mma)?;
-            self.mma
-                .q8_0_proj_split_half(
-                    stream,
-                    &i8w.gate_q,
-                    &i8w.gate_s,
-                    xq,
-                    xs,
-                    &mut s.z,
-                    g.hidden,
-                    g.value_dim(),
-                    tokens,
-                )
-                .map_err(GdnBlockError::Mma)?;
+            self.stage_activations(stream, &s.normed, tokens, g.hidden)?;
+            self.project_staged(
+                stream,
+                &i8w.qkv_q,
+                &i8w.qkv_s,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+                tokens,
+            )?;
+            self.project_staged(
+                stream,
+                &i8w.gate_q,
+                &i8w.gate_s,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+                tokens,
+            )?;
         } else if let Some(i8w) = gemv {
             self.project_split_pair(
                 stream,
@@ -3175,21 +3243,16 @@ impl GdnBlock {
             g.rms_eps,
         )?;
         if let Some(i8w) = tc {
-            self.quantize_activations(stream, &s.final_output, tokens, g.value_dim())?;
-            let (xq, xs) = self.xq.as_ref().expect("quantized above");
-            self.mma
-                .q8_0_proj_split_half(
-                    stream,
-                    &i8w.out_q,
-                    &i8w.out_s,
-                    xq,
-                    xs,
-                    &mut s.projected,
-                    g.value_dim(),
-                    g.hidden,
-                    tokens,
-                )
-                .map_err(GdnBlockError::Mma)?;
+            self.stage_activations(stream, &s.final_output, tokens, g.value_dim())?;
+            self.project_staged(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+                tokens,
+            )?;
         } else if let Some(i8w) = gemv {
             self.project_split_gemv(
                 stream,
@@ -3274,34 +3337,25 @@ impl GdnBlock {
         //    the weight is read once for the whole batch regardless of how
         //    many distinct sequences the tokens belong to.
         if let Some(i8w) = tc {
-            self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
-            let (xq, xs) = self.xq.as_ref().expect("quantized above");
-            self.mma
-                .q8_0_proj_split_half(
-                    stream,
-                    &i8w.qkv_q,
-                    &i8w.qkv_s,
-                    xq,
-                    xs,
-                    &mut s.qkv,
-                    g.hidden,
-                    g.conv_dim(),
-                    tokens,
-                )
-                .map_err(GdnBlockError::Mma)?;
-            self.mma
-                .q8_0_proj_split_half(
-                    stream,
-                    &i8w.gate_q,
-                    &i8w.gate_s,
-                    xq,
-                    xs,
-                    &mut s.z,
-                    g.hidden,
-                    g.value_dim(),
-                    tokens,
-                )
-                .map_err(GdnBlockError::Mma)?;
+            self.stage_activations(stream, &s.normed, tokens, g.hidden)?;
+            self.project_staged(
+                stream,
+                &i8w.qkv_q,
+                &i8w.qkv_s,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+                tokens,
+            )?;
+            self.project_staged(
+                stream,
+                &i8w.gate_q,
+                &i8w.gate_s,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+                tokens,
+            )?;
         } else if let Some(i8w) = gemv {
             self.project_split_pair(
                 stream,
@@ -3512,21 +3566,16 @@ impl GdnBlock {
         // 8/9. linear_attn_out-N, then attn_residual-N. No state, batches the
         //      same way step 2 does.
         if let Some(i8w) = tc {
-            self.quantize_activations(stream, &s.final_output, tokens, g.value_dim())?;
-            let (xq, xs) = self.xq.as_ref().expect("quantized above");
-            self.mma
-                .q8_0_proj_split_half(
-                    stream,
-                    &i8w.out_q,
-                    &i8w.out_s,
-                    xq,
-                    xs,
-                    &mut s.projected,
-                    g.value_dim(),
-                    g.hidden,
-                    tokens,
-                )
-                .map_err(GdnBlockError::Mma)?;
+            self.stage_activations(stream, &s.final_output, tokens, g.value_dim())?;
+            self.project_staged(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+                tokens,
+            )?;
             self.layer_ops
                 .add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         } else if let Some(i8w) = gemv {
@@ -3609,34 +3658,25 @@ impl GdnBlock {
 
         // 2. linear_attn_qkv_mixed-N, and the output gate z-N alongside it.
         if let Some(i8w) = tc {
-            self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
-            let (xq, xs) = self.xq.as_ref().expect("quantized above");
-            self.mma
-                .q8_0_proj_split_half(
-                    stream,
-                    &i8w.qkv_q,
-                    &i8w.qkv_s,
-                    xq,
-                    xs,
-                    &mut s.qkv,
-                    g.hidden,
-                    g.conv_dim(),
-                    tokens,
-                )
-                .map_err(GdnBlockError::Mma)?;
-            self.mma
-                .q8_0_proj_split_half(
-                    stream,
-                    &i8w.gate_q,
-                    &i8w.gate_s,
-                    xq,
-                    xs,
-                    &mut s.z,
-                    g.hidden,
-                    g.value_dim(),
-                    tokens,
-                )
-                .map_err(GdnBlockError::Mma)?;
+            self.stage_activations(stream, &s.normed, tokens, g.hidden)?;
+            self.project_staged(
+                stream,
+                &i8w.qkv_q,
+                &i8w.qkv_s,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+                tokens,
+            )?;
+            self.project_staged(
+                stream,
+                &i8w.gate_q,
+                &i8w.gate_s,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+                tokens,
+            )?;
         } else if let Some(i8w) = gemv {
             self.project_split_pair(
                 stream,
@@ -3756,21 +3796,16 @@ impl GdnBlock {
         // core output rather than the normed input — so it re-quantizes rather
         // than reusing what step 2 produced.
         if let Some(i8w) = tc {
-            self.quantize_activations(stream, &s.final_output, tokens, g.value_dim())?;
-            let (xq, xs) = self.xq.as_ref().expect("quantized above");
-            self.mma
-                .q8_0_proj_split_half(
-                    stream,
-                    &i8w.out_q,
-                    &i8w.out_s,
-                    xq,
-                    xs,
-                    &mut s.projected,
-                    g.value_dim(),
-                    g.hidden,
-                    tokens,
-                )
-                .map_err(GdnBlockError::Mma)?;
+            self.stage_activations(stream, &s.final_output, tokens, g.value_dim())?;
+            self.project_staged(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+                tokens,
+            )?;
             self.layer_ops
                 .add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         } else if let Some(i8w) = gemv {

@@ -107,6 +107,7 @@ use cudarc::driver::{
 
 use llmcuda_cuda::arena::ArenaError;
 use llmcuda_cuda::kernels::attention::{AttentionError, AttentionKernels, AttnDecodeScratch};
+use llmcuda_cuda::kernels::hgemm::{HalfWeight, HgemmError, bf16_half_exponent};
 use llmcuda_cuda::kernels::layer_ops::{GateShape, LayerOpsError, LayerOpsKernels};
 use llmcuda_cuda::kernels::lm_head::{
     HeadFormat, HeadTensor, LmHeadError, LmHeadGeometry, LmHeadKernels,
@@ -130,6 +131,8 @@ pub enum AttentionBlockError {
     /// The integer tensor-core path rejected a repack, a quantization, or a
     /// projection launch.
     Mma(MmaError),
+    /// The fp16 tensor-core path rejected a staging or projection launch.
+    Half(HgemmError),
     /// RMSNorm rejected a launch.
     LayerOps(LayerOpsError),
     /// A projection rejected a launch.
@@ -182,6 +185,7 @@ impl std::fmt::Display for AttentionBlockError {
             Self::Arena(e) => write!(f, "{e}"),
             Self::Attention(e) => write!(f, "{e}"),
             Self::Mma(e) => write!(f, "{e}"),
+            Self::Half(e) => write!(f, "{e}"),
             Self::LayerOps(e) => write!(f, "{e}"),
             Self::Projection(e) => write!(f, "{e}"),
             Self::K2(e) => write!(f, "{e}"),
@@ -239,6 +243,12 @@ impl From<ArenaError> for AttentionBlockError {
         Self::Arena(e)
     }
 }
+impl From<HgemmError> for AttentionBlockError {
+    fn from(e: HgemmError) -> Self {
+        Self::Half(e)
+    }
+}
+
 impl From<MmaError> for AttentionBlockError {
     fn from(e: MmaError) -> Self {
         Self::Mma(e)
@@ -555,6 +565,10 @@ pub(crate) struct AttentionLayerWeights {
     w_v: CudaSlice<u8>,
     w_out: CudaSlice<u8>,
     formats: ProjectionFormats,
+    /// Per projection (qgate, k, v, out), the power of two a bf16 tensor is
+    /// scaled by on its way to fp16 — see [`bf16_half_exponent`]. Zero for
+    /// every other format.
+    bf16_exponents: [i32; 4],
     int8: Mutex<Option<Arc<AttnInt8>>>,
 }
 
@@ -649,6 +663,9 @@ pub struct AttnScratch {
     /// Activations quantized once per contraction width and reused by every
     /// projection that shares it. Allocated on first use, then kept.
     xq: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
+    /// The fp16 tensor-core operand, when [`Self::enable_half_gemm`] was
+    /// called: a prefill-width pass then stages here instead of `xq`.
+    half: Option<crate::block::half::HalfStage>,
     /// Per-slice partials for the flash-decoding path. Sized by the head
     /// geometry rather than by `tokens`, and used only at `n_query == 1`, but
     /// held here because this is the struct with a stream to allocate from and
@@ -660,6 +677,27 @@ pub struct AttnScratch {
 }
 
 impl AttnScratch {
+    /// Run the tensor-core-width projections of every block using this
+    /// scratch on the fp16 tensor cores, bf16 tensors included. See
+    /// [`crate::block::half`].
+    pub fn enable_half_gemm(
+        &mut self,
+        ctx: &Arc<CudaContext>,
+        config: &ModelConfig,
+    ) -> Result<(), AttentionBlockError> {
+        let hidden = config.hidden_size as usize;
+        let a = &config.attention;
+        let q_dim = a.q_heads as usize * a.head_dim as usize;
+        let kv_dim = a.kv_heads as usize * a.head_dim as usize;
+        let stream = ctx.default_stream();
+        let mut half = crate::block::half::HalfStage::new(ctx)?;
+        for (n, k) in [(2 * q_dim, hidden), (kv_dim, hidden), (hidden, q_dim)] {
+            half.reserve(&stream, self.tokens, n, k)?;
+        }
+        self.half = Some(half);
+        Ok(())
+    }
+
     /// Allocate for a fixed token count, once per [`crate::forward::Forward`].
     pub fn new(
         stream: &Arc<CudaStream>,
@@ -692,6 +730,7 @@ impl AttnScratch {
             gated: stream.alloc_zeros::<f32>(tokens * q_dim)?,
             projected: stream.alloc_zeros::<f32>(tokens * hidden)?,
             xq: None,
+            half: None,
             // Prefill uses only entry zero; batched decode needs one entry per
             // independent sequence. The engine serves three and the isolated
             // width sweep exercises up to eight.
@@ -820,6 +859,19 @@ fn shared_or_try_init<T, E>(
     let value = Arc::new(build()?);
     *cached = Some(Arc::clone(&value));
     Ok(value)
+}
+
+/// One of the block's four projections, for [`GatedAttentionBlock::project_one`].
+#[derive(Clone, Copy)]
+enum Proj {
+    /// hidden -> `2 * q_dim`, the packed query+gate.
+    QGate,
+    /// hidden -> `kv_dim`.
+    K,
+    /// hidden -> `kv_dim`.
+    V,
+    /// `q_dim` -> hidden.
+    Out,
 }
 
 /// Which scratch buffer [`GatedAttentionBlock::quantize_activations`] reads.
@@ -996,6 +1048,123 @@ impl GatedAttentionBlock {
         self.kernels.mixer.set_decode_mma_blocks(blocks);
     }
 
+    /// Whether this pass stages fp16 operands rather than int8 ones: a
+    /// tensor-core shape (`int8` present) whose scratch carries the half stage.
+    fn half_active(&self, sc: &AttnScratch) -> bool {
+        self.int8.is_some() && sc.half.is_some()
+    }
+
+    /// Whether steps 2 and 5 need `normed` staged. On the half path every
+    /// projection reads the staged operand, bf16 ones included.
+    fn stages_normed(&self, sc: &AttnScratch) -> bool {
+        self.half_active(sc) || self.quantizes_normed()
+    }
+
+    /// Whether step 11 needs `gated` staged. See [`Self::stages_normed`].
+    fn stages_gated(&self, sc: &AttnScratch) -> bool {
+        self.half_active(sc) || self.quantizes_gated()
+    }
+
+    /// Stage one scratch buffer as the tensor-core operand: rounded to fp16
+    /// on the half path, quantized to int8 on the integer one.
+    fn stage_activations(
+        &self,
+        stream: &Arc<CudaStream>,
+        sc: &mut AttnScratch,
+        pick: ScratchPick,
+        tokens: usize,
+        k_dim: usize,
+    ) -> Result<(), AttentionBlockError> {
+        if !self.half_active(sc) {
+            return self.quantize_activations(stream, sc, pick, tokens, k_dim);
+        }
+        let src = match pick {
+            ScratchPick::Normed => &sc.normed,
+            ScratchPick::Gated => &sc.gated,
+        };
+        let half = sc.half.as_mut().expect("half_active checked");
+        half.stage(stream, src, tokens * k_dim)?;
+        Ok(())
+    }
+
+    /// One of the four projections into `out`, by whichever path this shape
+    /// and this tensor take: the fp16 tensor cores when the half stage is
+    /// active (Q8_0 through its split repack, bf16 directly), else the
+    /// integer tensor cores for a repacked Q8_0 tensor, else the GEMV over
+    /// the stored format reading `src` in fp32.
+    #[allow(clippy::too_many_arguments)]
+    fn project_one(
+        &self,
+        k: &AttentionKernelSet,
+        stream: &Arc<CudaStream>,
+        half: Option<&mut crate::block::half::HalfStage>,
+        xq: Option<&(CudaSlice<i8>, CudaSlice<f32>)>,
+        src: &CudaSlice<f32>,
+        which: Proj,
+        out: &mut CudaSlice<f32>,
+        t: usize,
+    ) -> Result<(), AttentionBlockError> {
+        let q_dim = self.q_heads * self.head_dim;
+        let kv_dim = self.kv_heads * self.head_dim;
+        let w = &self.weights;
+        let (k_dim, n_rows, bytes, format, exponent, int8, head) = match which {
+            Proj::QGate => (
+                self.hidden,
+                2 * q_dim,
+                &w.w_qgate,
+                w.formats.qgate,
+                w.bf16_exponents[0],
+                self.int8_qgate(),
+                &k.qgate,
+            ),
+            Proj::K => (
+                self.hidden,
+                kv_dim,
+                &w.w_k,
+                w.formats.k,
+                w.bf16_exponents[1],
+                self.int8_k(),
+                &k.kv,
+            ),
+            Proj::V => (
+                self.hidden,
+                kv_dim,
+                &w.w_v,
+                w.formats.v,
+                w.bf16_exponents[2],
+                self.int8_v(),
+                &k.kv,
+            ),
+            Proj::Out => (
+                q_dim,
+                self.hidden,
+                &w.w_out,
+                w.formats.out,
+                w.bf16_exponents[3],
+                self.int8_out(),
+                &k.out,
+            ),
+        };
+        if let Some(h) = half.filter(|_| self.int8.is_some()) {
+            let hw = match (int8, format) {
+                (Some((_, q, scales)), _) => Some(HalfWeight::Q8_0 { q, scales }),
+                (None, HeadFormat::Bf16) => Some(HalfWeight::Bf16 { bytes, exponent }),
+                _ => None,
+            };
+            if let Some(hw) = hw {
+                h.project(stream, hw, out, k_dim, n_rows, t)?;
+                return Ok(());
+            }
+        }
+        if let Some((mma, wq, ws)) = int8 {
+            let (xq, xs) = xq.expect("quantized before the first projection");
+            mma.q8_0_proj_split_half(stream, wq, ws, xq, xs, out, k_dim, n_rows, t)?;
+            return Ok(());
+        }
+        head.forward(stream, HeadTensor { bytes, format }, src, t, out)?;
+        Ok(())
+    }
+
     /// Quantize one scratch buffer to int8 for the projections that read it.
     ///
     /// Called twice per pass: once over `normed` for the three projections
@@ -1083,10 +1252,10 @@ impl GatedAttentionBlock {
         let projection = |role: Role, dims: &[u64]| {
             projection_weight(file, directory, stream, role, layer, dims)
         };
-        let (w_qgate, f_qgate) = projection(Role::AttnQGate, &[h, 2 * q_dim as u64])?;
-        let (w_k, f_k) = projection(Role::AttnK, &[h, kv_dim as u64])?;
-        let (w_v, f_v) = projection(Role::AttnV, &[h, kv_dim as u64])?;
-        let (w_out, f_out) = projection(Role::AttnOut, &[q_dim as u64, h])?;
+        let (w_qgate, f_qgate, e_qgate) = projection(Role::AttnQGate, &[h, 2 * q_dim as u64])?;
+        let (w_k, f_k, e_k) = projection(Role::AttnK, &[h, kv_dim as u64])?;
+        let (w_v, f_v, e_v) = projection(Role::AttnV, &[h, kv_dim as u64])?;
+        let (w_out, f_out, e_out) = projection(Role::AttnOut, &[q_dim as u64, h])?;
 
         Ok(AttentionLayerWeights {
             w_input_norm,
@@ -1102,6 +1271,7 @@ impl GatedAttentionBlock {
                 v: f_v,
                 out: f_out,
             },
+            bf16_exponents: [e_qgate, e_k, e_v, e_out],
             int8: Mutex::new(None),
         })
     }
@@ -1231,7 +1401,6 @@ impl GatedAttentionBlock {
         let t = self.tokens;
         let hidden_elems = t * self.hidden;
         let q_dim = self.q_heads * self.head_dim;
-        let kv_dim = self.kv_heads * self.head_dim;
         expect_len("block input", hidden_state.len(), hidden_elems)?;
         expect_len("block output", out.len(), hidden_elems)?;
         if pos_offset + t > cache.max_seq {
@@ -1262,34 +1431,19 @@ impl GatedAttentionBlock {
         //
         // Steps 2 and 5 all read `normed` and all contract over `hidden`, so
         // one quantization serves three projections.
-        if self.quantizes_normed() {
-            self.quantize_activations(stream, sc, ScratchPick::Normed, t, self.hidden)?;
+        if self.stages_normed(sc) {
+            self.stage_activations(stream, sc, ScratchPick::Normed, t, self.hidden)?;
         }
-        if let Some((mma, wq, ws)) = self.int8_qgate() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split_half(
-                stream,
-                wq,
-                ws,
-                xq,
-                xs,
-                &mut sc.packed,
-                self.hidden,
-                2 * q_dim,
-                t,
-            )?;
-        } else {
-            k.qgate.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_qgate,
-                    format: self.weights.formats.qgate,
-                },
-                &sc.normed,
-                t,
-                &mut sc.packed,
-            )?;
-        }
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.normed,
+            Proj::QGate,
+            &mut sc.packed,
+            t,
+        )?;
 
         // 3. Deinterleave. See the module docs: this is the step that is a
         //    different model if it is done as a halves split.
@@ -1309,46 +1463,26 @@ impl GatedAttentionBlock {
 
         // 5. Key and value projections, off the same normed input — and off
         //    the same quantization of it that step 2 already paid for.
-        if let Some((mma, wq, ws)) = self.int8_k() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
-            mma.q8_0_proj_split_half(stream, wq, ws, xq, xs, &mut sc.key, self.hidden, kv_dim, t)?;
-        } else {
-            k.kv.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_k,
-                    format: self.weights.formats.k,
-                },
-                &sc.normed,
-                t,
-                &mut sc.key,
-            )?;
-        }
-        if let Some((mma, wq, ws)) = self.int8_v() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
-            mma.q8_0_proj_split_half(
-                stream,
-                wq,
-                ws,
-                xq,
-                xs,
-                &mut sc.value,
-                self.hidden,
-                kv_dim,
-                t,
-            )?;
-        } else {
-            k.kv.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_v,
-                    format: self.weights.formats.v,
-                },
-                &sc.normed,
-                t,
-                &mut sc.value,
-            )?;
-        }
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.normed,
+            Proj::K,
+            &mut sc.key,
+            t,
+        )?;
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.normed,
+            Proj::V,
+            &mut sc.value,
+            t,
+        )?;
 
         // 6. Per-head RMSNorm on the key. The value is not normed.
         k.ops.rms_norm(
@@ -1482,34 +1616,19 @@ impl GatedAttentionBlock {
         // 11. Output projection. Contracts over `q_dim`, not `hidden`, and
         //     reads the gated core output — so it re-quantizes rather than
         //     reusing what step 2 produced.
-        if self.quantizes_gated() {
-            self.quantize_activations(stream, sc, ScratchPick::Gated, t, q_dim)?;
+        if self.stages_gated(sc) {
+            self.stage_activations(stream, sc, ScratchPick::Gated, t, q_dim)?;
         }
-        if let Some((mma, wq, ws)) = self.int8_out() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split_half(
-                stream,
-                wq,
-                ws,
-                xq,
-                xs,
-                &mut sc.projected,
-                q_dim,
-                self.hidden,
-                t,
-            )?;
-        } else {
-            k.out.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_out,
-                    format: self.weights.formats.out,
-                },
-                &sc.gated,
-                t,
-                &mut sc.projected,
-            )?;
-        }
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.gated,
+            Proj::Out,
+            &mut sc.projected,
+            t,
+        )?;
 
         // 12. Residual.
         k.ops
@@ -1617,34 +1736,19 @@ impl GatedAttentionBlock {
 
         // 2. The packed query+gate projection. See the method docs: this is
         //    the weight read batching exists to amortize.
-        if self.quantizes_normed() {
-            self.quantize_activations(stream, sc, ScratchPick::Normed, t, self.hidden)?;
+        if self.stages_normed(sc) {
+            self.stage_activations(stream, sc, ScratchPick::Normed, t, self.hidden)?;
         }
-        if let Some((mma, wq, ws)) = self.int8_qgate() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split_half(
-                stream,
-                wq,
-                ws,
-                xq,
-                xs,
-                &mut sc.packed,
-                self.hidden,
-                2 * q_dim,
-                t,
-            )?;
-        } else {
-            k.qgate.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_qgate,
-                    format: self.weights.formats.qgate,
-                },
-                &sc.normed,
-                t,
-                &mut sc.packed,
-            )?;
-        }
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.normed,
+            Proj::QGate,
+            &mut sc.packed,
+            t,
+        )?;
 
         // 3. Deinterleave. No position, no state: batches.
         k.mixer
@@ -1663,46 +1767,26 @@ impl GatedAttentionBlock {
 
         // 5. Key and value projections. The other half of the weight read
         //    batching exists to amortize.
-        if let Some((mma, wq, ws)) = self.int8_k() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
-            mma.q8_0_proj_split_half(stream, wq, ws, xq, xs, &mut sc.key, self.hidden, kv_dim, t)?;
-        } else {
-            k.kv.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_k,
-                    format: self.weights.formats.k,
-                },
-                &sc.normed,
-                t,
-                &mut sc.key,
-            )?;
-        }
-        if let Some((mma, wq, ws)) = self.int8_v() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
-            mma.q8_0_proj_split_half(
-                stream,
-                wq,
-                ws,
-                xq,
-                xs,
-                &mut sc.value,
-                self.hidden,
-                kv_dim,
-                t,
-            )?;
-        } else {
-            k.kv.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_v,
-                    format: self.weights.formats.v,
-                },
-                &sc.normed,
-                t,
-                &mut sc.value,
-            )?;
-        }
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.normed,
+            Proj::K,
+            &mut sc.key,
+            t,
+        )?;
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.normed,
+            Proj::V,
+            &mut sc.value,
+            t,
+        )?;
 
         // 6. Per-head RMSNorm on the key. Batches.
         k.ops.rms_norm(
@@ -1874,34 +1958,19 @@ impl GatedAttentionBlock {
         )?;
 
         // 11. Output projection. The third weight read batching amortizes.
-        if self.quantizes_gated() {
-            self.quantize_activations(stream, sc, ScratchPick::Gated, t, q_dim)?;
+        if self.stages_gated(sc) {
+            self.stage_activations(stream, sc, ScratchPick::Gated, t, q_dim)?;
         }
-        if let Some((mma, wq, ws)) = self.int8_out() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split_half(
-                stream,
-                wq,
-                ws,
-                xq,
-                xs,
-                &mut sc.projected,
-                q_dim,
-                self.hidden,
-                t,
-            )?;
-        } else {
-            k.out.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_out,
-                    format: self.weights.formats.out,
-                },
-                &sc.gated,
-                t,
-                &mut sc.projected,
-            )?;
-        }
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.gated,
+            Proj::Out,
+            &mut sc.projected,
+            t,
+        )?;
 
         // 12. Residual. Batches.
         k.ops
@@ -1969,34 +2038,19 @@ impl GatedAttentionBlock {
             self.hidden,
             self.rms_eps,
         )?;
-        if self.quantizes_normed() {
-            self.quantize_activations(stream, sc, ScratchPick::Normed, total, self.hidden)?;
+        if self.stages_normed(sc) {
+            self.stage_activations(stream, sc, ScratchPick::Normed, total, self.hidden)?;
         }
-        if let Some((mma, wq, ws)) = self.int8_qgate() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split_half(
-                stream,
-                wq,
-                ws,
-                xq,
-                xs,
-                &mut sc.packed,
-                self.hidden,
-                2 * q_dim,
-                total,
-            )?;
-        } else {
-            k.qgate.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_qgate,
-                    format: self.weights.formats.qgate,
-                },
-                &sc.normed,
-                total,
-                &mut sc.packed,
-            )?;
-        }
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.normed,
+            Proj::QGate,
+            &mut sc.packed,
+            total,
+        )?;
         k.mixer
             .split_query_and_gate(stream, &sc.packed, &mut sc.query, &mut sc.gate, total)?;
         k.ops.rms_norm(
@@ -2008,56 +2062,26 @@ impl GatedAttentionBlock {
             self.head_dim,
             self.rms_eps,
         )?;
-        if let Some((mma, wq, ws)) = self.int8_k() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split_half(
-                stream,
-                wq,
-                ws,
-                xq,
-                xs,
-                &mut sc.key,
-                self.hidden,
-                kv_dim,
-                total,
-            )?;
-        } else {
-            k.kv.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_k,
-                    format: self.weights.formats.k,
-                },
-                &sc.normed,
-                total,
-                &mut sc.key,
-            )?;
-        }
-        if let Some((mma, wq, ws)) = self.int8_v() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split_half(
-                stream,
-                wq,
-                ws,
-                xq,
-                xs,
-                &mut sc.value,
-                self.hidden,
-                kv_dim,
-                total,
-            )?;
-        } else {
-            k.kv.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_v,
-                    format: self.weights.formats.v,
-                },
-                &sc.normed,
-                total,
-                &mut sc.value,
-            )?;
-        }
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.normed,
+            Proj::K,
+            &mut sc.key,
+            total,
+        )?;
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.normed,
+            Proj::V,
+            &mut sc.value,
+            total,
+        )?;
         k.ops.rms_norm(
             stream,
             &sc.key,
@@ -2228,34 +2252,19 @@ impl GatedAttentionBlock {
             q_dim,
             GateShape::Elementwise,
         )?;
-        if self.quantizes_gated() {
-            self.quantize_activations(stream, sc, ScratchPick::Gated, total, q_dim)?;
+        if self.stages_gated(sc) {
+            self.stage_activations(stream, sc, ScratchPick::Gated, total, q_dim)?;
         }
-        if let Some((mma, wq, ws)) = self.int8_out() {
-            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split_half(
-                stream,
-                wq,
-                ws,
-                xq,
-                xs,
-                &mut sc.projected,
-                q_dim,
-                self.hidden,
-                total,
-            )?;
-        } else {
-            k.out.forward(
-                stream,
-                HeadTensor {
-                    bytes: &self.weights.w_out,
-                    format: self.weights.formats.out,
-                },
-                &sc.gated,
-                total,
-                &mut sc.projected,
-            )?;
-        }
+        self.project_one(
+            &k,
+            stream,
+            sc.half.as_mut(),
+            sc.xq.as_ref(),
+            &sc.gated,
+            Proj::Out,
+            &mut sc.projected,
+            total,
+        )?;
         k.ops
             .add(stream, hidden_state, &sc.projected, out, hidden_elems)?;
         Ok(())
@@ -2290,7 +2299,7 @@ fn projection_weight(
     role: Role,
     layer: u32,
     dims: &[u64],
-) -> Result<(CudaSlice<u8>, HeadFormat), AttentionBlockError> {
+) -> Result<(CudaSlice<u8>, HeadFormat, i32), AttentionBlockError> {
     let entry = directory
         .find(role, Some(layer))
         .ok_or(AttentionBlockError::MissingWeight { role, layer })?;
@@ -2314,7 +2323,14 @@ fn projection_weight(
     let bytes = file
         .tensor_bytes(&entry.spec.name)
         .ok_or(AttentionBlockError::MissingWeight { role, layer })?;
-    Ok((stream.clone_htod(bytes)?, format))
+    // Only the bf16 tensors take a scale on their way to fp16; reading the
+    // max of every other format here would be load time for nothing.
+    let exponent = if format == HeadFormat::Bf16 {
+        bf16_half_exponent(bytes)
+    } else {
+        0
+    };
+    Ok((stream.clone_htod(bytes)?, format, exponent))
 }
 
 /// Copy a resident f32 norm vector into a typed buffer.

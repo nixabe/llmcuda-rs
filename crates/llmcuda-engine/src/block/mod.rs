@@ -40,6 +40,7 @@ pub mod dense_ffn;
 pub mod ffn;
 pub mod gdn;
 pub mod gdn_verify;
+pub mod half;
 pub mod moe;
 pub mod mtp;
 

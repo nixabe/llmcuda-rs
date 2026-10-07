@@ -57,6 +57,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use llmcuda_cuda::kernels::compile;
+use llmcuda_cuda::kernels::hgemm::{HalfWeight, HgemmError, HgemmKernels};
 use llmcuda_cuda::kernels::layer_ops::LayerOpsKernels;
 use llmcuda_cuda::kernels::moe::{
     ExpertQuant, MoeBuffers, MoeGeometry, MoeKernels, QuantTensor, SharedExpertInt8,
@@ -164,6 +165,20 @@ fn split_entry_for(tokens: usize) -> (usize, u32) {
 /// register budget reaches; above it the staged weights and `RT * TT`
 /// accumulators stop fitting and the GEMM is the right shape again.
 const SPLIT_GEMV_MAX_TOKENS: usize = 16;
+
+/// Whether a prefill-width pass runs its projections on the fp16 tensor
+/// cores ([`HgemmKernels`]) rather than `shared_expert_mma`'s int8 ones.
+///
+/// Same weights either way — the split int8 layout, dequantized to the
+/// correctly rounded fp16 of `q * d` once per staged tile — so this changes
+/// the activation operand (fp16 rather than int8 against a block absmax,
+/// strictly the more accurate of the two) and the kernel, not the model.
+/// `LLMCUDA_HALF_GEMM=0` restores the integer path, for A/B and as the
+/// escape hatch — the same switch the mixer blocks read, so one variable
+/// moves the whole pass. Read once, at construction.
+fn dense_half_gemm() -> bool {
+    crate::block::half::enabled_for(true)
+}
 
 /// The dense FFN's weight residency, and the one real design decision in this
 /// module.
@@ -786,8 +801,102 @@ pub struct DenseFfnBlock {
     /// it. `None` on a prefill shape, where `shared_expert_mma` is the right
     /// kernel and these buffers would be hundreds of megabytes.
     split: Option<SplitGemv>,
+    /// The prefill path on the fp16 tensor cores; `None` on a narrow shape,
+    /// or when [`dense_half_gemm`] says the integer path. Boxed, so its
+    /// kernel handles do not size every `FfnBlock` variant.
+    half: Option<Box<HalfGemm>>,
     geometry: MoeGeometry,
     eps: f32,
+}
+
+/// The prefill-width MLP on [`HgemmKernels`] and its `[max_tokens]`-row
+/// scratch: the norm and SwiGLU emit the fp16 operands the next projection
+/// reads, exactly as the split GEMV's do.
+struct HalfGemm {
+    kernels: HgemmKernels,
+    rms_norm_narrow: CudaFunction,
+    swiglu_narrow: CudaFunction,
+    gate_out: CudaSlice<f32>,
+    up_out: CudaSlice<f32>,
+    normed_h: CudaSlice<u16>,
+    activated_h: CudaSlice<u16>,
+    /// Split-K partials for whichever of the three projections plans a split
+    /// at this width — at 512 tokens, the 5,120-row down projection.
+    workspace: Option<CudaSlice<f32>>,
+}
+
+impl HalfGemm {
+    /// `ffn_out = down(silu(gate . normed) * (up . normed))` over every row
+    /// of the buffer, reading `normed_h`, which the norm wrote.
+    fn mlp(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        w: &SharedExpertInt8,
+        g: MoeGeometry,
+        ffn_out: &mut CudaSlice<f32>,
+    ) -> Result<(), MoeBlockError> {
+        let t = g.max_tokens;
+        let (gate_q, gate_s) = w.gate();
+        let (up_q, up_s) = w.up();
+        let (down_q, down_s) = w.down();
+        let (k, n) = (g.hidden, g.intermediate);
+        let q8 = |q, scales| HalfWeight::Q8_0 { q, scales };
+        self.kernels.gemm(
+            stream,
+            q8(gate_q, gate_s),
+            &self.normed_h,
+            &mut self.gate_out,
+            self.workspace.as_mut(),
+            t,
+            n,
+            k,
+            n,
+            false,
+        )?;
+        self.kernels.gemm(
+            stream,
+            q8(up_q, up_s),
+            &self.normed_h,
+            &mut self.up_out,
+            self.workspace.as_mut(),
+            t,
+            n,
+            k,
+            n,
+            false,
+        )?;
+        swiglu_narrow(
+            stream,
+            &self.swiglu_narrow,
+            &self.gate_out,
+            &self.up_out,
+            &mut self.activated_h,
+            t * n,
+        )?;
+        self.kernels.gemm(
+            stream,
+            q8(down_q, down_s),
+            &self.activated_h,
+            ffn_out,
+            self.workspace.as_mut(),
+            t,
+            k,
+            n,
+            k,
+            false,
+        )?;
+        Ok(())
+    }
+}
+
+impl From<HgemmError> for MoeBlockError {
+    fn from(e: HgemmError) -> Self {
+        match e {
+            HgemmError::Compile(e) => Self::Compile(e),
+            HgemmError::Driver(e) => Self::Driver(e),
+            other => Self::Compile(other.to_string()),
+        }
+    }
 }
 
 /// The compiled split-layout GEMV and its `[max_tokens][intermediate]`
@@ -869,7 +978,32 @@ impl DenseFfnBlock {
         // GEMV's scratch is small enough to be unconditional; the tensor-core
         // staging arrays are not.
         let narrow = mma && geometry.max_tokens <= SPLIT_GEMV_MAX_TOKENS;
-        let buffers = moe.shared_only_buffers(stream, mma && !narrow)?;
+        let half = mma && !narrow && dense_half_gemm();
+        let buffers = moe.shared_only_buffers(stream, mma && !narrow && !half)?;
+        let half = if half {
+            let n = geometry.max_tokens * geometry.intermediate;
+            let kernels = HgemmKernels::new(ctx)?;
+            let (t, h, i) = (geometry.max_tokens, geometry.hidden, geometry.intermediate);
+            let ws = kernels
+                .workspace_elems(t, i, h)
+                .max(kernels.workspace_elems(t, h, i));
+            Some(Box::new(HalfGemm {
+                workspace: if ws > 0 {
+                    Some(stream.alloc_zeros::<f32>(ws)?)
+                } else {
+                    None
+                },
+                kernels,
+                rms_norm_narrow: module.load_function("dense_rms_norm_narrow")?,
+                swiglu_narrow: module.load_function("dense_swiglu_narrow")?,
+                gate_out: stream.alloc_zeros::<f32>(n)?,
+                up_out: stream.alloc_zeros::<f32>(n)?,
+                normed_h: stream.alloc_zeros::<u16>(geometry.max_tokens * geometry.hidden)?,
+                activated_h: stream.alloc_zeros::<u16>(n)?,
+            }))
+        } else {
+            None
+        };
 
         let split = if narrow {
             let n = geometry.max_tokens * geometry.intermediate;
@@ -899,6 +1033,7 @@ impl DenseFfnBlock {
             buffers,
             normed: stream.alloc_zeros::<f32>(geometry.max_tokens * geometry.hidden)?,
             split,
+            half,
             geometry,
             eps,
         })
@@ -1074,8 +1209,8 @@ impl DenseFfnBlock {
         //    The split path runs its own copy of that kernel, which emits the
         //    fp16 operand the projections read from the same registers rather
         //    than in a second pass over the row. See `dense_rms_norm_narrow`.
-        match &mut self.split {
-            Some(split) => dense_rms_norm(
+        match (&mut self.split, &mut self.half) {
+            (Some(split), _) => dense_rms_norm(
                 stream,
                 &split.rms_norm_narrow,
                 residual,
@@ -1086,7 +1221,18 @@ impl DenseFfnBlock {
                 g.hidden,
                 self.eps,
             )?,
-            None => self.layer_ops.rms_norm(
+            (None, Some(half)) => dense_rms_norm(
+                stream,
+                &half.rms_norm_narrow,
+                residual,
+                &w.post_norm,
+                &mut self.normed,
+                &mut half.normed_h,
+                g.max_tokens,
+                g.hidden,
+                self.eps,
+            )?,
+            (None, None) => self.layer_ops.rms_norm(
                 stream,
                 residual,
                 &w.post_norm,
@@ -1114,6 +1260,8 @@ impl DenseFfnBlock {
                     // path skips the residual-add launch below.
                     self.mlp_split_gemv(stream, i8w, residual, ffn_out, l_out)?;
                     return Ok(());
+                } else if let Some(half) = self.half.as_mut() {
+                    half.mlp(stream, i8w, g, ffn_out)?;
                 } else {
                     self.moe.shared_expert_mma(
                         stream,

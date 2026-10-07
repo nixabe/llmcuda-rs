@@ -699,6 +699,14 @@ __device__ __forceinline__ void k2_gemv_quads(const unsigned char* __restrict__ 
     }
 }
 
+// Exact float of h*256+l from MMA accumulators that started at K2_MAGIC_HI and
+// K2_MAGIC_LO. Their bits are then the floats 1.5*2^31+256h and 1.5*2^23+l
+// (ulp 256 and 1; |h|,|l| < 2^22), the first subtraction is exact, and the sum
+// is the integer itself whenever |h*256+l| < 2^24: two full-rate adds in place
+// of IMAD and a quarter-rate I2F.
+#define K2_MAGIC_HI 0x4f400000
+#define K2_MAGIC_LO 0x4b400000
+__device__ __forceinline__ float k2_magic_float(int hi,int lo){return __fadd_rn(__fsub_rn(__int_as_float(hi),3233808384.0f),__int_as_float(lo));}
 __device__ __forceinline__ void k2_mma_u8(int* d,unsigned a,unsigned b){asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};":"+r"(d[0]),"+r"(d[1]):"r"(a),"r"(b));}
 __device__ __forceinline__ void k2_mma_s8(int* d,unsigned a,unsigned b){asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};":"+r"(d[0]),"+r"(d[1]):"r"(a),"r"(b));}
 // Sixteen-bit tensor-core projection on int8 m8n8k16. Activations arrive in
@@ -846,12 +854,17 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
                         t0=raw_full_term(sc0[rs][g],hi[0]*256+lo[0],sc1[rs][g],m[g].z,m[g].x);
                         t1=raw_full_term(sc0[rs][g],hi[1]*256+lo[1],sc1[rs][g],m[g].w,m[g].y);
                     } else {
-                        int h0[2]={0,0},h1[2]={0,0},l0[2]={0,0},l1[2]={0,0};
+                        // The second sub-block converts on the FP32 pipe and the
+                        // first through I2F, splitting Q6's two conversions per
+                        // term between the two pipes.
+                        int h0[2]={0,0},l0[2]={0,0};
+                        int h1[2]={K2_MAGIC_HI,K2_MAGIC_HI},l1[2]={K2_MAGIC_LO,K2_MAGIC_LO};
                         k2_mma_s8(h0,a0[rs][g],b[g].x);k2_mma_s8(h1,a1[rs][g],b[g].y);
                         k2_mma_s8(l0,a0[rs][g],b[g].z);k2_mma_s8(l1,a1[rs][g],b[g].w);
-                        int v00=h0[0]*256+l0[0],v10=h1[0]*256+l1[0],v01=h0[1]*256+l0[1],v11=h1[1]*256+l1[1];
-                        t0=__fmul_rn(__fmul_rn(dl[rs],m[g].x),__fmaf_rn((float)v10,sc1[rs][g],__fmul_rn((float)v00,sc0[rs][g])));
-                        t1=__fmul_rn(__fmul_rn(dl[rs],m[g].y),__fmaf_rn((float)v11,sc1[rs][g],__fmul_rn((float)v01,sc0[rs][g])));
+                        float f00=(float)(h0[0]*256+l0[0]),f01=(float)(h0[1]*256+l0[1]);
+                        float f10=k2_magic_float(h1[0],l1[0]),f11=k2_magic_float(h1[1],l1[1]);
+                        t0=__fmul_rn(__fmul_rn(dl[rs],m[g].x),__fmaf_rn(f10,sc1[rs][g],__fmul_rn(f00,sc0[rs][g])));
+                        t1=__fmul_rn(__fmul_rn(dl[rs],m[g].y),__fmaf_rn(f11,sc1[rs][g],__fmul_rn(f01,sc0[rs][g])));
                     }
                     if(g<2){p[g][0]=t0;p[g][1]=t1;}else{p[g&1][0]+=t0;p[g&1][1]+=t1;}
                 }

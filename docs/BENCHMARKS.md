@@ -848,6 +848,14 @@ terms, windows and the ascending window sum stay the GEMV's fp32
 operations. No dispatch allocation or live-count readback is added to the hot
 path.
 
+Each Q6 term needs two exact integer-to-float conversions, and `I2F` issues
+at a quarter of the FP32 rate on sm_75. The prefill tile starts the second
+sub-block's high and low accumulators at the bit patterns of 1.5×2^31 and
+1.5×2^23, so after the MMA they hold the floats 1.5×2^31+256h and
+1.5×2^23+l; one exact subtraction and one exact add then give the float of
+256h+l, the value `I2F` returns. Splitting the two conversions between the
+pipes raised Q6 prefill about 2%.
+
 Q4's affine minimum multiplies the original activation sum, retaining the
 warp's summation tree. Q6 combines its two sixteen-value subscale dots before
 applying the common activation scale. Both paths add four 32-value terms as

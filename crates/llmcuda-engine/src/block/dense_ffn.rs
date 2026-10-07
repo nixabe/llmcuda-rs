@@ -826,16 +826,22 @@ struct HalfGemm {
 }
 
 impl HalfGemm {
-    /// `ffn_out = down(silu(gate . normed) * (up . normed))` over every row
-    /// of the buffer, reading `normed_h`, which the norm wrote.
+    /// `ffn_out = down(silu(gate . normed) * (up . normed))` over the first
+    /// `tokens` rows, reading `normed_h`, which the norm wrote.
+    ///
+    /// Sized by the host's `tokens`, not the device count the other paths
+    /// gate on: this path runs only at prefill widths, which are never
+    /// captured into a graph, and a pass shorter than its buffers
+    /// (`Forward::run_prefix`) should not pay for the rows it does not have.
     fn mlp(
         &mut self,
         stream: &Arc<CudaStream>,
         w: &SharedExpertInt8,
         g: MoeGeometry,
+        tokens: usize,
         ffn_out: &mut CudaSlice<f32>,
     ) -> Result<(), MoeBlockError> {
-        let t = g.max_tokens;
+        let t = tokens;
         let (gate_q, gate_s) = w.gate();
         let (up_q, up_s) = w.up();
         let (down_q, down_s) = w.down();
@@ -1261,7 +1267,7 @@ impl DenseFfnBlock {
                     self.mlp_split_gemv(stream, i8w, residual, ffn_out, l_out)?;
                     return Ok(());
                 } else if let Some(half) = self.half.as_mut() {
-                    half.mlp(stream, i8w, g, ffn_out)?;
+                    half.mlp(stream, i8w, g, tokens, ffn_out)?;
                 } else {
                     self.moe.shared_expert_mma(
                         stream,

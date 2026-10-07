@@ -406,6 +406,10 @@ pub enum ForwardError {
     /// Every block validates its buffer lengths exactly rather than accepting
     /// a prefix, so the token count is fixed at construction.
     WrongTokenCount { expected: usize, got: usize },
+    /// [`Forward::run_prefix`] on a pass it does not cover: one with image
+    /// rows staged or per-token rotary positions, a K2-Horizon pass, or a
+    /// model whose feed-forward block is not dense.
+    PrefixUnsupported(&'static str),
     /// `stage_image_rows` without `enable_image_injection` — vision serving
     /// must pre-allocate at load, never lazily (AGENTS.md rule 6).
     ImageInjectionNotEnabled,
@@ -517,6 +521,9 @@ impl std::fmt::Display for ForwardError {
                 f,
                 "this pass was built for {expected} tokens and was given {got}",
             ),
+            Self::PrefixUnsupported(what) => {
+                write!(f, "a prefix run of this pass is not supported: {what}")
+            }
             Self::ImageInjectionNotEnabled => write!(
                 f,
                 "image rows staged on a pass without enable_image_injection"
@@ -868,6 +875,9 @@ impl StageProfile {
 pub struct Forward {
     config: ModelConfig,
     tokens: usize,
+    /// Rows the pass in flight runs over: `tokens`, except inside
+    /// [`Self::run_prefix`].
+    active: usize,
     hidden: usize,
     vocab: usize,
     rms_eps: f32,
@@ -1404,6 +1414,7 @@ impl Forward {
         Ok(Self {
             config,
             tokens,
+            active: tokens,
             hidden,
             vocab,
             rms_eps,
@@ -3416,6 +3427,58 @@ impl Forward {
         })
     }
 
+    /// [`Self::run`] over the first `token_ids.len()` rows of this pass: a
+    /// prompt piece shorter than the width the pass was built for, run
+    /// without padding and without a pass of its own.
+    ///
+    /// Without it a piece runs as the largest prebuilt widths that fit, so an
+    /// 877-token prompt costs eight passes, each re-reading every weight. Here
+    /// every launch is sized to the piece: the gather, both mixers (handed
+    /// exact-length views of their activations and scratch, so each length
+    /// check inside them still holds) and the dense feed-forward block (whose
+    /// device token count gates its launches, and whose fp16 projections take
+    /// the live rows). The state advances by the piece; [`Self::final_norm`]
+    /// holds the piece's rows first, then stale ones; the logits are the
+    /// piece's last row's.
+    ///
+    /// The piece runs with this pass's kernels. At `MMA_SPLIT_TOKENS` rows
+    /// and above those are the kernels a pass of the piece's own width would
+    /// take, and the result is that pass's to the bit (`tests/prefix_pass.rs`).
+    /// Below it a pass built that narrow takes the small-batch GEMVs where
+    /// this one takes the tensor cores: the same model at a different
+    /// rounding, which is why the runtime decomposes such pieces instead.
+    ///
+    /// Text-only, dense models only: a pass with image rows staged or
+    /// per-token rotary positions, a K2-Horizon pass, or a mixture of
+    /// experts is refused (those paths have not been checked at a partial
+    /// width), as is an empty piece or one longer than the pass.
+    pub fn run_prefix(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        state: &mut SequenceState,
+        token_ids: &[i32],
+    ) -> Result<(), ForwardError> {
+        let n = token_ids.len();
+        if n == 0 || n > self.tokens {
+            return Err(ForwardError::WrongTokenCount {
+                expected: self.tokens,
+                got: n,
+            });
+        }
+        if !self.staged_rows.is_empty() || self.mrope_active {
+            return Err(ForwardError::PrefixUnsupported(
+                "image rows or per-token positions",
+            ));
+        }
+        if self.k2_ops.is_some() || self.config.dense_ffn().is_none() {
+            return Err(ForwardError::PrefixUnsupported("not a dense text model"));
+        }
+        self.active = n;
+        let result = self.run_active(stream, state, token_ids, &mut |_, _, _| {});
+        self.active = self.tokens;
+        result
+    }
+
     fn run_tagged(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -3429,6 +3492,17 @@ impl Forward {
                 got: token_ids.len(),
             });
         }
+        self.run_active(stream, state, token_ids, on_waypoint)
+    }
+
+    /// The pass over `self.active` rows, `token_ids` among them.
+    fn run_active(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        state: &mut SequenceState,
+        token_ids: &[i32],
+        on_waypoint: &mut impl FnMut(Option<u32>, WaypointStage, &CudaSlice<f32>),
+    ) -> Result<(), ForwardError> {
         // A state built for a different model would index the wrong cache in
         // the middle of the pass, so it is checked once at the edge instead.
         let (gdn_layers, attn_layers) = (self.gdn_weights.len(), self.attention.len());
@@ -3451,7 +3525,7 @@ impl Forward {
         // state's claim about how many positions its caches hold is true.
         // Advancing earlier would leave a failed pass claiming positions that
         // no cache was written for, and the next call would read them.
-        state.advance(self.tokens);
+        state.advance(self.active);
         Ok(())
     }
 
@@ -3576,7 +3650,7 @@ impl Forward {
         state
             .publish_position(stream)
             .map_err(ForwardError::State)?;
-        self.moe.publish_tokens(stream, self.tokens)?;
+        self.moe.publish_tokens(stream, self.active)?;
         Ok(())
     }
 
@@ -3631,7 +3705,7 @@ impl Forward {
             // 1. the mixer, into `attn_residual-N`.
             let kind = self.config.layer_kind(layer);
             match kind {
-                LayerKind::GatedDeltaNet => {
+                LayerKind::GatedDeltaNet if self.active == self.tokens => {
                     self.gdn.forward(
                         stream,
                         &self.gdn_weights[gdn_slot],
@@ -3639,6 +3713,18 @@ impl Forward {
                         state.gdn_mut(gdn_slot),
                         &self.hidden_state,
                         &mut self.mixer_out,
+                    )?;
+                    gdn_slot += 1;
+                }
+                LayerKind::GatedDeltaNet => {
+                    let (input, mut output) = self.active_rows(stream);
+                    self.gdn.forward(
+                        stream,
+                        &self.gdn_weights[gdn_slot],
+                        self.gdn_int8.get(gdn_slot).and_then(Option::as_ref),
+                        state.gdn_mut(gdn_slot),
+                        &input,
+                        &mut output,
                     )?;
                     gdn_slot += 1;
                 }
@@ -3650,16 +3736,30 @@ impl Forward {
                     } else {
                         crate::block::attention::RopeSource::Scalar(rope_scalar)
                     };
-                    self.attention[attn_slot].forward(
-                        stream,
-                        &mut self.attn_scratch,
-                        &self.hidden_state,
-                        cache,
-                        pos_offset,
-                        positions,
-                        rope,
-                        &mut self.mixer_out,
-                    )?;
+                    if self.active == self.tokens {
+                        self.attention[attn_slot].forward(
+                            stream,
+                            &mut self.attn_scratch,
+                            &self.hidden_state,
+                            cache,
+                            pos_offset,
+                            positions,
+                            rope,
+                            &mut self.mixer_out,
+                        )?;
+                    } else {
+                        let (input, mut output) = self.active_rows(stream);
+                        self.attention[attn_slot].forward(
+                            stream,
+                            &mut self.attn_scratch,
+                            &input,
+                            cache,
+                            pos_offset,
+                            positions,
+                            rope,
+                            &mut output,
+                        )?;
+                    }
                     attn_slot += 1;
                 }
             }
@@ -3672,7 +3772,7 @@ impl Forward {
                 stream,
                 &self.moe_weights[layer as usize],
                 &self.mixer_out,
-                self.tokens,
+                self.active,
                 &mut self.ffn_out,
                 &mut self.hidden_state,
             )?;
@@ -3692,13 +3792,32 @@ impl Forward {
                 self.rms_eps,
             )
             .map_err(MoeBlockError::from)?;
-        } else {
+        } else if self.active == self.tokens {
             self.layer_ops.rms_norm(
                 stream,
                 &self.hidden_state,
                 &self.w_output_norm,
                 &mut self.final_norm,
                 self.tokens,
+                self.hidden,
+                self.rms_eps,
+            )?;
+        } else {
+            let rows = self.active * self.hidden;
+            // SAFETY: `active < tokens` rows of two `[tokens][hidden]` buffers;
+            // both views die at the end of this block.
+            let (input, mut output) = unsafe {
+                (
+                    crate::viewslice::subslice(stream, &self.hidden_state, 0, rows),
+                    crate::viewslice::subslice(stream, &self.final_norm, 0, rows),
+                )
+            };
+            self.layer_ops.rms_norm(
+                stream,
+                &input,
+                &self.w_output_norm,
+                &mut output,
+                self.active,
                 self.hidden,
                 self.rms_eps,
             )?;
@@ -3714,7 +3833,7 @@ impl Forward {
         //    `final_norm` — and llama.cpp's `clef` graph computes none, so the
         //    head's full read of the output matrix is skipped there.
         if self.config.decision.is_none() {
-            let last = (self.tokens - 1) * self.hidden;
+            let last = (self.active - 1) * self.hidden;
             let row = self.final_norm.slice(last..last + self.hidden);
             stream.memcpy_dtod(&row, &mut self.last_hidden)?;
             self.lm_head.forward(
@@ -3732,15 +3851,36 @@ impl Forward {
         Ok(())
     }
 
+    /// The residual stream and the mixer output, narrowed to the pass's live
+    /// rows: what a mixer is handed during [`Self::run_prefix`].
+    ///
+    /// The views alias `hidden_state` and `mixer_out` without borrowing them,
+    /// so they must be dropped before either buffer is — which, as locals of
+    /// one loop iteration in [`Self::body`], they are.
+    fn active_rows(
+        &self,
+        stream: &Arc<CudaStream>,
+    ) -> (ManuallyDrop<CudaSlice<f32>>, ManuallyDrop<CudaSlice<f32>>) {
+        let rows = self.active * self.hidden;
+        // SAFETY: `active <= tokens`, and both buffers hold `tokens * hidden`
+        // floats; the views are dropped within the layer that uses them.
+        unsafe {
+            (
+                crate::viewslice::subslice(stream, &self.hidden_state, 0, rows),
+                crate::viewslice::subslice(stream, &self.mixer_out, 0, rows),
+            )
+        }
+    }
+
     /// `get_rows(token_embd.weight, ids)` into the residual stream.
     fn embed(&mut self, stream: &Arc<CudaStream>) -> Result<(), ForwardError> {
         let cfg = LaunchConfig {
-            grid_dim: (self.tokens as u32, 1, 1),
+            grid_dim: (self.active as u32, 1, 1),
             block_dim: (EMBED_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         let hidden_i32 = self.hidden as i32;
-        let tokens_i32 = self.tokens as i32;
+        let tokens_i32 = self.active as i32;
         let mut builder = stream.launch_builder(&self.embed_fn);
         builder
             .arg(&*self.w_token_embd)

@@ -98,6 +98,7 @@
 //! all (`crate::forward::arena_holds_entry`); the block's copy is the only
 //! one.
 
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
@@ -676,6 +677,42 @@ pub struct AttnScratch {
     pub(crate) k2: Option<super::k2::K2ValueScratch>,
 }
 
+/// An [`AttnScratch`] narrowed by [`AttnScratch::narrowed`].
+pub(crate) struct NarrowedScratch<'a> {
+    sc: &'a mut AttnScratch,
+    full: Option<FullScratch>,
+}
+
+/// The buffers a [`NarrowedScratch`] swapped out, to swap back.
+struct FullScratch {
+    tokens: usize,
+    f32s: [CudaSlice<f32>; 14],
+    row_positions: CudaSlice<i32>,
+}
+
+impl NarrowedScratch<'_> {
+    /// The narrowed scratch.
+    pub(crate) fn scratch(&mut self) -> &mut AttnScratch {
+        self.sc
+    }
+}
+
+impl Drop for NarrowedScratch<'_> {
+    fn drop(&mut self) {
+        let Some(full) = self.full.take() else { return };
+        for (slot, original) in self.sc.token_buffers().into_iter().zip(full.f32s) {
+            // The view does not own its memory: forgetting it is what keeps
+            // the original allocation from being freed twice.
+            std::mem::forget(std::mem::replace(slot, original));
+        }
+        std::mem::forget(std::mem::replace(
+            &mut self.sc.row_positions,
+            full.row_positions,
+        ));
+        self.sc.tokens = full.tokens;
+    }
+}
+
 impl AttnScratch {
     /// Run the tensor-core-width projections of every block using this
     /// scratch on the fp16 tensor cores, bf16 tensors included. See
@@ -747,6 +784,77 @@ impl AttnScratch {
     /// The token count this scratch was sized for.
     pub fn tokens(&self) -> usize {
         self.tokens
+    }
+
+    /// Every buffer sized by the token count, in one fixed order.
+    fn token_buffers(&mut self) -> [&mut CudaSlice<f32>; 14] {
+        [
+            &mut self.normed,
+            &mut self.packed,
+            &mut self.query,
+            &mut self.gate,
+            &mut self.query_normed,
+            &mut self.query_roped,
+            &mut self.key,
+            &mut self.key_normed,
+            &mut self.key_roped,
+            &mut self.value,
+            &mut self.pregate,
+            &mut self.gate_sigmoid,
+            &mut self.gated,
+            &mut self.projected,
+        ]
+    }
+
+    /// This scratch as if it had been built for `rows` tokens: every
+    /// token-sized buffer is swapped for an exact-length view of its first
+    /// `rows` rows until the guard drops, which swaps the full buffers back
+    /// (on unwind too). Nothing is allocated or copied, and every length
+    /// check that holds for a `rows`-token scratch holds here.
+    ///
+    /// The quantized-activation mirror (`xq`) is left alone, so a narrowed
+    /// pass must stage through the fp16 operand (`half`) — which checks its
+    /// buffers as lower bounds — or allocate a mirror of its own width.
+    ///
+    /// # Panics
+    ///
+    /// If `rows` is zero or more than [`Self::tokens`].
+    pub(crate) fn narrowed(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        rows: usize,
+    ) -> NarrowedScratch<'_> {
+        let tokens = self.tokens;
+        assert!(
+            (1..=tokens).contains(&rows),
+            "narrowing a {tokens}-token attention scratch to {rows} rows"
+        );
+        let view = |b: &CudaSlice<f32>| {
+            let len = b.len() / tokens * rows;
+            // SAFETY: `len <= b.len()`, and the view never outlives `b`: the
+            // guard swaps `b` back in, and forgets the view, before it lets go
+            // of `self`.
+            ManuallyDrop::into_inner(unsafe { crate::viewslice::subslice(stream, b, 0, len) })
+        };
+        let f32s = self.token_buffers().map(|b| {
+            let v = view(b);
+            std::mem::replace(b, v)
+        });
+        // SAFETY: as above; `row_positions` holds `tokens.max(1) >= rows`
+        // entries, one per row.
+        let rows_view = ManuallyDrop::into_inner(unsafe {
+            crate::viewslice::subslice(stream, &self.row_positions, 0, rows)
+        });
+        let row_positions = std::mem::replace(&mut self.row_positions, rows_view);
+        self.tokens = rows;
+        NarrowedScratch {
+            sc: self,
+            full: Some(FullScratch {
+                tokens,
+                f32s,
+                row_positions,
+            }),
+        }
     }
 
     /// Drop the quantized activation mirror. See
@@ -1386,6 +1494,13 @@ impl GatedAttentionBlock {
     /// Eight plain arguments rather than a config struct, for the reason the
     /// rest of this workspace gives: every one is a distinct per-call tensor or
     /// position, not related configuration.
+    ///
+    /// # Fewer rows than the block was built for
+    ///
+    /// `hidden_state` may hold fewer than [`Self::tokens`] rows — a prompt
+    /// piece run through a wider pass (`Forward::run_prefix`). The block runs
+    /// over exactly those rows, with `sc` narrowed to them for the call, so
+    /// every length check below stays exact.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &mut self,
@@ -1398,7 +1513,52 @@ impl GatedAttentionBlock {
         rope: RopeSource<'_>,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), AttentionBlockError> {
-        let t = self.tokens;
+        let t = hidden_state.len() / self.hidden;
+        if t == 0 || t > self.tokens {
+            expect_len("block input", hidden_state.len(), self.tokens * self.hidden)?;
+        }
+        if t == self.tokens || sc.tokens != self.tokens {
+            return self.forward_rows(
+                stream,
+                sc,
+                hidden_state,
+                cache,
+                pos_offset,
+                positions,
+                rope,
+                out,
+                t,
+            );
+        }
+        let mut narrowed = sc.narrowed(stream, t);
+        self.forward_rows(
+            stream,
+            narrowed.scratch(),
+            hidden_state,
+            cache,
+            pos_offset,
+            positions,
+            rope,
+            out,
+            t,
+        )
+    }
+
+    /// [`Self::forward`] over `t` rows, against scratch sized for exactly
+    /// `t`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_rows(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        sc: &mut AttnScratch,
+        hidden_state: &CudaSlice<f32>,
+        cache: &mut KvCache,
+        pos_offset: usize,
+        positions: &CudaSlice<i32>,
+        rope: RopeSource<'_>,
+        out: &mut CudaSlice<f32>,
+        t: usize,
+    ) -> Result<(), AttentionBlockError> {
         let hidden_elems = t * self.hidden;
         let q_dim = self.q_heads * self.head_dim;
         expect_len("block input", hidden_state.len(), hidden_elems)?;

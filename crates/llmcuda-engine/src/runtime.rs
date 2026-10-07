@@ -2220,6 +2220,30 @@ impl DeviceRuntime {
         result
     }
 
+    /// The narrowest prebuilt prefill pass at least `width` tokens wide, for
+    /// a piece run as its prefix.
+    ///
+    /// A width with a pass of its own is its own answer, and so is one below
+    /// the tensor-core tile (`MMA_SPLIT_TOKENS`): there a pass built for the
+    /// piece takes the narrow GEMV kernels and a wider one would not, so the
+    /// piece is decomposed into prebuilt widths as a generated prompt's is.
+    /// At and above the tile a prefix run is bit-identical to a pass of the
+    /// piece's own width (`tests/prefix_pass.rs`).
+    fn prefix_pass_width(&self, width: usize) -> usize {
+        if width < llmcuda_cuda::kernels::mma::MMA_SPLIT_TOKENS || width == self.prefill_chunk {
+            return width;
+        }
+        let retention = (self.retention_prefill.is_some()).then_some(self.retention_interval);
+        self.prefill_tails
+            .iter()
+            .map(|(w, _)| *w)
+            .chain(retention)
+            .chain(std::iter::once(self.prefill_chunk))
+            .filter(|&w| w >= width)
+            .min()
+            .unwrap_or(self.prefill_chunk)
+    }
+
     /// The prebuilt pass that just ran a prefill piece of `width` tokens —
     /// the same four-way choice the launch site makes, so the logits being
     /// read are the ones that pass produced.
@@ -2438,14 +2462,25 @@ impl DeviceRuntime {
                 .expect("resident sequence has state")
                 .position();
             let remaining = work.len() - offset;
-            let width = choose_prefill_width(
-                position,
-                remaining,
-                self.prefill_chunk,
-                self.retention_interval,
-                self.prefill_tails.iter().map(|(width, _)| *width),
-                self.max_batch,
-            );
+            // A decision prompt is scored once and never resumed, so it has
+            // no retention boundary to stop at and no reason to be cut into
+            // prebuilt widths: each piece runs whole, as a prefix of the
+            // narrowest pass that holds it (`Forward::run_prefix`).
+            let whole = remaining.min(self.prefill_chunk);
+            let (width, pass_width) =
+                if seq.decision.is_some() && self.prefix_pass_width(whole) != whole {
+                    (whole, self.prefix_pass_width(whole))
+                } else {
+                    let width = choose_prefill_width(
+                        position,
+                        remaining,
+                        self.prefill_chunk,
+                        self.retention_interval,
+                        self.prefill_tails.iter().map(|(width, _)| *width),
+                        self.max_batch,
+                    );
+                    (width, width)
+                };
             let piece = &work[offset..offset + width];
 
             // Image-bearing sequences: fix the rotary base for this chunk,
@@ -2486,26 +2521,37 @@ impl DeviceRuntime {
                 self.mrope_host = triples;
             }
             let wants_taps = seq.dflash.is_some();
-            let run_result = self.run_prefill_piece(
-                width,
-                seq.state.as_mut().expect("resident sequence has state"),
-                piece,
-                wants_taps,
-            );
+            let run_result = if pass_width == width {
+                self.run_prefill_piece(
+                    width,
+                    seq.state.as_mut().expect("resident sequence has state"),
+                    piece,
+                    wants_taps,
+                )
+            } else {
+                let stream = Arc::clone(&self.stream);
+                self.prefill_pass(pass_width)
+                    .run_prefix(
+                        &stream,
+                        seq.state.as_mut().expect("resident sequence has state"),
+                        piece,
+                    )
+                    .map_err(RuntimeError::from)
+            };
             {
-                let fwd = self.prefill_pass(width);
+                let fwd = self.prefill_pass(pass_width);
                 fwd.clear_mrope();
                 fwd.clear_staged_image_rows();
             }
             run_result?;
             // A decision request keeps this chunk's final hidden states: the
-            // pass's `final_norm` holds exactly these positions until the
-            // next chunk overwrites it.
+            // pass's `final_norm` holds exactly these positions, first, until
+            // the next chunk overwrites it.
             if let Some(decision) = seq.decision.as_mut() {
                 let hidden = self.hidden;
                 let rows = width * hidden;
                 let stream = Arc::clone(&self.stream);
-                let src = self.prefill_pass(width).final_norm().slice(0..rows);
+                let src = self.prefill_pass(pass_width).final_norm().slice(0..rows);
                 let mut dst = decision
                     .hidden
                     .slice_mut(position * hidden..position * hidden + rows);

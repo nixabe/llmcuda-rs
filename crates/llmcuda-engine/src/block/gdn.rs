@@ -2378,6 +2378,46 @@ impl Scratch {
             projected: stream.alloc_zeros::<f32>(hidden)?,
         })
     }
+
+    /// The first `tokens` rows of every buffer, as exact-length views: a
+    /// shorter pass run through scratch built for a longer one, with every
+    /// length check in the block still exact. Nothing is allocated or copied.
+    ///
+    /// # Safety
+    ///
+    /// `tokens <= self.tokens`, and the result must not outlive `self`. It
+    /// comes back in a `ManuallyDrop` and must stay there: its slices do not
+    /// own their memory, and dropping them would free `self`'s.
+    unsafe fn view(&self, stream: &Arc<CudaStream>, tokens: usize) -> std::mem::ManuallyDrop<Self> {
+        let rows = |b: &CudaSlice<f32>| {
+            let len = b.len() / self.tokens * tokens;
+            // SAFETY: `len <= b.len()` by the caller's `tokens <= self.tokens`,
+            // and the whole result is sealed in a `ManuallyDrop` below.
+            std::mem::ManuallyDrop::into_inner(unsafe {
+                crate::viewslice::subslice(stream, b, 0, len)
+            })
+        };
+        std::mem::ManuallyDrop::new(Self {
+            tokens,
+            normed: rows(&self.normed),
+            qkv: rows(&self.qkv),
+            conv_raw: rows(&self.conv_raw),
+            conv_silu: rows(&self.conv_silu),
+            q: rows(&self.q),
+            k: rows(&self.k),
+            v: rows(&self.v),
+            z: rows(&self.z),
+            alpha: rows(&self.alpha),
+            beta_raw: rows(&self.beta_raw),
+            a_softplus: rows(&self.a_softplus),
+            log_decay: rows(&self.log_decay),
+            beta: rows(&self.beta),
+            core: rows(&self.core),
+            core_norm: rows(&self.core_norm),
+            final_output: rows(&self.final_output),
+            projected: rows(&self.projected),
+        })
+    }
 }
 
 /// The Gated DeltaNet block.
@@ -2861,12 +2901,24 @@ impl GdnBlock {
             }));
         }
 
-        if self.scratch.as_ref().map(|s| s.tokens) != Some(tokens) {
+        // A pass may run fewer rows than its scratch was built for
+        // (`Forward::run_prefix`): it then runs on exact-length views of that
+        // scratch rather than reallocating it on every piece.
+        if self.scratch.as_ref().is_none_or(|s| s.tokens < tokens) {
             self.scratch = Some(Scratch::new(stream, &g, tokens)?);
         }
         // Split the borrow: the scratch is `&mut` for the whole body while the
         // kernels are `&`, and the launch helpers below take `&self`.
         let mut scratch = self.scratch.take().expect("scratch was just installed");
+        if scratch.tokens > tokens {
+            // SAFETY: `tokens < scratch.tokens`, and the view is dropped (as a
+            // `ManuallyDrop`, freeing nothing) before `scratch` is put back.
+            let mut view = unsafe { scratch.view(stream, tokens) };
+            let result = self.run(stream, weights, int8, state, hidden, out, &mut view, tokens);
+            self.scratch = Some(scratch);
+            result?;
+            return Ok(self.mixer);
+        }
 
         // All three Q8_0 projections read the same normed activations, so the
         // int8 conversion is done once here rather than three times inside

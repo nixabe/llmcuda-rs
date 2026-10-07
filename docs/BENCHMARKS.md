@@ -1,17 +1,7 @@
 # Benchmarks
 
-Where `llmcuda-rs` stands against `llama.cpp` on the target host, and the
-reasoning that produced it.
-
-This file is **not a journal**. It carries the current standing, the method
-that makes it trustworthy, and two lists that outlive any particular number:
-**why** the engine is shaped the way it is, and **why not** — the things that
-were built, measured, and rejected. Per-session narratives, superseded tables
-and the dated arc of individual changes live in `git log`, which is where a
-reader who wants the day-by-day should go.
-
-**These are measurements, not estimates.** Where a measurement contradicted a
-plan, the measurement won.
+Where `llmcuda-rs` stands against `llama.cpp` on the target host, the method
+behind it, and two durable lists: **WHY** and **WHY NOT**.
 
 ## Setup
 
@@ -23,8 +13,7 @@ plan, the measurement won.
 | Model | `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` — 30.36 GiB, 35.51 B params |
 | Second model | `Qwen3.8-27B-UD-Q8_K_XL.gguf` (`qwen35`, dense) — 29.30 GiB, 26.90 B params |
 
-The comparison configuration — llama.cpp at its own best settings, three
-parallel sequences, one card:
+llama.cpp at its own best settings, three parallel sequences, one card:
 
 ```sh
 llama-batched-bench -m Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
@@ -32,84 +21,16 @@ llama-batched-bench -m Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
   -npl 3 -npp <ctx> -ntg 32
 ```
 
-`-ub 2048` is llama.cpp's better decode setting and `-ub 4096` its better
-prefill setting at most depths, so both are kept as bars and the faster of the
-two is the one to clear. Its decode bars at `-ub 2048` are **187.90 tok/s** at
-2K and **153.79 tok/s** at 32K, N=3.
-
-## How these numbers are measured
-
-The discipline is the reason the standing can be trusted at all; several
-"wins" of 5–10% turned out to be the card warming up.
-
-- **Same card, same hour, alternating processes.** llama.cpp drifts about a
-  point a day on this host, this card's thermal drift is ~1.3% between a cold
-  and a warm run, and card-to-card spread is ~1.5% (GPU 2 fast, GPU 1 the
-  house standard). Only alternated pairs are comparable — a before/after taken
-  an hour apart carries about a percent of drift, which is the size of several
-  of this project's real margins.
-- **At least three interleaved pairs**, spreads reported. A change that wins
-  every pair is readable below the drift; a change that wins on the mean but
-  loses a pair is not.
-- **Never bench two GPUs at once on this host** — host contention costs ~6%
-  and has manufactured a phantom regression at 65K prefill. **Numbers need
-  the whole box, not just the card.** A *correctness* run on another GPU is
-  enough to poison a pair, and not because it competes for SMs you are not
-  using: the CUDA context spin-up and the NVRTC compile around it take host
-  CPU. Two sub-second test runs on a neighbouring card cost one measured pair
-  in this file's history. Outside a pairs window a sibling can use the other
-  cards freely; inside one, nothing else runs anywhere, builds included.
-- **Re-measure after a rebase, not before.** A branch that measured a win
-  against its own base can be net negative once it sits on a moved `main`,
-  and the arithmetic does not warn you: +1.1% over `ac341cc` landed on a
-  `main` that had meanwhile gone −5.0%, which three interleaved pairs found
-  only because the rebased tree was benched against the original baseline
-  rather than assumed equivalent to it.
-- **CUDA events, not `Instant`**, for anything inside a pass. Host clocks
-  measure enqueue latency.
-- **Kernel-level first, then end to end.** `bench_attention` (~6 s per A/B)
-  and `bench_dense_ffn` (~10 s, and it prints the card's measured streaming
-  ceiling beside every row) exist because whole-forward A/Bs are expensive
-  enough that the honest response to a small change was to not measure it.
-  **Then confirm in the model.** A narrow bench and a real step disagree about
-  cache state, and at least one change has won every interleaved pair of the
-  former while losing the latter — see `ld.global.cs` in the WHY NOT list.
-- **`ncu` does not work on this host** (`ERR_NVGPUCTRPERM`). The working
-  substitutes are `nsys`/`nvprof` timelines, `nvcc -Xptxas -v` and
-  `cuobjdump -sass` on an extracted kernel, roofline arithmetic from the GGUF
-  tensor directory, and ablation. Do not spend time re-trying `ncu`.
-- **Rebuild through Cargo.** Invoking `target/release/<bin>` directly does not
-  ask Cargo whether it is stale; this has twice produced numbers that were a
-  stale binary rather than a result.
-- **Compare against llama.cpp's best settings, never its defaults.** Measuring
-  against `-ub 512` inflated three separate claims before the rule was named.
-- **A sweep decides nothing, and one three-pair set decides less than it
-  looks.** One run per point does not resolve anything below roughly 1.5% on
-  this host, so a sweep is for choosing *where* to put pairs and never for
-  choosing a value. The router's expert tile read 208.0 / 208.7 / 207.6 /
-  207.6 across `ET` 8/4/2/1 — non-monotonic, and read by two agents
-  independently as drift rather than a knee. Three interleaved reversed pairs
-  then had `ET = 4` winning every one at +1.31%, which was believed and
-  written up. Re-measured against a *pinned baseline built from the same
-  commit* rather than a stale binary, the same change reads **+0.24 / −0.19 /
-  −0.05%** at N=3 and the sign flips inside the set. The +1.31% was an
-  artifact and there is no effect to find. Non-monotonic single runs mean
-  *unmeasured*; three pairs against a drifting box mean *barely measured*.
-  The floor is set by the drift, and the drift is what you have to show.
-- **Report the pairs, not the mean.** A three-pair set whose arms are
-  208.7/206.3, 207.9/201.4 and 207.3/205.3 has a mean of +1.79% and an honest
-  reading of about +1.1%: the 201.4 is 2.4% below its own siblings, so it is a
-  bad reading of the baseline rather than a good result. A mean cannot tell
-  those apart and a list of pairs can.
+The bar is the faster of `-ub 2048` (llama.cpp's better decode setting) and
+`-ub 4096` (its better prefill setting at most depths). Its decode bars at
+`-ub 2048`, N=3: **187.90 tok/s** at 2K, **153.79 tok/s** at 32K.
 
 ## Current standing
 
-The latest recorded cross-engine measurements cover the serving target:
-one card, N=3, llama.cpp at `-np 3 -b 4096 -ub 4096`. Prefill uses GPU 2,
-decode GPU 1; pairing conditions and exceptions are recorded below.
-The newer [engine-only comparison](OPTIMIZATION_CAMPAIGN.md#final-comparison-with-the-original-implementation)
-has its own original-versus-final pairs. These cross-engine margins have
-not been re-measured for those changes.
+One card, N=3, llama.cpp at `-np 3 -b 4096 -ub 4096`; prefill on GPU 2,
+decode on GPU 1. Not re-measured since the
+[engine-only campaign](OPTIMIZATION_CAMPAIGN.md#final-comparison-with-the-original-implementation),
+which has its own pairs and the single-sequence numbers.
 
 | cell | llmcuda-rs tok/s | llama.cpp tok/s | margin |
 | :--- | ---: | ---: | ---: |
@@ -122,22 +43,12 @@ not been re-measured for those changes.
 | decode 2K | 217.3 / 217.1 / 216.6 | 184.5 / 185.9 / 183.3 | **+16.8–18.2%** |
 | decode 32K | 165.7 / 166.5 / 165.2 | 151.0 / 150.4 / 150.8 | **+9.5–10.7%** |
 
-Provenance, in the spirit of the drift rules above: the 512–32K prefill rows
-ran a binary predating the per-sequence prefill fork, whose effect at those
-depths is orders of magnitude inside the reported margins; the 65K row was
-measured while gates ran on a neighbouring card and its margin is therefore a
-floor; the 128K rows ran clean and uncontended. The two decode rows are
-three same-hour alternating pairs (middle pair reversed) of the measured
-engine revision against `llama-batched-bench` on GPU 1 with the box quiet, listed
-pair by pair; the prefill 2K row is an alternating same-card run of the
-measured engine revision whose llama.cpp column is the standing head-to-head rather
-than a same-hour re-run, so read that margin with llama.cpp's ~1%/day
-drift in mind.
-
-Current single-sequence engine observations are included in the linked
-campaign comparison, separately for single-stream and batch-1 decode.
-Aggregate throughput across three cards with one session each is a deployment
-measurement; the serving target here remains N=3 on one instance.
+The 512–32K prefill rows ran a binary predating the per-sequence prefill fork
+(an effect orders of magnitude inside the margins); the 65K row ran while
+gates used a neighbouring card, so its margin is a floor; 128K ran
+uncontended. Both decode rows are three same-hour alternating pairs (middle
+pair reversed) on a quiet box, listed pair by pair. The prefill 2K llama.cpp
+column is not a same-hour re-run, so allow for llama.cpp's ~1%/day drift.
 
 ### Capability
 
@@ -151,21 +62,14 @@ measurement; the serving target here remains N=3 on one instance.
 
 ### K2-Horizon on one card
 
-Measured on GPU 0, Quadro RTX 8000 (sm_75), driver 595.91.07, using IFM's
-Q4_K_M and Q6_K files, engine at `90b2a35`. Three serial alternating process
-pairs per cell in one sitting; no concurrent builds, tests or work on another
-card. The publisher reference is
-[MBZUAI-IFM/llama.cpp `42adf019`](https://github.com/MBZUAI-IFM/llama.cpp/tree/42adf019f76013dac873b5b43950d54d5ab27216),
-branch `model/K2Horizon`, built for CUDA sm_75. The reference column takes the
-faster mean of `-ub 2048` and `-ub 4096` per cell, with full GPU offload,
-`-sm none -fa on -b 4096` and f16 KV. Differences between these two settings at
-512 tokens are small; a Q4 calibration also checked `-ub 512`.
+GPU 0, IFM's Q4_K_M and Q6_K files, engine at `90b2a35`, three alternating
+process pairs per cell on an idle box, against
+[MBZUAI-IFM/llama.cpp `42adf019`](https://github.com/MBZUAI-IFM/llama.cpp/tree/42adf019f76013dac873b5b43950d54d5ab27216)
+(branch `model/K2Horizon`, sm_75) at its faster of `-ub 2048` and `-ub 4096`,
+`-sm none -fa on -b 4096`, f16 KV. Synthetic token streams: timings, not
+quality.
 
-Prefill is N=1, cold cache, three timed repetitions per process. The engine
-uses a full pass at both 512 and 2,048 tokens; `llama-bench` uses its own physical
-microbatch. Reported ± values are sample SDs of the three process means.
-Synthetic token streams exercise routing; these are inference timings, not
-quality scores.
+Prefill: N=1, cold cache; ± is the SD of three process means.
 
 | quant | prompt tokens | engine tok/s | publisher tok/s | publisher ubatch | margin |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -174,14 +78,10 @@ quality scores.
 | Q6_K | 512 | 2137.19 ± 20.70 | 1627.75 ± 5.53 | 2048 | **+31.3%** |
 | Q6_K | 2,048 | 2439.53 ± 19.25 | 2405.35 ± 10.80 | 2048 | **+1.4%** |
 
-Decode uses greedy sampling with token readback, four warmup steps and 64 timed
-steps per process. The engine replays its CUDA graph. The reference harness
-[`tools/oracle/bench_decode.cpp`](../tools/oracle/bench_decode.cpp) attaches
-backend greedy sampler chains and uses the same deterministic prompt ids as
-`bench_decode_batch`. Each engine follows its own greedy continuation.
-Throughput is aggregate across N sequences; a step produces one token per
-sequence. Mean latency ranges cover the three process means, and p95 ranges
-cover each process's 64 steps.
+Decode: greedy, 64 timed steps per process; the engine replays its CUDA
+graph, the reference runs
+[`tools/oracle/bench_decode.cpp`](../tools/oracle/bench_decode.cpp).
+Throughput is aggregate across N.
 
 | quant | starting context | N | engine tok/s | publisher tok/s | publisher ubatch | margin |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -194,7 +94,8 @@ cover each process's 64 steps.
 | Q6_K | 2,048 | 1 | 69.1 | 62.7 | 2048 | **+10.2%** |
 | Q6_K | 2,048 | 3 | 119.7 | 114.7 | 4096 | **+4.4%** |
 
-Latency in milliseconds:
+Latency in ms; mean ranges span the process means, p95 ranges each process's
+64 steps:
 
 | quant | starting context | N | engine mean (range) | engine p95 range | publisher mean (range) | publisher p95 range |
 | --- | ---: | ---: | --- | --- | --- | --- |
@@ -207,37 +108,49 @@ Latency in milliseconds:
 | Q6_K | 2,048 | 1 | 14.48 (14.45–14.50) | 14.49–14.54 | 15.96 (15.95–15.96) | 15.98–16.12 |
 | Q6_K | 2,048 | 3 | 25.06 (25.02–25.08) | 25.33–25.48 | 26.16 (26.15–26.17) | 26.35–26.41 |
 
-The engine is faster in every measured K2 cell. The thinnest margin, Q6_K
-prefill at 2,048 tokens, won its three pairs by +2.1%, +1.5% and +0.7%: treat
-it as parity to keep, not headroom. K2 contractions here use sixteen-bit
-activation codes and fp32 scaled accumulation, where the publisher's
-quantized matrix multiplications use eight-bit `q8_1` activations; these are
-timings, not quality comparisons. Engine N=3 decode peaks at
-**26.90 GiB for Q4_K_M** and **34.90 GiB for Q6_K** at 2K, including resident
-prefill and decode workspaces.
+Q6_K prefill at 2,048 won its pairs by only +2.1%, +1.5% and +0.7%: parity to
+keep. The engine uses sixteen-bit activation codes, the publisher `q8_1`.
+N=3 decode peaks at **26.90 GiB** (Q4_K_M) and **34.90 GiB** (Q6_K) at 2K.
+Both quants pass the publisher capture's gates at all 48 block boundaries and
+final logits ([TESTING.md](TESTING.md#k2-projection-and-routing-gates)). Not
+measured: HTTP time to first token, mixed contention, three-card serving,
+deeper contexts.
 
-The measurements cover N=1 prefill and N=1/3 decode on one card at 512 and
-2,048-token contexts. HTTP time to first token, mixed prefill/decode contention,
-three-card serving and deeper real-model K2 contexts were not measured. Both
-quants pass the six-token publisher capture's gates at all 48 block boundaries
-and final logits. Integer GEMV/GEMM contractions match bit for bit across tested
-shapes; a 42-token repeated prefix also checks full-width versus chunked prefill.
-A 512-token repeated prefix checks serial versus batched graph decode at the
-tensor-core attention threshold. These checks do not certify numerical
-agreement on broader prompts. See
-[TESTING.md](TESTING.md#k2-projection-and-routing-gates).
+## How these numbers are measured
+
+- **Same card, same hour, alternating processes.** llama.cpp drifts about a
+  point a day, cold-to-warm drift is ~1.3%, and cards differ by ~1.5% (GPU 2
+  fast, GPU 1 the house standard).
+- **At least three interleaved pairs; report the pairs, not the mean.** A
+  change must win every pair. Arms of 208.7/206.3, 207.9/201.4 and
+  207.3/205.3 average +1.79% but read about +1.1%: the 201.4 is a bad
+  baseline reading.
+- **A sweep only chooses where to put pairs.** One run per point resolves
+  nothing below roughly 1.5%. An `ET = 4` win of +1.31% read
+  +0.24 / −0.19 / −0.05% against a baseline built from the same commit.
+- **Numbers need the whole box, not just the card.** Never bench two GPUs at
+  once (~6% host contention). Inside a pairs window nothing else runs
+  anywhere, correctness runs and builds included.
+- **Re-measure after a rebase.** A +1.1% branch landed on a `main` that had
+  meanwhile gone −5.0%.
+- **CUDA events, not `Instant`**, inside a pass.
+- **Kernel-level first, then confirm in the model.** A narrow bench and a real
+  step disagree about cache state (`ld.global.cs` in WHY NOT).
+- **`ncu` does not work here** (`ERR_NVGPUCTRPERM`). Use `nsys`,
+  `cuobjdump -sass`, roofline arithmetic from the GGUF tensor directory, and
+  ablation.
+- **Rebuild through Cargo.** Running `target/release/<bin>` directly has twice
+  benchmarked a stale binary.
+- **Compare against llama.cpp's best settings, never its defaults:** `-ub 4096`
+  for prefill at depth, `-fa 1` and backend sampling for decode. See
+  "The baseline was llama.cpp's default, not its best" in WHY NOT.
 
 ## A second `qwen35moe` checkpoint
 
-`ornith-ai/Ornith-1.5-35B-A3B` is a different finetune of the same
-architecture, requantized to the shipped mix (see
-[MODEL.md](MODEL.md#serving-a-second-qwen35moe-checkpoint)). It is here
-because it is the only evidence that the standing above is a property of the
-*engine* and not of one file.
-
-Same method as the table above — one card, N=3, llama.cpp at its own best
-settings, three interleaved alternating reps, prefill on GPU 2 and decode on
-GPU 1. llama.cpp's column is the faster of `-ub 2048` and `-ub 4096` per cell.
+`ornith-ai/Ornith-1.5-35B-A3B`, a different finetune requantized to the
+shipped mix ([MODEL.md](MODEL.md#serving-a-second-qwen35moe-checkpoint)),
+shows the standing belongs to the engine, not one file. Same method as
+Current standing.
 
 | cell | Ornith | sd | llama.cpp | margin | Qwen3.6 above |
 | :--- | ---: | ---: | ---: | ---: | ---: |
@@ -250,50 +163,22 @@ GPU 1. llama.cpp's column is the faster of `-ub 2048` and `-ub 4096` per cell.
 | decode 2K | 207.8 | 0.05% | 187.3 | **+10.9%** | +11.4% |
 | decode 32K | 158.6 | 0.22% | 151.6 | **+4.6%** | +5.0% |
 
-**Every cell won all three interleaved pairs**, which is the claim that
-matters at 128K prefill — the thinnest margin here, as it is for Qwen3.6, and
-one this file elsewhere says stands only on alternating pairs: 1,567.6 v
-1,555.9, then 1,570.0 v 1,555.8, then 1,563.7 v 1,553.0.
-
-Two readings of the right-hand column, and only one of them is safe. The
-margins agreeing to within half a point on five of eight cells says the two
-checkpoints are interchangeable to this engine. It does **not** say either
-model moved: those Qwen3.6 numbers were taken on other days, and this file's
-own provenance note says its 512–32K prefill rows predate the per-sequence
-prefill fork.
-
-The 512 row is llama.cpp's noise, not ours. It ranged 2,770.8–2,910.3 across
-the ladder while Ornith sat at 3,322.8 with no measurable spread, and `-c` was
-ruled out as the cause by direct control — 2,843.8 mean at `-c 4096` against
-2,852.3 at the model default of 262,144. The margin is quoted against
-llama.cpp's *best* of three; against its mean it reads +16.6%.
-
-**The bar was re-checked and holds.** The decode 2K row's opponent was
-re-measured on a later day, same card, same settings: **186.22 tok/s** at
-`-ub 2048` against the 187.3 recorded above, which is inside this host's own
-run-to-run spread. That matters beyond one row — llama.cpp not having drifted
-is what keeps the other seven cells on live footing rather than stale, and it
-is the cheap half of any head-to-head because that side runs whether or not
-our column has moved. The llmcuda-rs column was **not** re-measured into this
-table on that day: the run that would have supplied it was taken on a tree
-carrying an unrelated 5% regression, so it was discarded rather than
-published. Re-checking the opponent is worth doing on its own.
+Every cell won all three pairs, including 128K prefill: 1,567.6 v 1,555.9,
+1,570.0 v 1,555.8, 1,563.7 v 1,553.0. Margins within half a point of
+Qwen3.6's on five of eight cells say the checkpoints are interchangeable; that
+column is from other days, so it does not say either model moved. The
+512 margin is llama.cpp's noise (2,770.8–2,910.3 against Ornith's steady
+3,322.8; `-c` ruled out), quoted against its best of three; against its mean
+it reads +16.6%. llama.cpp's decode 2K, re-measured on a later day, read
+186.22 tok/s against 187.3, inside spread.
 
 ## Qwen3.8-27B (`qwen35`)
 
-The dense sibling landed after the standing above was taken, and **nothing in
-this section is comparable to it**: a different model and a different
-arithmetic mix. Its own baseline is the same `llama-batched-bench`, same card
-(GPU 1), alternating processes, three interleaved reps.
-
-The dense model is the smaller file and reads **15× the feed-forward weight
-per token** (17.11 B parameters against 35B-A3B's 1.13 B) and 3.2× the KV. No
-expectation carries across from the table above — and none of it did.
-
-**Every cell is clear of llama.cpp or level with it, on both files, and the
-file no longer decides the prefill result.** Two files, same card (GPU 1),
-alternating processes, three interleaved reps; llmcuda-rs's spread is under
-1.2% in every cell:
+**Not comparable to the Qwen3.6 standing**: the dense model reads 15× the
+feed-forward weight per token (17.11 B parameters against 1.13 B) and 3.2×
+the KV. GPU 1, alternating processes, three interleaved reps, llama.cpp
+same-hour; our spread is under 1.2% per cell. **Every cell is clear of
+llama.cpp or level with it, on both files.**
 
 | cell | file | llmcuda-rs agg | per slot | llama.cpp agg | per slot | margin |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
@@ -308,76 +193,35 @@ alternating processes, three interleaved reps; llmcuda-rs's spread is under
 | decode, N=1, `draft-mtp` | Q8_0 | 35.1 | 35.1 | 19.40 | 19.40 | **+81%** |
 | decode, N=3, `draft-mtp` | Q8_0 | 50.0 | 16.7 | 48.15 | 16.05 | **+3.8%** |
 
-Two cells needed more than the three reps. llama.cpp's N=1 prefill on the
-shipped file read 612.6 / 541.6 / 655.0 across them, an 18.8% spread no other
-cell came near; three more alternating pairs read 682.1 / 674.8 / 665.4
-against our 849.5 / 845.1 / 844.1, and that re-run is the row. The same
-re-run's llama.cpp decode came out at 18.09–18.14 against the reps'
-17.74–18.05, which turns a +1.1% into parity — so parity is what the row says.
+- `UD-Q8_K_XL` is the shipped Unsloth file (Q8_0, with bf16 `output.weight`
+  and `attn_q`/`attn_k`/`attn_v`); `Q8_0` is Unsloth's plain Q8_0 (27.05
+  GiB), whose logits have not been compared against llama.cpp's.
+- llama.cpp's N=1 prefill on the shipped file spread 18.8%, so that row is
+  three further alternating pairs; that re-run also turned N=1 decode's +1.1%
+  into parity. Per slot is aggregate / N by construction.
+- The `draft-mtp` rows are opt-in, not re-run with the rest, and not
+  like-for-like: the engine drafts with the file's next-token-prediction head,
+  which llama.cpp discards
+  (`model has unused tensor blk.64.nextn.eh_proj.weight -- ignoring`).
+- **Prefill wins** because dense prefill projections run on the fp16 tensor
+  cores ("Arithmetic: on a dense projection, the fp16 tensor cores beat the
+  integer ones" in WHY). llama.cpp's int8 `mmq` (Q8_0) and fp32 (bf16) paths
+  make its two files differ by 13% at N=1; ours differ by 0.5%. bf16 still
+  costs decode its bytes: 18.11 against 19.37 tok/s, 6.5%.
+- **N=1 decode is parity to keep**: both engines are at the streaming wall.
+  llama.cpp's best on this model is neither file (see quantization below);
+  do not quote these rows against the MoE standing.
 
-The two `draft-mtp` rows were not re-run with the rest; they are the latest
-measurement of those cells, against llama.cpp's numbers of the same hour.
-They are **not the default** and are not a like-for-like kernel comparison:
-they are this engine running the file's own trained next-token-prediction head
-as a drafter, with a bit-exact verify, against llama.cpp running the same file
-the only way it can. Upstream discards that head — `model has unused tensor
-blk.64.nextn.eh_proj.weight -- ignoring`, on every load — so there is no
-setting that gives it the same option. What the rows are for is the size of
-the gap between a decode step that reads 27 GB for one token and one that
-reads it for 2.86. See the speculative section for why it stays opt-in.
-
-`UD-Q8_K_XL` is the shipped Unsloth file: Q8_0 everywhere except
-`output.weight` and every `attn_q`/`attn_k`/`attn_v`, which are bf16. `Q8_0` is
-Unsloth's plain Q8_0 file from the same repository, 27.05 GiB — the bf16
-tensors folded down, which is what an earlier revision of this table
-approximated with a local `llama-quantize --allow-requantize` of the shipped
-file. Its last-token logits have not been compared against llama.cpp's; the
-shipped file's have (see "Arithmetic: on a dense projection" in WHY).
-
-**Per slot is uniform by construction on both sides**, not three separately
-observed rates: a batched step advances all N sequences through one set of
-launches, so each slot's rate is exactly the aggregate over N. These columns
-answer "what does one user see while N are served", not "do the slots differ".
-The second question needs a running server under mixed arrival, which is the
-serving section below and is not comparable to this table.
-
-What the rows say together:
-
-- **Prefill went from the gap to the margin.** It lost every cell, by 13% on
-  the Q8_0 file and by half on the shipped one; it now wins every cell, by
-  the most on the shipped file. The whole change is one kernel family: every
-  dense prefill projection runs on the fp16 tensor cores over weights
-  dequantized per staged tile, instead of the int8 ones — see "Arithmetic: on
-  a dense projection, the fp16 tensor cores beat the integer ones" in WHY.
-  llama.cpp runs its Q8_0 weights through int8 `mmq` on Turing and its bf16
-  tensors through fp32, which is why its two files differ by 13% at N=1 and
-  ours by 0.5%.
-- **The bf16 tensors no longer cost prefill.** They take the same fp16
-  tensor cores as the Q8_0 ones, at a per-tensor scale that makes the
-  conversion exact. At decode they still cost what their extra bytes cost:
-  18.11 against 19.37 tok/s, 6.5%.
-- **N=3 decode wins on both files and N=1 decode is level.** N=1 decode
-  reads 30 GB per token against a measured streaming ceiling both engines
-  are close to (see "Where the dense decode step goes" below); its margin is
-  inside one rep's spread and is parity to be kept, not headroom. llama.cpp's
-  column is a same-hour alternating re-run in every row.
-
-And llama.cpp's outright best on this model is neither file: see "What the
-quantization is worth" below. Do not quote any row here as a claim about the
-engine as a whole, and do not let them soften the MoE standing above.
-
-llama.cpp (`/tmp`-built upstream `abeada3`, sm_75 release) at `-b 2048 -ub 2048
--fa on -ctk f16 -ctv f16 -sm none`, `-npl 1` or `-npl 3`, `-npp 512 -ntg 64`.
-Ours is `bench_forward`'s 512-token column (a cold full forward, comparable to
-`pp`), `bench_forward` with `LLMCUDA_PREFILL_SEQUENCES=3` for N=3 prefill, and
-`bench_decode_batch 512 64`'s `batch 1` and `batch 3` rows — which carry their
-own `single_stream` baseline in the same process. Peak VRAM 31.42 GiB of 47.27
-at N=3 prefill on the shipped file, 30.42 on Q8_0.
+llama.cpp `abeada3` ran
+`-b 2048 -ub 2048 -fa on -ctk f16 -ctv f16 -sm none -npp 512 -ntg 64` with
+`-npl 1` or `-npl 3`; ours
+is `bench_forward`'s 512-token column (`LLMCUDA_PREFILL_SEQUENCES=3` for N=3)
+and `bench_decode_batch 512 64`. Peak VRAM 31.42 GiB of 47.27 at N=3 prefill
+on the shipped file, 30.42 on Q8_0.
 
 ### `-ub` is not a knob on this workload
 
-Measured, because "llama.cpp's best settings" is a rule this project has been
-burned by three times. Three reps each, `-npl 1,3 -npp 512 -ntg 64`:
+Three reps each, `-npl 1,3 -npp 512 -ntg 64`:
 
 | llama.cpp config | PP N=1 | TG N=1 | PP N=3 | TG N=3 |
 | :--- | ---: | ---: | ---: | ---: |
@@ -386,28 +230,14 @@ burned by three times. Three reps each, `-npl 1,3 -npp 512 -ntg 64`:
 | `-c 6144 -ub 4096` | 692.0 | 18.05 | 742.9 | 43.89 |
 | `-c 6144 -ub 512` | 692.2 | 18.03 | 674.3 | 42.65 |
 
-`-ub 4096` changes nothing, and it cannot: at `-npp 512 -npl 3` the physical
-batch is 1536 rows, already under the 2048 cap, so raising the cap has nothing
-to raise. (At the default `-c` it does not even fit — llama.cpp reserves the
-full 262K context, and a 4.04 GiB compute buffer will not go beside ~29.3 GiB
-of weights and ~16 GiB of KV. Capping `-c` makes it fit and still buys
-nothing.) `-ub 512` is the only setting that moves anything and it *loses* 9%
-of N=3 prefill by splitting 1536 rows into three ubatches. Decode ignores `-ub`
-entirely — it is one token per slot. The `-b 2048 -ub 2048` baseline above is
-therefore llama.cpp's best of these, not its default.
+At `-npp 512 -npl 3` the batch is 1536 rows, under the 2048 cap, so
+`-ub 4096` has nothing to raise (at the default `-c` its 4.04 GiB compute
+buffer does not fit). `-ub 512` loses 9% of N=3 prefill; decode
+ignores `-ub`. So `-b 2048 -ub 2048` is llama.cpp's best here.
 
 ### Speculative decode: what the width band was hiding
 
-This section used to end with an experiment it had not run — "instantiating
-`dense_proj_split_t5..t16` would test whether the N=3 result inverts too;
-that is unmeasured and is the obvious next experiment, not a claim." It was
-run, and it inverted.
-
-The MoE model's finding — "verify-step cost sets the sign; a net win at N=1
-only" — transfers in *shape* but not in size, because dense decode is at the
-memory wall and a verify step reads the same 27 GB whether it checks one
-token or nine. `bench_worker_spec` on the `all-Q8_0` file, GPU 1, context
-256, 512 tokens per sequence:
+`bench_worker_spec`, `all-Q8_0`, GPU 1, context 256, 512 tokens per sequence:
 
 | drafter | N=1 tok/s | tokens/step | N=3 tok/s | tokens/step |
 | :--- | ---: | ---: | ---: | ---: |
@@ -415,49 +245,31 @@ token or nine. `bench_worker_spec` on the `all-Q8_0` file, GPU 1, context
 | `ngram` | 20.2 | 1.101 | 23.5 | 4.152 |
 | `draft-mtp` | **35.1** | 2.860 | **50.0** | 9.350 |
 
-**`draft-mtp` is worth +83% at N=1** — far above the +21% the same class of
-change bought on `qwen35moe`, and for the reason the roofline predicts. What
-changed is N=3, which used to lose 7% and now wins. `ngram` still loses
-there, and heavily — it drafts on 1.101 tokens a step at N=1, so at N=3 it
-buys a twelve-row verify pass with almost no acceptance to pay for it.
+**`draft-mtp` is +83% at N=1** (+21% for the same class of change on
+`qwen35moe`): a dense verify step reads the same 27 GB for one token or nine.
+`ngram` loses at N=3: its twelve-row verify pass has almost no acceptance.
+N=3 won once both kernel families served the verify shape, a few rows
+against a deep window:
 
-Two constants were holding it down, and neither was the drafter's:
+- **FFN:** the GEMV now covers up to 16 rows instead of falling to
+  `shared_expert_mma` above four: 1.374 -> 0.974 ms a layer at twelve rows,
+  N=3 from 42.2 to 48.2.
+- **Attention:** at twelve query rows the GQA-shared prefill kernel launches
+  only `kv_heads` (two) blocks, 433 us a layer. Routing those rows through
+  the flash-decode split took N=1 from 32.0 to 35.5 and N=3 from 48.2 to 50.5.
 
-- **The FFN's GEMV/GEMM crossover.** A verify step presents
-  `N x (1 + drafts)` rows to the feed-forward block — twelve at N=3 — and
-  above four rows that fell onto `shared_expert_mma`, the GEMM that stages a
-  64-token tile and discards most of it. Carrying the GEMV to sixteen tokens
-  is 1.374 -> 0.974 ms a layer at twelve, and took N=3 from 42.2 to 48.2.
-- **The prefill attention kernels' query-axis parallelism.** At twelve query
-  rows the GQA-shared kernel launches `kv_heads` blocks — two, on a 72-SM
-  card — and scans the whole window with them, 433 us a layer. Running those
-  rows through the flash-decode split instead, which carries its parallelism
-  in the key axis, took N=1 from 32.0 to 35.5 and N=3 from 48.2 to 50.5.
-
-So the honest reading was never "speculation loses at N=3 on this model". It
-was that a verify pass is a *shape* — a handful of rows against a deep
-window — that both the decode kernels and the prefill kernels were written
-to exclude, and once something serves that shape the N=3 result follows the
-N=1 one.
-
-**It is still off by default, and the reason is memory, not speed.** The
-head is one more transformer layer of weights and one more draft cache per
-resident sequence. On `all-Q8_0` that fits; on the shipped `UD-Q8_K_XL`,
-which is 2.25 GiB larger, `bench_worker_spec` at N=3 dies in the Gated
-DeltaNet state allocation with 34.99 GiB free after the weights. Turning it
-on by default would trade the 128K-at-N=3 capability for the decode number
-on one file, and it would do it silently, because admission (AGENTS.md
-rule 4) does not yet know a drafter changes the per-sequence reservation.
-That is the work this would need, and it is scheduler work, not kernel work.
+**Off by default for memory, not speed.** On the shipped `UD-Q8_K_XL` (2.25
+GiB larger than `all-Q8_0`) the head's extra layer and per-sequence draft
+cache make N=3 die in the Gated DeltaNet state allocation, with 34.99 GiB
+free after the weights. Enabling it needs admission (AGENTS.md rule 4) to
+count the drafter's reservation: scheduler work, not kernel work.
 
 ### A whittled MoE is the structural version of requantizing
 
-`Qwen3.8-Whittle-MoE-27B-A17.8B` (community, `research-preview`) is the same
-64-layer, 5120-wide skeleton with the 17,408 dense MLP replaced by 64 experts
-of width 192, 16 active, plus a 5120 shared expert — 26.9 B parameters of
-which ~17.8 B are read per token. It reaches the same lever as a requant, by
-reading fewer weights rather than smaller ones. llama.cpp, same card, three
-interleaved reps, everything Q8_0 except Qwen3.6:
+`Qwen3.8-Whittle-MoE-27B-A17.8B` (community) swaps the dense MLP for 64
+experts (16 active) plus a shared expert: ~17.8 B of 26.9 B parameters read
+per token. llama.cpp, same card, three interleaved reps, Q8_0 except
+Qwen3.6:
 
 | model | GiB | PP N=1 | TG N=1 | PP N=3 | TG N=3 |
 | :--- | ---: | ---: | ---: | ---: | ---: |
@@ -465,44 +277,22 @@ interleaved reps, everything Q8_0 except Qwen3.6:
 | Qwen3.8-Whittle-MoE A17.8B | 26.71 | 665.5 | **25.73** | 889.5 | 51.51 |
 | Qwen3.6-35B-A3B (Q6_K) | 30.36 | 2101.7 | **102.57** | 2912.1 | **194.19** |
 
-**+33.7% decode at N=1** for −16% prefill, shrinking to +6.5% at N=3 as three
-tokens activate the union of more of the 64 experts. It is *less* bandwidth
-efficient than the dense model (72% of peak against 79%) and wins only by
-reading ~32% fewer bytes.
+Whittle buys **+33.7% decode at N=1** for −16% prefill (+6.5% at N=3) by
+reading ~32% fewer bytes, at lower efficiency (72% of peak against 79%).
+**Qwen3.6-35B-A3B is 4x Whittle and 5.3x the dense model on decode, and 3x on
+prefill.**
 
-And the row that decides deployment: **Qwen3.6-35B-A3B is 4x Whittle and 5.3x
-the dense model on decode, and 3x on prefill.** A17.8B is still 17.8 B active
-where A3B is 3 B. For serving several sessions on one card the routed model is
-not a close call, and no variant of the 27B family changes that ranking.
-
-This engine cannot load the Whittle file. It declares `general.architecture =
-qwen35moe` and every tensor is Q8_0 or F32 — no bf16, no k-quant, so every
-kernel it needs exists — but `ModelConfig::for_architecture("qwen35moe")`
-returns the hardcoded Qwen3.6-35B-A3B geometry and the schema then fails on
-about a thousand shapes. **`general.architecture` names a family, not a
-model**, and this file is the counterexample: three files now claim two
-architecture names across three geometries. Every field a config needs is
-*declared* in its metadata (`block_count`, `embedding_length`, `expert_count`,
-`expert_used_count`, `expert_feed_forward_length`, the four `ssm.*` keys), so
-deriving one would be reading rather than inferring from tensor shapes — but
-that is a design change, and the failure today is a wall of `ShapeMismatch`
-where it should be one line naming the geometry.
+This engine cannot load Whittle, though every kernel it needs exists:
+`general.architecture = qwen35moe` maps to the hardcoded Qwen3.6-35B-A3B geometry, and the schema fails on about a
+thousand shapes. **`general.architecture` names a family, not a model.**
+Reading the geometry from metadata would be a design change.
 
 ### What the quantization is worth, and where the ceiling is
 
-Decode reads the whole model once per token, so bytes per token *is* the
-decode budget. From the file's own tensor directory, per decoded token:
-`DenseFfn` 17.198 GiB + `Projections` 8.363 + `LmHead` 2.368 + norms =
-**27.93 GiB = 29.99 GB**. On a 672 GB/s card that is 44.6 ms, so **22.4 tok/s
-is the theoretical ceiling** at N=1 and neither engine is far off it:
-llama.cpp's 18.11 is 542 GB/s (80.7% of peak), our 17.2 is 516 GB/s (76.8%).
-This is why the N=1 decode margin is small and why it will stay small — both
-engines are streaming the same 30 GB against the same wall. For contrast the
-MoE model reads 2.86 GB/token, which is the whole reason it decodes at ~100
-tok/s single-sequence; no expectation transfers between the two.
-
-Which makes requantizing the only large decode lever. llama.cpp, same card,
-three interleaved reps per file:
+Decode reads the whole model per token: **27.93 GiB = 29.99 GB**, a
+**22.4 tok/s ceiling** at 672 GB/s. llama.cpp's 18.11 is 542 GB/s (80.7% of
+peak), our 17.2 is 516 GB/s (76.8%). Requantizing is the only large decode
+lever (llama.cpp, three interleaved reps per file):
 
 | file | GiB | PP N=1 | TG N=1 | PP N=3 | TG N=3 | achieved BW at N=1 |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -511,34 +301,19 @@ three interleaved reps per file:
 | Q6_K | 20.89 | 669.3 | 22.13 | 674.0 | 52.64 | 463 GB/s |
 | Q4_K_M | 15.66 | 714.1 | **29.51** | 718.2 | **60.11** | 453 GB/s |
 
-**+63% decode from Q4_K_M**, and the k-quants get it while *losing* streaming
-efficiency — 453 GB/s against Q8_0's 538, because unpacking a k-quant costs
-integer-pipe work. They win anyway by reading half as much. That is the same
-bound the WHY list records for the MoE decode GEMVs, seen from the other side.
-
-**We cannot load either k-quant.** Both are refused at build by name rather
-than breaking: ``token_embd.weight` is q6_K, this pass unpacks q8_0``. The
-dense FFN loader already accepts Q6_K; what does not is the embedding gather,
-the LM-head GEMV family (`HeadFormat` is Q8_0 or bf16) and the attention
-projections. So llama.cpp's best configuration on this model is one this
-engine has no answer to, and the margins in the standing table above are
-like-for-like margins at a file we can both read — not a claim about the
-fastest way to serve Qwen3.8-27B on this card. Today that is llama.cpp at
-Q4_K_M.
+**+63% decode from Q4_K_M**, despite less efficient streaming (453 against
+538 GB/s: k-quant unpacking is integer-pipe work). **We cannot load either
+k-quant**: the dense FFN accepts Q6_K, but the embedding gather, the LM-head
+GEMV (`HeadFormat` is Q8_0 or bf16) and the attention projections do not, and
+the build refuses them by name. The fastest way to serve
+Qwen3.8-27B on this card today is llama.cpp at Q4_K_M.
 
 ### Where the dense decode step goes, and what the card can actually stream
 
-The dense model's decode step is one streaming problem with a small tail, and
-the only way to read the numbers below is against a measured ceiling rather
-than the pin rate. `bench_dense_ffn`'s calibration kernel — a fully coalesced
-`uint4` read of exactly the resident weight bytes, no arithmetic — streams
-**604.5 GB/s, 90.0% of the 672 GB/s pin rate** (sd 0.43%). That is the number
-a kernel on this card is allowed to be compared against.
-
-One `bench_decode` step on `all-Q8_0` at N=1, from an `nsys` capture with
-`--cuda-graph-trace=node` (decode replays a captured graph, and without that
-flag none of it is attributed). Weight bytes are counted from the GGUF tensor
-directory, not inferred from the time:
+`bench_dense_ffn`'s calibration kernel, a coalesced `uint4` read of the
+resident weights, streams **604.5 GB/s, 90.0% of the 672 GB/s pin rate**:
+that is the ceiling. One `bench_decode` step, `all-Q8_0`, N=1, from
+`nsys --cuda-graph-trace=node`, bytes from the tensor directory:
 
 | stage | launches | ms | weight bytes | GB/s | of 604.5 |
 | :--- | ---: | ---: | ---: | ---: | ---: |
@@ -550,48 +325,23 @@ directory, not inferred from the time:
 | everything else | ~596 | 2.60 | — | — | — |
 | **step** | ~1,045 | **51.98** | 27.19 GB | 523 | **87%** |
 
-Three things follow, and together they say where a win on this model is and
-is not.
+- **The LM head is at 100% of calibration**; the GEMV families are at 87–95%
+  (97% weighted). The shortfall is the tail.
+- **llama.cpp is at the same wall**: 19.40 tok/s is 528 GB/s, 87%. The 1.0%
+  between us is 0.43 ms of launch tail, not bandwidth.
+- **The tail** is 2.60 ms over ~596 launches (5.0%). The gates are 1.02 ms of
+  it for 30 MB (48 warps on 72 SMs; attempts in WHY NOT). Tail fusions that
+  worked were ~0.13 ms each.
 
-- **The LM head is at 100% of what this card streams** — 1.35 GB in 2.23 ms
-  is 606 GB/s against a 604.5 GB/s calibration. It is the cleanest available
-  proof that the ceiling is the ceiling. The three GEMV families beside it
-  are at 87–95%. Weighted together the streaming kernels are at 97% of
-  calibration; the "13% off peak" that the step total reads as is almost all
-  the tail, not the GEMVs.
-- **Both engines are against the same wall.** llama.cpp's 19.40 tok/s on this
-  file is 51.55 ms for the same 27.19 GB, 528 GB/s, 87% of the same ceiling.
-  The 1.0% between us is 0.43 ms of launch tail on a 52 ms step. It is not a
-  bandwidth difference and it will not be closed by a faster GEMV.
-- **What is left is the tail** — 2.60 ms across ~596 launches that move almost
-  no weight, 5.0% of the step. The gates are 1.02 ms of it for 30 MB, because
-  one warp per head is 48 warps on a 72-SM card. Every attempt to recover that
-  particular millisecond is now in the WHY NOT list; the ones that worked
-  elsewhere in the tail are single fused launches worth ~0.13 ms each.
-
-The way past the wall is therefore not a kernel. It is reading those 27.19 GB
-for more than one token, which is what the speculative section is about.
-
-An earlier version of this table had one `attention projections + LM head`
-row, because the two share an entry point — `GatedAttentionBlock` runs its
-four projections through `LmHeadKernels::forward`, so `lm_head_gemv_b1`
-appears 65 times a step. Splitting them by duration histogram is what showed
-the head at 606 GB/s; the merged row read as 94% and hid both halves.
+Attention projections and the LM head share `LmHeadKernels::forward`; merged
+they read 94%, and only a duration histogram separated them.
 
 ### What the FFN residency is worth
 
-The one real decision in the dense port, measured rather than argued. One
-layer's three matrices are 267 M elements and 271 MiB in *either* layout —
-the split form keeps the file's own fp16 scale, so it is a re-layout at the
-same 1.0625 bytes an element — and across 64 layers holding **both** is
-16.9 GiB twice over on a card already carrying 11.8 GiB of arena. It does not
-fit — the first attempt died on `CUDA_ERROR_OUT_OF_MEMORY` — so it is one or
-the other, and then the kernel follows from the residency.
-
-(The split layout used to be the larger of the two, at 287 MiB a layer,
-because the repack widened those scales to fp32 for no precision. That cost
-is gone; the rows below were measured before it was, and their *ranking* is
-what they are kept for.)
+Both layouts are 271 MiB a layer; holding both did not fit
+(`CUDA_ERROR_OUT_OF_MEMORY`), so the residency picks the kernel. All rows
+predate removing the split layout's fp32 scales and are kept for their
+ranking; the first two are single runs, the shipped row a three-pair figure.
 
 | residency | prefill 512 | decode | note |
 | :--- | ---: | ---: | :--- |
@@ -599,32 +349,20 @@ what they are kept for.)
 | split int8, `shared_expert_mma` everywhere | 321.3 | 9.17 | prefill 4.2×; decode −47% |
 | split int8, GEMV at ≤ 16 tokens (**shipped**) | 317.5 | 17.26 | both |
 
-The first two rows are single runs on the same card, taken to choose between
-the three; only the shipped row is the three-pair figure from the table above.
-
-The middle row is the lesson. `shared_expert_mma` is a GEMM: at one token it
-stages a 64-token tile and throws 63/64 of it away, and the weight bytes are
-the same either way — what it loses is the *shape* it reads them in, 63.5 ms
-becoming 109.0. The fix was not a new kernel but an existing one:
-`GdnBlock`'s split-layout projection GEMV already reads exactly this layout at
-exactly these widths, and it is the form this project measured as the fastest
-at one token. The dense block runs a copy of it.
-
-That copy also made decode the *accurate* path rather than the fast-and-loose
-one: the GEMV rounds activations to fp16, where the int8 GEMM quantizes them
-to int8. Against the CPU reference, `max_abs` 4.18e-3 and cosine 1.000000 for
-the GEMV against 6.45e-2 and 0.999997 for the int8 GEMM — and 4.62e-3 for the
-fp16 one prefill takes now.
+`shared_expert_mma` stages a 64-token tile and discards 63/64 of it at one
+token: 63.5 ms became 109.0. The shipped GEMV reuses `GdnBlock`'s
+split-layout projection GEMV and is the accurate path (fp16 activations):
+`max_abs` 4.18e-3, cosine 1.000000 against the CPU reference, versus 6.45e-2
+and 0.999997 for the int8 GEMM, and 4.62e-3 for prefill's fp16 GEMM.
 
 ### Greedy agreement with llama.cpp
 
-Stated because "it produced plausible text" is not a result. Greedy
-(`--temp 0 --top-k 1`) against `llama-completion` on the same file, 160
-tokens of raw completion, no chat template. The prompts are "The capital of
-France is" (5 tokens); "Explain how a B-tree stays balanced when keys are
-inserted and deleted, and why databases use B-trees for indexes." (25); and a
-917-token operations log ending in a request to summarize it — the only one
-with prefill pieces wide enough for the fp16 GEMM:
+Greedy (`--temp 0 --top-k 1`) against `llama-completion`, same file, 160
+tokens, no chat template. Prompts: "The capital of France is" (5 tokens);
+"Explain how a B-tree stays balanced when keys are inserted and deleted, and
+why databases use B-trees for indexes." (25); a 917-token operations log
+ending in a request to summarize it (the only one wide enough for the fp16
+GEMM).
 
 | prompt | UD-Q8_K_XL | Q8_0 |
 | :--- | :--- | :--- |
@@ -632,8 +370,7 @@ with prefill pieces wide enough for the fp16 GEMM:
 | B-tree, 25 tokens | diverges at char 190 of 711 | diverges at the first token |
 | operations log, 917 tokens | identical, 690/690 chars | diverges at char 82 of 707 |
 
-Every divergence is a near-tie in llama.cpp's *own* logits, read at that
-position by a one-ubatch prefill of the common prefix:
+Every divergence is a near-tie in llama.cpp's own logits:
 
 | divergence | llama.cpp's top two | gap | we chose |
 | :--- | :--- | ---: | :--- |
@@ -641,28 +378,21 @@ position by a one-ubatch prefill of the common prefix:
 | Q8_0, B-tree, first token | "Here" 14.115, "\n\n" 13.728 | 0.387 | "\n\n" |
 | Q8_0, operations log, char 82 | "," 23.6089, " and" 23.6085 | 0.0004 | "," |
 
-The two engines' last-token logits differ by 0.13–0.43 max-abs on the same
-ids, so a gap under that is a coin the rounding flips. The third is a tie
-llama.cpp breaks both ways itself: its decode chose " and", its prefill of
-the same prefix ",". Recomputed as one pass over each common prefix, our int8
-prefill path (`LLMCUDA_HALF_GEMM=0`) takes llama.cpp's token in all three
-and the fp16 path in the third only. That is agreement in rounding — llama.cpp
-rounds its activations to int8 as that path does — not in accuracy: against
-the CPU reference the fp16 path's error is 14× smaller (TESTING.md).
+The engines' last-token logits differ by 0.13–0.43 max-abs, so smaller gaps
+flip on rounding; llama.cpp breaks the third tie both ways itself. Our int8
+prefill path (`LLMCUDA_HALF_GEMM=0`) takes llama.cpp's token in all three,
+the fp16 path in the third: agreement in rounding, not accuracy, since the
+fp16 path's error against the CPU reference is 14× smaller (TESTING.md).
 
 ## Clef-Flash (`clef`)
 
-Clef-Flash is a decision model: a 9.1B `qwen35` trunk read by a head that
-scores the options of each question in a prompt, served on `/v1/systemone`.
-A request is one prefill and no decode, so **nothing in this section is
-comparable to the tables above**. Its baselines are the other two ways to
-serve it: llama.cpp's `llama-server` (the same build as the 27B's, on its own
-`/v1/systemone`) and Cloudflare's PyTorch reference
-(`joint_schema_model.py`, with `fla` and `causal-conv1d` installed).
-
-**Every cell is clear of both.** Same card (GPU 1), the same requests, prompt
-tokens per second over the whole set (median latency in brackets);
-`Clef-Flash-Q8_0.gguf` for both servers, the HF safetensors for PyTorch:
+A decision model: a 9.1B `qwen35` trunk plus a head that scores each
+question's options, served on `/v1/systemone`. One prefill, no decode:
+**nothing here is comparable to the tables above**. Baselines: `llama-server`
+(the 27B's build) and Cloudflare's PyTorch reference (`joint_schema_model.py`,
+with `fla` and `causal-conv1d`). GPU 1, same requests, prompt tokens/s
+(median latency); `Clef-Flash-Q8_0.gguf` for the servers, HF safetensors for
+PyTorch:
 
 | set | conc. | llmcuda-rs | llama-server | PyTorch fp16 | vs llama-server | vs PyTorch |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -671,34 +401,21 @@ tokens per second over the whole set (median latency in brackets);
 | long, 8 × 3,012–3,512 tokens | 1 | **2,451** (1,376 ms) | 1,481 (1,409 ms) | 1,730 (1,977 ms) | **+65%** | **+42%** |
 | long | 4 | **2,446** | 2,406 | 1,791 | **+1.7%** | **+37%** |
 
-The short rows and both PyTorch columns are the median of three rounds with
-the engine order rotated; the two long rows for the servers are the median of
-three alternating pairs, each pair won. PyTorch's "conc. 4" is its batch of
-four, its own form of concurrency; at batch 1 it is the c1 column.
+Short rows and PyTorch: median of three rounds, engine order rotated. Long
+server rows: median of three alternating pairs, each won. PyTorch's conc. 4
+is its batch of four.
 
-Read the long rows by their latency and the c4 row, not by the c1 rate:
+- **Read the long rows by latency and c4.** llama-server re-reserves its
+  graph for each new longest prompt (3.0–3.8 s against 1.2–1.5 s), inflating
+  the c1 margin. At steady state it is **2.3% on latency and 1.7% on
+  throughput**: parity to keep.
+- llama-server serializes decisions:
+  `-ngl 99 -fa on -c 20480 -b 16384 -ub 4096 -np 1`.
+- PyTorch's best on Turing is fp16; bf16 has no tensor-core path here
+  (446–460 tokens/s at batch 1, a quarter of fp16's).
 
-- **llama-server's long c1 rate carries a warm-up.** Each prompt longer than
-  any it has served re-reserves its compute graph: on the long set the four
-  prompts that set a new length (one of them a warm-up request) took
-  3.0–3.8 s against 1.2–1.5 s for every other. A long-running server pays
-  that a few times and never again. Its median latency and its c4 rate,
-  measured after those prompts, are its steady state, and against that the
-  margin is **2.3% on latency and 1.7% on throughput** — parity to keep, not
-  headroom.
-- **llama-server serializes decisions** (a joint head reads the whole batch),
-  so it runs one slot, the whole context, the prompt in one ubatch:
-  `-ngl 99 -fa on -c 20480 -b 16384 -ub 4096 -np 1`. Its c4 rate exceeds its
-  c1 rate only by the requests queued behind the first.
-- **PyTorch's best setting on Turing is fp16.** The checkpoint is bf16, which
-  has no tensor-core path on this card: 446–460 tokens/s at batch 1 in an
-  earlier round on the same card, a quarter of fp16's.
-
-Accuracy is not traded for it. Against the PyTorch reference on the same
-requests, both servers pick the reference's option on all 99 questions, and
-our probabilities sit closer to the reference than llama-server's on every
-summary below (the servers round to four decimals, so differences under 5e-5
-are rounding; the long rows are the configuration in the table above):
+Both servers pick the reference's option on all 99 questions; ours sits
+closer to it on every summary (servers round to four decimals):
 
 | set | vs | engine | median \|Δp\| | p99 | max |
 | :--- | :--- | :--- | ---: | ---: | ---: |
@@ -711,33 +428,24 @@ are rounding; the long rows are the configuration in the table above):
 | long | PyTorch bf16 | llmcuda-rs | 8.9e-4 | 6.1e-3 | 8.8e-3 |
 | long | PyTorch bf16 | llama-server | 1.4e-3 | 1.4e-2 | 2.5e-2 |
 
-Where a request's time goes, on the same card: the trunk alone, a cold pass
-in `bench_forward`, is 323 ms at 877 tokens and 1,321 ms at 3,350; the
-served medians are 342 and 1,376 ms. The rest — the decision head (11 ms at
-2,048 positions, measured in its own commit), the template, tokenization and
-HTTP — is 4–6% of a request. So the prefill is the request, and why it is a
-single pass is in WHY ("A decision prompt is one pass, at the width it is").
+The trunk alone is 323 ms at 877 tokens and 1,321 ms at 3,350, against
+served medians of 342 and 1,376 ms; head, template, tokenization and HTTP
+are 4–6% of a request. The prefill is the request (WHY: "A decision prompt is
+one pass, at the width it is").
 
 ## Serving concurrent sessions
 
-The numbers above are single-sequence kernel throughput against llama.cpp.
-These are the *server*: real HTTP requests through `/v1/chat/completions`,
-streamed, measured end to end. They are not comparable to the standing table
-and must not be quoted against llama.cpp.
-
-Measured with `bench_server.py` (see Reproducing): every prompt's length is
-read from the response's own `usage.prompt_tokens` rather than estimated, and
-each cell's prompts carry a unique leading token so nothing is served from the
-prefix cache. Both precautions exist because their absence produced wrong
-numbers here — see WHY NOT. Prefill rate is total prompt tokens over time to
-the *last* first-token; decode per-slot is the reciprocal of median
-inter-token latency. Trials agree to within 0.5% except where noted.
-
+End-to-end HTTP through `/v1/chat/completions`, streamed: **not comparable to
+the standing table.** `bench_server.py` (see Reproducing) reads prompt
+lengths from `usage.prompt_tokens` and gives each prompt a unique leading
+token to bypass the prefix cache (WHY NOT has why). Prefill rate is prompt
+tokens over time to the last first-token; decode per-slot is 1 / median
+inter-token latency. Trials agree within 0.5% unless noted.
 `--spec-type none -c 405504 -s 3 -tb 4096 -pc 2048`, three slots per card.
 
 ### One card, prefill
 
-Aggregate is the card's total; per-slot is what one session sees.
+Aggregate / per-slot:
 
 | depth | 1 session | 2 sessions | 3 sessions |
 | :--- | ---: | ---: | ---: |
@@ -746,11 +454,9 @@ Aggregate is the card's total; per-slot is what one session sees.
 | 64K | 1,785 / 1,785 | 1,784 / 892 | 1,709 / 570 |
 | 128K | 1,310 / 1,310 | — | 1,310 / 437 |
 
-Aggregate is flat across session count: adding sessions divides the card, it
-does not cost it. The one visible dip — 16K at three sessions, −4.9% — is the
-kernel's own price for interleaving three sequences (measured separately at
-2,795 → 2,656 tok/s, ratio 0.95), not scheduling overhead. At 128K the
-aggregate is identical to within 0.2% at one and three sessions.
+Aggregate is flat across sessions. The 16K three-session dip (−4.9%) is the
+kernel's own cost of interleaving three sequences (2,795 → 2,656 tok/s
+measured separately), not scheduling.
 
 ### One card, decode
 
@@ -761,9 +467,7 @@ aggregate is identical to within 0.2% at one and three sessions.
 | 64K | 61.9 / 62.7 | 79.3 / 41.5 | 96.1 / 33.3 |
 | 128K | 51.6 / 52.4 | — | 71.5 / 26.1 |
 
-Decode aggregate *rises* with session count — 63.6 → 117.0 at 16K — because
-concurrent sequences share one weight read per step. Per-slot falls, as it
-must; the batched read is what makes the aggregate grow anyway.
+Aggregate rises with sessions because they share one weight read per step.
 
 ### Three cards, the nine-session target
 
@@ -774,22 +478,15 @@ must; the batched read is what makes the aggregate grow anyway.
 | 16K decode | 202.3 / 68.4 | 297.4 / 52.2 | 368.6 / 42.5 |
 | 64K decode | 193.7 / 66.8 | 244.4 / 44.0 | 304.0 / 35.0 |
 
-The nine-session cells are the noisiest on this host: their two trials spread
-6.1% on 16K prefill and 3.9% on 64K decode, against 0.7% or better everywhere
-else. Read them as the pair, not the digit.
-
-Nine sessions at 64K reach 5,071 tok/s of prefill against one card's
-three-session 1,709 — **2.97x for 3x the cards**, and every session makes
-progress throughout: first tokens land at [93.9, 99.3, 108.5 x5, 110.7 x2],
-grouped by card rather than staggered one prompt at a time.
+Nine-session trials spread 6.1% (16K prefill) and 3.9% (64K decode); read
+them as the pair, not the digit. At 64K nine sessions reach **2.97x** one
+card's three-session rate on 3x the cards, first tokens grouped by card at
+[93.9, 99.3, 108.5 x5, 110.7 x2].
 
 ### A session beside busy neighbours
 
-Aggregate throughput says nothing about what one session feels while the other
-cards are working, and that is the number a person actually notices. One
-session decodes 200 tokens while two 64K prompts prefill on the *other* two
-cards; its inter-token latency is the measurement, and its own baseline on an
-idle fleet is measured in the same run.
+One session decodes 200 tokens while 64K prompts prefill on the other two
+cards:
 
 | decoding session | mean | median | p90 | p99 | max | wall spent stalled |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -797,19 +494,14 @@ idle fleet is measured in the same run.
 | workers on their own loops | 11.8 ms | 11.6 | 12.1 | 14.2 | 21.1 | 0% |
 | the same fleet, idle | 11.7 ms | 11.6 | 11.8 | 12.4 | 19.8 | — |
 
-The median is the trap: it is 12.1 ms in every row, and a probe that reported
-it concluded the fleet cost a decoding session 1.3x. The cost was entirely in
-the tail — 21 of 199 tokens absorbed 26.9 s of the 29.0 s that session took,
-each stall the length of one 2048-token prefill chunk on a card that session
-was not running on. Decoding beside two busy cards is now indistinguishable
-from decoding on an idle fleet, and the prefills alongside it finished no
-slower.
+The median, 12.1 ms in every row, hides the cost: in lockstep 21 of 199
+tokens absorbed 26.9 s of the session's 29.0 s. With per-worker loops it
+matches an idle fleet, and the neighbouring prefills finished no slower.
 
 ### Prefix cache: coverage decides whether it hits at all
 
-Six-turn conversations, each turn extending the last, three of them at once on
-one card. `reused_prefix_tokens` is the server's own admission telemetry, not
-inferred from latency.
+Six-turn conversations, three at once on one card; reuse is the server's own
+`reused_prefix_tokens`.
 
 | arena | snapshots/worker | coverage per slot | prefix reuse | wall |
 | :--- | ---: | ---: | ---: | ---: |
@@ -817,50 +509,30 @@ inferred from latency.
 | `--cache-ram 12GiB` | 119 | 79,872 | 73% → 86% | 133.2 s |
 | current default | 198 | 135,168 (100%) | 73% → 86% | 132.2 s |
 
-The 0% is the point. An undersized arena does not cache less — it caches
-*nothing*: publishing yields rather than evicts when slots are scarce, so a
-worker that cannot hold its sessions' retention points publishes nothing, the
-next turn has nothing to match, and every turn re-prefills from zero. There is
-no partial-credit region, which is why the default is now derived from the
-serving configuration rather than fixed.
-
-Reuse is quantised to the retention interval — 43,008 of 49,879 tokens is
-21 × 2048 — so the last partial interval is always re-prefilled. A single
-conversation never shows this: 40K tokens needs ~20 snapshots and even the old
-default held 24. It takes concurrent sessions to exceed the arena.
-
-A larger arena than the context needs buys nothing, and the preflight says so.
-Measured on three cards at `--cache-ram 64GiB`: 63.86 GiB pinned, 212
-snapshots per worker, **106% of the context** covered, 60 s to healthy against
-34 s at 19.88 GiB — and reuse identical to full coverage, 73% → 85% over six
-turns. Host memory was fully released on shutdown. `RLIMIT_MEMLOCK` does not
-bind: 63.86 GiB pinned against a 15.72 GiB soft *and hard* limit, because the
-NVIDIA driver pins outside it.
-
-The plateau at ~85% is not a shortfall. Each of these turns adds 6,179 tokens
-that did not previously exist, and against the *reusable* prefix the cache
-takes 97.1% → 98.4%. What is left is the partial retention interval below the
-last snapshot boundary — 552 to 692 tokens per turn, bounded by `R` and
-averaging about `R/2`. Only token-granular reuse would recover it; see the WHY
-entry on what llama.cpp does with in-place slots.
-
+- **An undersized arena caches nothing.** Publishing yields rather than
+  evicts, so a worker that cannot hold its sessions' retention points
+  publishes nothing. The default is derived from the serving configuration.
+- **The ~85% plateau is the retention quantum** (43,008 of 49,879 tokens is
+  21 × 2048). Against the reusable prefix, reuse is 97.1% → 98.4%; the
+  remaining 552–692 tokens per turn (about `R/2`) need token-granular reuse
+  (see WHY on llama.cpp's in-place slots).
+- **Oversizing buys nothing.** `--cache-ram 64GiB` on three cards pinned
+  63.86 GiB (106% of the context) and took 60 s to healthy against 34 s at
+  19.88 GiB, with identical reuse. `RLIMIT_MEMLOCK` (15.72 GiB) does not bind;
+  the NVIDIA driver pins outside it.
 
 ### What this cost to get right
 
-Two lock faults in the driver loop, not the scheduler, dominated everything
-else. Before them, four sessions on one card produced first tokens at 34, 71,
-136 and 203 seconds — one prompt at a time wearing three slots — and three
-sessions at 64K were bimodal on a lock race, 1,734 tok/s or 826. Both are in
-WHY. The scheduler's own contribution, sharing each step across prefilling
-sessions, is worth +3.0% at 16K and +3.4% at 64K with worst-case time to
-first token 3.5% lower; it is small next to the locks and was unmeasurable
-until they were fixed.
+Two driver-loop lock faults dominated. Before their fixes, four sessions on
+one card got first tokens at 34, 71, 136 and 203 seconds, and three sessions at 64K were bimodal
+at 1,734 or 826 tok/s (both in WHY). The scheduler's step sharing across
+prefilling sessions is worth +3.0% at 16K and +3.4% at 64K, with worst-case
+time to first token 3.5% lower.
 
 ## Correctness gates
 
-Throughput claims in this file were all taken with these green. They are hard
-gates: a speedup that flips a logit ranking or needs a loosened tolerance is a
-reject regardless of size.
+Every throughput number here was taken with these green. A speedup that flips
+a logit ranking or needs a loosened tolerance is a reject regardless of size.
 
 | Gate | What it asserts |
 | --- | --- |
@@ -870,178 +542,94 @@ reject regardless of size.
 | `attention_differential` | Nine cases including a 128K window, at `GATE` 1e-5 for scalar paths and `MMA_GATE` (8 × binary16 half-ulp) for tensor-core paths |
 | `moe_differential`, `gdn_*_differential`, `lm_head_differential` | Every kernel against its CPU reference, plus exact cross-kernel identity where two compiled kernels must agree |
 
-The batch-vs-single-stream gate is a **serving contract**, not a tolerance:
-three instances share a card, and a sequence's output must not depend on which
-other sequences happen to be resident with it. `0.000e0`, not "small enough",
-is the only target that makes a downstream discrete decision — top-8 expert
-routing today, activation quantization if it is ever re-attempted — safe to
-sit on. Measured directly: a ~1e-5 reduction-order residual upstream was
-enough to flip expert selection and spike a layer's divergence 26×.
+`0.000e0` batch-vs-single is a **serving contract**, not a tolerance: a
+sequence's output must not depend on which others are resident. A ~1e-5
+reduction-order residual upstream was measured flipping expert selection
+(top-8 routing) and spiking a layer's divergence 26×.
 
 ---
 
 # WHY
 
-The reasons the engine is shaped the way it is. Each is a mechanism that paid,
-stated so it transfers to the next kernel rather than as a changelog entry.
+Why the engine is shaped as it is: each entry is a mechanism that paid,
+stated so it transfers to the next kernel.
 
-## K2 integer projections keep one contraction order across shapes
+## K2 integer projections: one contraction order across shapes
 
-K2 projections pack weights at upload and quantize activations into sixteen-bit
-integer codes with a separate fp32 scale for each 32 values. The quantizer
-gives each lane four consecutive values and eight lanes a group; its
-activation sum reproduces the warp-per-group butterfly's pairing, with the
-first three levels across lanes and the last two in-lane. Narrow shapes use
-DP4A; prefill uses Turing integer tensor cores. Q4 codes remain nibbles. Q6
-codes remain six bits, split into four words of low nibbles and two of high
-bit pairs inside each 32-value group, arranged so that each code word lines up
-with one activation word. Dense and expert records both interleave each word
-across four rows. These formats have their own residency calculation;
-using the Qwen weight constant in K2 preflight would misreport free memory.
-Native record boundaries preserve word alignment: Q4's `d/dmin` is loaded as
-one 32-bit word and Q6's `d` as one 16-bit halfword. Hardware half widening
-retains their original bit patterns while avoiding byte assembly on the
-integer projection path.
+Weights are packed at upload; activations become sixteen-bit integer codes
+with an fp32 scale per 32 values. Decode uses DP4A, prefill the int8 tensor
+cores.
 
-Decode widths share one kernel for dense and routed projections. With every
-record interleaved, one 16-byte load gives a lane the same word of four rows.
-The lane owns one 32-value group of that row quad and reuses the group's
-sixteen-bit activation codes across all four rows. Q6 decode takes those
-codes unsigned and removes their bias of 32 with each subgroup's activation code
-sum, which is shared by the quad, instead of fixing the sign of every byte.
-Giving each lane its own row, as before, made L1 activation traffic about four
-times the weight traffic per token; reuse halved a 2560×4096 Q4 projection at
-one token. Integer dots
-are exact in any order, and the group terms, windows and ascending window sum
-are the same fp32 operations, so outputs stay bit-identical to the tensor-core
-tiles.
+- **GEMV and GEMM agree bit for bit**, including incomplete tiles: integer
+  dots are exact in any order, and group terms, windows and the ascending
+  window sum are the same fp32 operations (`(t0+t2)+(t1+t3)` per 128-value
+  window). This is a new contraction, not bit-equal to the old fp32
+  projection; CPU differentials and model oracle gates cover it.
+- **Formats.** Q4 stays nibbles; Q6 stays six bits (four low-nibble and two
+  high-bit words per 32-value group, each aligned with an activation word).
+  Records interleave each word across four rows. K2 has its own residency
+  calculation; the Qwen constant would misreport free memory.
+- **Decode reuse.** One 16-byte load gives a lane one word of four rows, and
+  its activation codes serve all four; Q6 removes its bias of 32 with the
+  quad's shared code sum. A lane per row had made L1 activation traffic about
+  four times the weight traffic; reuse halved a 2560×4096 Q4 projection at one
+  token.
+- **Prefill.** One kernel for Q4 and Q6, dense and routed. Activations are
+  quantized in fragment order; high and low code planes each take one m8n8k16
+  pair, combined exactly as high×256+low in int32. Load offsets are fixed
+  outside the window loop; recomputing them had been about a sixth of each
+  window's instructions. Replacing the nibble-plane kernels raised cold Q4
+  prefill about 40% at 512 tokens.
+- **Magic-number int-to-float.** `I2F` issues at a quarter of the FP32 rate on
+  sm_75. Accumulators seeded with the bit patterns of 1.5×2^31 and 1.5×2^23
+  yield the float of 256h+l after one exact subtraction and one exact add.
+  Splitting the conversions between pipes raised Q6 prefill about 2%.
+- **Q6 de-phased staging.** Ablation at 2,048 tokens found no binding pipe
+  (FP32 epilogue 16%, epilogue plus MMAs no more, window barriers 15%): the
+  phases ran serially. Double-buffered activations (58,752 bytes of shared
+  memory) let two token warps unpack the next window on opposite sides of
+  their products, overlapping integer and tensor/FP32 work. Q4 loses with
+  this arrangement (WHY NOT).
+- **Shared quantization.** An unchanged input is quantized once per workspace
+  generation, graph capture included. FFN-down quantizes `silu(gate)·up`
+  inside the quantizer, so SwiGLU is never stored or launched. Routed and
+  shared-expert gate/up share one quantization, and one pass adds routed,
+  shared and residual with the separate launches' rounding.
+- **Grouped q/gate/k.** One prefill grid: 72 row blocks per token tile fill
+  the 72 SMs, where 32, 32 and 8 each ended on a partial wave.
+- **Routing.** Count, prefix and an order-preserving gather run on device into
+  runs padded to 64, in buffers and grids fixed at construction. Sigmoid ties
+  go to the lowest expert id; combining follows route order.
+- **Attention.** Prefill keeps fp32 query and softmax-weight residuals around
+  half operands and stages 32 keys per barrier pair for two 16-query tiles,
+  so each K/V element serves 32 queries; one key octet for 16 queries had cost
+  about 6% of cold Q4 prefill at 2,048 tokens. Decode uses compensated
+  tensor-core attention with 32 fixed splits from 512 visible keys.
 
-Sixteen-bit prefill is one int8 tensor-core kernel for Q4 and Q6, dense and
-routed. The quantizer writes activations in fragment order: sixteen bytes per
-32-value group and k chunk carry the high and low words for both k16 halves,
-so staging is a straight copy. The high and low planes each take one
-m8n8k16 pair, combined exactly as high×256+low in int32. Q4 weights enter
-the MMA as unsigned nibbles; Q6 codes are unpacked once while staging. A
-block covers 128 rows by one 64-slot dispatch run, or 64 tokens when dense.
-Each warp keeps a 128-value window's weight fragments and scales in
-registers across four 8-token subtiles, while the next window's global loads
-are already in flight in registers. Load offsets are fixed before the
-window loop: row quads past the matrix and padded token slots read the
-block's first quad or token, whose outputs are never stored, so the window
-loads carry neither address arithmetic nor predicates; recomputing them had
-been about a sixth of each window's instructions. Q6 staging spreads over all
-256 threads, two per row quad and group, each unpacking half of the group's
-code words into one 16-byte store per row, and padded shared-memory pitches
-keep the staging stores conflict-free. Fully padded runs and subtiles are
-skipped. The nibble-plane kernels this replaced needed four int4 MMAs and an
-integer Horner sum per 32 values, and staged weights one load per four
-codes; the change raised cold Q4 prefill about 40% at 512 tokens. Group
-terms, windows and the ascending window sum stay the GEMV's fp32
-operations. No dispatch allocation or live-count readback is added to the hot
-path.
-
-Each Q6 term needs two exact integer-to-float conversions, and `I2F` issues
-at a quarter of the FP32 rate on sm_75. The prefill tile starts the second
-sub-block's high and low accumulators at the bit patterns of 1.5×2^31 and
-1.5×2^23, so after the MMA they hold the floats 1.5×2^31+256h and
-1.5×2^23+l; one exact subtraction and one exact add then give the float of
-256h+l, the value `I2F` returns. Splitting the two conversions between the
-pipes raised Q6 prefill about 2%.
-
-Q6 tiles stage the next window while multiplying the current one. Ablating
-the dense Q6 kernel at 2,048 tokens showed no single pipe binding it:
-dropping the FP32 epilogue saved 16%, dropping the epilogue and the MMAs
-together saved no more, and dropping both window barriers (racy; timing
-only) saved 15%. The window's phases ran one after another, and with eight
-warps per SM nothing overlapped them. Weight fragments and scales now reach
-registers before the window's first barrier, which frees the weight buffer,
-and activations alternate between two buffers (58,752 bytes of opted-in
-shared memory). Token warp 0 unpacks the next window's codes before its
-products and token warp 1 after them, so each scheduler pairs a warp on the
-integer unpack with one on the tensor and FP32 pipes, still at two barriers
-per window. Q4's lighter staging loses with the same arrangement (WHY NOT).
-
-Q4's affine minimum multiplies the original activation sum, retaining the
-warp's summation tree. Q6 combines its two sixteen-value subscale dots before
-applying the common activation scale. Both paths add four 32-value terms as
-`(t0+t2)+(t1+t3)` inside each 128-value window. GEMV and GEMM must agree bit for
-bit, including flat FFN-down inputs and incomplete row/token tiles. This is a
-new integer contraction, not a claim of bit equality with the old fp32 FMA
-projection. CPU differentials and real-model oracle gates cover that change.
-
-Projections sharing an unchanged input explicitly prepare its activation codes
-once. The FFN down projections quantize `silu(gate)·up` straight from the
-gate and up outputs, with `swiglu_mul`'s expression inside the quantizer, so
-the product is never stored and SwiGLU is not a separate launch. The routed and
-shared-expert gate/up projections share one quantization of the normed
-input, and one pass forms routed plus shared and then adds the residual,
-rounding each add as the separate element-wise launches did. A workspace generation prevents reuse after another input is prepared;
-Q4 consumers declare their need for packed nibble planes. Attention projections
-and gate/up pairs reuse that generation, including during graph capture.
-At prefill widths the attention query, gate and key projections then run as
-one tensor-core grid, its row blocks indexing the three matrices in turn: 72
-row blocks per token tile fill the 72 SMs, where 32, 32 and 8 had each ended
-on a partial wave of their own. Every block computes what its own launch did.
-Rotary coefficients are evaluated in double precision at layer zero, stored
-as fp32, and reused by the remaining heads and layers of that pass. The
-fixed token arena is refreshed from device positions on every graph replay;
-it does not retain a table for the model's entire context. CPU and direct-GPU
-checks cover rotary coefficients, tails, independent positions and cache writes.
-
-The F32 router projection gives each warp four rows of the eight-token
-prefill tile, so one load of a token's activations feeds four rows; every
-`(row, token)` keeps its lane-slice accumulation and shuffle-down tree.
-
-Expert dispatch counts contiguous slices in parallel, prefixes counts on the
-device, and gathers flat `(token, slot)` indices in their original order. Runs
-are padded to 64; unused owners are `-1`. Both buffers and grids are fixed at
-construction. Decode reads direct ids and skips this padded gather. Combining
-results follows route order. The router resolves sigmoid-score ties to the
-lowest expert id and retains the ordered normalization floor and bias rule.
-
-K2 prefill attention retains fp32 query and softmax-weight residuals around
-its half tensor-core operands. All prefill widths use the same compensated query tile,
-including masked short chunks. A block covers two 16-query tiles of one KV
-head's four query heads and stages 32 keys per barrier pair, so each staged
-K/V element serves 32 queries; every warp still walks its keys in 8-key
-steps with the single-tile kernel's operations and stops at its own tile's
-visible keys, which a bitwise differential test checks. Blocks start
-longest causal run first, the last query block of every KV head before the
-next-to-last, so the deepest blocks do not fall into the final wave. Staging one key
-octet per barrier pair for 16 queries had cost about 6% of cold Q4 prefill at
-2,048 tokens. Single-token attention avoids split reduction
-at tiny contexts. At 512 visible keys and above, the 128-dimensional decode
-path uses compensated tensor-core attention with two warps and 32 fixed
-splits. The shorter-window scalar kernel specializes K2's four query heads
-per KV head and four dimensions per lane, bounding its register arrays.
-Batched decode appends rotated keys/values and attends to independent caches
-with fixed pointer slots, keeping the serial arithmetic in both paths. Qwen
-uses its existing kernels and split geometry. Deep-window CPU and
-batch/serial checks gate the K2 path.
-
-`bench_k2` measures real query and value-expert tensors with CUDA events,
-including device dispatch. Full-model results and limits are in
-[Current standing](#current-standing); kernel timing alone does not establish
-serving throughput.
+`bench_k2` times real tensors with CUDA events; kernel timing does not
+establish serving throughput ([Current standing](#current-standing)).
 
 ## Rust kernel authoring can keep the existing launcher
 
-The opt-in `llmcuda-cuda/rust-kernels` feature replaces `tensor_add` with
-cuda-oxide-generated PTX. It preserves the existing cudarc ABI, allocations
-and graph capture. The pinned Rust source, compiler revision and regeneration
-procedure are in [TOOLCHAIN.md](TOOLCHAIN.md) and
-[`experiments/cuda-oxide`](../experiments/cuda-oxide). CUDA C++ remains the
-default; this is a tested migration path, not an inference-speed claim.
+The opt-in `llmcuda-cuda/rust-kernels` feature swaps eight kernels for
+cuda-oxide PTX behind the existing cudarc ABI, allocations and graph capture:
+residual add, standalone SwiGLU, sigmoid gating, softplus, standalone RoPE,
+production tiled RoPE, RMSNorm and fused RMSNorm/SwiGLU. Toolchain pin:
+[TOOLCHAIN.md](TOOLCHAIN.md), [`experiments/cuda-oxide`](../experiments/cuda-oxide).
+CUDA C++ stays the default: every model comparison below changes sign across
+pairs. Deep contexts, the dense model and three-card serving were not
+measured.
 
-The following residual-only measurements isolate that port from the
-activation ports now selected by the same feature.
+Kernel tables: six alternating CUDA-event pairs on GPU 1, order reversed on
+odd pairs, 100 graph-captured launches per interval; small shapes are
+cache-hot. Model tables: three alternating prebuilt process pairs on GPU 1,
+only the switch different, middle pair reversed, box quiet; cells are
+pair 0 / 1 / 2. Register counts are offline CUDA 12.4 `ptxas -arch=sm_75`,
+not the driver's JIT.
 
-The compiler difference is concrete: NVRTC unrolls the grid-stride loop,
-where cuda-oxide leaves one loop body. Offline CUDA 12.4 `ptxas -arch=sm_75`
-uses 36 registers for the former and 16 for the latter, with no spills.
-Those are offline assembler counts, not measurements of the driver's JIT.
-Six alternating GPU 1 CUDA-event pairs, order reversed on odd pairs, timed
-100 graph-captured launches per interval:
+Residual add: NVRTC unrolls the grid-stride loop and cuda-oxide does not
+(36 against 16 registers, no spills). The port is bit-exact, including signed
+zero, subnormals, in-place aliases and graph replay.
 
 | Elements | NVRTC us/launch, min–max | Rust us/launch, min–max |
 | ---: | ---: | ---: |
@@ -1050,54 +638,22 @@ Six alternating GPU 1 CUDA-event pairs, order reversed on odd pairs, timed
 | 1,048,576 | 23.859–23.940 | 23.817–23.879 |
 | 8,388,608 | 183.419–183.807 | 180.163–180.305 |
 
-Repeated small inputs are cache-hot. The whole Qwen3.6 model has only 40
-standalone mixer residuals per step; the MoE residual is already fused.
-Three alternating process pairs on GPU 1, middle pair reversed, therefore
-read as parity. Both arms used the same source tree with only the feature
-different, prebuilt in separate target directories, with the box otherwise
-quiet. Values within each cell are pair 0 / 1 / 2:
+Only 40 standalone residuals run per step, so the model pairs are parity:
 
 | N=3, 2K per sequence | NVRTC tok/s | Rust tok/s | Rust change across pairs |
 | --- | --- | --- | --- |
 | Decode, 64 steps after 4 warmup | 217.8 / 216.8 / 216.5 | 217.3 / 216.8 / 216.7 | −0.23% / 0.00% / +0.09% |
 | Prefill, 1,536 total chunk rows, 5 timed repetitions | 3073.34 / 3055.24 / 3057.28 | 3062.50 / 3059.73 / 3054.73 | −0.35% / +0.15% / −0.08% |
 
-Prefill's within-process standard deviations were 6.88–12.42 tok/s for
-NVRTC and 7.21–9.79 for Rust. This compares the two kernel backends at a
-fixed 512-row-per-sequence chunk; the standing configuration and llama.cpp
-comparison remain in [Current standing](#current-standing). Deep contexts,
-the dense model and concurrent three-card serving were not measured for this
-feature. A full context sweep is required before changing the default.
+Prefill within-process standard deviations: 6.88–12.42 tok/s NVRTC,
+7.21–9.79 Rust.
 
-The residual differential is bit-exact, including signed zero, subnormals,
-ragged tails, both in-place aliases and graph replay. All 12 layer-op GPU
-differentials and the 19-token, 40-block Qwen3.6 forward golden passed with
-the feature enabled. The narrow gain establishes a viable Rust kernel; its
-sign-changing model pairs establish no engine throughput improvement.
+### Activation ports
 
-### Activation ports need their own shape measurements
-
-The single, disabled-by-default `rust-kernels` feature also selects
-`swiglu_mul` and `sigmoid_gate_mul`, including per-row broadcasting and the
-separate sigmoid waypoint. It forwards from the server through the engine
-to `llmcuda-cuda`. Their raw-pointer ABI and launch geometry are unchanged;
-loading happens at construction. The same generated PTX contains the
-residual entry, whose instructions are unchanged apart from label numbering.
-
-`bench_rust_activations` compares both implementations with the existing CPU
-oracles and tolerances, including empty/ragged/grid-stride lengths, saturated
-gates, guarded buffers, supported exact aliases and graph replay. All cases
-passed on GPU 1. The feature-enabled layer-op suite passed all 12 tests;
-SwiGLU's million-element max-abs error was **2.861e-6**, and elementwise
-sigmoid gating's 262,144-element max-abs error was **4.768e-7**, both with
-cosine **1.000000000**. The 19-token Qwen3.6 golden passed all 40 block gates
-and selected token **25358**. CUDA 12.4 offline `ptxas -arch=sm_75` uses
-22 registers for Rust SwiGLU and 26 for Rust sigmoid gating, with no spills;
-these are not driver-JIT measurements.
-
-Six alternating GPU 1 pairs, order reversed on odd pairs, each timed 100
-graph-captured launches with CUDA events. Small shapes are cache-hot. Both
-arms use the normal 256-thread grid capped at 1,024 blocks:
+`swiglu_mul` and `sigmoid_gate_mul` pass the existing CPU oracles: max-abs
+**2.861e-6** (SwiGLU, a million elements) and **4.768e-7** (sigmoid, 262,144),
+cosine **1.000000000**. The 19-token, 40-block golden selects token **25358**.
+22 and 26 registers, no spills; 256-thread grid capped at 1,024 blocks.
 
 | Kernel / shape | Elements | NVRTC us/launch, min–max | Rust us/launch, min–max |
 | --- | ---: | ---: | ---: |
@@ -1111,59 +667,30 @@ arms use the normal 256-thread grid capped at 1,024 blocks:
 | Sigmoid, per row, width 2,048 | 262,145 | 4.585–4.618 | 4.356–4.380 |
 | Sigmoid, per row, width 2,048 | 8,388,608 | 132.924–133.251 | 142.222–142.510 |
 
-The model uses fused SwiGLU and shared-expert paths, so the activation
-ports change only the standalone attention sigmoid gates in the current
-forward path. The following measurements isolate those ports from residual
-addition; they do not measure the combined `rust-kernels` switch. Three alternating process pairs on GPU 1 used prebuilt
-binaries from the same tree, selecting Rust activations only in the candidate
-and CUDA C++ residual addition in both arms. No other GPU work or builds ran during
-timing. Values are pair 0 / 1 / 2; the middle pair reversed order:
+SwiGLU is fused in the model, so only the standalone attention sigmoid gates
+change. Activation ports alone:
 
 | Qwen3.6, N=3, 2K per sequence | NVRTC tok/s | Rust activations tok/s | Rust change across pairs |
 | --- | --- | --- | --- |
 | Decode, 64 steps after 4 warmup | 217.6 / 216.8 / 217.0 | 217.4 / 217.5 / 217.0 | −0.09% / +0.32% / 0.00% |
 | Prefill, 1,536 total chunk rows, 5 timed repetitions | 3080.91 / 3059.20 / 3060.56 | 3071.82 / 3065.06 / 3059.15 | −0.30% / +0.19% / −0.05% |
 
-Prefill's within-process standard deviations were 8.49–10.13 tok/s for
-NVRTC and 6.84–8.23 for Rust. Both model comparisons change sign across
-pairs: no engine throughput improvement is established. Large standalone
-SwiGLU and broadcast sigmoid regress despite passing correctness, so the
-migration remains opt-in. Deep contexts, the dense model and concurrent
-three-card serving were not measured for this feature. The llama.cpp
-comparison remains in [Current standing](#current-standing).
+Prefill standard deviations: 8.49–10.13 tok/s NVRTC, 6.84–8.23 Rust. Large
+standalone SwiGLU and broadcast sigmoid regress.
 
 ### Rust normalization and rotary kernels need separate kernel and model gates
 
-The single disabled-by-default `rust-kernels` feature selects eight entries:
-residual add, standalone SwiGLU, sigmoid gating, softplus, standalone RoPE,
-production tiled RoPE, RMSNorm and fused RMSNorm/SwiGLU. Standalone softplus,
-SwiGLU and layer-ops RoPE are API ports, not the corresponding production
-hot paths. Attention's tiled RoPE is used by prefill; fused batched decode
-rotary/append and multimodal IMRoPE remain CUDA C++.
+Standalone softplus, SwiGLU and layer-ops RoPE are API ports, not production
+hot paths; fused batched-decode rotary/append and multimodal IMRoPE remain
+CUDA C++.
 
-Normalization keeps the row/block geometry, 32-bit column loops and one
-shared float per warp. Its second reduction is parallel: each warp reads
-the immutable warp partials, reduces them with shuffles and broadcasts lane
-zero, removing the second block barrier. This changes floating-point addition
-order; it is not bit-identical to the old serial warp sum. Squared-value
-accumulation retains FMA, and inverse RMS retains division and square root.
-Small fused rows retain the input and gate in registers across the reduction,
-then write both the normalized intermediate and the gated output.
-
-`bench_rust_norm` gates both compilers against CPU RMSNorm and composed
-RMSNorm/SwiGLU without changing tolerances. Widths 1, 31, 33, 129, 1,025 and
-5,120 cover ragged and multi-iteration cases alongside target widths 128,
-256 and 2,048. Zero/sparse rows, two epsilon values, guarded and offset buffers,
-standalone in-place normalization and graph replay pass. Target-width maximum
-absolute CPU errors are **3.099e-6**, **1.192e-6** and **9.537e-7** for hidden,
-attention-head and GDN-head normalization, respectively; all cosines are
-**1.000000000**. The eight-port feature passes the layer-operation CPU gates
-and the 19-token, 40-block golden without relaxed thresholds, selecting token
-25358. That short golden does not validate deep-context Rust inference.
-
-Six alternating GPU 1 CUDA-event pairs reverse order on odd pairs and time
-100 graph-captured launches per interval. Small shapes are cache-hot; 1,536
-rows are a physical prefill chunk, with head rows scaled by head count:
+RMSNorm's second reduction is now a parallel shuffle over the warp partials,
+removing a block barrier; the changed addition order makes it not
+bit-identical to the old kernel. Target-width max-abs errors against CPU were
+**3.099e-6**, **1.192e-6** and **9.537e-7** (hidden, attention-head,
+GDN-head), cosines **1.000000000**, at unchanged tolerances. The 19-token
+golden passes but does not validate deep context. 1,536 rows are one prefill
+chunk:
 
 | Kernel | Rows × width | NVRTC us/launch, min–max | Rust us/launch, min–max |
 | --- | ---: | ---: | ---: |
@@ -1180,32 +707,18 @@ rows are a physical prefill chunk, with head rows scaled by head count:
 | RMSNorm/SwiGLU | 49,152 × 128 | 182.724–182.995 | 182.378–182.496 |
 | RMSNorm/SwiGLU | 24,576 × 256 | 182.834–182.926 | 182.565–182.701 |
 
-Standalone decode RMSNorm improves **2.4–3.8%** throughput. Hidden-width
-prefill has substantial spread (**−0.9% to +9.1%** across pairs), so it does
-not establish a stable win. Fused GDN normalization at 96 × 128 improves
-**9.8–11.0%**, and its prefill shape improves **0.16–0.27%**. Generic fused
-width 2,048 still loses. The decode saving is about 0.26 us per GDN layer,
-only roughly 8 us across 30 GDN layers before cache and scheduling effects;
-it is small beside a 13.8 ms batch decode step.
+Decode RMSNorm gained **2.4–3.8%**; hidden-width prefill spread **−0.9% to
++9.1%**, not a stable win. Fused GDN normalization gained **9.8–11.0%** at
+96 × 128, about 0.26 us per GDN layer or roughly 8 us across 30 layers against
+a 13.8 ms batch decode step, and **0.16–0.27%** at its prefill shape. Generic
+fused width 2,048 still loses.
 
-RoPE has two different APIs. The standalone port shares each rotated pair's
-frequency, trigonometry and input loads. Production `attn_rope_partial_neox`
-already does this in C++ and additionally reuses frequencies across 16 tokens;
-its Rust port preserves that band and device-side base-position pointer.
-For grids of at most 72 blocks, the target card's SM count, the otherwise
-unused second half of rotary threads processes alternate tokens. Each group
-then reuses its frequency over eight tokens. Larger grids retain one group
-and 16-token reuse: duplicating frequency work everywhere loses on query
-prefill. This is a performance heuristic for the 72-SM target, with no new
-feature or launch argument. Bounded 32-bit token loops handle partial bands.
-Both APIs retain double-precision angles and copy the tail bit-for-bit. `bench_rust_rope` checks zero, partial and full
-rotary spans, signed-zero tails, guarded/offset buffers reset independently
-for each compiler, partial token bands and graph replay. Position probes
-reach `u32::MAX` for the standalone API and cross 262,143 for the tiled API.
-Timing uses the model's frequency base 10,000,000 and positions starting at
-2,048, width 256 with 64 rotated dimensions, under the same six-pair method.
-The model's 1,536-row N=3 batch calls RoPE over 512 rows per sequence; 1,536
-rows also exercise a larger individual call:
+Production `attn_rope_partial_neox` already reuses frequencies across 16
+tokens. Its Rust port keeps that and, in grids of at most 72 blocks (the SM
+count), puts idle rotary threads on alternate tokens at 8-token reuse; larger
+grids keep 16-token reuse, since duplicated frequency work loses on query
+prefill. Angles stay double precision. Timing used frequency base 10,000,000,
+positions from 2,048, width 256 with 64 rotated dimensions:
 
 | RoPE API | Tokens × heads | NVRTC us/launch, min–max | Rust us/launch, min–max |
 | --- | ---: | ---: | ---: |
@@ -1222,17 +735,13 @@ rows also exercise a larger individual call:
 | Production tiled | 1,536 × 16 | 209.058–210.680 | 211.395–213.299 |
 | Production tiled | 1,536 × 2 | 26.941–27.400 | 26.255–26.352 |
 
-The standalone port's large gain does not transfer directly to production's
-existing frequency reuse. The selected layout improves production key RoPE
-at 512 tokens by **49.8–50.5%** throughput (about **6.5 us** per call); query
-RoPE at that size is **0.4–0.8% slower**. At 1,536 tokens, key RoPE improves
-**2.2–4.0%**, while query RoPE loses **0.4–2.0%**. The small three-token cases
-improve **4.8–8.9%**, but batched decode uses the separate fused rotary/append
-path. These are kernel measurements, not inference throughput gains.
+Production key RoPE at 512 tokens gained **49.8–50.5%** (about **6.5 us** per
+call) while query RoPE was **0.4–0.8% slower**; at 1,536 tokens key gained
+**2.2–4.0%** and query lost **0.4–2.0%**. The three-token cases gained
+**4.8–8.9%**, but batched decode uses the fused rotary/append path.
 
-Softplus retains libdevice exp/log and the `x > 20` overflow guard.
-`bench_rust_activations` checks the threshold, saturation, empty/ragged and
-grid-stride lengths, supported aliases, guards and replay. Six event pairs:
+Softplus keeps libdevice exp/log and the `x > 20` guard; it is not on the
+production GDN gate path:
 
 | Softplus elements | NVRTC us/launch, min–max | Rust us/launch, min–max |
 | ---: | ---: | ---: |
@@ -1240,186 +749,85 @@ grid-stride lengths, supported aliases, guards and replay. Six event pairs:
 | 49,152 | 1.597–1.611 | 1.393–1.413 |
 | 8,388,608 | 129.293–130.004 | 126.403–126.484 |
 
-Softplus improves at these sizes, but it is not the production GDN gate path.
-Offline CUDA 12.4 `ptxas -arch=sm_75` reports no spills; this is not
-a measurement of the driver's JIT.
-
-The whole-model comparison enables all eight Rust ports together. Three
-alternating prebuilt process pairs on GPU 1 use the same tree with only
-`rust-kernels` different, the middle pair reversed, and no other GPU work
-or builds during timing. These numbers measure the combined switch:
+All eight ports together:
 
 | Qwen3.6, N=3, 2K per sequence | CUDA C++ tok/s | Eight Rust ports tok/s | Rust change across pairs |
 | --- | --- | --- | --- |
 | Decode, 64 steps after 4 warmup | 217.8 / 217.7 / 216.9 | 217.7 / 217.6 / 217.0 | -0.05% / -0.05% / +0.05% |
 | Prefill, 1,536 total chunk rows, 5 timed repetitions | 3085.54 / 3065.17 / 3064.11 | 3074.83 / 3067.78 / 3061.60 | -0.35% / +0.09% / -0.08% |
 
-Prefill's within-process standard deviations span
-**7.78–9.42 tok/s** for C++ and
-**6.86–11.02** for Rust. Both modes change sign across pairs.
-There is no clear end-to-end speedup at this shape; the kernel improvements
-occupy only a small fraction of the pass. The single feature remains disabled
-by default. Deep-context inference, dense-model Rust correctness and
-concurrent three-card serving were not checked for these ports. The
-llama.cpp comparison remains in [Current standing](#current-standing).
+Prefill standard deviations: **7.78–9.42 tok/s** C++, **6.86–11.02** Rust. The
+kernel gains are a small fraction of the pass.
 
 ## Compile-time formats free registers that ptxas then spends
 
-The MoE expert prologue took its format as a runtime argument inside a
-`__forceinline__` function, so every arm was emitted at all nine call sites
-and the arms paid for each other — the mechanism that made adding three
-community formats cost 5.05% (see WHY NOT). The fix is to make the format a
-template parameter, `dequant_tile_ct<Q>`, and compile each tuned family once
-per format: one unpacker per instantiation, branch gone before ptxas sees it.
-
-**That is not automatically free, and the direction of the surprise is worth
-carrying.** Removing the branch *raised* register counts on the hot kernels,
-because ptxas allocates against an occupancy target and freed budget gets
-spent on unrolling and loads in flight rather than returned:
+A runtime format argument in a `__forceinline__` MoE prologue emitted every
+arm at all nine call sites; that is why three community formats cost 5.05%
+(WHY NOT). The format is now a template parameter, `dequant_tile_ct<Q>`, and
+removing the branch *raised* register counts, because ptxas spends freed
+budget on unrolling and loads in flight:
 
     moe_expert_ffn        80 -> 96 registers   24 -> 16 warps/SM
     moe_expert_ffn_gemv   44 -> 59             40 -> 32 (both cap at 32)
     moe_shared_ffn_gemv   42 -> 57             40 -> 32 (both cap at 32)
     moe_shared_ffn_gemv_t3  64 -> 66           32 -> 24
 
-Only two of those are real. sm_75 holds 64 K registers and 32 warps per SM, so
-**64 registers per thread is the full-occupancy budget at any block size**, and
-a kernel moving 44 -> 59 changes nothing because the warp ceiling was already
-binding. `moe_expert_ffn` crossing into 96 and `..._t3` crossing 64 are the two
-that cost blocks.
-
-Both are recovered with `__launch_bounds__(GEMM_THREADS_CU, N)` at the blocks
-per SM the runtime-ladder form reached — 3 for `moe_expert_ffn`, 4 for `_t3` —
-and **ptxas hits those caps with zero spill stores and zero spill loads**, so
-the branch removal is kept and the occupancy with it. Final state: 57 kernels,
-no occupancy regression against the 33-kernel baseline anywhere, no spills
-anywhere, and module compile 3.13 s -> 3.82 s.
-
-**And it is a win, not merely a wash.** `bench_decode_batch 2048 32`,
-`LLMCUDA_BATCH_N=1,2,3`, GPU 0, box otherwise idle, three interleaved pairs
-with the order reversed in the middle one, against the immediately preceding
-commit:
+**64 registers per thread is sm_75's full-occupancy budget at any block
+size**, so only `moe_expert_ffn` and `_t3` lost blocks.
+`__launch_bounds__(GEMM_THREADS_CU, N)` at 3 and 4 blocks per SM recovered
+both with **zero spill stores and zero spill loads**; module compile went
+3.13 s -> 3.82 s. `bench_decode_batch 2048 32`, GPU 0, three interleaved pairs
+(middle reversed), against the preceding commit, not llama.cpp:
 
     N=1   +6.98%  +2.86%  +6.92%   (worst +2.86%)
     N=2   +1.58%  +1.46%  +0.98%   (worst +0.98%)
     N=3   +1.36%  +1.51%  +1.21%   (worst +1.21%)
 
-Nine of nine comparisons favour the specialized form, including the reversed
-pair where run order works against it. N=1's spread is wide and its smallest
-delta is the base-first pair, which is what first-runner-wins predicts; treat
-+2.9% as the N=1 claim rather than +7%. N=2 and N=3 are tight enough to read
-directly. Binaries were checked with `strings` to confirm each arm carried the
-kernels it was supposed to before any of this was believed.
+N=1 spreads widely; read it as +2.9%, the base-first pair, as
+first-runner-wins predicts. `__launch_bounds__(T, 1)` is not a
+no-op: it relaxes ptxas's heuristic and made `_t4` and `_t8` worse. A
+register count means nothing until converted to blocks per SM (granularity 8
+on Turing, then the warp ceiling).
 
-**The standing table has not been re-measured against llama.cpp**, so these
-are deltas against our own previous commit and nothing more.
+## Arithmetic: prefill belongs on the tensor cores
 
-Two traps in the tool, both paid for here. `__launch_bounds__(T, 1)` is not a
-no-op — it tells ptxas one block per SM suffices, which *relaxes* its default
-heuristic and made `_t4` and `_t8` worse than leaving the attribute off. And a
-register count is not an outcome: it is only evidence once turned into blocks
-per SM, which needs the granularity (8 on Turing) and the warp ceiling.
+On this card `mma.m16n8k8` fp32-accumulate measured **97.6 TFLOP/s** and
+`mma.m8n8k16` s8→s32 **~198 TOP/s**, against fp32 FMA's 16.3 TFLOP/s;
+llama.cpp's int8 `mmq` runs a 512-token pass at ~61% of fp32 peak, and a
+perfectly tiled fp32 engine lands ~3.9× behind. Quantized weights reach the
+tensor cores one of two ways, chosen by VRAM:
 
-## Arithmetic: the tensor cores are the only way to win prefill
+- **Repack** into split quant/scale arrays (dense projections, shared
+  expert): 27 TOP/s against 2.1 TOP/s assembling operands from GGUF Q8_0's
+  34-byte blocks, which never word-align a fragment.
+- **Stage through shared memory** (routed experts: 10.7 G weights, no room
+  for a second copy).
 
-llama.cpp runs the same 2,491 GFLOP of a 512-token pass at ~61% of this card's
-16.31 TFLOP/s fp32 peak, which no dequantize-then-FMA pipeline reaches. It is
-not spending fp32: `mmq` dots in int8 on Turing's tensor cores. Measured on
-this card: `mma.m16n8k8` fp32-accumulate **97.6 TFLOP/s**, `mma.m8n8k16` s8→s32
-**~198 TOP/s**, against fp32 FMA's 16.3 TFLOP/s. A perfectly tiled fp32 engine
-lands ~3.9× behind; the ceiling is arithmetic, not tuning.
+The integer gate is per tensor. A layer-wide `weights.formats.all_q8_0()`
+sent Qwen3.8-27B's whole attention block to fp32 GEMV, because `UD-Q8_K_XL`
+stores `attn_q`/`attn_k`/`attn_v` as bf16 (requantizing the file to Q8_0 was
+**2.05× and 2.12×** prefill at N=1 and N=3). Per tensor, `attn_output`
+qualifies on `qwen35`: **+13.7%** prefill (316.0 → 359.3 tok/s, won 3/3), at
+**+0.50 GiB** resident and an *unexplained* **−0.5%** dense N=3 decode
+(43.87 → 43.63 tok/s; decode launches are unchanged). On `qwen35moe` the
+predicates coincide (prefill 2452.4 → 2446.3, spreads overlap; peak VRAM
+byte-identical). `LLMCUDA_ATTN_INT8_ALL_OR_NOTHING=1` restores the old one.
 
-Q6_K and Q8_0 weights are *already integers*, so using the integer tensor cores
-is not a precision downgrade imposed on float weights — it is declining to
-convert integers into floats in order to multiply them more slowly *on fp32*.
-Against fp16 tensor cores that argument does not hold for a dense projection;
-see the next section.
+## Arithmetic: on dense projections, fp16 tensor cores beat integer ones
 
-Two ways to reach a tensor core from a quantized weight, and the choice is
-VRAM, not preference:
+On the dense model's shapes the int8 split path (`mma_q8_0_proj_split`)
+reaches **~44 TOP/s**, 22% of its peak; cuBLASLt fp16 sustains **62–83
+TFLOP/s**. The per-32 weight and activation scales sit inside the
+contraction, so every 8×8 accumulator is rescaled after every two `m8n8k16`,
+on the MMAs' issue slots. `hgemm` dequantizes each staged weight tile to fp16
+once in shared memory, reuses it across the tile's tokens, and accumulates
+the whole K in fp32: 50–58 TFLOP/s at the 27B's 512-token shapes, the rest
+being load latency.
 
-- **Repack** into split quant/scale arrays so operand loads are aligned words.
-  Used for the dense projections and the shared expert. The same kernel
-  measures 27 TOP/s repacked against 2.1 TOP/s assembling operands byte by byte
-  from the on-disk layout — reading GGUF Q8_0 in place is fatal, because a
-  34-byte block means a fragment's four bytes are never word-aligned.
-- **Stage through shared memory**, where the kernel picks the layout. Used for
-  the routed experts, whose 10.7 G weights cannot afford a second copy.
-
-This is why llama.cpp's MMQ, TurboMind and vLLM's Marlin all carry their own
-packed weight layouts instead of reading the on-disk format.
-
-And the corollary, which cost 2× prefill before it was measured: **a weight
-that is not an integer used to take the whole block off the tensor cores.**
-The attention int8 repack was gated on `weights.formats.all_q8_0()` — every
-projection in the layer, not each one on its own. Qwen3.8-27B's shipped
-`UD-Q8_K_XL` stores `attn_q`/`attn_k`/`attn_v` as bf16, so that predicate was
-false, and the entire attention block fell back to the fp32 GEMV path at
-prefill width. Measured in that state, requantizing the file to plain Q8_0
-took N=1 prefill from 319.4 to 655.4 tok/s and N=3 from 326.3 to 692.0 —
-**2.05× and 2.12×**, with no engine change at all.
-
-The gate was not *wrong* — an int8 repack of a bf16 tensor is a quantization
-decision, not a re-layout — but it was all-or-nothing where it could be
-per-tensor, and its cost went unmeasured until a second model arrived carrying
-mixed formats. It is now per-tensor: each projection takes the integer path if
-its own weight is Q8_0. On the shipped `qwen35` file that means `attn_output`
-alone, and it is worth **+13.7%** of prefill (316.0 → 359.3 tok/s, three
-interleaved pairs, won 3/3) — not the 2x, because `attn_output` is ~30% of a
-layer's projection elements and only 16 of the 64 layers are attention layers.
-The other 70% needed the file to change, this section concluded; it did not
-(next section).
-
-(The current numbers for that same comparison are 360.4 → 660.7 and
-368.8 → 700.3, a 1.83× and 1.90×: the engine collected the part of the gap
-that was its own, and the rest belongs to the file.)
-
-Two costs, both measured, neither hidden: the repack is now built for a file
-that previously built none, so **+0.50 GiB** resident; and dense N=3 decode
-went 43.87 → 43.63 tok/s, **−0.5%**, consistently across all three pairs. At
-three tokens `uses_tensor_cores` is false and the decode step's launches are
-unchanged, so that delta is *unexplained* — it is not the integer path being
-taken. N=1 decode is unaffected. On `qwen35moe`, where all four projections
-are Q8_0, the new predicate and the old one are the same predicate:
-prefill 2452.4 → 2446.3 (spreads overlap), decode 100.87 → 100.83 at N=1 and
-204.73 → 204.73 at N=3, peak VRAM byte-identical.
-`LLMCUDA_ATTN_INT8_ALL_OR_NOTHING=1` restores the old predicate in the same
-binary, which is how those two rows were measured rather than asserted.
-
-## Arithmetic: on a dense projection, the fp16 tensor cores beat the integer ones
-
-The section above is right that prefill belongs on the tensor cores and wrong
-about which ones, for every projection that is not a routed expert. It
-compared int8 against fp32; nobody had compared it against fp16.
-
-Measured on the dense model's own shapes, the int8 split path
-(`mma_q8_0_proj_split`) reaches **~44 TOP/s** — 22% of the 198 TOP/s its
-instruction peaks at — and cuBLASLt's fp16 GEMM over the same shapes sustains
-**62–83 TFLOP/s**, 64–85% of fp16's 97.6. The int8 kernel is not badly
-written; its arithmetic is. Q8_0 carries a scale per 32 weights and the int8
-activation another per 32 values, so every 8×8 accumulator is converted to
-float, rescaled and added back after every two `m8n8k16` instructions. The
-scale is *inside* the contraction, and on Turing that epilogue runs on the
-same issue slots as the MMAs.
-
-`hgemm` moves it out. Each staged weight tile is dequantized to fp16 once in
-shared memory — `q * d` for Q8_0, the stored value times a per-tensor power of
-two for bf16 — and every token in the 128-row tile reuses it; the `m16n8k8`
-fp16 MMA then accumulates a whole K in fp32 with no epilogue until the end. It
-reaches 50–58 TFLOP/s at the 27B's 512-token shapes, about three quarters of
-sustained cuBLAS with dequantization included. The rest of the gap is load
-latency, measured by ablation on an earlier revision of the kernel: removing
-its global loads took it from 38–62 to 86–89 TFLOP/s, removing everything but
-the MMAs to 111–116.
-
-It is also the more precise path by construction: activations keep fp16's
-11-bit significand instead of an int8 code against a 32-value absmax, at the
-price of one rounding of each Q8_0 weight to the fp16 nearest `q * d` (a bf16
-weight converts exactly) — 2^-11 relative, against an int8 code's up to 1/254
-of its block's max. What that is *not* is closer to
-llama.cpp, which rounds its own activations to int8 the same way the int8 path
-does. Last-token logits on one 512-token prompt, against llama.cpp's on the
-same file:
+Activations keep fp16's 11-bit significand; each Q8_0 weight rounds once
+(2^-11 relative, against an int8 code's up to 1/254 of its block max).
+Last-token logits on one 512-token prompt against llama.cpp, which rounds
+activations to int8:
 
 | file | path | max-abs | 1 − cos | argmax, top-10 |
 | :--- | :--- | ---: | ---: | :--- |
@@ -1428,23 +836,11 @@ same file:
 | Q8_0 | fp16 | 0.3080 | 1.26e-4 | agree |
 | Q8_0 | int8 | 0.2669 | 1.00e-4 | agree |
 
-Neither is uniformly nearer, and nearness to an engine that quantizes its
-activations is not the measure; the kernel's own differential test
-(`tests/hgemm_differential.rs`) holds it to its rounding contract, computed in
-f64.
-
-And bf16, which "has no integer tensor-core path at all", has an fp16 one. A
-bf16 value converts to fp16 exactly whenever it lands in fp16's normal range;
-a per-tensor power of two chosen from the tensor's max-abs
-(`bf16_half_exponent`) puts it there, and `alpha` undoes it in the epilogue.
-On the shipped `UD-Q8_K_XL` that is exact for all but **12 of 2.57e9** bf16
-values, each subnormal-tiny and under 1e-12 off. "The other 70% needs the file
-to change, not the engine" was wrong: it needed the engine to stop insisting on
-integers.
-
-What it is worth, in the model — `bench_forward`'s in-process A/B
-(`LLMCUDA_BENCH_AB=LLMCUDA_HALF_GEMM`), the int8 path against this one, six
-alternating pairs each, GPU 1:
+Neither is uniformly nearer; `tests/hgemm_differential.rs` holds the kernel
+to its own rounding contract in f64. bf16 converts exactly after a per-tensor
+power-of-two shift (`bf16_half_exponent`), for all but **12 of 2.57e9**
+values on `UD-Q8_K_XL`, each under 1e-12 off. `bench_forward` in-process A/B
+(`LLMCUDA_BENCH_AB=LLMCUDA_HALF_GEMM`), six alternating pairs, GPU 1:
 
 | file | tokens | int8 path | fp16 path | pairs |
 | :--- | ---: | ---: | ---: | :--- |
@@ -1453,668 +849,196 @@ alternating pairs each, GPU 1:
 | Q8_0 | 512 | 653.2 | **839.9** | 1.28–1.29× |
 | Q8_0 | 1,536 | 649.8 | **817.9** | 1.26× |
 
-The shipped file gains the most because three of its projections had no
-tensor-core path at all; the plain Q8_0 file gains 28% on arithmetic alone.
-The standing table above has both against llama.cpp.
-
-What this does not cover: `qwen35moe`. Its routed experts stay staged through
-shared memory as integers, and its projections keep the int8 path by default;
-`LLMCUDA_HALF_GEMM=1` moves those projections to this path, and that has not
-been measured. So the section above still stands for the target model, and
-this one replaces it for the dense ones only.
+The shipped file gains most because three projections had no tensor-core
+path. Dense model only: `qwen35moe` keeps int8 by default, and
+`LLMCUDA_HALF_GEMM=1` there is unmeasured.
 
 ## Memory: find the index the operand does not depend on
 
-Roughly half of every large win in this project's history was not arithmetic.
-It was a kernel re-reading the same bytes, found by asking one question of
-every kernel: *how many times does this grid read the same byte?*
+About half of every large win was a grid re-reading bytes its operand does
+not depend on:
 
-- The GDN projection's grid was one warp per (output row, token), so the weight
-  matrix was read once per token — 512× at prefill width.
-- `gdn_chunk_inter` re-read the entire recurrent state once per token; the
-  state does not depend on the token index.
-- The MoE router re-read a 2,048-float weight row per (expert, token) pair —
-  2.1 GB of loads per layer to cover 6 MB.
-- Prefill attention's grid was one block per (query tile, **query** head), and
-  this model has 16 query heads against 2 KV heads, so eight blocks each
-  streamed the same K and V independently. Grid on the **KV** head with K/V
-  staged in shared is a straight 4–8× traffic cut.
-- The GDN scan gives one warp four adjacent value columns: they share the same
-  normalized q/k row, decay, beta and address arithmetic, and only the
-  accumulators differ.
-- The LM head's four-row tile hoists the activation `float4` loads outside the
-  row loop, so the activation-pipe cost per weight element divides by the tile.
+- The GDN projection read its weights once per token, 512× at prefill width.
+- `gdn_chunk_inter` re-read the recurrent state per token.
+- The MoE router loaded 2.1 GB per layer to cover 6 MB.
+- Prefill attention gridded on 16 query heads re-streamed 2 KV heads' K/V;
+  gridding on the KV head cut traffic 4–8×.
+- The GDN scan gives a warp four value columns sharing q/k, decay and beta.
 
-Two operands, two reuses, and they are complementary: a **token tile**
-amortizes the weight, a **row band** amortizes the activation. The optimum is
-interior and is not where "bigger tile is better" would put it.
+A token tile amortizes the weight, a row band the activation; the optimum is
+interior, not at the biggest tile.
 
 ## Prefill attention: keep softmax values in their owning warp
 
-One warp owns each query head, and the scores from `Q K^T` already have the
-fragment layout that `P V` consumes. Sending them through shared memory
-only to redistribute the rows for softmax adds a handoff with no cross-warp
-reuse. Scores, probabilities, maxima, and normalizers therefore stay in
-registers. Even and odd key subsequences reduce separately before a quad
-leader broadcast, preserving the former writer lane's addition tree.
-
-The score product rounds explicitly, and the normalizer update uses explicit
-FMA. Relying on contraction of the source expression changed a model ranking;
-the rejected form is recorded below. The query and eight-key tiles, output
-accumulator, and K/V prefetch depth remain unchanged. K/V still use shared
-memory and two block barriers per eight keys. Runtime allocation is 255
-registers with zero local bytes and 8,320 dynamic shared bytes per block;
-registers still limit residency to one block per SM. Offline barrier sites
-are unchanged, so removing the source-level softmax fences is not a claim
-of fewer hardware barrier instructions. The measured benefit is confirmed
-by the [full-model prefill pairs](OPTIMIZATION_CAMPAIGN.md#full-model-prefill-pairs).
+`Q K^T` scores already have the fragment layout `P V` consumes, so each query
+head's warp keeps scores, probabilities, maxima and normalizers in registers
+with no shared-memory handoff. Even and odd key subsequences reduce separately
+before a quad-leader broadcast, preserving the old addition tree. The score
+product rounds explicitly and the normalizer uses explicit FMA, because
+relying on contraction changed a model ranking (WHY NOT). 255 registers, 8,320
+dynamic shared bytes, one block per SM. Gain: the
+[full-model prefill pairs](OPTIMIZATION_CAMPAIGN.md#full-model-prefill-pairs).
 
 ## GDN input normalization: consume the row before leaving the block
 
-The alpha/beta projection consumes a complete normalized input row. At the
-target's small decode widths, one block per head computes that normalization
-and feeds its first warp directly from shared memory. Head zero also writes
-the normalized row for the other projections. Their dependency is ordinary
-kernel completion; the consumer needs no cross-block reduction or ownership
-handoff.
+At decode widths one block per head computes the input norm and feeds the
+alpha/beta projection from shared memory; head zero also writes the
+normalized row for the other projections. Accumulation order and the gate's
+FMA/XOR tree are preserved, so outputs are bit-identical to the separate
+kernels. It duplicates statistics per head, so it is selected only for the
+2,048-wide, 32-head F32 geometry at N≤3 (57 registers, no spills). The
+[model pairs](OPTIMIZATION_CAMPAIGN.md#normalization-full-model-pairs) show a
+small decode gain, smaller than the isolated kernel's.
 
-Four virtual bands of 256 threads preserve the standalone norm's logical
-1,024-thread accumulation order, followed by the same warp reductions and
-ascending sum of 32 partials. The gate retains its original lane-strided FMA
-and XOR tree. This duplicates statistics across heads, so it is selected
-only for the measured 2,048-wide, 32-head F32 geometry at N≤3. Other shapes
-keep the separate launches. The combined kernel uses 57 registers, 8,320
-shared bytes, and no spills or local memory; its resource ceiling remains
-32 resident warps per SM. The normalized row and all gate outputs agree in
-bits with the separate kernels and are also checked against composed CPU
-references. The [model pairs](OPTIMIZATION_CAMPAIGN.md#normalization-full-model-pairs)
-establish a small decode gain; the larger isolated fragment gain is not the
-model result.
+## Residency: one copy per projection, in its reader's form
 
-## Residency: every projection on the card once, in the form its reader wants
-
-The same question, asked of the card instead of a grid: *how many copies of
-this tensor are resident, and how many are read?* The answer was two and
-one, for every mixer projection. The arena held the file's layout of the
-three Gated DeltaNet projections and the four attention projections, and
-nothing read those copies: the GDN block reads its split int8 repack at
-every width (the repack was built *from* the arena's copy and then the copy
-sat there), and the attention block copied its four out of the arena into
-allocations of its own for the decode GEMV and repacked from *those* for the
-tensor cores. Per tensor directory that was 8.3 GiB held twice on the
-dense file and about 1.3 GiB on `qwen35moe`.
-
-The fix is a filter, not a kernel. The engine loads with
-`arena_holds_entry`, which sees the stored format beside the role: the
-attention projections stay out of the arena in every format, the GDN
-projections stay out when Q8_0, and `Forward::new` repacks a Q8_0 GDN
-projection from a transient upload of the file's bytes that is freed once
-the repack kernel has read it — one tensor at a time, so the build's peak
-is one 83 MiB tensor above steady state. A GDN projection in any other
-format has no repack and stays in the arena, read in place by the generic
-kernels as before. The golden found the one width that still read the
-stored layout — the single-sequence pass at 2..63 tokens took the
-standard-layout Q8_0 tile where the batch paths took the split tile — and
-that path now takes the split tile too, which moved the 19-token golden's
-margins toward llama.cpp (final-logit cosine 0.999736 → 0.999759, max-abs
-0.464 → 0.415). Measured with `bench_forward` (512 tokens, three prompts,
-driver accounting), against the tree before it:
+The arena held the file's layout of every GDN and attention projection, which
+nothing read (GDN reads its split int8 repack, attention its own copies). The
+load filter `arena_holds_entry` keeps attention projections out in every
+format and Q8_0 GDN projections out, repacking those from a transient upload
+one tensor at a time (build peak one 83 MiB tensor above steady state). The
+golden caught one width (single sequence, 2..63 tokens) still reading the
+stored layout. `bench_forward`, 512 tokens, three prompts, driver accounting:
 
 | file | arena | peak VRAM |
 | :--- | ---: | ---: |
 | `Qwen3.8-27B-UD-Q8_K_XL` | 11.822 → 3.658 GiB | 39.387 → **31.262 GiB** |
 | `Qwen3.6-35B-A3B-UD-Q6_K_XL` | 2.291 → 1.025 GiB | 33.479 → **32.229 GiB** |
 
-Nothing any kernel reads changed — the repack and the block's copy are the
-same bytes they were — so throughput was not measured and none is claimed.
-What the 8.1 GiB buys on the dense card (a deeper KV pool, `draft-mtp`
-beside three 128K caches, a fourth slot) is not measured either; the
-Capability table above still says what was. The role-only filter
-`arena_holds` still exists for one reader: `tests/int8_forward.rs` builds
-an fp32 twin over the stored-format path, and that twin needs the arena to
-carry the bytes. Under the engine's filter `Forward::disable_tensor_cores`
-refuses rather than build a pass with nothing to read.
+Kernels read the same bytes, so throughput was not measured.
 
 ## The instruction-count bug that looks like a bandwidth bug
 
-Turing issues **4 load/store operations per SM per clock against 64 FMAs**. Any
-kernel written at roughly one memory instruction per multiply-add runs at a
-sixteenth of the arithmetic pipe, and no amount of L2 hit rate moves it. Four
-kernels — flash attention, the GDN state update, the GDN solve, the alpha/beta
-gates — each looked bandwidth-bound in a roofline sense and none were: the
-attention kernel was reaching 2 TB/s of *effective* bandwidth, which is L2
-working perfectly, and it was still 16× off.
-
-The fix is the same in all four: a register tile, so one loaded element feeds
-many multiply-adds. All four were **bit-identical** afterwards, which is not a
-coincidence — a register tile reassociates nothing, and that is why each was
-safe to make.
+Turing issues **4 load/store operations per SM per clock against 64 FMAs**, so
+a kernel at one memory instruction per multiply-add runs at a sixteenth of the
+arithmetic pipe at any L2 hit rate. Flash attention, the GDN state update and
+solve, and the alpha/beta gates all looked bandwidth-bound; attention reached
+2 TB/s effective and was still 16× off. A register tile fixed all four and
+left them **bit-identical**, because it reassociates nothing.
 
 ## Layout: banks and sectors
 
-Three separate wins came from arithmetic on addresses, and none of them shows
-up as bytes moved or instructions issued:
-
 - **A shared stride that is a multiple of 32 words is an 8-way bank
-  conflict.** Both MoE tensor-core kernels staged their activation tile at a
-  128-byte row stride — exactly 32 banks — so all eight fragment rows landed on
-  the same four banks. 144 bytes (36 words, `36 mod 32 = 4`) tiles the banks
-  exactly. **+13% of prefill**, from sixteen wasted bytes a row.
-- **Q6_K's 210-byte superblock is padded to 224 on the device.** 224 is a
-  multiple of 16 *and* of 32, so every field is aligned for wide loads and a
-  superblock starts on a sector boundary. A 212-byte stride buys the load
-  alignment without the fetch alignment and is not equivalent. The pad costs
-  6.7% more sector traffic on two tensors, which prefill has spare bandwidth
-  for and decode does not — a deliberate trade, taken.
-- **Q8_0 puts a row's quants at byte `b * 34 + 2`.** Fifteen warp reads in
-  sixteen straddle a 32-byte sector boundary, so half of every fetch is
-  discarded. The split repack built for the tensor cores fixes this for free,
-  and turns out to be worth having for its *alignment* even where the
-  arithmetic stays fp32. Where the on-disk layout must be read directly, two
-  aligned 16-bit loads recover four signed bytes without the misalignment.
-- **The split repack's scale width is traffic, not precision.** Splitting the
-  scales out of the quants said nothing about how wide to store them, and they
-  were stored fp32 — which widens a value that has no more precision to give,
-  because a Q8_0 block's scale *is* an fp16. The layout cost 1.125 bytes an
-  element against the on-disk 1.0625, so the repack that exists to make the
-  loads aligned was also making them 5.9% more numerous. Invisible where it
-  covers a MoE shared expert (0.1 MB in a layer of 725); on `qwen35`, where the
-  same struct holds a 17,408-wide dense FFN, it was **1.01 GiB of every decoded
-  token**. Keeping the file's own fp16 bits — moved, not converted, so the
-  values are identical to the last bit — is worth 4.2% of the dense FFN block
-  at one token and 1.4 GiB of resident VRAM, and every differential test is
-  unchanged because nothing about the arithmetic changed.
+  conflict.** The MoE tensor-core kernels moved activation staging from
+  128-byte to 144-byte rows (36 words, `36 mod 32 = 4`): **+13% of prefill**.
+- **Q6_K's 210-byte superblock is padded to 224 on the device**, aligning
+  fields for wide loads and superblocks on sectors (212 aligns only the
+  loads). It costs 6.7% more sector traffic on two tensors, a trade prefill
+  can afford and decode cannot.
+- **Q8_0 puts a row's quants at byte `b * 34 + 2`**: fifteen warp reads in
+  sixteen straddle a 32-byte sector, discarding half of every fetch. The split
+  repack fixes it; reading in place, two aligned 16-bit loads recover four
+  signed bytes.
+- **The split repack's scale width is traffic, not precision.** fp32 scales
+  cost 1.125 bytes per element against the file's 1.0625, though a Q8_0 scale
+  is an fp16; on `qwen35`'s dense FFN that was **1.01 GiB of every decoded
+  token**. Keeping the fp16 bits is worth 4.2% of the dense FFN block at one
+  token and 1.4 GiB of resident VRAM.
 
-Naming a load's width matters too: a runtime-derived stride and a per-element
-predicate both block vectorisation, and `cuobjdump -sass` counting
-`LDG.E.128` against scalar `LDG.E` is how that is settled without a profiler.
+`cuobjdump -sass` counting `LDG.E.128` against scalar `LDG.E` shows whether a
+runtime-derived stride or a per-element predicate blocked vectorisation.
 
-## Decode is a GEMV, and a GEMM's machinery is pure overhead there
+## Decode is a GEMV, so a GEMM's machinery is overhead
 
-At one token every matmul in the model is a GEMV. Three kernels were still
-staging an activation tile in shared memory and crossing two barriers per 128
-elements of contraction in order to multiply each dequantized weight exactly
-once. There is no reuse to capture at that shape — a weight is read, used, and
-dropped — so all of that apparatus is cost.
+At one token each weight is read once, so activation staging and barriers are pure cost. The step is launch-latency-bound: added stream work (events, graph nodes) loses at N=1 whatever it overlaps.
 
-The same principle repeats at every level of the dispatch:
+- **Skip the all-padding tile pass.** A `bm == 0` early-continue: **+21% at N=3**.
+- **Route pairs directly at small widths.** At N=3, 24 token/expert pairs land on 23.26 distinct experts in expectation. A fixed grid over `max_tokens * top_k`, gated by the device-side `valid_tokens` scalar, beats bucketing and skips both dispatch-table launches.
+- **Give every prefill-widened tile a one-unit sibling.** `TT` 8 at one token wastes 7/8 of its work, hence `_t1` and `_t3`. Halving the router's expert tile `ET` was worth nothing measurable (WHY NOT).
+- **Select the kernel by width, not residency.** Qwen3.8-27B's dense FFN as a GEMM at one token cost 109.0 ms against a GEMV's 63.5 on identical weight traffic.
+- **Merge small launches into one grid, not onto side streams** (side streams lost at N=1 or were flat; WHY NOT). A `blockIdx` seam runs each body unchanged and bit-identical in one grid, paying the launch floor once. Each merge below: three interleaved pairs at 2K on GPU 1, middle pair reversed, against the one before it.
 
-- A dispatch bucket wider than a tile pass meant the second, all-padding pass
-  still dequantized and contracted the full weight stack for a result that
-  could only be zero. One `bm == 0` early-continue: **+21% at N=3**.
-- The live-row count per bucket is a closed form of two values the dispatch
-  kernel already has, so it is precomputed into a table rather than re-derived
-  by every consumer.
-- At N=3 there are 24 routed token/expert pairs against 23.26 distinct experts
-  in expectation, so almost every bucket holds exactly one real token. Routing
-  those pairs **directly** — a fixed grid over `max_tokens * top_k` reading
-  `topk_ids[flat]`, with the device-side `valid_tokens` scalar gating it so
-  graph capture is preserved — beats the bucketed mapping, and lets the two
-  dispatch-table launches be skipped entirely at those widths.
-- A tile widened for prefill needs a one-unit sibling before it is committed,
-  because decode is the one-unit case of every one of them. A partial band
-  costs its empty lanes in full: at `n_query == 1` a banded flash kernel still
-  ran eight multiply-adds per key to throw seven away.
-- The rule survives a change of *model*. Qwen3.8-27B's dense FFN is resident
-  in one layout only (VRAM decides that), so its residency cannot select the
-  kernel — its width has to. Running the GEMM at one token cost 109.0 ms
-  against a GEMV's 63.5 on identical weight traffic, and the fix was not a new
-  kernel: `GdnBlock`'s split-layout projection GEMV already reads that exact
-  layout at that exact width. A second architecture is a good test of whether
-  a lesson was learned as a mechanism or as a constant.
-- The rule does **not** reach the router's expert tile, though it looks like
-  it should and that reasoning was acted on twice. At decode `grid.y` is 1, so
-  `num_experts / ET` is the entire grid — 32 blocks, 256 warps against the
-  2,304 this part holds — and halving `ET` to 4 doubles the blocks. It is
-  worth nothing measurable; see the WHY NOT row. The token tile is a different
-  matter and does pay: `TT` 8 at one token spends 7/8 of the arithmetic and
-  7/8 of the staged tile recomputing one clamped row, which is why `_t1` and
-  `_t3` exist.
-
-Two launches that each fail to fill the card *look* like they can be made to
-fill it together, and the Gated DeltaNet block's input projections are the
-strongest case for it this engine has: `qkv` and `gate` read the same
-normalized activation, write disjoint scratch, and are ordered by nothing but
-the stream they are issued on. At N=3 with the row tile 4 they are 2,048 and
-1,024 warps against the 1,152 this part holds at that kernel's 128 registers —
-1.78 waves and then 0.89, each paying its own ramp against a half-empty
-machine, reading **407** and **351 GB/s** where the routed-expert GEMVs beside
-them run 21 waves deep and read 503–518. Forked onto a side stream they do
-overlap, 1.46x, and the main stream's busy time falls 12.95 → 12.21 ms per
-step in `nsys`.
-
-**The fork is not in the engine; the merge is.** The fork was built,
-measured at +0.79% at N=3, found to be −1.2% at N=1, reverted for a defect,
-and never re-measured against a clean baseline — see WHY NOT. What it left
-behind was the second data point on where this step's ceiling comes from:
-two independent measurements saying the step is launch-latency-bound at one
-token, so anything that *adds* work to the stream — an event pair per layer,
-sixty graph nodes — loses there whatever it overlaps elsewhere.
-
-What survives that constraint is putting both matrices under **one grid**.
-`gdn_proj_split_pair_*` takes the two weight pointers, the two outputs and
-the row seam, and each warp group runs the single-matrix body on whichever
-matrix its rows fall in — no event, no second stream, and every output is
-the same chain of additions the separate launches produced, asserted bit for
-bit at every token width the tile table has structure at. The two partial
-waves become one grid of 2.67, and the ramp and drain are paid once. Three
-interleaved pairs at 2K on GPU 1, order reversed in the middle pair, the
-baseline arm flat across the sitting (210.1–210.6):
+`gdn_proj_split_pair_*` puts the GDN `qkv` and `gate` projections (1.78 and 0.89 waves alone) in one grid of 2.67; baseline arm flat:
 
 | width | pair 1 | pair 2 | pair 3 |
 | :--- | ---: | ---: | ---: |
 | N=3 | 210.3 → 213.4 | 210.1 → 213.7 | 210.6 → 212.9 |
 | N=1 | 109.3 → 111.1 | 108.9 → 111.3 | 109.3 → 111.7 |
 
-**+1.1–1.7% at N=3 and +1.6–2.2% at N=1**, every pair won, and the N=1 side
-is the tell: the fork *lost* there, and a merge that pays no events wins
-there, which is the launch-bound reading confirmed from the other direction.
-Depth was not measured; the saving is a fixed amount per layer and is a
-smaller fraction of a deeper step.
+**+1.1–1.7% at N=3 and +1.6–2.2% at N=1.** The second pointer set cost registers (one-token tile 80 → 96) until `__launch_bounds__(128, 6)` restored 80 without spill. The bounds that would help `t8` and `t16` spill, so those stay unbounded; check every tile of a family.
 
-The one thing it cost was registers, and only until it was told not to.
-Left to itself ptxas spent the second pointer set: the one-token tile went
-80 → 96 registers and crossed from six resident blocks to five for no
-arithmetic. `__launch_bounds__(128, 6)` put it back at 80 with no spill and
-`t2`–`t4` held their counts under the matching bound; the two widest tiles
-are left unbounded, because the bound that would restore `t8`'s fourth
-block costs 24 bytes of spill and `(128, 2)` on `t16` sends ptxas to 255
-registers *and* a spill against 208 unbounded — the `(T, 1)` trap from
-"Compile-time formats free registers", one notch up. Check the count on
-every tile of a family, not the one the target width uses.
-
-**The same seam carries a whole small kernel into a big one's grid.** The
-shared expert at decode width was two launches of its own — 2.2 MB of
-gate/up and 1.1 MB of down at 6.8 and 4.1 us, which is 240–330 GB/s and
-mostly ramp and drain — beside a routed-expert launch several waves deep
-that reads the same activation and is ready at the same moment. Its
-side-stream overlap is in WHY NOT (flat at N=3, −2.5–3% at N=1: events).
-`moe_fused_{ffn,down}_*` give the shared expert's blocks `blockIdx.y` slots
-past the routed grid and run the shared body there — two rows per
-256-thread block for the gate/up, since that body was written for four
-warps splitting one row's contraction, and one row per warp for the down —
-while the routed blocks run the routed body on the indices the separate
-launch gave them. Forty layers lose two launches each, `partial`,
-`shared_inter` and the shared output are bit-identical to the four-launch
-form at every width the fused entries cover (`moe_fused_shared_
-differential`, widths 1–4 with every slot live and with one live token in a
-wider pass), and the register count is the max of the two bodies rather
-than their sum. Three interleaved pairs against the qkv+gate merge as the
-baseline, same method and card, baseline arm drifting −0.5% over the
-sitting:
+`moe_fused_{ffn,down}_*` run the shared expert in `blockIdx.y` slots past the routed grid; baseline arm drifting −0.5%:
 
 | width | pair 1 | pair 2 | pair 3 |
 | :--- | ---: | ---: | ---: |
 | N=3 | 213.6 → 216.8 | 212.7 → 214.9 | 212.6 → 216.0 |
 | N=1 | 111.9 → 114.7 | 111.1 → 114.2 | 111.2 → 113.9 |
 
-**+1.0–1.6% at N=3 and +2.4–2.8% at N=1**, every pair won; by `nsys` the
-step lost 80 launches (745 → 665 at N=1) and 0.25 ms of wall at N=1 and
-0.28 ms at N=3. The rule the two merges share: at one token every launch
-under ten microseconds is mostly its own floor, and the floor is paid once
-per grid, not once per body. What a side stream cannot buy — because the
-events it needs are themselves graph nodes on a step with no slack — a
-seam in `blockIdx` buys for free, as long as each body is left exactly as
-its separate launch ran it.
+**+1.0–1.6% at N=3 and +2.4–2.8% at N=1**; 80 fewer launches per step at N=1.
 
-**Three folds under a launch floor each, measured together.** Each too
-small to time alone, each bit-identical to what it replaces, and each with
-the differential that says so:
-
-- Rope over q, rope over k and the KV append for *every* decode sequence in
-  one launch (`attn_decode_rope_append_batch`, the same eight pointer slots
-  the step already uses, selected by `blockIdx.y`): three launches per
-  sequence per attention layer became one per layer.
-  `attention_differential`.
-- The dispatch table's 256-expert prefix sum as a shuffle scan across the
-  block instead of thread 0 walking 256 dependent shared-memory adds while
-  255 threads waited (`dispatch_token`; integer addition, so the table is
-  identical). `moe_differential`, slot for slot against the reference.
-- The Gated DeltaNet convolution step, SiLU and q/k/v split in one launch at
-  decode width (`gdn_conv_silu_split_step_batch`): the thread that
-  convolves a channel gates its own accumulator, so `conv_raw` is written
-  for the trace and never read back. `gdn_conv_silu_differential`, five
-  outputs and every cache at 1–8 sequences.
-
-Three interleaved pairs against the shared-expert fold as the baseline,
-same method and card, middle pair reversed:
+Three folds, each bit-identical with its differential: rope and KV append for every sequence in one launch per layer (`attn_decode_rope_append_batch`), the 256-expert dispatch prefix sum as a shuffle scan (`dispatch_token`), and GDN convolution, SiLU and q/k/v split in one launch (`gdn_conv_silu_split_step_batch`):
 
 | width | pair 1 | pair 2 | pair 3 |
 | :--- | ---: | ---: | ---: |
 | N=3 | 216.5 → 217.4 | 215.0 → 218.0 | 213.5 → 217.0 |
 | N=1 | 114.3 → 115.9 | 114.3 → 115.1 | 114.2 → 115.5 |
 
-**+0.7–1.4% at N=1 and +0.4–1.6% at N=3**, every pair won. The baseline arm
-drifted −0.1% at N=1 and −1.4% at N=3 over the sitting, so the N=3 margin
-is inside its own drift and stands on the pairs, not on the means. By
-construction the step is 50 launches shorter at N=1 (745 → 665 after the
-shared-expert fold, 615 now) and 110 shorter at N=3. The dense model gets
-the qkv+gate merge, the rope+append batch and the convolution fold (its FFN
-has no shared expert and no dispatch table): against the tree before the
-first of them, `bench_decode_batch 2048 32` on the `UD-Q8_K_XL` file went
-17.8 → 18.0 tok/s at N=1 (+1.1%) and 46.1 → 47.2 / 47.1 at N=3 (+2.4% /
-+2.2%) on two clean pairs — a peer's test run overlapped the first minute
-of a third, which agreed in sign and is dropped — with peak VRAM 38.4 →
-30.3 GiB from the residency change below. Where the first two
-folds each bought 1–3%, these three together bought about one, which is
-the shape of the remaining tail: what is left under ten microseconds is
-mostly norms and gates that sit between two dependent projections. Moving
-one of those into a producer's tail was measured and lost (WHY NOT, "The
-next layer's RMSNorm in the MoE combine kernel's tail"); what is left of
-the tail needs the consumer to normalize as it reads.
+**+0.7–1.4% at N=1 and +0.4–1.6% at N=3**; the N=3 margin is inside the baseline arm's −1.4% drift and stands on the pairs. On the dense model the applicable merge and folds took `bench_decode_batch 2048 32` (`UD-Q8_K_XL`) from 17.8 → 18.0 tok/s at N=1 and 46.1 → 47.2 / 47.1 at N=3, two clean pairs. The remaining tail under ten microseconds is norms and gates between dependent projections; folding one into a producer's tail lost (WHY NOT, "The next layer's RMSNorm in the MoE combine kernel's tail").
 
-## Parallelism: fill the wave, and split the only axis decode has
+## Parallelism: fill the wave, split the only axis decode has
 
-Decode attention's grid was `(1, q_heads)` — **sixteen blocks on a 72-SM
-card**, each streaming its whole KV window sequentially. The fix is
-flash-decoding: split the key range across blocks, have each produce a partial
-`(m, l, acc)`, and merge them. That recovers the parallelism *and* the GQA
-redundancy at once, and it is worth 114% at 8K depth.
+Decode attention's `(1, q_heads)` grid was sixteen blocks on a 72-SM card. Flash-decoding (split keys across blocks, merge partial `(m, l, acc)`) was worth **114% at 8K depth**. Logical split count sets the numerics: 36 and 48 fail the deep-window 1e-5 gate at `2.28e-5`, 72 and 96 pass. Block count only schedules: at 96 splits, 48 blocks per call take two splits each and N=3's three calls fill all 288 resident block slots in one even wave. Per-sequence work on disjoint state forks onto side streams: 2–4%.
 
-The wave shape then matters as much as the split count, and the two are
-different axes:
+GDN kernels take `STEP_MAX_BATCH` state-pointer slots with `grid.z` picking the sequence, so one capturable launch advances every sequence bit-identically. The recurrent step went from 291 GB/s across three serial launches to **~583 GB/s (87% of streaming peak)**. One warp per state row, reducing with shuffles, replaced a block per row that ran at 44% of peak.
 
-- The **logical** split count sets the numerics (each split's reduction length
-  is what the deep-window 1e-5 gate sees). 36 and 48 logical splits fail it at
-  `2.28e-5`; 72 and 96 pass.
-- The **block** count is pure scheduling once the kernel grid-strides its
-  splits, and the partials are bit-identical at any block count because no
-  reduction boundary moves.
+## Prefill: no GDN chunking, and wider passes
 
-At 96 logical splits, 48 blocks per call grid-stride exactly two splits each,
-and the N=3 shape's three concurrent calls fill all 288 resident block slots in
-one wave. Uneven division is what sank the earlier 48-block attempt at 72
-splits: half the blocks took two splits and the long blocks set the makespan.
+The chunked GDN form does **26% more arithmetic** at this geometry and pays only on tensor cores, which Turing lacks for fp32. Prefill runs an unchunked register-resident scan, as llama.cpp's `gated_delta_net_cuda` does: worth 4.5%.
 
-Per-sequence work that touches disjoint state — rope, cache append, the causal
-read — forks onto side streams and rejoins before the batched projections. This
-is worth 2–4% where the launches are several partial waves whose scheduling
-tail was otherwise paid once per sequence per layer.
+Flattening the N=3 prompts into one pass wins only when it makes the pass wider than any one sequence, not at equal total ubatch: 6,138 rows at 2K, the whole 24,576-row prompt at 8K, 12,288 at 32K and above. This is the shape behind llama.cpp preferring `-ub 4096` over `-ub 2048`.
 
-Sequence-owned state forbids batching over the *token* axis, and for a long
-time that was read as forcing one launch per sequence — 2n GDN launches per
-layer per decode step, and n serialized whole-chunk scans per layer at
-prefill. It only forces one *state pointer* per sequence: the kernels take
-`STEP_MAX_BATCH` scalar pointer slots, `grid.z` picks a sequence, and one
-launch advances every sequence's state against the batch scratch it was
-already reading. Graph capture sees exactly the pointer stability the
-per-sequence launches gave it, and batch-vs-single bit-equality is a property
-of the source — each z slice runs the identical arithmetic. The recurrent
-step went from 291 GB/s across three serial launches to **~583 GB/s (87% of
-streaming peak)** in one; the batched scan is bounded instead by its own
-register-limited occupancy (~1.8 waves at N=3), which is why prefill gained
-one point where decode gained several.
+## A decision prompt is one pass, at its own width
 
-A warp per state row, not a block. The delta-rule step's block-per-row form
-paid two block-wide reductions — two `__syncthreads`, a shared round trip
-and a serial cross-warp combine — per 512-byte row, and moved state at 44% of
-peak. One warp per row holds the row in four `float4` registers per lane,
-reduces with barrier-free shuffle butterflies, and loads and stores nothing
-narrower than 16 bytes.
+A generated prompt runs as the largest prebuilt passes that fit, so pieces end where the prefix cache restores. A decision prompt (`clef`) is never resumed; decomposed that way, an 877-token prompt was eight passes, and the short Clef set ran 1,742 tokens/s against llama-server's 1,857. `Forward::run_prefix` runs a piece as the unpadded prefix of the narrowest prebuilt pass that holds it, bit-identical at and above the tensor-core tile (`tests/prefix_pass.rs`); narrower pieces are still decomposed.
 
-## Prefill: delete the chunking, and widen the pass
+Two decision-model defaults (Clef long set, three alternating pairs each, all the same sign):
 
-llama.cpp does not chunk the Gated DeltaNet at all — `gated_delta_net_cuda` is
-a sequential token-by-token scan with the whole per-head state in registers,
-zero shared memory and zero `__syncthreads`, and its CUDA file carries a
-`//TODO: Add chunked kernel for even faster pre-fill`. The arithmetic says why:
-at this geometry the chunked form does **26% more arithmetic**, and it only
-pays when the matmul shape buys tensor cores. Turing has no fp32 tensor cores,
-so in fp32 on this card chunking is pure overhead. Deleting it for prefill was
-worth 4.5%.
-
-Above that, the physical pass width is a throughput lever in its own right.
-Flattening all three N=3 prompts into one physical pass over independent
-carried KV and recurrent state is **not** a win at equal total ubatch — three
-2,046-token serial prompts and three 682-row chunks are the same three
-2,046-row passes — but it is a large win when it makes the pass *wider* than
-any single sequence could: 6,138 rows for 2K, the whole 24,576-row prompt for
-8K, 12,288 for 32K and above. That is the shape llama.cpp's own tuning points
-at when it prefers `-ub 4096` over `-ub 2048`.
-
-## A decision prompt is one pass, at the width it is
-
-A pass's buffers and launch plans are fixed when it is built, so the engine
-prefills through prebuilt widths: the prefill chunk, the 2,048-token retention
-width, and the powers of two from 4 to 256. A generated prompt runs as the
-largest of them that fit, and has to — its pieces end where the prefix cache
-restores from. A decision prompt (`clef`) is scored once and never resumed,
-and decomposed the same way it was ruinous: an 877-token prompt was eight
-passes, 256 ×3 + 64 + 32 + 8 + 4 + 1, each reading every weight, the four
-below the tensor-core tile through the small-batch GEMVs. Served like that
-the short Clef set ran at 1,742 tokens/s against llama-server's 1,857 in the
-same round, which prefills the whole prompt as one ubatch.
-
-`Forward::run_prefix` runs a piece as the prefix of the narrowest prebuilt
-pass that holds it. Every launch is sized to the piece, and every block is
-handed exact-length views of buffers built for more rows, so each length check
-inside it still holds and nothing is padded. At and above the tensor-core tile
-the result is the pass of the piece's own width **to the bit**
-(`tests/prefix_pass.rs`, on Clef and on the 27B): not a new rounding of the
-model, only fewer passes. Below the tile it is not — a pass built that narrow
-takes the GEMVs where a wide one takes the tensor cores — so the runtime still
-decomposes those pieces.
-
-Two scheduler defaults follow from the same fact, and both were worth
-measuring separately (Clef's long set, three alternating pairs each, every
-pair the same sign):
-
-- **The per-session slice is the prefill chunk.** It stops at the retention
-  interval elsewhere because a pass may not straddle a snapshot, and a
-  decision model keeps none. A 2,048 slice ran a 3,350-token prompt as two
-  passes: 2,361 → 2,451 tokens/s at concurrency 1.
-- **The step budget holds every slot's whole prompt.** It protects a decode
-  step's latency elsewhere, and a decision model has no decodes. A 4,096
-  budget split each concurrent prompt by whatever the one before it left:
-  2,362 → 2,445 tokens/s at concurrency 4.
+- **The per-session slice is the prefill chunk**, since there are no snapshots to align to. A 2,048 slice → the chunk: 2,361 → 2,451 tokens/s at concurrency 1.
+- **The step budget holds every slot's whole prompt**, since there are no decodes to protect. A 4,096 budget → whole prompts: 2,362 → 2,445 tokens/s at concurrency 4.
 
 ## Precision is a design constraint, not a tuning knob
 
-The engine carries activations in fp32 end to end and gates every kernel
-against a CPU reference. Two consequences shape the kernels:
+Activations are fp32 end to end, every kernel gated against a CPU reference.
 
-- **`Q K^T` at decode uses a split-precision `Q`.** `m16n8k8` takes fp16
-  operands only, and a single fp16 rounding of `Q` breaks the 1e-5 decode gate
-  at `n_keys = 61`. Row `g` carries `f16(q[g])` and row `g+8` carries
-  `f16(q[g] - f32(q_hi[g]))`, so `D[g] + D[g+8]` is `Q K^T` at roughly `2^-22`.
-  The fragment's dead rows were being multiplied by zero anyway, so the split
-  is free *relative to this kernel* — though it costs exactly 2× the tensor-core
-  issue count of a single rounding, which is a real and permanent tax against
-  llama.cpp's own shape.
-- **The router cannot afford a reassociation.** Its output feeds a top-8 argmax
-  over 256 experts, so a last-bit disagreement does not perturb an answer
-  slightly — it runs a different expert, and everything downstream is a
-  different model. The tiled router stages a contraction width equal to the
-  block width, reproducing the untiled per-thread index order exactly.
-  Correctness cost 1.1% and a faster wrong version was caught by the golden
-  test's error-growth guard.
+- **Decode `Q K^T` splits `Q`.** One fp16 rounding of `Q` for `m16n8k8` breaks the 1e-5 gate at `n_keys = 61`. Rows `g` and `g+8` carry `f16(q[g])` and `f16(q[g] - f32(q_hi[g]))`, so `D[g] + D[g+8]` is `Q K^T` at roughly `2^-22`. It costs 2× the tensor-core issue count, a permanent tax against llama.cpp's shape.
+- **The router cannot reassociate.** A last-bit difference changes the top-8 of 256 experts, so the tiled router reproduces the untiled index order exactly, at a cost of 1.1%. A faster wrong version was caught by the golden test's error-growth guard.
 
-`exp2f` in the prefill softmax lands because it is an **identity**, not an
-approximation: `expf(x)` is `exp2f(x)` plus range reduction, so folding
-`log2(e)` into the score scale computes the same function. It was still held to
-the full gate, because "identity in exact arithmetic" is not "identity in
-floating point".
+`exp2f` in the prefill softmax is an identity (`log2(e)` folded into the score scale), and was still held to the full gate.
 
 ## CUDA graph capture: kept for the host, not for throughput
 
-Capture works and does exactly what it should — idle per decode step falls from
-0.97 ms to 0.405 ms, host turnaround from 0.31 ms to 0.02 ms — and the wall
-clock does not move. Under replay every decode kernel is 0.3–0.5 µs slower,
-uniformly, across all ~1,100 of them: on Turing a graph node costs roughly what
-the launch gap it replaces cost. (Ampere added hardware acceleration for graph
-node dispatch; do not generalize this result forward.)
+Measured worth: ~0.4% at prefill shape, bounded above by 5.8% on a decode step. Capture cut idle per decode step from 0.97 ms to 0.405 ms and the wall clock did not move: under replay each of ~1,100 decode kernels ran 0.3–0.5 µs slower. On Turing a graph node costs about the launch gap it replaces; Ampere accelerates graph dispatch, so do not generalize forward.
 
-It is kept anyway, for reasons that are not throughput: the host cost of a
-decode step went from 3.1 ms to ~0.05 ms, which is most of what a serving
-surface needs the host for, and capture forces every launch shape to be a
-function of geometry rather than of a host-side value — design rule 5, which
-costs nothing and would be expensive to reinstate later.
+It stays because it cut a decode step's host cost from 3.1 ms to ~0.05 ms, and because it forces launch shapes to depend on geometry rather than host values (design rule 5), which costs nothing now and would be expensive to reinstate.
 
-## Vision rides along without touching the text path
+## Vision does not touch the text path
 
-Image support (the `--mmproj` tower, M-RoPE, embedding injection) is shaped so
-the text path cannot pay for it. The rotary base and the cache slot are two
-values in one position buffer with persistent subslice views, so captured
-decode graphs bind the rope view once and a text sequence publishes the same
-number to both; the per-token M-RoPE kernel shares the scalar kernel's
-double-precision angle arithmetic and collapses bit-exactly when t == h == w,
-so switching kernels is a dispatch decision, not a numerics decision; and the
-prefix cache hashes per-slot content lanes in place of `<|image_pad|>` ids so
-identical pad runs from different images cannot cross-hit — the SGLang pad
-substitution, strengthened to one lane per slot. Verified by alternating-pair
-A/B of the pre-vision and post-vision binaries with vision off (three decode
-pairs on one card, nine prefill pairs including order-reversed ones on
-another): decode N=3 +0.5% with the new binary winning 2 of 3, prefill at
-parity once position-in-session drift (~0.8%, first runner wins regardless of
-binary) is controlled for. Numbers in the enabling commits.
+Rotary base and cache slot share one position buffer, M-RoPE is bit-exact with the scalar kernel when t == h == w, and the prefix cache hashes a per-slot content lane in place of each `<|image_pad|>` id so different images cannot cross-hit. With vision off, the post-vision binary measured decode N=3 +0.5% (winning 2 of 3 pairs) and prefill at parity once ~0.8% position-in-session drift was controlled for.
 
 ## The snapshot arena is all-or-nothing, so size it from the configuration
 
-A prefix cache that is too small is intuitively a cache that hits less often.
-This one hits *never*. Publishing a snapshot yields rather than evicts when
-slots are scarce (`Engine::publish` calls `reclaim_for` and returns without
-publishing if it cannot reserve), so a worker whose arena cannot hold its
-sessions' retention points publishes nothing at all — and with nothing
-published, the next turn has nothing to match, so it re-prefills from zero and
-publishes nothing in turn. Measured with three growing conversations on one
-card: 0% reuse on every request against 73–86% once the arena covered the
-context, 319 s of wall clock against 132.
+Publishing yields rather than evicts when slots are scarce, so an undersized arena publishes nothing and the cache never hits. Three growing conversations on one card: 0% reuse against 73–86% once the arena covered the context; 319 s of wall clock against 132. The arena now holds one snapshot per retention interval, per slot, across the slot's share of `--total-context`, capped at a quarter of `MemAvailable` because it is page-locked; `--cache-ram full` lifts the cap.
 
-The fixed 24-slot default was sized against the host's locked-memory limit and
-covered 16,384 tokens per slot — under one agent turn at this context. It is
-now derived from what is being served: one snapshot per retention interval,
-per slot, across that slot's share of `--total-context`, capped at a quarter
-of the host's `MemAvailable` because the arena is page-locked and the weights
-still need the page cache to be read through. `--cache-ram full` lifts the
-cap.
+llama.cpp keeps a slot's KV in place between requests; ours restores from host snapshots. A test-only resident-slot prototype cut follow-up TTFT 8.34–18.31% but whole-conversation time only 0.27–0.83% (six paired file-tool conversations); it is not in production routing. [All pairs, transfer bytes and scope](OPTIMIZATION_CAMPAIGN.md#exact-prefix-resident-continuation).
 
-llama.cpp reaches the same place from the other side and is worth reading on
-this: `--cache-ram` defaults to 8192 MiB there against our former 2.41 GiB
-effective, and its `server_prompt_cache` is an LRU bounded in *bytes* rather
-than a fixed pool, so it degrades by evicting rather than by declining to
-publish. It also has a tier we do not: a slot keeps its KV in place between
-requests and takes the common prefix against what it already holds
-(`get_common_prefix` → `n_past`), so a continuing conversation that lands on
-its own slot costs nothing at all. Our production route still restores from
-host snapshots (102.81 MiB in that measurement). A test-only exact-prefix resident-slot prototype now
-checks the mechanism: follow-up TTFT falls 8.34–18.31% across six paired
-file-tool conversations, while whole-conversation time falls only
-0.27–0.83% because file prefill and generation dominate. Both arms still
-write host snapshots. Identity, ownership, eviction and fallback are
-exercised; production routing under multiple sessions remains unimplemented.
-[All pairs, transfer bytes and scope](OPTIMIZATION_CAMPAIGN.md#exact-prefix-resident-continuation).
+## An output ceiling is not a reservation
 
-## A speculative output ceiling is not a prediction, so it is not a reservation
-
-Admission reserves `prompt + max_output_tokens` and the pool hands out real
-pages for all of it, held for the sequence's whole life — rule 4, and right
-about the prompt, because chunked prefill splits compute and not memory. It is
-wrong about the output. `max_output_tokens` is the caller's ceiling, not its
-estimate: an agent that asks for 65,536 tokens and emits fifty has taken 256
-blocks — 1.28 GiB at this model's 5 MiB pages — from its neighbours for
-nothing, and the arithmetic is unforgiving. Against one card's 1,584 blocks,
-three sessions on 100K prompts fit at `max_tokens` 4,096 and only two fit at
-65,536; at 150K prompts it is two against one.
-
-llama.cpp does not do this. It checks the prompt against the slot
-(`tools/server/server-context.cpp`, `slot.task->n_tokens() >= slot.n_ctx`) and
-treats `n_predict` purely as a stopping condition (`server_slot::n_remaining`,
-`has_budget`), allocating as the sequence grows.
-
-So the ceiling is capped at one slot's share of the pool rather than honoured
-in full, with a floor of one block so a prompt longer than the share can still
-generate. It caps the *reservation*: a sequence that genuinely runs that far
-stops there and reports `length`, which is what llama.cpp does when a slot's
-context fills. Capping is also what makes the refusal legible — a caller who
-asked for 410,000 output tokens used to get `503 every worker refused
-admission` and no way to tell an impossible prompt from a full queue, because
-`can_admit` was a bool. Refusals now carry the scheduler's own reason.
+Admission reserves real pages for `prompt + max_output_tokens` for the sequence's life (rule 4). That is right for the prompt, but `max_output_tokens` is the caller's ceiling, not an estimate. Against one card's 1,584 blocks, three 100K-prompt sessions fit at `max_tokens` 4,096 but only two at 65,536. llama.cpp checks only the prompt and treats `n_predict` as a stopping condition. The output reservation is capped at one slot's share of the pool (floor one block); a sequence that reaches it stops with `length`. Refusals carry the scheduler's reason.
 
 ## Concurrency is a lock property before it is a scheduler property
 
-Nine sessions across three cards were not concurrent for four reasons, and
-not one of them lived in `llmcuda-sched`. They all presented identically — as a
-scheduler that refused to share — and each was diagnosed only once a step
-logged what it actually carried, which is why that log is in the tree.
+Nine sessions across three cards failed to run concurrently for four reasons, none in `llmcuda-sched`:
 
-**The driver loop must yield the lock it steps under.** A driver loop takes
-it, holds it for a whole GPU step, releases it and takes it straight back, so
-a handler blocked in `place_tokens` loses that race indefinitely. This was
-first found when that lock was one `Mutex<Engine>`; it survives the split into
-per-worker locks, because a submission still has to score every worker. Two symptoms, one fault. A client is registered
-*before* its request reaches the engine, so between those two moments there is
-nothing to run and the loop span on empty steps — 20,636 of them in a 27 s
-run against 15 in a run that happened to win the race. And while a long prompt
-is prefilling every step is productive, so no idle back-off can help: at 64K,
-sessions dispatched 2 ms apart were not merely unscheduled but never
-submitted, `running=1 waiting=0` for twenty-two consecutive steps while the
-first prompt had the card to itself. Handlers now raise an atomic before they
-block and the loop stands aside 1 ms when it is non-zero. Three sessions at
-64K went from bimodal — 1,734 tok/s at [36.5, 107, 110] or 826 at [36.5, 228,
-231] — to 1,635–1,708 with first tokens clustered at [105, 117, 117], spread
-2.2%.
-
-**A step is shared, capped at one retention interval per session.** Phase 2
-stopped at the first request whose prompt did not fit in one step, so that
-request took the whole budget every step until it finished. It now walks the
-running set from a rotating start, granting each prefilling session at most
-`--prefill-slice` tokens — the snapshot retention interval, which is already
-the widest pass the engine can issue because a pass may not straddle a
-boundary. The same tokens therefore move at the same width, spread across
-sessions rather than stacked behind one; the rotation decides who is short
-when the budget covers fewer slices than there are sessions. Worth +3.0% at
-16K and +3.4% at 64K on aggregate prefill, with worst-case time to first token
-3.5% lower.
-
-**The fleet must not step in lockstep.** One driver thread spawned all three
-workers every step and joined them before starting the next, so every card ran
-at the speed of the slowest card *in that step*. A card with one decode token
-to emit finished in 12 ms and then sat at the join for the rest of a 2048-token
-prefill chunk on somebody else's card. The engine is now one lock per worker
-with a driver thread each, taking only its own worker's lock and releasing it
-before the step's cache bookkeeping; `step_devices` survives for the smoke
-binary and the tests, which do want one bounded unit of fleet-wide progress.
-Worth 4.7–12.1% on aggregate decode and 0.6–16.2% on aggregate prefill across
-the nine-session table, and it is what makes a session beside busy neighbours
-cost nothing rather than 12x.
-
-**Routing is the one decision that must stay atomic.** Scoring reads every
-worker's load and then admits to the cheapest one, and that pair was atomic
-only because one `Mutex<Engine>` happened to make it so. Per-worker locks took
-that away, and concurrent handlers all scored the same idle fleet and all
-chose the same card: nine simultaneous 64K sessions placed 4/2/3, and the
-fourth session on the oversubscribed card waited for a free slot — 150 s to
-its first token against 113 s for its neighbours, and 269 s on a worse split,
-which read as the barrier not being fixed at all. A routing lock held across
-score-and-admit restores it. It never covers a GPU step, so the driver loops
-never wait on it, and placements are exact thirds again.
-
-The order matters for anyone reading the history: the scheduler change was
-measured as a 3% *regression* until the locks were fixed, because it could not
-get sessions to schedule. The routing race is the same lesson one level up —
-removing a lock removed an invariant nothing had written down.
+- **The driver loop yields its lock.** Handlers raise an atomic before blocking and the loop stands aside 1 ms, instead of retaking the lock at once and starving them. Three 64K sessions went from bimodal (1,734 or 826 tok/s) to 1,635–1,708, first tokens spread 2.2%.
+- **A step is shared.** Each prefilling session gets at most `--prefill-slice` tokens (the retention interval) per step, from a rotating start: +3.0% at 16K and +3.4% at 64K aggregate prefill, worst-case time to first token 3.5% lower.
+- **Workers step independently**, one lock and driver thread each: 4.7–12.1% on aggregate decode and 0.6–16.2% on aggregate prefill across the nine-session table.
+- **Routing stays atomic.** Without a lock across score-and-admit, concurrent handlers picked the same idle card: nine 64K sessions placed 4/2/3, the fourth waiting 150 s to first token against 113 s. The routing lock is never held over a GPU step.
 
 ## Speculative decode: exact arithmetic before acceptance
 
-Seven drafters feed one serving mechanism: five model-free n-gram policies,
-the trained MTP head, and DFlash. Per-sequence draft windows enter a batched
-verify pass, and acceptance requires equality with the target's output.
-That contract also requires the verify pass to reproduce ordinary decode
-arithmetic. Verification retains split-layout GDN projections in exact
-four-row slices, FP32 attention projections, and per-query decode attention
-even when a wide window crosses prefill dispatch thresholds. Regression
-tests cover three 49-row windows, mixed acceptance, and recurrent rollback;
-a prefill-shaped arithmetic path is not interchangeable merely because it
-produces plausible tokens.
+Seven drafters (five n-gram policies, MTP, DFlash) feed one batched verify pass, and acceptance requires equality with the target, so verify reproduces decode arithmetic at every width: exact four-row GDN projection slices, FP32 attention projections, and per-query decode attention even past prefill thresholds. Regression tests cover three 49-row windows, mixed acceptance and recurrent rollback.
 
-The current target-model measurements use GPU 1 and three interleaved,
-reversed rounds. The N=1 window has a 512-token quota; N=3 uses fixed
-scheduler steps and rejects any retired sequence. Actual generated lengths
-differ by policy and are reported, with every observation and sample SD, in
-[the campaign measurements](OPTIMIZATION_CAMPAIGN.md#speculative-decoding-after-the-kernel-changes).
-These are deterministic model-generated continuations of a synthetic prompt,
-not a representative workload distribution. Rates are aggregate tokens/s;
-the changes below are the range across paired observations.
+GPU 1, three interleaved, reversed rounds; N=3 uses fixed scheduler steps and rejects any retired sequence. Synthetic-prompt continuations, not a representative workload. Aggregate tokens/s; changes are the range across pairs ([every observation](OPTIMIZATION_CAMPAIGN.md#speculative-decoding-after-the-kernel-changes)).
 
 | Initial context / width | Policy (draft cap) | Decode mean | Paired change |
 | --- | --- | ---: | ---: |
@@ -2134,335 +1058,216 @@ the changes below are the range across paired observations.
 | 122,880 / N=3 | MTP (3) | 89.3 | −11.14–11.23%; full acceptance |
 | 122,880 / N=3 | simple (48) | — | out of memory |
 
-At 120K, map-k4v emits all 27 available tokens per step and wins every pair,
-but only narrowly. Its roughly 265 ms step costs about 8.9 times a plain
-30 ms step; nine times the output barely repays it. MTP also has full
-acceptance, at 12 tokens/step, but its roughly 134 ms step costs more than
-that fourfold output multiple can recover. The crossover is therefore
-policy- and workload-specific; the older assertion that every deep policy
-loses is not supported by the current measurements.
-
-The shallow N=3 comparison runs 512 steps, so a high-acceptance sequence
-can grow farther into its context than plain decode. The map arm emits
-2,439 / 512 / 3,633 tokens during timing, against plain decode's
-512 / 512 / 512. That imbalance is explicit; the benchmark no longer lets a
-retired request silently reduce N. The 32K and 120K windows use 64 and 32
-steps respectively, limiting growth relative to the initial context.
-
-Model-free drafting has no neural draft pass, but each candidate row still
-costs verification work. MTP adds its own draft passes and prefill catch-up:
-at 32K its prefill is 2,260.1 tokens/s against plain decode's 2,410.8, while
-the model-free policies remain near 2,410. The GDN snapshot rings also grow
-with the draft cap, independently of acceptance. At 122,880 tokens per
-sequence, simple's 48-token cap fails allocation under the same 4,096-token
-output reservation that the smaller policies use. DFlash is not measured
-because its model file is absent.
-
-The serving default remains `--spec-type none`. A policy decision needs the
-actual width, depth, output length and acceptance distribution. Prefill MMA
-speedups do not directly accelerate this exact verify path, and the narrow
-per-query decode dispatch predates the campaign; differences from old tables
-cannot be attributed solely to its attention rewrite.
+The verify-step cost sets the sign. At 120K map-k4v emits all 27 available tokens per step and wins narrowly, its ~265 ms step costing about 8.9 times a plain 30 ms step; MTP's ~134 ms step outweighs its fourfold output (12 tokens/step). Shallow N=3 lengths diverge over 512 steps (map arm 2,439 / 512 / 3,633 against 512 / 512 / 512). MTP slows 32K prefill to 2,260.1 tokens/s against 2,410.8. GDN snapshot rings grow with the draft cap, so simple's 48-token cap fails allocation at 122,880 tokens. DFlash is not measured (model file absent). The default remains `--spec-type none`.
 
 ---
 
 # WHY NOT
 
-Everything below was built or derived far enough to measure, and rejected.
-They are recorded so they are not re-attempted: several have already been
-proposed twice.
+Everything below was built or derived far enough to measure, and rejected. It is recorded so it is not re-attempted; several have been proposed twice.
 
 ## Rejected on measurement
 
+Each row gives the decisive measurement and why it lost.
+
 | Attempt | Result |
 | --- | --- |
-| Dense K2 cuBLAS with materialized half operands | GPU 0, Q4 six-token publisher input and the unchanged full-model gates. Rounding dense weights and inputs to half fails three-sequence batch prefill at **0.31854** logit max-abs (limit **0.02**). Three GEMMs with high/low half operands and sixteen-bit quantized inputs reduce the shallow error, but the 42-token full-width/chunked comparison still fails at **0.30180**. Both use preallocated buffers. Rejected on correctness before throughput claims; a fast library contraction cannot replace the serving-width numerical contract. |
-| Exact twelve-bit K2 dots on half tensor cores | Integral half operands keep each Q4 32-value and Q6 16-value dot exact in fp32; the 256-thread version passes CPU and bitwise cross-shape tests. The 128-row/64-token prototype needs **96–112-byte stack frames** and reports **276–324 bytes of spill stores**, at a two-block launch bound. Splitting its token columns over 512 threads improves routed calibration, but at 512 tokens query/value means remain **1.332/1.428 ms** for Q4 and **1.401/1.793 ms** for Q6, above compact integer calibration. Rejected on timing; no production precision change or publisher-quality claim. |
-| Direct register staging for dense Q4 and Q6 | GPU 0 resident query/value calibration, sixteen-bit activations and 64 token columns. Q4 query at 512 tokens takes **0.748 ms**, against shared-staged candidate calibration near **0.681 ms**; Q6 query/value take **1.008/1.412–1.433 ms**, against roughly **0.945/1.05 ms**. Q4 routed values improve, so direct staging is restricted to that path. Reducing dense Q4 to 32 columns makes it slower again (**0.967–0.971 ms**). Rejected before numerical and model gates for the dense/Q6 variants. |
-| Smaller Q4 register tiles in both dimensions | GPU 0 routed-value calibration at 512 tokens: 128 rows × 16 tokens takes **0.683–0.715 ms**, 64 × 32 takes **0.728–0.774 ms**, and 64 × 16 takes **0.835–0.922 ms**, against **0.590–0.594 ms** for 128 × 32. At 2K the smaller alternatives are also slower. Keep the wider row tile; reducing live accumulators indefinitely does not compensate for repeated weight traffic. Rejected at calibration, before numerical and model gates. |
-| Smaller Q6 expert tiles based only on the value benchmark | A 32-column, 64-row tile gives 512-token routed-value calibration **0.919–0.974 ms**, but 2K costs **3.264–3.610 ms**. A serial full-model Q6 calibration at 512 tokens measures **1,096.91 ± 2.48 tok/s** against **1,144.49 ± 0.43** for 64 columns, each with three timed passes. The value-only uniform-route gain does not survive the FFN and real routing. Rejected before further numerical gates; keep 64 columns. |
-| Reusing both Q4 nibble halves inside routed decode | Reordering each group to consume both halves of a packed word helps N=1 value calibration (**22.9–23.0 us**) but costs **72.2–72.4 us** at N=3, above the original ordering's calibration near **47–54 us**. Integer dots permit this reordering, but the resulting N=3 kernel calibrates slower. Rejected before numerical and model gates. |
-| Explicit block-residency bounds on K2 decode | GPU 0 resident query/value calibration with a 128-thread, eight-block launch bound: N=3 Q4 query/value take **42.8–43.0/60.8–60.9 us**, and Q6 **49.9–50.1/75.2–75.5 us**. The unrestricted candidate calibrates near **43/47–54** and **47/62 us**. Four- and sixteen-block bounds also fail to improve the routed path. A register ceiling alone does not establish a useful occupancy gain; rejected before numerical and full-model gates. |
-| Four lanes per K2 decode scale group | GPU 0 resident query/value calibration, three CUDA-event rounds, sixteen-bit activations. At N=3, Q4 query/value take **55.4/79.8 us** and Q6 **68.9/106.8 us**, against compact-control calibration near **43/47** and **51/62 us**. Sharing each integer dot needs extra intra-group reductions before the fixed fp32 tree. Q4 N=1 query alone improves to **27.4 us**, which does not justify the losses elsewhere. Rejected before numerical and model gates. |
-| Precomputed Q4 scale products and byte-expanded Q6 records | A 192-byte Q4 record and 276-byte Q6 record move unpacking work to upload. GPU 0 resident calibration at N=3: query/value **43.7/54.9 us** for Q4, **53.0/71.0 us** for Q6. Q4 routed prefill improves in calibration, but decode does not repay the additional residency. No model capacity or throughput claim was made; rejected before full-model and numerical gates. |
-| 128-token dense K2 nibble tiles | With 128 weight rows, eight warps and register-held weights, a dense 128-column Q4 tile uses **48 KiB shared memory**. At 512 tokens its three CUDA-event rounds take **0.9602/0.9599/0.9618 ms**, versus the 64-column candidate calibration near **0.681 ms**. More reuse does not offset the larger tile's resource cost. Rejected before numerical and model gates. |
-| Unrolling fixed-width K2 decode loops | GPU 0 resident query/value calibration at N=3. Unroll factors two/five/ten give Q4 query **44.9/46.0/282.4 us**, against **43.0 us** at factor one; Q6 query **51.6/56.3/65.0 us**, against **47.1 us**. Statically specializing routed Q6 at factor one also loses: N=1 **41.8 us**, versus generic calibration near **33 us**. Keep dense specialization without forced loop unrolling and keep routed widths dynamic. Rejected at the narrow gate. |
-| Staging the whole dense K2 activation once | One shared-memory copy and barrier per block, restricted to the 2,560-wide dense path. GPU 0 N=3 query calibration takes **63.5–63.7 us** for Q4 and **50.0 us** for Q6, against unstaged candidate calibration near **43/47 us**. Moving all input codes and metadata into shared memory does not repay its staging and residency cost. Rejected before numerical and full-model gates. |
-| K2 Q6 low-nibble and high-two-bit planes | Three alternating GPU 0 resident-tensor pairs, sixteen-bit activations, N=3: query means **54.17 / 54.27 / 54.10 us** against packed six-bit **50.87 / 50.90 / 51.10 us**; routed values **66.37 / 66.57 / 67.67 us** against **62.47 / 62.70 / 62.53 us**. Keeping the publisher’s separate bit planes reduces field assembly but requires two distant word loads for each four-value group. The CPU and exact-shape gates pass; every decode pair loses. Rejected before model integration. The production layout keeps both planes inside each group's six contiguous words, so a group still costs one run of loads; see WHY. |
-| K2 Q4 records in consecutive eight-nibble words | Three alternating GPU 0 resident-tensor pairs at N=3: query means **49.37 / 49.50 / 49.40 us** against **45.77 / 45.80 / 45.80 us**; routed values **58.13 / 52.67 / 52.90 us** against **48.67 / 48.70 / 50.70 us**. Direct tensor-core staging removes packing instructions, but decode loses its group-contiguous word loads. A four-lane-per-group decode calibration is slower again (**95.2–96.5 us** for routed values). Rejected on timing before numerical and model gates; the native layout stays. |
-| Double-buffered K2 tensor-core staging | Q4 tiles with two 31 KiB stages (62 KiB of opted-in dynamic shared memory) and one barrier per window; the next window is stored right after the current one is computed. Two alternating narrow rounds on GPU 0, CUDA events with the quantizer: `attn_q` **412.6/412.2 us** at 512 tokens and **1526.8/1513.9 us** at 2,048, against **362.2** and **1342.3/1342.0 us** single-stage; routed `ffn_gate` **437.0/439.0 us** against **405.6/403.2 us**. Bitwise tests pass. Q6's 39 KiB stage cannot be doubled within 64 KiB at all. Rejected at the narrow gate. |
-| Sixteen row warps per K2 router block | The F32 router projection's eight-token tile with sixteen warps per block instead of four, so a block's activation loads serve four times as many rows through L1. Outputs stay bit-identical. nsys at 2,048 tokens, whole pass: **20.60 ms** (Q4) and **20.25 ms** (Q6) against **20.86** and **19.69 ms**. The kernel is not bound by re-reading activations; reverted. |
-| 32-token K2 router blocks | The F32 router projection's eight-token warps stacked four (or two) to a block over the same sixteen rows, so one block's weight loads serve 32 tokens through L1 and the weight stream from L2 falls fourfold. Outputs stay bit-identical. nsys of the Q6 2,048-token pass on GPU 1: **12.35 ms** with four token warps and **12.14 ms** with two, against **12.16 ms** at one. With the sixteen-row-warp row above, neither re-reading activations nor re-reading weights binds this kernel; the remaining suspect, L1 load throughput per FMA, was not measured. Reverted. |
-| FP32-pipe conversion for every K2 Q6 term | Both sub-blocks' MMA sums start at the magic bit patterns, removing `I2F` from the Q6 epilogue entirely; still exact and bitwise-tested. Full model on GPU 0, two alternating rounds: Q6 **1911.72/1895.33 tok/s** at 512 tokens and **2175.50/2161.89** at 2,048, against **1980.31/1948.40** and **2255.26/2224.55** with one conversion per pipe. Two adds per conversion overload the FP32 pipe instead. Rejected; the split stays. |
-| No subtile skip in dense K2 tensor-core tiles | Dense tiles computed every 8-token subtile, padded tail included, so the four subtiles need no per-subtile branch. Same rounds: Q6 **1947.31/1938.97** and **2220.03/2212.80 tok/s** against the skipping kernel's numbers above; Q4 flat (**2500.02/2501.65** and **2769.18/2767.32** against **2508.76/2487.25** and **2766.21/2751.43**). Rejected. |
-| 64-row K2 tensor-core tiles, two blocks per SM | Half the row tile under a two-block launch bound, so a second resident block covers the first one's barriers. Full model on GPU 0, two alternating rounds: Q6 **1658.29/1657.12 tok/s** at 512 tokens and **1893.67/1888.49** at 2,048, against **1994.39/1986.69** and **2276.96/2269.38** for 128 rows at one block; Q4 **2098.68/2092.06** and **2318.56/2316.96** against **2557.57/2563.93** and **2834.84/2829.07**. Every block stages the same 64-token activation window for half as many weight rows, which doubles staging per MMA; the second block does not hide it. Rejected. |
-| Magic conversion in only some K2 Q6 scale groups | The second sub-block of each Q6 term converts through the FP32 pipe in two (or one) of a window's four scale groups and through `I2F` in the rest, to balance the two pipes differently. Full model on GPU 0, two alternating rounds: two groups **2003.09/1997.90 tok/s** at 512 tokens and **2301.05/2297.58** at 2,048; one group **1980.11/1979.35** and **2279.68/2278.83**; all four (the shipped kernel) **2000.75/1981.36** and **2282.43/2266.92** in the same rounds. Two groups sits inside the four-group kernel's own spread; one group loses. The uniform loop stays. |
-| De-phased staging in K2 Q4 tensor-core tiles | Q6's arrangement applied to Q4: weight fragments to registers before the first barrier, double-buffered activations (50,000 bytes of opted-in shared memory), token warp 0 staging the next window before its products and token warp 1 after them. Full model on GPU 0, two alternating rounds: **2590.61/2572.80 tok/s** at 512 tokens and **2872.95/2867.13** at 2,048, against **2661.70/2656.46** and **2942.16/2945.18** single-buffered. Q4's nibble staging is too light to repay the arrangement; Q4 keeps the single-buffered loop. |
-| Q4 sixteen-bit dots using exact half digits | A 64-row/64-token HMMA prototype stages raw Q4 codes and the existing high/low activation bytes as half operands, preserving sixteen-bit codes. At 512 tokens on GPU 0, query calibration takes **1.109–1.208 ms** and routed values **1.955–2.014 ms**, against integer-path calibration **0.620–0.647 / 0.898–0.913 ms**. Two half products avoid integer digit reconstruction but move more shared-memory data and use lower-throughput tensor instructions. Rejected on timing before numerical and model gates; no precision or production-path change. |
-| Interleaved high/low activation words in K2 GEMV | GPU 0 resident Q4 calibration, N=3: explicit `ld.global.v2.u32` loads take **63.3–63.4 us** for the query and **72.3–72.7 us** for routed values. The separate-byte-plane control calibrates at **42.9–43.8 / 53.9–54.5 us**. Packing the two parts reduces load instruction count but doubles the address stride seen by neighbouring scale groups, and adds packing work. Rejected at the narrow calibration; no numerical or model-level claim. |
-| K2 Q6 prefill row tile 128 | GPU 0 resident-tensor calibration at 512 tokens, sixteen-bit activations: the 128-row tile takes **0.997–1.083 ms** for query and **1.458–1.545 ms** for routed values, versus the 64-row control calibration **0.860–0.935 / 1.096–1.130 ms**. The wider tile uses **39,168 shared bytes and 177 registers**, limiting it to one block per SM; relaxing the launch bound does not recover the loss. Rejected before numerical and full-model gates. |
-| Fully scaled f16 operands for K2 projections | A separate HMMA prototype dequantizes weights and rounds activations to half before the dot, removing per-group scaled accumulation from the tensor-core loop. GPU 0 calibration tests four/eight/sixteen-row decode tiles and 64/128-value K tiles. With four rows and K=64, Q4/Q6 query means at N=1 are **81.5 / 75.3 us**, versus integer calibration **29.1–29.4 / 33.8–33.9 us**. The best routed N=3 cells (eight rows, K=128) take **166.6 / 218.4 us**, versus **49.3–50.0 / 62.4–62.7 us**. At 512-token prefill the dense query improves to **0.547 / 0.618 ms**, but routed values take **1.031 / 1.128 ms** against integer **0.898–0.925 / 1.135–1.141 ms**. All tested decode tiles remain slower. Shared half staging does not pay for itself at decode width. Rejected on timing before CPU or publisher gates; production rounding is unchanged. |
-| Reusing K2 decode rows across matching routes in one CTA | Resident Q4 MoVA at three tokens, identical expert ids across all token rows: the candidate takes **77.9 / 77.8 / 77.8 us** in three CUDA-event rounds. The ordinary direct path's distinct-route calibration takes **53.1–53.6 us**. Collapsing three grids into one larger per-thread token accumulator loses more execution parallelism than it saves unpacking. Rejected at the narrow gate; the input cases differ, so this is not an end-to-end A/B claim. |
-| Asymmetric eight-bit K2 activation projections | Calibration, not a standing comparison: Q4_K_M with all attention/value and routed FFN projections at eight bits fails the six-token publisher final-norm gate (**cosine 0.999169**, required **0.9995**). Keeping attention at sixteen bits passes the same capture. Q6_K all-eight passes that capture but GPU 1 calibration gives **20.83 / 37.90 ms** at N=1/3, context 512, and **887.15 ± 1.57 tok/s** at 512-token prefill. A passing low-precision capture is insufficient evidence of a speed benefit. Sixteen bits remain the production path. |
-| Zero-centered Q8_1 arithmetic for K2 projections | The six-token captures and CPU/shape checks pass for both quants, but the 26-token science capture does not. With half activation scales and quantized sums, Q4 logits have **max-abs 0.9601** (gate **0.75**) and Q6 block 28 has **max-abs/RMS 0.4033** (gate **0.3**). Matching MMQ's float4 original-sum tree, Q4 half sum and Q6 fp32 scale still fails: Q4 logit **max-abs 0.9264** and Q6 final-norm **cosine 0.9992134** (gate **0.9995**). A larger 128-row byte tile calibrates at **1,295.10 ± 9.91 / 1,211.54 ± 3.97 tok/s** for Q4/Q6 at 512 tokens on GPU 0; those are candidate timings, not a validated model result. Rounding Q4 weight coefficients to half as well fails even the six-token Q4 block-0 gate (**max-abs/RMS 0.4350**); at 26 tokens Q4 logit max-abs is **0.9212** and Q6 final-norm cosine **0.9991633**. Rejected as the production precision. |
-| K2 routed token tile 128 instead of 64 | Three alternating GPU 1 narrow pairs, sixteen-bit activations, a 64-row/128-token candidate against the 128-row/64-token Q4 tile: routed Q4 value means at 512 tokens are **2.6729 / 2.6539 / 2.6241 ms** against **1.0065 / 1.0413 / 1.0066 ms**; at 2K, **4.7136 / 4.8219 / 4.7916 ms** against **2.5676 / 2.6749 / 2.6096 ms**. Q6 routed 512-token means are **2.3503 / 2.3431 / 2.3570 ms** against **1.1554 / 1.1558 / 1.1596 ms**. Larger activation staging permits only one resident CTA and pads sparse expert runs more. CPU and exact shape gates pass; rejected at the narrow gate. |
-| Predicate Q4 nibble staging on live rows and load coefficients separately | Three alternating GPU 0 narrow pairs, Q4 query/value tensors at 512 tokens, sixteen-bit activations: ordinary query means **0.6678 / 0.6999 / 0.6978 ms**, candidate **0.6929 / 0.7170 / 0.7253 ms**; ordinary routed value means **0.9289 / 0.9687 / 0.9732 ms**, candidate **1.0271 / 1.0497 / 1.0670 ms**. Reducing redundant metadata loads by a separate live-row predicate loses every pair. CPU and exact shape gates pass; rejected before the full-model gate. |
-| Expanding K2 Q6 weights to byte codes | The 304-byte record calibration holds **44.57 GiB** at 512-token prefill, leaving little cache capacity on a 47.27 GiB card. The 240-byte packed control uses **36.51 GiB** and passes the same CPU and shape gates. The production format drops metadata needed only by rejected eight-bit offset experiments; those sums can be computed from codes when requested. Do not trade the context pool for an unpacking shortcut without an end-to-end measurement. |
-| Tiny tensor-core K2 dense decode | GPU 2 resident Q4 query calibration: eight-token/32-row MMA tiles take **161 / 172 us** at one/three tokens, against vector **31 / 47 us**. Most columns are padding and the tensor-core setup cannot be amortized. Rejected at the primitive gate, before a full-model claim. |
-| DP2A for K2 sixteen-bit activation digits | Q4 query calibration takes **33.3 / 65.5 us** at one/three tokens versus DP4A **31.1 / 46.6 us**. The differential and matching-tree gates pass; the wider packed operand does not offset its unpacking and instruction cost. |
-| Smaller K2 Q4 prefill row tiles | Resident Q4 query at 512 tokens: 64-row tiles take **806.7–832.7 us**, against 128-row calibration **689.5–699.4 us**. Routed values with a 32-token/64-row tile take **1004.9–1015.0 us**; that alone does not justify the dense loss. Retain the wider dense tile. |
-| Sixteen-bit K2 digits rounded to half coefficient products | On a separate 26-token heat-transfer prompt, Q4 publisher logit error is **0.8241**, cosine **0.9994492**, versus the six-token gates **0.75 / 0.9995**. The sixteen-bit control also misses those gates (**0.8021 / 0.9994252**). Rounding a coefficient to imitate one publisher detail does not establish whole-model agreement; the six-token capture does not certify longer prompts. |
-| Eight-token dense projection tiles at K2 decode width | At three tokens on GPU 0, real layer-3 query weights, three interleaved CUDA-event rounds: Q4_K four-token tiles take **50.2 / 50.1 / 50.1 us**, eight-token tiles **58.8 / 58.9 / 58.7 us**; Q6_K **36.5 / 36.4 / 36.4** versus **40.8 / 40.8 / 40.8 us**. The wider tile cannot amortize its work over three live tokens. Keep four below eight physical tokens. These are resident-tensor measurements; rejected before changing model dispatch to eight at decode width. |
-| Grouping K2 value experts at decode width | Real layer-3 value stacks, uniform deterministic top-4 routes and dispatch included, GPU 0 CUDA events. Three-token Q4_K scalar/grouped pairs: **115.7/126.1, 114.6/123.2, 112.0/122.9 us**; Q6_K **98.1/120.2, 98.0/120.3, 98.3/120.5 us**. One-token cases also lose in all three rounds. With few selected slots, fixed padded dispatch and a second launch cost more than row reuse saves. Use grouping at eight physical tokens and above; the scalar decode path stays. Rejected at the kernel gate, without a full-model grouped-decode claim. |
-| Cooperative loading before an exact-order GDN gate contraction | One 256-thread block per (head, token) stages the two weight rows and input in 24 KiB shared memory; one warp retains the original FMA and XOR reduction order. All five outputs match bit for bit at N=1/3/7 (1,760 values). Registers fall 64 → 45 without spills, but N=3 resident-weight latency rises **3.857/3.869/3.868 → 4.237/4.245/4.245 us**. Rotating 30 weight pairs improves **5.241/5.273/5.272 → 5.008/5.033/5.041 us**, still slower than simply giving the original kernel one head per block. Loading cooperation does not establish a cache-independent win; rejected before model integration. The current target's gates total only 0.181 ms/step, not the older 1 ms estimate. [All pairs and resources](OPTIMIZATION_CAMPAIGN.md#exact-order-gdn-gate-experiments). |
-| One persistent block per GDN value head for normalization and recurrent update | Exact state, Q/K and output bits over three updates at N=1/N=3; **62 registers, 1,056 shared bytes, no spills**. The N=3 state grid collapses from 3,072 blocks to 96; at N=1 only 32 blocks remain on 72 SMs. Three interleaved CUDA-event pairs lose **30.6–35.2%** throughput at N=1 with one state bank and **21.6–21.7%** with 30. N=3 loses **1.20–1.66%** with one bank, but gains **2.01–2.35%** rotating 30 banks (only **0.55–0.65 us** saved per fragment). Lower registers and one fewer launch do not provide a robust isolated win. Rejected without model integration; a cache-dependent narrow gain is not an inference result. [All pairs and geometry](OPTIMIZATION_CAMPAIGN.md#block-persistent-gdn-fragment). |
-| Query/key head RMSNorm in one disjoint grid | Same 22 registers, 32 shared bytes and exact arithmetic; isolated N=3 fragment throughput improves **72.9–73.8%**. Three interleaved GPU 1 model pairs at 2K favor it by **0.09/0.28/0.14%**, but 32K changes sign: **166.7/166.2/166.6 → 166.5/166.6/166.2 tok/s** (−0.12/+0.24/−0.24%). Batch-1 ties at 32K; single-stream signs also change. The tiny effect is unresolved against the 0.30% baseline spread at depth and does not justify a context cutoff. Forward golden, batch decode/prefill and CPU/GPU norm differentials pass. Reverted; no prefill claim. [All pairs](OPTIMIZATION_CAMPAIGN.md#head-normalization-full-model-pairs). |
-| One head per block for small target-model F32 GDN gates | Keeps the original compiled arithmetic and spreads N=3 over 96 one-warp blocks instead of 24 four-warp blocks. The isolated result changes sign with weight reuse. Three full-model GPU 1 pairs at 2K, 128 timed steps after four warmups, give N=3 **216.8/216.1/215.7 → 216.6/215.8/215.5 tok/s** (−0.09/−0.14/−0.09%). Single-stream N=1 gains 0.18–0.26%, while batch N=1 includes a tie, below 0.4–0.5% baseline drift. No N=1-only dispatch is justified. Forward golden, GDN gates, batch decode and wide prefill pass; reverted, with no deeper-context or prefill timing claim. [All model pairs](OPTIMIZATION_CAMPAIGN.md#gate-grid-full-model-pairs). |
-| Relying on implicit FMA contraction after moving prefill softmax state into registers | The fragment layout passed all ten attention differentials and batch prefill/decode, then failed the 19-token forward golden at **rank 4** (captured separation **0.153701**, shared top-logit error **0.088937**). Direct old/new attention differs by at most **2.384e-7** on four small shapes. NVRTC moved one normalizer addition across MMA control flow, splitting the original FMA into a rounded multiply and add. Explicit `__fmaf_rn` restores bit identity on those shapes and the original golden result. Preserve the compiled arithmetic, not just the source expression; isolated tolerance gates cannot replace the model golden. No timing conclusion was drawn from the failing version. |
-| Alternating shared K/V buffers in prefill attention | Removes the arrival barrier before staging each 8-key tile, preserving arithmetic and the existing register prefetch. Shared memory grows 13,952 → 22,272 B; offline CUDA 12.4 `ptxas` uses 255 registers without spills in both arms. Four prefill CPU differentials (including 128K keys), carried-chunk and wide N=3 prefill checks, and the 19-token/40-block forward golden passed; the optional divergence audit was not run. Three GPU 1 pairs, middle reversed, with `rust-kernels` in both arms: N=3 **2K** at total chunk 6,144 gives **3640.53 / 3622.19 / 3631.72 → 3635.66 / 3630.55 / 3626.47 tok/s** (−0.13 / +0.23 / −0.14%); **8K** at chunk 24,576 gives **3490.51 / 3481.65 / 3475.60 → 3491.82 / 3482.26 / 3477.35** (+0.04 / +0.02 / +0.05%). One warmup and three timed repetitions per process; 8K within-process SD is 9.80–23.47 tok/s, much larger than the difference. The 2,048-query CUDA-event attention bench gains 1.2–1.5% at offset zero but loses 5.0–16.6% at offset 8K, and changes sign at several deeper offsets. Fewer barriers bought no meaningful full-prefill throughput. Reverted; full-model depths above 8K were not measured. |
-| Applying two token groups to every Rust tiled RoPE grid | Six alternating GPU 1 pairs: at 512 tokens × 2 heads, splitting alternate tokens across the otherwise idle rotary threads improves **51.2–51.6%** throughput. At 512 × 16 it loses **5.0–5.2%**. More active rotary warps help the underfilled grid, but duplicate double-precision frequency work. Use two groups only at at most 72 blocks on this 72-SM target; retain 16-token frequency reuse for larger grids. |
-| Keeping the literal production tiled RoPE port's unused rotary threads | Six alternating GPU 1 pairs at the model's 512-token per-sequence chunk: NVRTC **19.437–19.511 us**, Rust **20.400–20.426 us**, **4.5–4.7% lower throughput** over 2 key heads. The grid has only 64 blocks on 72 SMs, while half the rotary threads exit and the remaining group processes all 16 tokens. Splitting alternate tokens into that unused half is an independently gated layout change, not a benefit of translation alone. |
-| Promoting the optimized eight-port Rust bundle to the default backend | Three alternating Qwen3.6 GPU 1 N=3/2K pairs give **−0.05% to +0.05% decode** and **−0.35% to +0.09% prefill** despite the fused GDN norm and underfilled key RoPE kernel gains. These calls account for too little of a pass to establish an inference win here; query RoPE and generic fused hidden-width normalization still lose narrow comparisons. Keep the single `rust-kernels` feature opt-in. |
-| Removing a Rust RMSNorm barrier by repeating the serial warp-partial sum in every warp | Six alternating GPU 1 event pairs, 100 captured launches each: hidden-width RMSNorm at 3 × 2,048 loses **11.4–12.7%** kernel throughput to NVRTC; at 1,536 × 2,048 it loses **9.7–11.2%**. The same-order variant removes one barrier but repeats up to 32 dependent additions per warp. Use a parallel second shuffle reduction and verify its changed addition order against the existing CPU and model gates. |
-| Literal `usize` column loops and a rolled warp sum in the Rust normalization port | CPU and graph-replay gates passed, but six alternating GPU 1 CUDA-event pairs (100 captured launches per interval) at 24,576 × 256 gave **100.606–102.575 us NVRTC** versus **104.244–105.007 us Rust** (2.3–3.5% lower throughput); at 49,152 × 128, **100.073–100.855 us** versus **101.102–101.683 us** (0.8–1.1% lower). The first translation used 64-bit column counters where NVRTC uses 32-bit ones, and a single warp-partial loop body where NVRTC unrolls four ways. Retain 32-bit counters; changing the final reduction requires its own numerical and timing gates. The narrower code still needs model validation; lower register counts alone did not predict throughput. |
-| Promoting the literal five-kernel Rust bundle to the default backend | Three alternating Qwen3.6 GPU 1 N=3/2K pairs: the combined switch loses **0.05–0.28% decode** and **0.05–0.38% prefill**, despite head-width standalone RMSNorm winning its narrow gate. Fused width-128 decode normalization loses **3.8–4.4%** kernel throughput, and hidden-width RMSNorm also loses. Matching the arithmetic and keeping shared memory/launch geometry unchanged does not guarantee a compiler-neutral migration. Keep the entire bundle behind the single disabled-by-default `rust-kernels` switch; no whole-engine speedup claim. |
-| Enabling the plain Rust activation ports by default | Six alternating GPU 1 CUDA-event pairs, 100 captured launches per interval, at 8,388,608 elements: standalone SwiGLU **182.156–182.255 us NVRTC** versus **186.574–186.675 us Rust** (2.3–2.4% lower throughput); per-row sigmoid at width 2,048 **132.924–133.251 us** versus **142.222–142.510 us** (6.4–6.7% lower). Width 7 also loses 4.2–4.3%. The direct grid-stride port preserves the runtime broadcast indexing and memory geometry; passing CPU/replay gates and winning cache-hot shapes does not establish a universal replacement. Current forward execution uses only its elementwise sigmoid path; three N=3/2K model pairs change sign on both prefill and decode. Retained behind `rust-kernels`, rejected as a default or speed claim. |
-| Four-float Rust residual loads/stores with the existing launch grid | Bit-exact against the CPU, including aligned and unaligned buffers, both aliases and ragged tails. Six alternating GPU 1 CUDA-event pairs against the scalar Rust kernel, 100 graph-captured launches per interval: at 16,384 elements scalar **1.577–1.640 us**, vector **1.798–1.835 us** (8.9–13.9% lower kernel throughput); at 8,388,608 elements scalar **180.408–180.593 us**, vector **179.876–180.062 us** (only 0.20–0.35% higher). The candidate used cuda-oxide `vector::F32x4`, confirmed `ld/st.global.v4.b32`, scalar fallback below 16K or on misalignment, and a scalar tail. Retaining the scalar-sized grid while assigning four elements per thread leaves three quarters of its blocks empty at 16K; at large sizes it moves the same bytes and changes little. Rejected at the narrow gate; no whole-model throughput claim. |
-| GDN split projection at row tiles 1 and 2 (`uint4` form, N=3) | 78.4 and 46.4 us per qkv/gate call against RT=4's 33.9. RT=1 octuples the warps and the in-flight bytes and is the *worst* of the three, so memory-level parallelism was never the binding constraint — instruction count per byte is, and it falls with RT. |
-| The output projection at row tile 2 (2,048 rows, 512 warps at RT = 4 — under half a wave) | Bit-identical by construction and **flat at N=1** (23.0 us either way), **+25% at N=3** (28.2 → 35.2 us). Same finding as the row above on a second shape: the grid was 0.44 waves deep and doubling its warps bought nothing, because the kernel's cost at three tokens is the activation instruction count per weight byte, which RT halving doubles. Wave fill is not what binds a decode-width GEMV on this card; do not re-derive it from the grid arithmetic. |
-| The next layer's RMSNorm in the MoE combine kernel's tail (fixed-order last-block reduction, the mixer skips its norm launch; 41 launches a step) | **Flat to −0.6%**: N=1 116.3 → 115.8, 115.2 → 114.7, 115.2 → 115.3; N=3 218.4 → 217.5, 218.0 → 216.7, 217.8 → 217.1, three pairs, middle reversed. The norm agreed with the separate launch to 2 ulps and every decode gate passed; it lost on time. The combine kernel runs eight blocks per token row, so the fold adds a block reduce, a fence and an atomic to every one of them and then serializes a whole-row pass on the block that arrives last, and that repays the ~2.8 us floor it removes. A tail fold pays only where the producer's blocks already stream the row — the shape a peer engine measured it winning in — not where the row is split across blocks that must first agree. The launch tail that remains here is norms and gates between dependent kernels, and this is the evidence that removing them needs the *consumer* to normalize on the fly, not the producer to reduce across blocks. |
-| GDN split projection, char4 partition + row tile + prefetch | 40.0/36.7 us against the shipped `uint4` form's 33.9/29.3, despite fully-coalesced activation loads and ~2.7x fewer L1 wavefronts per byte on paper. The wavefront model predicted the wrong winner; the wide weight load won anyway. |
-| `q8_0` KV cache (llama.cpp side) | −2.5% at depth 0, **−15.5%** at 32K, **−35.8%** at 128K. Turing's in-kernel dequant costs more than the halved traffic saves, and the KV path already ran at ~80% of peak. Keep `-ctk f16 -ctv f16`. |
+| Dense K2 cuBLAS with materialized half operands | Half-rounded dense weights and inputs fail three-sequence batch prefill at **0.31854** logit max-abs (limit **0.02**); high/low half operands with sixteen-bit inputs still fail the 42-token full-width/chunked comparison at **0.30180**. Rejected on correctness before any throughput claim. |
+| Exact twelve-bit K2 dots on half tensor cores | Exact in fp32 and bitwise-tested, but the 128-row/64-token prototype reports **276–324 bytes** of spill stores. Split over 512 threads, 512-token query/value still take **1.332/1.428 ms** (Q4) and **1.401/1.793 ms** (Q6), above compact integer calibration. Rejected on timing. |
+| Direct register staging for dense Q4 and Q6 | GPU 0, 512 tokens: Q4 query **0.748 ms** vs shared-staged **0.681 ms**; Q6 query/value **1.008/1.412–1.433 ms** vs roughly **0.945/1.05 ms**. Q4 routed values improve, so direct staging is kept for that path only. Rejected for dense and Q6. |
+| Smaller Q4 register tiles in both dimensions | GPU 0 routed values at 512 tokens: 128 × 16 **0.683–0.715 ms**, 64 × 32 **0.728–0.774 ms**, 64 × 16 **0.835–0.922 ms**, vs **0.590–0.594 ms** for 128 × 32; also slower at 2K. Fewer live accumulators do not repay repeated weight traffic. Rejected at calibration. |
+| Smaller Q6 expert tiles based only on the value benchmark | 32 columns × 64 rows: 512-token routed values **0.919–0.974 ms**, but 2K costs **3.264–3.610 ms**; full-model Q6 at 512 tokens **1,096.91 ± 2.48 tok/s** vs **1,144.49 ± 0.43** for 64 columns. The value-only gain does not survive real routing. Rejected; keep 64 columns. |
+| Reusing both Q4 nibble halves inside routed decode | Helps N=1 values (**22.9–23.0 us**) but costs **72.2–72.4 us** at N=3, vs the original ordering's **47–54 us**. Rejected before numerical and model gates. |
+| Explicit block-residency bounds on K2 decode | GPU 0, N=3, eight-block bound: Q4 query/value **42.8–43.0/60.8–60.9 us**, Q6 **49.9–50.1/75.2–75.5 us**, vs unrestricted **43/47–54** and **47/62 us**. Four- and sixteen-block bounds also fail to improve the routed path. Rejected. |
+| Four lanes per K2 decode scale group | GPU 0, N=3: Q4 query/value **55.4/79.8 us**, Q6 **68.9/106.8 us**, vs control **43/47** and **51/62 us**. Shared dots need extra intra-group reductions before the fixed fp32 tree; the Q4 N=1 query gain (**27.4 us**) does not offset this. Rejected. |
+| Precomputed Q4 scale products and byte-expanded Q6 records | 192-byte Q4 and 276-byte Q6 records move unpacking to upload. GPU 0, N=3 query/value: Q4 **43.7/54.9 us**, Q6 **53.0/71.0 us**. Q4 routed prefill improves in calibration, but decode does not repay the extra residency. Rejected before full-model gates. |
+| 128-token dense K2 nibble tiles | The 128-column Q4 tile uses **48 KiB shared memory**; at 512 tokens it takes **0.9602/0.9599/0.9618 ms** vs **0.681 ms** for 64 columns. More reuse does not offset the resource cost. Rejected. |
+| Unrolling fixed-width K2 decode loops | GPU 0, N=3, unroll factors 2/5/10: Q4 query **44.9/46.0/282.4 us** vs **43.0 us** at factor one; Q6 **51.6/56.3/65.0 us** vs **47.1 us**. Statically specialized routed Q6 also loses (N=1 **41.8 us** vs near **33 us**). Rejected; routed widths stay dynamic. |
+| Staging the whole dense K2 activation once | One shared-memory copy per block on the 2,560-wide dense path. GPU 0, N=3 query: Q4 **63.5–63.7 us**, Q6 **50.0 us**, vs unstaged **43/47 us**. Staging and residency cost exceed the savings. Rejected. |
+| K2 Q6 low-nibble and high-two-bit planes | Three alternating GPU 0 pairs, N=3: query **54.17 / 54.27 / 54.10 us** vs packed six-bit **50.87 / 50.90 / 51.10 us**; routed values **66.37 / 66.57 / 67.67 us** vs **62.47 / 62.70 / 62.53 us**. Separate planes need two distant word loads per group. Rejected; see WHY. |
+| K2 Q4 records in consecutive eight-nibble words | Three alternating GPU 0 pairs, N=3: query **49.37 / 49.50 / 49.40 us** vs **45.77 / 45.80 / 45.80 us**; routed values **58.13 / 52.67 / 52.90 us** vs **48.67 / 48.70 / 50.70 us**. Tensor-core staging gets simpler, but decode loses group-contiguous loads. Rejected; the native layout stays. |
+| Double-buffered K2 tensor-core staging | Two 31 KiB Q4 stages (62 KiB shared). GPU 0: `attn_q` **412.6/412.2 us** at 512 tokens and **1526.8/1513.9 us** at 2,048 vs single-stage **362.2** and **1342.3/1342.0 us**; routed `ffn_gate` **437.0/439.0 us** vs **405.6/403.2 us**. Q6's 39 KiB stage cannot be doubled within 64 KiB. Rejected. |
+| Sixteen row warps per K2 router block | Sixteen warps per block instead of four; bit-identical. nsys at 2,048 tokens, whole pass: **20.60 ms** (Q4) and **20.25 ms** (Q6) vs **20.86** and **19.69 ms**. The F32 router projection is not bound by re-reading activations. Reverted. |
+| 32-token K2 router blocks | Four (or two) token warps per block, cutting the L2 weight stream fourfold; bit-identical. nsys, Q6 2,048-token pass, GPU 1: **12.35 ms** (four) and **12.14 ms** (two) vs **12.16 ms** (one). Weight re-reads do not bind either; L1 load throughput per FMA was not measured. Reverted. |
+| FP32-pipe conversion for every K2 Q6 term | Removes `I2F` from the Q6 epilogue; exact. Full model, GPU 0: Q6 **1911.72/1895.33 tok/s** at 512 tokens and **2175.50/2161.89** at 2,048, vs **1980.31/1948.40** and **2255.26/2224.55** with one conversion per pipe. Two adds per conversion overload the FP32 pipe. Rejected; the split stays. |
+| No subtile skip in dense K2 tensor-core tiles | Every 8-token subtile computed, padded tail included, to drop per-subtile branches. Same rounds: Q6 **1947.31/1938.97** and **2220.03/2212.80 tok/s** vs the shipped kernel's numbers in the row above; Q4 flat (**2500.02/2501.65** and **2769.18/2767.32** vs **2508.76/2487.25** and **2766.21/2751.43**). Rejected. |
+| 64-row K2 tensor-core tiles, two blocks per SM | Full model, GPU 0: Q6 **1658.29/1657.12 tok/s** at 512 tokens and **1893.67/1888.49** at 2,048, vs **1994.39/1986.69** and **2276.96/2269.38** for 128 rows; Q4 **2098.68/2092.06** and **2318.56/2316.96** vs **2557.57/2563.93** and **2834.84/2829.07**. Half the rows doubles activation staging per MMA; the second block does not hide it. Rejected. |
+| Magic conversion in only some K2 Q6 scale groups | Two (or one) of four scale groups convert via the FP32 pipe, the rest via `I2F`. Full model, GPU 0: two groups **2003.09/1997.90 tok/s** at 512 and **2301.05/2297.58** at 2,048; one group **1980.11/1979.35** and **2279.68/2278.83**; all four (shipped) **2000.75/1981.36** and **2282.43/2266.92**. Two groups is within spread; one loses. The uniform loop stays. |
+| De-phased staging in K2 Q4 tensor-core tiles | Q6's de-phased, double-buffered arrangement applied to Q4 (50,000 bytes shared). Full model, GPU 0: **2590.61/2572.80 tok/s** at 512 tokens and **2872.95/2867.13** at 2,048, vs **2661.70/2656.46** and **2942.16/2945.18** single-buffered. Q4's nibble staging is too light to repay it. Rejected. |
+| Q4 sixteen-bit dots using exact half digits | 64 × 64 HMMA prototype on raw Q4 codes and high/low activation bytes as half. GPU 0, 512 tokens: query **1.109–1.208 ms**, routed values **1.955–2.014 ms**, vs integer **0.620–0.647 / 0.898–0.913 ms**. More shared-memory traffic and lower-throughput tensor instructions. Rejected on timing. |
+| Interleaved high/low activation words in K2 GEMV | GPU 0, Q4, N=3: `ld.global.v2.u32` loads take **63.3–63.4 us** (query) and **72.3–72.7 us** (routed values) vs separate byte planes **42.9–43.8 / 53.9–54.5 us**. Fewer load instructions, but double the stride between neighbouring scale groups, plus packing work. Rejected. |
+| K2 Q6 prefill row tile 128 | GPU 0, 512 tokens: query **0.997–1.083 ms**, routed values **1.458–1.545 ms**, vs 64-row **0.860–0.935 / 1.096–1.130 ms**. **39,168 shared bytes and 177 registers** allow one block per SM; relaxing the launch bound does not recover the loss. Rejected. |
+| Fully scaled f16 operands for K2 projections | HMMA on dequantized weights and half activations. N=1 Q4/Q6 query **81.5 / 75.3 us** vs integer **29.1–29.4 / 33.8–33.9 us**; best routed N=3 **166.6 / 218.4 us** vs **49.3–50.0 / 62.4–62.7 us**. At 512 tokens dense query improves (**0.547 / 0.618 ms**); routed values **1.031 / 1.128 ms** vs **0.898–0.925 / 1.135–1.141 ms**. Every decode tile loses. Rejected on timing. |
+| Reusing K2 decode rows across matching routes in one CTA | Q4 at three tokens with identical expert ids: **77.9 / 77.8 / 77.8 us** vs the direct path's distinct-route **53.1–53.6 us** (different inputs, not an end-to-end A/B). One larger per-thread accumulator loses more parallelism than it saves in unpacking. Rejected. |
+| Asymmetric eight-bit K2 activation projections | Q4_K_M with attention/value and routed FFN at eight bits fails the six-token final-norm gate (**cosine 0.999169**, required **0.9995**). Q6_K all-eight passes, but calibration gives **20.83 / 37.90 ms** (N=1/3, context 512) and **887.15 ± 1.57 tok/s** at 512-token prefill. Sixteen bits stay. |
+| Zero-centered Q8_1 arithmetic for K2 projections | Passes six-token captures, fails the 26-token science capture: Q4 logit **max-abs 0.9601** (gate **0.75**), Q6 block 28 **max-abs/RMS 0.4033** (gate **0.3**). Matching MMQ's sum tree still fails (Q4 **0.9264**; Q6 final-norm **cosine 0.9992134**, gate **0.9995**). Half Q4 coefficients fail even six tokens (**0.4350**). Rejected as production precision. |
+| K2 routed token tile 128 instead of 64 | GPU 1, three pairs, 64-row/128-token vs 128-row/64-token: Q4 routed values at 512 tokens **2.6729 / 2.6539 / 2.6241 ms** vs **1.0065 / 1.0413 / 1.0066 ms**; at 2K **4.7136 / 4.8219 / 4.7916** vs **2.5676 / 2.6749 / 2.6096 ms**. One resident CTA, and sparse expert runs pad more. Rejected. |
+| Predicate Q4 nibble staging on live rows and load coefficients separately | Three alternating GPU 0 pairs, 512 tokens, ordinary → candidate: query **0.6678 / 0.6999 / 0.6978 → 0.6929 / 0.7170 / 0.7253 ms**; routed values **0.9289 / 0.9687 / 0.9732 → 1.0271 / 1.0497 / 1.0670 ms**. Fewer redundant metadata loads lose every pair. Rejected before the full-model gate. |
+| Expanding K2 Q6 weights to byte codes | 304-byte records hold **44.57 GiB** at 512-token prefill on a 47.27 GiB card, vs **36.51 GiB** for the 240-byte packed format, leaving little cache capacity. Do not trade the context pool for an unpacking shortcut without an end-to-end measurement. |
+| Tiny tensor-core K2 dense decode | GPU 2, Q4 query: eight-token/32-row MMA tiles take **161 / 172 us** at one/three tokens vs vector **31 / 47 us**. Most columns are padding; tensor-core setup cannot be amortized. Rejected. |
+| DP2A for K2 sixteen-bit activation digits | Q4 query **33.3 / 65.5 us** at one/three tokens vs DP4A **31.1 / 46.6 us**; correctness gates pass. The wider packed operand does not repay its unpacking and instruction cost. |
+| Smaller K2 Q4 prefill row tiles | Q4 query at 512 tokens: 64-row tiles **806.7–832.7 us** vs 128-row **689.5–699.4 us**. A 32-token/64-row routed-value tile (**1004.9–1015.0 us**) does not justify the dense loss. Keep the wider dense tile. |
+| Sixteen-bit K2 digits rounded to half coefficient products | 26-token heat-transfer prompt: Q4 logit error **0.8241**, cosine **0.9994492**, vs six-token gates **0.75 / 0.9995**; the sixteen-bit control also misses (**0.8021 / 0.9994252**). Imitating one publisher rounding detail does not establish agreement; six-token captures do not certify longer prompts. |
+| Eight-token dense projection tiles at K2 decode width | Three tokens, GPU 0, layer-3 query weights, three rounds: Q4_K four-token tiles **50.2 / 50.1 / 50.1 us** vs eight-token **58.8 / 58.9 / 58.7 us**; Q6_K **36.5 / 36.4 / 36.4** vs **40.8 / 40.8 / 40.8 us**. Keep four-token tiles below eight physical tokens. Rejected. |
+| Grouping K2 value experts at decode width | Layer-3 value stacks, top-4 routes, dispatch included, GPU 0. Three-token scalar/grouped: Q4_K **115.7/126.1, 114.6/123.2, 112.0/122.9 us**; Q6_K **98.1/120.2, 98.0/120.3, 98.3/120.5 us**; one token also loses. Padded dispatch and a second launch outweigh row reuse. Grouping starts at eight physical tokens. |
+| Cooperative loading before an exact-order GDN gate contraction | Bit-exact at N=1/3/7; registers 64 → 45, but N=3 latency rises **3.857/3.869/3.868 → 4.237/4.245/4.245 us**. Rotating 30 weight pairs: **5.241/5.273/5.272 → 5.008/5.033/5.041 us**, still slower than one head per block. Gates total only 0.181 ms/step. Rejected. [All pairs](OPTIMIZATION_CAMPAIGN.md#exact-order-gdn-gate-experiments). |
+| One persistent block per GDN value head for normalization and recurrent update | Exact; **62 registers**. The N=3 grid collapses from 3,072 blocks to 96 (32 on 72 SMs at N=1). Three pairs: N=1 loses **30.6–35.2%** (one state bank) and **21.6–21.7%** (30); N=3 loses **1.20–1.66%** with one bank, gains **2.01–2.35%** rotating 30 (cache-dependent). Rejected. [All pairs](OPTIMIZATION_CAMPAIGN.md#block-persistent-gdn-fragment). |
+| Query/key head RMSNorm in one disjoint grid | Exact; isolated N=3 fragment **72.9–73.8%** faster. Three GPU 1 model pairs: 2K favors it by **0.09/0.28/0.14%**, but 32K changes sign (**166.7/166.2/166.6 → 166.5/166.6/166.2 tok/s**, −0.12/+0.24/−0.24%), inside the 0.30% baseline spread. Reverted; no prefill claim. [All pairs](OPTIMIZATION_CAMPAIGN.md#head-normalization-full-model-pairs). |
+| One head per block for small target-model F32 GDN gates | 96 one-warp blocks instead of 24 four-warp blocks at N=3; the isolated sign depends on weight reuse. Three GPU 1 model pairs at 2K: N=3 **216.8/216.1/215.7 → 216.6/215.8/215.5 tok/s** (−0.09/−0.14/−0.09%); N=1 gains 0.18–0.26%, below 0.4–0.5% drift. Reverted. [All model pairs](OPTIMIZATION_CAMPAIGN.md#gate-grid-full-model-pairs). |
+| Relying on implicit FMA contraction after moving prefill softmax state into registers | Passed all ten attention differentials, then failed the 19-token forward golden at **rank 4** (separation **0.153701**, top-logit error **0.088937**). NVRTC moved a normalizer addition across MMA control flow, splitting an FMA; explicit `__fmaf_rn` restores bit identity. Preserve the compiled arithmetic; isolated tolerance gates cannot replace the model golden. |
+| Alternating shared K/V buffers in prefill attention | Removes one barrier per 8-key tile; shared memory 13,952 → 22,272 B; all gates passed. Three GPU 1 N=3 pairs: 2K **−0.13 / +0.23 / −0.14%**, 8K **+0.04 / +0.02 / +0.05%**, inside 8K's 9.80–23.47 tok/s within-process SD. Fewer barriers bought no full-prefill throughput. Reverted; above 8K not measured. |
+| Applying two token groups to every Rust tiled RoPE grid | Six alternating GPU 1 pairs: splitting alternate tokens over idle rotary threads gains **51.2–51.6%** at 512 tokens × 2 heads but loses **5.0–5.2%** at 512 × 16, duplicating double-precision frequency work. Use two groups only at most 72 blocks (72 SMs); keep 16-token frequency reuse above that. |
+| Keeping the literal production tiled RoPE port's unused rotary threads | Six alternating GPU 1 pairs, 512-token chunk, 2 key heads: NVRTC **19.437–19.511 us**, Rust **20.400–20.426 us** (**4.5–4.7% lower throughput**). 64 blocks on 72 SMs, and half the rotary threads exit. Using that half is a separately gated layout change, not a benefit of translation. |
+| Promoting the optimized eight-port Rust bundle to the default backend | Three alternating Qwen3.6 GPU 1 N=3/2K pairs: **−0.05% to +0.05% decode**, **−0.35% to +0.09% prefill**, despite narrow wins for the fused GDN norm and key RoPE. Query RoPE and generic fused hidden-width normalization still lose narrow gates. `rust-kernels` stays opt-in. |
+| Removing a Rust RMSNorm barrier by repeating the serial warp-partial sum in every warp | Six alternating GPU 1 pairs vs NVRTC: hidden-width RMSNorm loses **11.4–12.7%** at 3 × 2,048 and **9.7–11.2%** at 1,536 × 2,048. Up to 32 repeated dependent additions per warp cost more than the barrier. Use a parallel second shuffle reduction, gated for its changed addition order. |
+| Literal `usize` column loops and a rolled warp sum in the Rust normalization port | Six alternating GPU 1 pairs: 24,576 × 256 **100.606–102.575 us NVRTC** vs **104.244–105.007 us Rust** (2.3–3.5% lower throughput); 49,152 × 128 **100.073–100.855** vs **101.102–101.683 us** (0.8–1.1%). Causes: 64-bit column counters where NVRTC uses 32-bit, and an un-unrolled warp-partial loop. Keep 32-bit counters; lower register counts did not predict throughput. |
+| Promoting the literal five-kernel Rust bundle to the default backend | Three alternating Qwen3.6 GPU 1 N=3/2K pairs lose **0.05–0.28% decode** and **0.05–0.38% prefill**; fused width-128 decode normalization loses **3.8–4.4%** kernel throughput. Matching arithmetic and geometry does not make a migration compiler-neutral. The bundle stays behind the disabled-by-default `rust-kernels` switch. |
+| Enabling the plain Rust activation ports by default | Six alternating GPU 1 pairs at 8,388,608 elements: SwiGLU **182.156–182.255 us NVRTC** vs **186.574–186.675 us Rust** (2.3–2.4% lower throughput); per-row sigmoid at width 2,048 **132.924–133.251** vs **142.222–142.510 us** (6.4–6.7%). Three N=3/2K model pairs change sign. Kept behind `rust-kernels`, rejected as default. |
+| Four-float Rust residual loads/stores with the existing launch grid | Bit-exact. Six GPU 1 pairs vs scalar Rust: 16,384 elements scalar **1.577–1.640 us**, vector **1.798–1.835 us** (8.9–13.9% lower throughput); 8,388,608 elements **180.408–180.593** vs **179.876–180.062 us** (0.20–0.35% higher). The unchanged grid leaves three quarters of its blocks empty at 16K. Rejected. |
+| GDN split projection at row tiles 1 and 2 (`uint4` form, N=3) | 78.4 and 46.4 us per qkv/gate call vs RT=4's 33.9. RT=1 has the most warps and in-flight bytes and is worst: memory-level parallelism does not bind; instruction count per byte does, and it falls with RT. |
+| The output projection at row tile 2 (2,048 rows, 512 warps at RT = 4 — under half a wave) | Bit-identical; **flat at N=1** (23.0 us), **+25% at N=3** (28.2 → 35.2 us). The grid was 0.44 waves deep, yet doubling warps bought nothing: at three tokens the cost is activation instructions per weight byte, which halving RT doubles. Wave fill does not bind a decode-width GEMV here. |
+| The next layer's RMSNorm in the MoE combine kernel's tail (fixed-order last-block reduction, the mixer skips its norm launch; 41 launches a step) | Three pairs, middle reversed, **flat to −0.6%**: N=1 116.3 → 115.8, 115.2 → 114.7, 115.2 → 115.3; N=3 218.4 → 217.5, 218.0 → 216.7, 217.8 → 217.1. Within 2 ulps. Each of eight blocks per row gains a block reduce, fence and atomic, plus a serialized last-block pass, cancelling the ~2.8 us floor removed. Removing norm launches needs the consumer to normalize on the fly. |
+| GDN split projection, char4 partition + row tile + prefetch | 40.0/36.7 us vs the shipped `uint4` form's 33.9/29.3, despite coalesced activation loads and ~2.7x fewer L1 wavefronts per byte on paper. The wavefront model predicted the wrong winner. |
+| `q8_0` KV cache (llama.cpp side) | −2.5% at depth 0, **−15.5%** at 32K, **−35.8%** at 128K. Turing's in-kernel dequant costs more than the halved traffic saves; the KV path already ran at ~80% of peak. Keep `-ctk f16 -ctv f16`. |
 | Requantize experts Q6_K → Q8_0 | 4–8% for **+30% VRAM**. The dequantization format is not what limits that kernel. |
-| Marlin-style register prefetch on the MoE MMA kernels | 20% slower at 512 tokens. `__launch_bounds__` already trades registers for occupancy on purpose; a register pipeline competes with that trade and ptxas spills instead of exceeding the occupancy target. |
-| Widening the prefill softmax-rescale tile (`MMA_KEY_TRIPS` 2/4) | A wash then **1.96× slower**. The kernel sits at 252 of 255 registers with zero spill; the wider prefetch arrays spill immediately. |
-| `MMA_KOCT=4` (32-key prefill staging tile) | **−30%**. Same mechanism: the cross-tile prefetch arrays grow with the tile and spill. One octet is the largest tile whose prefetch fits beside `o` and `qa` at head_dim 256. |
-| Staging `Q` to shared in the decode MMA kernel | 73 registers freed, zero spill, and **37–40% slower** at every depth. Shared grew past the 3-blocks/SM line, and 64 shared loads per warp per trip replaced registers that were free. llama.cpp's own Turing config keeps `Q` in registers here too. |
+| Marlin-style register prefetch on the MoE MMA kernels | 20% slower at 512 tokens. A register pipeline competes with the deliberate register-for-occupancy trade in `__launch_bounds__`, so ptxas spills instead of exceeding the occupancy target. |
+| Widening the prefill softmax-rescale tile (`MMA_KEY_TRIPS` 2/4) | A wash, then **1.96× slower**. The kernel sits at 252 of 255 registers with zero spill; the wider prefetch arrays spill immediately. |
+| `MMA_KOCT=4` (32-key prefill staging tile) | **−30%**. The cross-tile prefetch arrays grow with the tile and spill; one octet is the largest tile whose prefetch fits beside `o` and `qa` at head_dim 256. |
+| Staging `Q` to shared in the decode MMA kernel | 73 registers freed, zero spill, **37–40% slower** at every depth. Shared grew past the 3-blocks/SM line, and 64 shared loads per warp per trip replaced free registers. llama.cpp's Turing config also keeps `Q` in registers. |
 | Per-warp online softmax in decode without the cross-warp round trip | 255 registers and 104–120 B of spill at both occupancy widths; the shared-memory mitigation collapses to 1 block/SM by arithmetic. Not built past `ptxas`. |
-| fp16 `P V` accumulation | 54 registers freed — and **209× over `MMA_GATE`** on the constant-`V` test, growing with depth. With `V` coherent the accumulator grows purely additively between rescales until increments round away entirely; an IID-random-`V` simulation held with 26–30× margin and tested the wrong regime. Also buys nothing: fp16- and fp32-accumulate `m16n8k8` measured within 0.4% on this card. |
+| fp16 `P V` accumulation | 54 registers freed, but **209× over `MMA_GATE`** on the constant-`V` test, growing with depth: with coherent `V` the accumulator grows additively until increments round away (an IID-random-`V` simulation tested the wrong regime). fp16- and fp32-accumulate `m16n8k8` measured within 0.4%, so it buys nothing. |
 | `__expf` in the prefill softmax | 1.075× on attention, and a **real rank-4 ranking error** against llama.cpp's separation. Greedy decoding would not notice; sampling would. |
-| `half2` on the decode `P V` accumulator | Fewer registers, fewer instructions, **11.3% slower**. `pack_h2`'s broadcast of the scalar softmax weight added 40 `PRMT` and 16 `F2F` on a value that was already in a register. Instruction counting is retired as a predictor for this kernel. |
-| `dp4a` / Q8_1 activation quantization (llama.cpp's `mmvq`) | Passes every isolated per-kernel gate at a bound derived from llama.cpp's own arithmetic, then fails `batch_decode` at **5.1e-1** (asymmetric) and **7.1e-1** (symmetric) against a 5e-3 bound. Round-to-nearest is discontinuous, so it amplifies any upstream residual into expert-selection flips. Re-attempted after the paths became bit-identical and still failed the exact cross-width gate at `4.4e-5`: identical inputs must produce identical codes at every serving width. |
-| `ldmatrix.sync.aligned.m8n8.x4` | Both fragment layouts verified correct on hardware, and **0.8% slower**. The kernel is not bound by shared-load instruction count. |
-| `mma.m8n8k4` (Turing's "native" shape) | **49.1 TFLOP/s** measured against `m16n8k8`'s 97.6. Half the throughput, not hidden headroom. Ruled out without writing the kernel. |
-| Swapping the flash grid's axes for L2 reuse | **−1.7%**. Sibling blocks start together but drift apart faster than 6 MB of L2 spans; only a staging barrier inside one block makes them share. |
-| `ATTN_QT` 16, `GQA_KT` 16, `__maxnreg__(84)` | −10%, −14%, −6%. All three trade the second resident block per SM for something worth less than it. |
-| Copying llama.cpp's 4-query/64-key outer prefill tile | **~8× slower**, `ptxas` clean at 255 registers with zero spill. Four queries launch four times the blocks and a conservative 64-key softmax serialized through four lanes. Copying tile dimensions does not copy the fragment-resident softmax and combine that make them competitive. |
-| Prefetching the GDN alpha/beta gate contraction | 21.2 us a call becomes 28.5 (four blocks staged), 30.8 (two), or 46.3 (one block ahead, the `gdn_proj_split_rows` double-buffer idiom). The kernel is 12 blocks on a 72-SM card and looks latency-bound, so this should have worked; every restructuring made it worse, which says ptxas was already scheduling the tight loop better than the source could. The gates stay as written, and their 1.0 ms stays on the table. |
-| Staging the weights instead of the activations at every GEMV width | 0.549 -> 0.585 ms a layer at three tokens and 0.570 -> 0.695 at four. Hoisting `RT * 8` dequantized weights is what lets `TT` pass four, but at `TT <= 4` the row tile is 8 and sixty-four weights live costs more than the `TT * 8` activations it replaces. Both stagings ship, chosen by `TT`. |
-| Hoisting the GDN Gram kernel out of the chunk loop | Bit-identical, 240 launches → 30, and **0.5% slower**, losing every interleaved pair. In the loop the Gram output hits L2 immediately; hoisted, all eight chunks' squares must coexist in a 6 MiB L2. On this part, launch count is not worth trading locality for. |
-| `shared_expert_mma` on the dense FFN at decode width (Qwen3.8-27B) | 109.0 ms per step against the fp32 path's 63.5, and 9.17 tok/s against 15.74. A GEMM stages a 64-token tile and at one token discards 63/64 of it; the weight bytes are identical either way, so what it loses is the shape it reads them in, not the traffic. Replaced by a copy of `GdnBlock`'s split-layout GEMV — 17.26 tok/s, and *more* accurate than the GEMM besides, since it dequantizes the weights and multiplies in fp32 rather than quantizing activations. |
-| Tiling `gdn_chunk_gram` over target tokens | Nothing. Its keys are 32 KiB per head and sit in L2 — the arithmetic that says a kernel re-reads its input does not say the re-read costs anything. |
-| Shared-memory staging on the GDN decode GEMV and the routed-expert GEMV | −3.6% and −0.8%. The re-reads staging removes were L1 hits; staging replaced a hit with a copy and a barrier, and cost a resident block. |
-| Shared-staged flat decode GEMVs (`int4` staging, as the LM head uses) | Bit-identical by construction and **1.3–2.4% slower**. These kernels are bound by the **integer pipe**, not by load issue: Q6_K unpack costs ~9 integer ops per element against a ~10-op budget at the streaming roofline. |
-| Shared-memory activation staging in the dense split GEMV | 0.528 ms against 0.512 at one token and 0.862 against 0.684 at four, losing every pair. The staged form reads activations coalesced once per *block* instead of half-used once per *warp* — 2x fewer sector requests, exactly what the address arithmetic predicts — and the two barriers a 512-element step needs cost more than the sectors save. Third time shared staging has lost to registers on a decode-width GEMV in this file. |
-| `ld.global.cs` (evict-first) on the dense split GEMV's weight loads | Wins every cell of the isolated bench — 0.508 against 0.512 at one token, 0.601 against 0.690 at four, three interleaved pairs — and **loses in the model**: `dense_proj_split_t1_r4` 166.6 -> 167.6 us and the GDN out projection 67.8 -> 71.9, for a net 52.28 -> 52.65 ms step. The hypothesis (streamed weights evicting the re-read activations from L1) is right about the isolated kernel and wrong about a step where twenty other kernels have already decided what is in cache. A narrow bench that wins is a candidate, not a result. |
-| `CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 0` on the dense split GEMV | Nothing, at any width. The kernel already requests zero shared memory, so the driver was already giving it the large-L1 split; the hint had nothing to ask for. |
-| Splitting the GDN gate contraction across eight warps | 20.9 -> 5.4 us on the kernel, 52.28 -> 51.57 ms on the step (**+1.3%**), and it moves the model's logits: `1 - cosine` against llama.cpp's own logits grows 2.64e-4 -> 2.94e-4 and `forward_pass` fails. The reduction is *more* accurate on the top-8 logits (max disagreement 0.309 -> 0.147) and less accurate in L2, which is the metric that gate is written on. One warp per head leaves 48 warps on a 72-SM card and the kernel at 25 GB/s; that is a real 1.9% of the decode step sitting behind a summation order the goldens are gated on, and any replacement has to be bit-identical to collect it. |
-| Unrolling the GDN gate loop for memory-level parallelism | Exactly nothing — 20.9 us before and after. `ptxas` was already issuing the loads ahead; the kernel is short of *warps*, not of in-flight loads per warp. |
-| I2F-free unpack (exact-mantissa trick) | Bit-exact, every gate green, **flat**. With both the load-issue and XU-pipe hypotheses dead, the flat decode GEMVs at 473–519 GB/s read as at their practical equilibrium for this quantization on this card. |
-| Even/odd MMA accumulator chains | −2% prefill, noise at decode. The compiler's schedule was not accumulator-stalled, and eight more registers on kernels already at ~230 costs more than the chain relief. |
-| Skipping the online-softmax rescale when the running max did not move | Bit-identical by construction and **2.8% slower** at 128K prefill. The identity multiplies hid under staged-load latency the schedule pays anyway; the vote-and-branch costs more than the work it skips. |
-| Speculation during sustained shallow N=3 generation | From 256-token prompts over 512 fixed scheduler steps, simple at cap 48 loses **32.06–32.27%**, map-k4v at cap 8 loses **53.80–53.92%**, and MTP at cap 3 loses **23.13–23.25%**, across three interleaved reversed pairs. Every sequence stays active. Acceptance and context growth differ: the map arm emits 12.859 tokens/step against plain decode's 3.000, but cannot repay verification. At 32K, the active map and MTP policies still lose **28.91–29.07%** and **22.93–23.25%**. A shallow single-stream win does not select the N=3 policy. See the campaign for all observations and emitted lengths. |
-| MTP at the N=3 deep-context target, cap 3 | At 122,880 tokens/sequence, **89.3 / 89.3 / 89.4 tok/s** against plain **100.5 / 100.6 / 100.7**, losing **11.14–11.23%** across three reversed pairs despite full acceptance (12 tokens/step). Prefill averages 1,416.6 against 1,528.1 tok/s. The approximately 134 ms draft/verify step cannot repay itself with four times the output of a 30 ms plain step. This rejects this MTP configuration, not every deep policy: map-k4v at cap 8 wins **1.29–1.49%** under perfect acceptance in the same measurement. |
-| Widening the trained drafters to the trained maximum (`--spec-draft-n-max 15`) | Earlier three-pair measurements lost **55.4%** (MTP) and **65.8%** (DFlash) at N=1, and **67.3%** / **54.8%** at N=3, with spreads ≤1.0%. MTP acceptance rose from 2.86 to 3.90 tokens/step, but a 3 → 15 block added **57.2 ms/step** for MTP and **52.6 ms** for DFlash. Those rates belong to that configuration, not the current policy table. A trained draft pass scales with the block; making it longer does not make it cheaper. The older claim that wide verification itself is nearly free is not a current contract: exact verification must preserve decode arithmetic at every width. |
-| `ngram-mod` at llama.cpp's default `n_max` 64, N=3 | `CUDA_ERROR_OUT_OF_MEMORY` before the first step, in every round. The verify path holds one GDN snapshot ring set per decode slot — 30 layers × (32·128·128 + 8192·3) fp32 × `(drafts + 2)` — which is 4.05 GiB per slot at 64 drafts and 12.15 GiB for three, beside a 29.6 GiB model on a 48 GiB card. 48 drafts (9.2 GiB for three) fits at shallow context and still loses; that does not imply it fits beside three 120K caches. The draft cap is a VRAM knob, not only a scheduling one. |
+| `half2` on the decode `P V` accumulator | Fewer registers and instructions, **11.3% slower**: `pack_h2`'s broadcast of the scalar softmax weight added 40 `PRMT` and 16 `F2F`. Instruction counting is retired as a predictor for this kernel. |
+| `dp4a` / Q8_1 activation quantization (llama.cpp's `mmvq`) | Passed every isolated per-kernel gate, then failed `batch_decode` at **5.1e-1** (asymmetric) and **7.1e-1** (symmetric) against a 5e-3 bound: round-to-nearest amplifies upstream residuals into expert-selection flips. Re-attempted with bit-identical paths, it still failed the exact cross-width gate at `4.4e-5`. |
+| `ldmatrix.sync.aligned.m8n8.x4` | Both fragment layouts verified on hardware, **0.8% slower**. The kernel is not bound by shared-load instruction count. |
+| `mma.m8n8k4` (Turing's "native" shape) | **49.1 TFLOP/s** against `m16n8k8`'s 97.6: half the throughput. Ruled out without writing the kernel. |
+| Swapping the flash grid's axes for L2 reuse | **−1.7%**. Sibling blocks drift apart faster than 6 MB of L2 spans; only a staging barrier inside one block makes them share. |
+| `ATTN_QT` 16, `GQA_KT` 16, `__maxnreg__(84)` | −10%, −14%, −6%. Each trades the second resident block per SM for something worth less. |
+| Copying llama.cpp's 4-query/64-key outer prefill tile | **~8× slower**, `ptxas` clean at 255 registers, zero spill. Four queries launch four times the blocks and the 64-key softmax serialized through four lanes; the tile dimensions are not competitive without llama.cpp's fragment-resident softmax and combine. |
+| Prefetching the GDN alpha/beta gate contraction | 21.2 us a call became 28.5 (four blocks staged), 30.8 (two), or 46.3 (one block ahead, the `gdn_proj_split_rows` double-buffer idiom). ptxas already scheduled the tight loop better than the source could. The gates stay as written, and their 1.0 ms stays on the table. |
+| Staging the weights instead of the activations at every GEMV width | 0.549 -> 0.585 ms a layer at three tokens and 0.570 -> 0.695 at four. Weight staging is what lets `TT` pass four, but at `TT <= 4` the row tile is 8 and sixty-four live weights cost more than the `TT * 8` activations they replace. Both stagings ship, chosen by `TT`. |
+| Hoisting the GDN Gram kernel out of the chunk loop | Bit-identical, 240 launches → 30, and **0.5% slower**, losing every interleaved pair. In the loop the Gram output hits L2 immediately; hoisted, all eight chunks' squares must coexist in a 6 MiB L2. |
+| `shared_expert_mma` on the dense FFN at decode width (Qwen3.8-27B) | 109.0 ms per step against the fp32 path's 63.5 (9.17 against 15.74 tok/s). At one token a GEMM discards 63/64 of its 64-token tile; same weight bytes, wrong shape. Replaced by a copy of `GdnBlock`'s split-layout GEMV: 17.26 tok/s, and more accurate (fp32 multiply, no activation quantization). |
+| Tiling `gdn_chunk_gram` over target tokens | Nothing. Its keys are 32 KiB per head and sit in L2; arithmetic that says a kernel re-reads its input does not say the re-read costs anything. |
+| Shared-memory staging on the GDN decode GEMV and the routed-expert GEMV | −3.6% and −0.8%. The removed re-reads were L1 hits; staging replaced a hit with a copy and a barrier, and cost a resident block. |
+| Shared-staged flat decode GEMVs (`int4` staging, as the LM head uses) | Bit-identical, **1.3–2.4% slower**. These kernels are bound by the **integer pipe**, not load issue: Q6_K unpack costs ~9 integer ops per element against a ~10-op budget at the streaming roofline. |
+| Shared-memory activation staging in the dense split GEMV | 0.528 ms against 0.512 at one token and 0.862 against 0.684 at four, losing every pair. It halved sector requests as predicted, but the two barriers a 512-element step needs cost more than the sectors save. Third shared-staging loss to registers on a decode-width GEMV. |
+| `ld.global.cs` (evict-first) on the dense split GEMV's weight loads | Won every isolated-bench cell (0.508 against 0.512 at one token, 0.601 against 0.690 at four, three interleaved pairs) and **lost in the model**: `dense_proj_split_t1_r4` 166.6 -> 167.6 us, GDN out projection 67.8 -> 71.9, step 52.28 -> 52.65 ms. A narrow bench that wins is a candidate, not a result. |
+| `CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 0` on the dense split GEMV | Nothing, at any width. The kernel already requests zero shared memory, so the driver already gave it the large-L1 split. |
+| Splitting the GDN gate contraction across eight warps | 20.9 -> 5.4 us on the kernel, 52.28 -> 51.57 ms on the step (**+1.3%**), but `1 - cosine` against llama.cpp's logits grew 2.64e-4 -> 2.94e-4 and `forward_pass` failed. The kernel is a real 1.9% of the decode step; a replacement must be bit-identical to collect it. |
+| Unrolling the GDN gate loop for memory-level parallelism | Nothing: 20.9 us before and after. `ptxas` already issued the loads ahead; the kernel is short of *warps*, not of in-flight loads per warp. |
+| I2F-free unpack (exact-mantissa trick) | Bit-exact, every gate green, **flat**. With the load-issue and XU-pipe hypotheses dead, the flat decode GEMVs at 473–519 GB/s read as at their practical equilibrium for this quantization on this card. |
+| Even/odd MMA accumulator chains | −2% prefill, noise at decode. The schedule was not accumulator-stalled, and eight more registers on kernels at ~230 cost more than the chain relief. |
+| Skipping the online-softmax rescale when the running max did not move | Bit-identical, **2.8% slower** at 128K prefill. The skipped multiplies hid under staged-load latency anyway; the vote-and-branch costs more than the work it skips. |
+| Speculation during sustained shallow N=3 generation | 256-token prompts, 512 fixed steps, three interleaved reversed pairs: simple at cap 48 lost **32.06–32.27%**, map-k4v at cap 8 **53.80–53.92%**, MTP at cap 3 **23.13–23.25%**. At 32K, map and MTP still lost **28.91–29.07%** and **22.93–23.25%**. Higher emission cannot repay verification. |
+| MTP at the N=3 deep-context target, cap 3 | At 122,880 tokens/sequence, **89.3 / 89.3 / 89.4 tok/s** against plain **100.5 / 100.6 / 100.7** (**−11.14–11.23%**, three reversed pairs) despite full acceptance. The ~134 ms draft/verify step cannot repay four times the output of a 30 ms plain step. Map-k4v at cap 8 won **1.29–1.49%** in the same measurement. |
+| Widening the trained drafters to the trained maximum (`--spec-draft-n-max 15`) | Lost **55.4%** (MTP) and **65.8%** (DFlash) at N=1, **67.3%** / **54.8%** at N=3. MTP acceptance rose 2.86 → 3.90 tokens/step, but a 3 → 15 block added **57.2 ms/step** (MTP) and **52.6 ms** (DFlash): a trained draft pass scales with the block. Rates are from that configuration, not the current policy table. |
+| `ngram-mod` at llama.cpp's default `n_max` 64, N=3 | `CUDA_ERROR_OUT_OF_MEMORY` before the first step. Verify holds one GDN snapshot ring set per decode slot, scaling with `(drafts + 2)`: 4.05 GiB per slot at 64 drafts, 12.15 GiB for three, beside a 29.6 GiB model on 48 GiB. 48 drafts (9.2 GiB) fit shallow and still lost. The draft cap is a VRAM knob. |
 | Tensor cores for routed MoE at N=3 (`MMA_MIN_TOKENS` 8 → 3) | 135.2 vs 147.7 tok/s. Padding a three-row dispatch into MMA fragments and quantizing its activations costs more than the arithmetic recovers. |
-| The general fp32 expert tiles at N=3 (`MOE_NARROW_DECODE_MAX` 4 → 2) | 129.6 vs 147.7 tok/s. With the tensor-core result above, this brackets the current N=3 choice: both neighbouring kernel paths are slower. |
+| The general fp32 expert tiles at N=3 (`MOE_NARROW_DECODE_MAX` 4 → 2) | 129.6 vs 147.7 tok/s. With the row above, both kernel paths neighbouring the current N=3 choice are slower. |
 | The scalar warp decode kernel at depth | 133.0 vs 148–151 tok/s at 32K N=3. The depth-aware dispatch onto the tensor-core kernel stands. |
-| `WPO=4` decode occupancy width | ~4.5% slower than `WPO=2` at 32K N=3, before and after the register-spill fix. Never wins at any depth measured. |
+| `WPO=4` decode occupancy width | ~4.5% slower than `WPO=2` at 32K N=3, before and after the register-spill fix; never won at any depth measured. |
 | Decode blocks 48 or 60 at 72 logical splits | 150.5 and 139.5 against 36 blocks' 152–153. 48 divides 72 unevenly and the long blocks set the makespan; 60 spills into a second wave. |
-| Three independent N=1 decode graphs on one card | 129.9 vs 147.7 tok/s at 2K. Separate streams repeat weight traffic and contend more than their overlap recovers; serving keeps batched weight reuse. |
-| Shared-expert side-stream overlap | Flat at N=3 (no SM or DRAM slack to hide in), **−2.5–3%** at N=1 (the step is launch-latency-bound and two events per MoE layer is pure overhead). The launches it tried to hide were later removed instead — the shared expert's blocks now ride the routed expert's grid, no events; see WHY, "The same seam carries a whole small kernel". |
+| Three independent N=1 decode graphs on one card | 129.9 vs 147.7 tok/s at 2K. Separate streams repeat weight traffic and contend more than their overlap recovers. |
+| Shared-expert side-stream overlap | Flat at N=3 (no SM or DRAM slack), **−2.5–3%** at N=1 (launch-latency-bound; two events per MoE layer is pure overhead). The shared expert's blocks now ride the routed expert's grid instead; see WHY, "The same seam carries a whole small kernel". |
 | Independent GDN streams at prefill | Within thermal drift, reversing across warmed pairs. Removed rather than kept on a cold-card gain. |
-| Cross-sequence prefill flattening at *equal* total ubatch | 0.99×. At fixed physical width, batching does not reduce the number of full-model passes. It wins only when the pass gets wider — see WHY. |
-| The two-kernel `bm == 1` split, first attempt | −5.2% before `bucket_live` existed: both kernels then walked `sorted_token_ids` and crossed two barriers per bucket to compute `bm`, and only one used the answer. It landed as a win only once `bm` became a table read. |
-| GEMV unroll pragmas on the direct-1 helpers | 20% slower on ffn. A register cliff — the standalone GEMV kernel's unroll depth was tuned against a register budget the narrow kernel, which carries the tiled fallback in the same function, does not have. |
-| A `KU` unroll hint on the GDN tiled projection | Byte-identical SASS at the width N=3 actually uses; −9% at N=2. `ptxas` already reached the same schedule. Whatever closes that kernel's 28%-of-roofline ceiling must change what ptxas schedules, not hint at a schedule it already finds. |
-| Selecting prefill arithmetic for wide speculative verification | Three 49-row windows crossed the GDN projection threshold at 64 total rows and requested a stored Q8_0 representation that production no longer keeps. Fixing residency alone then accepted **10** tokens where a full-model regression required **24**. Verification now retains exact split projections and per-query decode attention regardless of window width. The unchanged test passes at zero, partial and full acceptance, including rollback and every bonus token. Token-equality acceptance is only an identity guarantee when the target verify pass reproduces ordinary decode. |
-| Removing the routed-partial clear | Below run-to-run spread, and reversing. Deleting a defensive correctness aid for a result smaller than host drift is not justified. |
-| Grant alignment as a prefill lever (`ADMISSION_RESERVE_FRACTION` 4 → 2) | Predicted **+27%**, measured **+1.5%**. The width curve is real — 2,048-wide passes run at 2,760 tok/s against 256-wide at 1,510, and the ratio holds at depth (1,896 vs 1,050 at 64K) — and `choose_prefill_width` does decompose a 3,072-token grant into 2,048 + 4×256. `max_batch = 3`, the 256 tail ceiling, and the grant reaching `execute_prefill` intact were all verified. The penalty still does not appear end to end. The constant stays at 2 because it is never worse and an aligned grant is the honest default, but **do not rank work by that width arithmetic**; the mechanism is confirmed and its cost is not. |
-| Snapshot retention as the cause of the concurrent-session penalty | Nothing. `--cache-ram 0` (no snapshots) and `16GiB` (159 per worker) both land within noise of the 2.41 GiB default's 24, at 64K × 3 sessions. The arena arithmetic is seductive — a 64K prompt needs 31 snapshots at R=2048, three sessions ~93 against 24 — and wrong. Worse, it was first "ruled out" at 16K, where three sessions need exactly 24 and the arena *cannot* bind, which proved nothing in either direction. Test a capacity hypothesis at a depth where the capacity is actually exceeded. |
-| Community-quant formats in the runtime `dequant_tile` ladder, and `__noinline__` to contain them | The ladder is `__forceinline__` with a runtime `quant`, so every arm is emitted at every call site — nine of them across `tile_gemm_pair`, `tile_gemm_single`, the `_direct1` variants and the shared-expert bodies. Three extra formats cost `moe_shared_ffn_gemv` +20 registers (42 → 62), `moe_expert_ffn_flat` +18, `moe_expert_ffn` +16, `moe_expert_ffn_gemv` +11; 20 kernels moved, **−5.05%** on Ornith N=3 2K (195.5 against 205.9, three interleaved pairs, same card two minutes apart). `moe_expert_ffn_flat_q6` did **not** move — it is specialized with no runtime `quant` — which localizes the cost to the ladder rather than to the bodies existing. **`__noinline__` is worse, not better**: `moe_expert_ffn` 80 → 124 and `moe_shared_ffn` 92 → 130, because a non-inlined device call spills live values across the ABI boundary. Reverted. **The compile-time flag it prescribed has since landed** — `dequant_tile_ct<Q>`, one instantiation per format, no runtime branch; see "Compile-time formats free registers that ptxas then spends" in WHY for the before/after and for the occupancy trap it turned up on the way. **The generalisation is structural**: a runtime ladder inside a `__forceinline__` function is a *shared resource*, so an arm added for one format is paid for by every format already using it; a macro that emits a separate `__global__` per format — as `GDN_GATES` does — is not, and a new one there touches nothing existing. Which of the two shapes a kernel family uses decides whether adding a format is free, and it is worth knowing before writing the format rather than after measuring it. |
-| Forking the Gated DeltaNet input projections onto a side stream | **−1.2%** at N=1 2K, losing both interleaved pairs, against +0.79% winning all three at N=3; a first pair read −7.5% and is quoted only as the reason the set was extended. The overlap is real at both widths (1.46x in `nsys`) and irrelevant at one token: the step is launch-latency-bound there, so two events per layer across thirty layers is sixty graph nodes bought against a machine with no wave to fill. Second independent change to hit that wall — see the shared-expert side-stream row above. **Reverted, and the N=3 figure is not a current claim**: a `replace_all` had put the fork into `run_batch_prefill` as well as `run_batch_decode` — one uncaptured path and one inside a graph capture, both forking onto one side stream recording one pair of events, on a `GdnBlock` that serving alternates between them. The +0.79% was measured against a stale pinned binary by the same method that produced the router tile's +1.31%, which did not survive re-measurement against a baseline built from its own commit. Anyone re-attempting this owes it a clean baseline before quoting a number. |
-| Narrowing the router's expert tile at decode width (`ET` 8 → 4) | **Nothing — and the sweep that motivated it cannot resolve anything it claimed.** This host drifts **−0.8% at N=3 over ten minutes**, monotonically and in one direction, which is larger than every effect the `ET` sweep reported; a sequential sweep crossing that drift produces exactly the ragged curve that invites an occupancy-knee story, so **neither the sweep's shape nor its knee is evidence of anything until it is re-run interleaved**. Nor can a sweep be corrected for order after the fact: drift favours the first position and cold caches, first-touch faults and the NVRTC compile penalise it, so the sign of the bias is not even known without measuring it. Re-measured against a baseline built from the pinned commit rather than a stale binary: three interleaved reversed pairs at 2K read +0.24 / −0.19 / −0.05% at N=3, +0.30 / +0.18 / −0.12% at N=2 and +0.49 / +0.29 / 0.00% at N=1 — the sign flips inside every set. The +1.31% recorded here before came from pairs against a stale pinned binary, and a control A/B of that binary against current main read +0.53 / −0.05% at N=3, so the baseline gap does not explain it; the original sweep's run order was not kept, so it cannot be checked against the drift either. The grid arithmetic is not wrong — `grid.y` is 1 at decode, so `ET = 8` is 32 blocks and 256 warps against the 2,304 this part holds — it is just not what binds. `ptxas -v` either side: the prefill kernel unmoved at 96 registers, so nothing was traded for the non-result. Prefill cannot be hiding a win (it selects that unmoved kernel) and depth cannot be (router cost is independent of KV depth, so the tile is a *smaller* fraction of a deeper step). |
-| Reading the Ornith fork's 32K result at all | Three interleaved pairs gave −0.31%, +2.62% and +1.39% while the *baseline* arm ranged 1.85% across its own three runs. The prediction on record was +0.55–0.6%, from a fixed per-layer saving over a step that grows 14.5 → 18.9 ms. The set can neither confirm nor refute that, so no 32K figure is quoted for this change. Recorded because the temptation was to take the mean and call it +1.2%. |
-| Inferring scheduler behaviour from client-side timings | Wrong three times: a lock-starvation fault was read as a scheduler refusing to share, an admission-pacing artefact as a race, and a 2x throughput collapse as a kernel concurrency limit (the kernel charges 5%, not 50%). All three fell out immediately once a step logged its own grants. Instrument the component before theorising about it. |
-| Single-buffered fp16 weight-only GEMM for dense projections | The first W8A16 kernel dequantized one Q8_0 tile into shared memory per k-step behind two barriers, with no register stage. `bench_w8a16` (now `bench_hgemm`) on GPU 2, 27B and Clef shapes, best of three CUDA-event rounds: **0.46–1.07×** the int8 split path (27B FFN gate/up at 2,048 tokens **22.6 TFLOP/s** against int8 **43.4 TOP/s**; cuBLASLt fp16 on the same shape **100.2**). Every global load stalls the MMAs it feeds. The double-buffered rewrite that replaced it measured **1.02–1.33×** on the same shapes the same hour, and is what `hgemm` grew from. |
-| Explicit `prefetch.global.L2` ahead of the `hgemm` stage | Standalone harness over the production source, GPU 1, clocks warmed, 512 and 2,048 tokens, seven 27B/Clef shapes on the 256-row Q8_0 tile. Prefetching 128/256/512 bytes ahead was slower than the `L2::128B` control on **6/7, 7/7 and 7/7** shapes (GDN qkv 10,240×5,120: **52.9 → 50.0 / 48.6 / 45.9 TFLOP/s**; FFN gate at 2,048 tokens **61.6 → 57.6 / 55.8 / 52.8**). One shape improved at 128 bytes (FFN gate at 512, 50.7 → 57.4) and lost it at 256. The prefetch instructions compete with the loads they are meant to hide for the same issue slots. The control is the preceding sweep, minutes earlier, not an interleaved pair; rejected on the consistency of the sign. |
-| A second register stage in `hgemm` | Holding two stages in flight instead of one: **255 registers, 24 bytes of spill stores**, and 50.7 → 50.2 / 41.7 → 40.0 TFLOP/s on the FFN gate and down shapes at 512 tokens. The extra stage buys latency hiding the kernel cannot keep resident. |
-| Tile-contiguous activation layout for `hgemm` | `[M/128][K/32][128][32]` fp16 so a stage's activation tile is one contiguous 8 KiB run (four full lines per warp load instead of eight half-used ones). Against the preceding control: equal or slower on **13 of 14** shape/tile cells (256-row tile at 512 tokens 63.3 / 42.7 / 52.4 → 62.9 / 42.4 / 52.1 TFLOP/s). Activations are 1/2 to 1/8 of a stage's bytes and already L2-resident across the column group; the weight stream is what the loads wait on. Measured while another bench ran on a different card; rejected for no gain, not for a measured loss. |
-| Split-K wherever wave arithmetic said it pays | The first `HgemmPlan` priced the partials' round trip at 2% of a round and split any grid with a ragged last wave, so the 27B's 10,240- and 12,288-row projections ran split four and three ways. Harness, warmed: 10,240×5,120 split 2/3/4 **1.02 / 1.11 / 1.15 ms** against **0.98** unsplit; 12,288×5,120 split 3 **1.26** against **1.11**. In the model, retuning to split only under 1.25 waves and price a split at 8% won every one of six interleaved pairs on GPU 1: 512 tokens **834.0 → 845.0 tok/s** (pairs 0.980–0.990), 1,536 tokens **774.3 → 821.8** (0.938–0.947), last-token logits within 0.0064 of each other. A ragged last wave is cheaper than the model's tail term says once two blocks share an SM. |
+| Cross-sequence prefill flattening at *equal* total ubatch | 0.99×. At fixed physical width, batching does not reduce full-model passes; it wins only when the pass gets wider (see WHY). |
+| The two-kernel `bm == 1` split, first attempt | −5.2% before `bucket_live` existed: both kernels walked `sorted_token_ids` and crossed two barriers per bucket to compute `bm`. It landed as a win once `bm` became a table read. |
+| GEMV unroll pragmas on the direct-1 helpers | 20% slower on ffn. A register cliff: the unroll depth was tuned for the standalone GEMV's register budget, which the narrow kernel (carrying the tiled fallback in the same function) does not have. |
+| A `KU` unroll hint on the GDN tiled projection | Byte-identical SASS at the width N=3 uses; −9% at N=2. `ptxas` already reached that schedule; closing the kernel's 28%-of-roofline ceiling must change what ptxas schedules, not hint at it. |
+| Selecting prefill arithmetic for wide speculative verification | Three 49-row windows crossed the GDN projection threshold at 64 total rows and requested a Q8_0 representation production no longer keeps; with residency fixed it accepted **10** tokens where a regression required **24**. Verification now keeps exact split projections and per-query decode attention at any width. |
+| Removing the routed-partial clear | Below run-to-run spread, and reversing. Not worth deleting a defensive correctness aid for. |
+| Grant alignment as a prefill lever (`ADMISSION_RESERVE_FRACTION` 4 → 2) | Predicted **+27%**, measured **+1.5%**. The width curve is real (2,048-wide passes 2,760 tok/s against 256-wide 1,510; 1,896 vs 1,050 at 64K) and the grant decomposition was verified, but the penalty does not appear end to end. Kept at 2 (never worse); **do not rank work by that width arithmetic**. |
+| Snapshot retention as the cause of the concurrent-session penalty | Nothing. At 64K × 3 sessions, `--cache-ram 0` (no snapshots) and `16GiB` (159 per worker) both landed within noise of the 2.41 GiB default's 24. An earlier test at 16K, where the arena cannot bind, proved nothing. Test a capacity hypothesis where capacity is actually exceeded. |
+| Community-quant formats in the runtime `dequant_tile` ladder, and `__noinline__` to contain them | The `__forceinline__` runtime-`quant` ladder emits every arm at every call site, so every format pays for each added arm: three formats cost `moe_shared_ffn_gemv` 42 → 62 registers and **−5.05%** on Ornith N=3 2K (195.5 against 205.9). **`__noinline__` is worse** (`moe_expert_ffn` 80 → 124, spilling across the ABI). Reverted; `dequant_tile_ct<Q>` has since landed (see WHY, "Compile-time formats free registers that ptxas then spends"). |
+| Forking the Gated DeltaNet input projections onto a side stream | **−1.2%** at N=1 2K, losing both interleaved pairs: the step is launch-latency-bound, and two events per layer is sixty graph nodes with no wave to fill. **Reverted.** The +0.79% at N=3 is not a current claim: it was measured against a stale pinned binary, with the fork leaked into `run_batch_prefill` too. |
+| Narrowing the router's expert tile at decode width (`ET` 8 → 4) | **Nothing.** Three interleaved reversed pairs at 2K against a baseline built from the pinned commit read +0.24 / −0.19 / −0.05% at N=3; the sign flipped inside every set at N=3, N=2 and N=1. The earlier +1.31% came from a stale pinned binary; the motivating sequential sweep crossed host drift (**−0.8% at N=3 over ten minutes**) larger than any effect it reported. |
+| Reading the Ornith fork's 32K result at all | Three interleaved pairs gave −0.31%, +2.62% and +1.39% while the baseline arm ranged 1.85% across its own runs, so the predicted +0.55–0.6% can be neither confirmed nor refuted. No 32K figure is quoted; the +1.2% mean is not one. |
+| Inferring scheduler behaviour from client-side timings | Wrong three times: lock starvation read as a scheduler refusing to share, an admission-pacing artefact as a race, and a 2x throughput collapse as a kernel concurrency limit (the kernel charges 5%, not 50%). Each resolved once a step logged its own grants. Instrument the component first. |
+| Single-buffered fp16 weight-only GEMM for dense projections | **0.46–1.07×** the int8 split path on 27B and Clef shapes (27B FFN gate/up at 2,048 tokens **22.6 TFLOP/s** against int8 **43.4 TOP/s**). One Q8_0 tile per k-step behind two barriers, no register stage: every global load stalls its MMAs. The double-buffered rewrite (**1.02–1.33×**, same hour) became `hgemm`. |
+| Explicit `prefetch.global.L2` ahead of the `hgemm` stage | Prefetching 128/256/512 bytes ahead was slower than the `L2::128B` control on **6/7, 7/7 and 7/7** 27B/Clef shapes (GDN qkv 10,240×5,120: **52.9 → 50.0 / 48.6 / 45.9 TFLOP/s**); prefetches compete for the issue slots of the loads they hide. Control was the preceding sweep, not interleaved pairs; rejected on the sign's consistency. |
+| A second register stage in `hgemm` | **255 registers, 24 bytes of spill stores**, and 50.7 → 50.2 / 41.7 → 40.0 TFLOP/s on the FFN gate and down shapes at 512 tokens. The kernel cannot keep the extra stage resident. |
+| Tile-contiguous activation layout for `hgemm` | `[M/128][K/32][128][32]` fp16 was equal or slower on **13 of 14** shape/tile cells against the preceding control. Activations are 1/2 to 1/8 of a stage's bytes and L2-resident; loads wait on the weight stream. Rejected for no gain, not a measured loss. |
+| Split-K wherever wave arithmetic said it pays | Splitting any ragged-last-wave grid lost in the harness: 10,240×5,120 split 2/3/4 **1.02 / 1.11 / 1.15 ms** against **0.98** unsplit; 12,288×5,120 split 3 **1.26** against **1.11**. Splitting only under 1.25 waves at an 8% price won all six interleaved pairs on GPU 1: 512 tokens **834.0 → 845.0 tok/s**, 1,536 tokens **774.3 → 821.8**. |
 
 ## Rejected on arithmetic, before building
 
-- **Widening Qwen3.8-27B's bf16 tensors on the host.** 53 of its 866 tensors
-  are bf16 and they are among its largest: `output.weight` alone is 2.54 GiB,
-  and every attention `attn_q`/`attn_k`/`attn_v` besides. fp32 would put
-  5.1 GiB on the card for the head alone and *double* the per-token read of
-  the model's most bandwidth-expensive tensor. Requantizing them to Q8_0
-  instead changes the model. The LM-head GEMV grew a bf16 body instead — the
-  simpler of its two, since bf16 widening is a shift and a bf16 row is dense
-  enough to need neither the staging pass nor the alignment prologue Q8_0's
-  34-byte stride forces.
-- **Holding the dense FFN in both Q8_0 and the split int8 layout.** 16.9 GiB
-  twice over across 64 layers, on a card already carrying 11.8 GiB of arena.
-  This one was not rejected on arithmetic in time — the first attempt at the
-  dense model died on `CUDA_ERROR_OUT_OF_MEMORY`, which is what the arithmetic
-  would have said. See "What the FFN residency is worth" above for what
-  choosing between them measured.
-- **TensorRT.** Not installed, and not a drop-in if it were: it consumes ONNX
-  or its network-definition API, Q6_K's two-level superblock scales are not a
-  TensorRT weight format, and Gated DeltaNet is not a builtin layer. Adopting
-  it means writing an exporter *and* plugins that reimplement the kernels this
-  project already has.
-- **vLLM's Marlin MoE.** It ships a real fused sm_75 tensor-core kernel, and it
-  accepts only int4/int8 weights with fp16/int8 activations. Q6_K is not one of
-  those formats. Port vLLM's *indexing strategy* onto llama.cpp's *primitives*.
-- **Shared-memory double-buffering in the MoE MMA kernels.** The footprint is
-  21,760 B and `__launch_bounds__` already asks for three resident blocks —
-  `3 × 21,760 = 65,280` of 65,536, with 256 B of slack. Any double buffer
-  admits one block per SM. That is the same trade the register prefetch lost,
-  3× worse.
-- **Split-K in the LM head.** Split-K manufactures parallelism when the output
-  dimension cannot fill the machine. The LM head is the opposite: 248,320 warps
-  against 2,304 resident, a 107× surplus. Splitting K adds a launch, a
-  `vocab × K` partial buffer and a split-dependent summation order for no
-  occupancy gain. Asserted in a unit test so it fails loudly if the vocabulary
-  ever shrinks.
-- **`mma.m16n8k16`.** NVRTC accepts it at `compute_75` and emits PTX; `ptxas`
-  then rejects it (`requires .target sm_80 or higher`). NVRTC success is not
-  proof of reachability — only PTX→SASS is. Any MMA work hand-decomposes to
-  `m16n8k8` / `m8n8k16`.
+| Idea | Number | Why not |
+| --- | --- | --- |
+| Widening Qwen3.8-27B's bf16 tensors to fp32 on the host | `output.weight` 2.54 GiB → 5.1 GiB | doubles the head's per-token read; requantizing to Q8_0 changes the model. The LM-head GEMV reads bf16 instead |
+| Dense FFN held in both Q8_0 and split int8 | 16.9 GiB twice, beside 11.8 GiB of arena | first attempt hit `CUDA_ERROR_OUT_OF_MEMORY`; see "What the FFN residency is worth" |
+| TensorRT | — | not installed; needs an ONNX exporter plus plugins: Q6_K superblock scales and Gated DeltaNet are not builtins |
+| vLLM's Marlin MoE | — | int4/int8 weights only, not Q6_K; port its indexing onto llama.cpp's primitives |
+| Shared-memory double-buffering in the MoE MMA kernels | `3 × 21,760 = 65,280` of 65,536 B | any double buffer admits one block per SM, the register prefetch's lost trade 3× worse |
+| Split-K in the LM head | 248,320 warps vs 2,304 resident (107×) | adds a launch, a `vocab × K` buffer and a split-dependent sum order for no occupancy gain; a unit test asserts it |
+| `mma.m16n8k16` | — | NVRTC emits PTX at `compute_75`, `ptxas` rejects it (sm_80+); hand-decompose to `m16n8k8` / `m8n8k16` |
 
 ## Diagnoses that were right about the fact and wrong about the cost
 
-Recorded because the *reasoning* is what misleads, not the number.
-
-- **"The fleet-wide step barrier costs a neighbouring session almost
-  nothing."** The probe reported **1.3x** and it was believed long enough to
-  nearly abandon the fix. It had taken the *median* inter-token latency, which
-  is 12.1 ms whether the other cards are busy or idle, because the barrier
-  does not slow tokens down — it freezes them, 21 times out of 199, for the
-  length of somebody else's prefill chunk. The mean was **12.1x**. Summary
-  statistics choose which failures they can see: report the mean and the tail
-  for anything whose cost arrives in stalls.
-- **"The MoE dispatch kernel is single-block."** True, and worth **0.12%** of
-  runtime. Parallelized anyway because it was cheap.
-- **"The LM head computes logits for all positions."** It never did; it already
-  mirrors `get_rows(cur, inp_out_ids)` and runs on one row.
-- **"Per-element dequant re-reads the superblock header."** True, and bounded
-  small — the Q6_K kernel, whose unpack is far more expensive, is the *more*
-  efficient of the two per FLOP. Hand-hoisting it produced **byte-identical
-  SASS**: `ptxas` was already doing it.
-- **"Decode attention is bandwidth-bound."** Seven hypotheses were tested
-  against that assumption before it was checked. A calibration ladder — the
-  identical grid and loads with nothing else — reaches **90% of streaming
-  roofline**, and adding the dot product costs 3 points. The cost is the
-  softmax machinery, not the access pattern.
-- **"Sector amplification is costing 4×."** The diagnosis was real and `SASS`
-  proved it; the recovery was **1.08×**, because L1 was absorbing nearly all
-  the redundant sector requests.
-- **Any experiment that perturbs numerics also perturbs expert routing**, and
-  therefore weight traffic. Halving an inner loop made a pass 12% faster and
-  stripping scale multiplies made it 10% slower — neither measured anything.
-  The valid ablation runs the staging loop *twice*, writing the same bytes to
-  the same addresses, so the output is bit-identical and routing cannot move.
-- **A negative result taken during an unrelated regression is not a
-  measurement.** One change was recorded as a 57% regression while a decode bug
-  was live; against a clean baseline it is a small improvement.
-- **Two agents agreeing on a mechanism is the same guess twice.** A −5%
-  regression was correctly localized to a force-inlined runtime dispatch
-  ladder, and both agents then independently reasoned that hiding the extra
-  arms behind `__noinline__` would contain it. It made things worse —
-  `moe_expert_ffn` 80 → 124 registers — because the ABI boundary spills what
-  the inlining had kept live. The diagnosis was measured and right; the fix
-  was reasoned and wrong, and it was written into a commit message as *the*
-  fix before being compiled once. Concurrence is not corroboration when both
-  parties are reasoning from the same model.
-- **"The sweep is non-monotonic, so there is nothing there" — right answer,
-  and the reasoning was still wrong.** Two agents read the router expert
-  tile's sweep that way. Non-monotonicity across single runs is the signature
-  of a method that cannot resolve the effect, not of an absent effect, and
-  inferring absence from a measurement that could not have detected presence
-  is an error whatever the subject — so three interleaved pairs were run, the
-  tile won all three at +1.31%, and that was written up as the sweep having
-  understated it threefold. It had not. Re-measured against a baseline built
-  from the pinned commit, the same change reads ±0.2% with the sign flipping
-  inside the set. **Both readings were unresolved, and the confident one was
-  the more expensive mistake**: an absent effect confidently rejected costs
-  an opportunity, an absent effect confidently *measured* costs the standing
-  and everything reasoned from it afterwards. Ask what the method's
-  resolution is before reading either shape — on this host one run per point
-  resolves nothing below about 1.5%, and one three-pair set against a box
-  drifting 0.8% in ten minutes resolves less than it appears to.
+- **"The step barrier costs a neighbouring session almost nothing."** The
+  median said **1.3x**, the mean **12.1x**: the barrier freezes tokens (21 of
+  199) rather than slowing them. Report mean and tail for costs that arrive in
+  stalls.
+- **"The MoE dispatch kernel is single-block."** True; **0.12%** of runtime.
+- **"The LM head computes logits for all positions."** False; it runs one row
+  (`get_rows(cur, inp_out_ids)`).
+- **"Per-element dequant re-reads the superblock header."** True; hoisting it gave
+  **byte-identical SASS**; `ptxas` already did it.
+- **"Decode attention is bandwidth-bound."** A calibration ladder with the
+  identical grid and loads reaches **90% of streaming roofline**; the cost is
+  the softmax.
+- **"Sector amplification is costing 4×."** Real in SASS; recovery was
+  **1.08×** because L1 absorbed it.
+- **Ablations that perturb numerics move expert routing.** Halving an inner
+  loop (12% faster) and stripping scale multiplies (10% slower) measured
+  nothing; the valid ablation runs the staging loop twice, bit-identical.
+- **A result taken during an unrelated regression is not a measurement.** A
+  57% "regression" under a live decode bug is a small improvement against a
+  clean baseline.
+- **Two agents agreeing is one guess twice.** The reasoned `__noinline__` fix
+  for a −5% dispatch-ladder regression made it worse: `moe_expert_ffn` 80 → 124
+  registers.
+- **"The sweep is non-monotonic, so there is nothing there."** Right answer,
+  wrong reasoning: non-monotonic single runs mean the method cannot resolve
+  the effect. A later +1.31% (three of three pairs) read ±0.2% against a
+  baseline built from the pinned commit. One run per point resolves nothing
+  below about 1.5%; the box drifts 0.8% in ten minutes.
 - **A green test target is not a test that ran.** `forward_pass` reports
-  `ok, 8 passed` in 0.36 s when it cannot find the golden, because a skip is
-  a pass and cargo captures stdout. `.golden/` is gitignored, so **every run
-  from a `git worktree` skips it silently** unless `LLMCUDA_GOLDEN` points at
-  the main checkout's copy. Related: a `cargo test | grep` pipeline reports
-  grep's exit status, and a sweep that died at target 29 of 60 is
-  indistinguishable from one that passed. All three were live in one
-  afternoon; `docs/TESTING.md` carries the checks.
-- **`ptxas` allocates across a wider scope than the edit.** Adding a branch to
-  one device function moved an unrelated `__global__` function's register count
-  from 80 to 126, and removing a branch from two near-identical sibling kernels
-  moved their allocations in opposite directions. Register math is a proxy;
-  `cuobjdump -sass` diffing every kernel against its stated blast radius is the
-  check.
-- **"It was verified" — at the widths it was benched at.** The router's narrow
-  expert tile was swept at N=3, confirmed under pairs at N=3, and checked for
-  bit-identity at N=1 and N=3. It shipped sizing a launch for one
-  instantiation's dynamic shared memory and dispatching another's kernel at
-  exactly `max_tokens == 2`. Two rules derived the tile widths; they agreed at
-  every width anyone had reason to look at and disagreed at the one no
-  benchmark produces. Nothing asked which widths **exist** — speculative
-  decode drives the scheduler at width 2 and no bench does. A gate scoped by
-  *what the change is* only ever confirms what is already believed; scope it
-  by the entry points the edit lands in and the shapes the scheduler puts
-  through them. The same afternoon and the same mistake in the other
-  direction: an edit's *shape* was verified and not its *location*, and a
-  `replace_all` put a decode-only fork into the uncaptured prefill path as
-  well. The tile was then re-measured against a clean baseline and had no win
-  to defend; the fork has not been re-measured and its number stands only as
-  history. **The correctness fault is what sent anyone back to the
-  measurement at all** — without it both would have kept their figures.
+  `ok, 8 passed` in 0.36 s without the golden, and **every run from a
+  `git worktree` skips it silently** unless `LLMCUDA_GOLDEN` is set.
+  `cargo test | grep` reports grep's exit status. Checks: `docs/TESTING.md`.
+- **`ptxas` allocates beyond the edit.** One added branch moved an unrelated
+  `__global__` function 80 → 126 registers; diff `cuobjdump -sass` for every
+  kernel.
+- **"It was verified" — at the widths it was benched at.** The narrow expert
+  tile, checked at N=1 and N=3, mis-sized its launch at `max_tokens == 2`, a
+  width only speculative decode produces; a `replace_all` also put a
+  decode-only fork into the prefill path. Gate by entry points and scheduler
+  shapes, not by what the change is. Re-measured cleanly, the tile had no win.
 
 ---
 
 # Ceilings that are closed by design
 
-These are not open work items. Each is a trade the project made on purpose,
-verified, and would have to be *un*-made to reopen.
+Deliberate, verified trades; reopening one means un-making it.
 
-**Deep decode, against llama.cpp's own kernel.** llama.cpp decodes through its
-tensor-core prefill kernel at this geometry (head_dim 256, GQA 8, Turing) — it
-never runs a scalar per-key softmax loop at batch 1 here. Its edge over this
-engine decomposes into three things this engine forbids:
+- **Deep decode, against llama.cpp's own kernel.** At head_dim 256, GQA 8 on
+  Turing, llama.cpp decodes through its tensor-core prefill kernel. Its edge is
+  three things this engine forbids:
+  1. **A single fp16 rounding of `Q`** (2× key rate): broke the 1e-5 gate at
+     `n_keys = 61`, hence the `q_hi`/`q_lo` split.
+  2. **fp16 `VKQ` accumulation**: within 0.4% on throughput, but `half2`
+     packing is what fits its barrier-free per-warp design in Turing's
+     registers; with fp32 accumulators, measured shut from four directions.
+  3. **`mmvq`/dp4a activation quantization**: rejected on the serving
+     contract.
+- **Aggregate concurrency.** 131.7 MB/token of GDN recurrent and conv state
+  **never amortizes at any batch width**; llama.cpp pays it too and holds flat
+  at ~41% of the concurrency-aware roofline from one sequence to three. Only
+  routed experts batch, and N=3 touches `D(3) = 23.26` distinct experts
+  against one sequence's 8.00.
 
-1. A **single fp16 rounding of `Q`**, which issues keys at 2× this kernel's
-   rate. Forbidden: that exact rounding broke the 1e-5 gate at `n_keys = 61`,
-   which is why the `q_hi`/`q_lo` split exists.
-2. **fp16 `VKQ` accumulation**, which is not a throughput lever (measured
-   within 0.4%) but a *capacity* one — a `half2` accumulator packs two values
-   per register, which is what makes its barrier-free per-warp design fit
-   Turing's register file. With fp32 accumulators, every route to that
-   structure costs registers or shared-memory occupancy this card cannot fund
-   at once, measured shut from four directions.
-3. **`mmvq`/dp4a activation quantization**, rejected above on the serving
-   contract rather than on accuracy in isolation.
-
-**Aggregate concurrency.** The per-sequence state term — 131.7 MB/token of GDN
-recurrent and conv state — **never amortizes at any batch width**, because
-there is nothing to share. llama.cpp pays it identically, which is why its own
-efficiency holds flat at ~41% of the concurrency-aware roofline from one
-sequence to three rather than climbing. The batching win either engine can
-capture is the routed-expert term's, and at N=3 that term is on the steep part
-of its own curve: three sequences touch `D(3) = 23.26` distinct experts against
-one sequence's 8.00, so amortization is partial by construction, not by defect.
-
-The named workstreams that would legally reopen (1) and (3) are recorded in
-[OPTIMIZATION.md](OPTIMIZATION.md), not here.
+Workstreams that would reopen (1) and (3): [OPTIMIZATION.md](OPTIMIZATION.md).
 
 ---
 
@@ -2482,9 +1287,7 @@ CUDA_VISIBLE_DEVICES=1 llama-batched-bench \
   -c 131072 -npp 32768 -ntg 32 -npl 3
 ```
 
-The dense (`qwen35`) rows use the same harnesses, which take the model by
-environment variable — nothing else about them changes for a second
-architecture:
+Dense (`qwen35`) rows, model set by environment variable:
 
 ```sh
 M=Qwen3.8-27B-UD-Q8_K_XL.gguf
@@ -2533,19 +1336,14 @@ LLMCUDA_PROFILE_TIMED=1 LLMCUDA_SKIP_SINGLE_STREAM=1 LLMCUDA_BATCH_N=3 \
 nsys export --type sqlite -o d.sqlite d.nsys-rep
 ```
 
-`LLMCUDA_PROFILE_TIMED` excludes loading, prefill setup, and discarded
-decode warmups from capture. `bench_forward` accepts the same switch and
-captures each timed prefill chunk separately; repeated ranges produce
-numbered reports. Export and sum their kernel intervals individually.
-Capture start/stop can take seconds on this host, so profiled rates are
-not throughput results. Bounded captures also avoid the event-order import
-failure observed when tracing long context setup. The current engine
-baseline and detailed attribution are in
-[OPTIMIZATION_CAMPAIGN.md](OPTIMIZATION_CAMPAIGN.md).
+`LLMCUDA_PROFILE_TIMED` captures only the timed region; `bench_forward` writes
+each timed prefill chunk as a numbered report, so export and sum each. Capture
+start/stop takes seconds, so profiled rates are not throughput results;
+bounded captures also avoid an event-order import failure on long context
+setup. Attribution: [OPTIMIZATION_CAMPAIGN.md](OPTIMIZATION_CAMPAIGN.md).
 
-The requantized files, and the two the engine cannot read. These are
-generated artifacts rather than anything shipped, so a checkout will not have
-them until this is run:
+Requantized files (generated, not shipped; the engine cannot read the last
+two, see [MODEL.md](MODEL.md#which-formats-the-engine-actually-reads)):
 
 ```sh
 llama-quantize --allow-requantize "$M" Qwen3.8-27B-req-q8_0.gguf  q8_0   12
@@ -2553,20 +1351,11 @@ llama-quantize --allow-requantize "$M" Qwen3.8-27B-req-q6_k.gguf  q6_k   12
 llama-quantize --allow-requantize "$M" Qwen3.8-27B-req-q4_k_m.gguf q4_k_m 12
 ```
 
-*Why* the last two cannot be read — and which formats each kernel family has
-a reader for at all — is
-[MODEL.md](MODEL.md#which-formats-the-engine-actually-reads). It is not an
-oversight: a k-quant projection has no path to the integer tensor cores, so
-reading one would cost the prefill advantage it was quantized to preserve.
+Interleave the files within each repetition; the card drifts. For the
+greedy-agreement table use `llama-completion ... -no-cnv < /dev/null`; build
+10456's `llama-cli` ignores `-no-cnv` and applies the chat template.
 
-Interleave the *files* within each repetition, not the repetitions within each
-file — this table compares models, and the card drifts.
-
-For the greedy-agreement table, `llama-completion ... -no-cnv < /dev/null` —
-`llama-cli -no-cnv` is not honoured in build 10456 and enters conversation
-mode, which applies the chat template and makes the two sides incomparable.
-
-The serving tables come from a running server rather than a kernel harness:
+Serving tables come from a running server:
 
 ```sh
 CUDA_VISIBLE_DEVICES=0 ./target/release/llmcuda \
@@ -2575,74 +1364,41 @@ python3 tools/serving/bench_server.py http://127.0.0.1:8000 out.json \
   '{"depths":[2800,5500,11000,22000],"sessions":[1,2,3],"trials":3,"max_tokens":48}'
 ```
 
-`depths` are word counts, not tokens — the harness measures each prompt's real
-length through `usage.prompt_tokens` and reports against that. Drop
-`CUDA_VISIBLE_DEVICES` for the three-card fleet and raise `sessions` to 9.
-`--prefill-slice 0` restores whole-step prefill, which is how the sharing A/B
-was run.
+`depths` are words; results are reported against `usage.prompt_tokens`. For
+the three-card fleet drop `CUDA_VISIBLE_DEVICES` and set `sessions` to 9.
+`--prefill-slice 0` restores whole-step prefill (the sharing A/B).
 
-Narrow harnesses, for anything smaller than a whole-pass change:
-`bench_attention` (`LLMCUDA_ATTN_CHUNK=1` for decode shape), `bench_moe`,
-`bench_moe_mma`, `bench_mma`, `bench_decode`, `bench_worker_decode`,
-`profile_forward`, and `audit_batch_divergence` for per-layer
-batch-vs-single-stream divergence.
+Narrow harnesses: `bench_attention` (`LLMCUDA_ATTN_CHUNK=1` for decode shape),
+`bench_moe`, `bench_moe_mma`, `bench_mma`, `bench_decode`,
+`bench_worker_decode`, `profile_forward`, `audit_batch_divergence` (per-layer
+batch-vs-single-stream).
 
 ## Not measured
 
-- Any hardware counter. Every efficiency figure here is necessary-work ÷
-  measured-time, which understates real traffic and therefore understates how
-  far off peak a kernel is.
-- Multi-GPU aggregate under real routed traffic. The three-card figures are
-  one session per card, not three sessions per card.
-- Output *quality* over long runs under any of the precision trades; they were
-  verified against gates and short samples, not long-horizon generation.
-- Vision serving throughput. The tower's resident VRAM was measured
-  (1152 MiB at load, ~1320 MiB after first use, per worker — see
-  [DEVELOPMENT.md](DEVELOPMENT.md)), and text-path preservation was A/B'd
-  with vision off; encode latency and image-heavy throughput were not
-  benchmarked.
-- Sustained thermal behaviour; all runs are short.
-- The dense model anywhere except the cells in its own section: N=1 and N=3 at
-  one depth only — no depth sweep, no N>3, no server, no vision.
+- Any hardware counter: efficiency figures are necessary-work ÷ measured-time,
+  so they understate distance from peak.
+- Multi-GPU under real routed traffic; three-card figures are one session per
+  card.
+- Long-run output quality under the precision trades; only gates and short
+  samples.
+- Vision serving throughput and encode latency. Tower VRAM was measured
+  (1152 MiB at load, ~1320 MiB after first use, per worker;
+  [DEVELOPMENT.md](DEVELOPMENT.md)).
+- Sustained thermals; all runs are short.
+- The dense model beyond its section: N=1 and N=3 at one depth only.
 - **Any accuracy check on the requantized files.** The `all-Q8_0`, Q6_K and
-  Q4_K_M files were produced with `--allow-requantize` from an already-quantized
-  source and measured for speed alone. The greedy-agreement table is about the
-  shipped `UD-Q8_K_XL` file. Do not ship a requant on the strength of the
-  throughput table.
-- **Narrowing the activations, in the dense GEMV and the GDN gates alike.**
-  Both read them fp32 against int8 weights, so an activation costs four bytes
-  where the weight it multiplies costs one, and that ratio — not the weight
-  traffic — is what each kernel's remaining cost is made of.
-
-  In the dense split GEMV it is `4 * TT / RT` reads per weight byte, which is
-  why the block costs 0.51 ms at one token and 0.68 at four for *identical*
-  weight bytes, and why `RT` is worth raising until the register file stops
-  it. In the GDN gate kernel it is starker: per warp per 32-element step the
-  activations are 8 sectors against the quants' 4, so the misaligned Q8_0
-  read that the Layout section calls out is only 17% of that kernel's sector
-  budget. **Fixing the alignment there is not worth building** — it was
-  costed at 2x on the strength of the layout rule and is worth ~0.3% of the
-  step once the activation sectors are counted. This entry exists so the
-  next reader does not re-derive that the expensive way.
-
-  fp16 activations halve the ratio in both, and cost the decode path the
-  exactness the residency section credits it with — the one place this engine
-  is more accurate than llama.cpp, which quantizes activations to Q8_1 here.
-  Not built, not measured, and the trade is a decision rather than a tuning
-  question.
-- **Fusing the dense FFN's SwiGLU into the up projection and its residual add
-  into the down projection.** Both are arithmetically free — the ADD path is
-  already a template parameter the dense entry points do not instantiate — and
-  together they retire 128 launches of a 51.8 ms step, worth about 0.5%. Not
-  taken: the residual add is the only thing on that path gated on the device
-  `valid_tokens` scalar (AGENTS.md rule 5), and folding it into a GEMV that
-  writes every row of the buffer would put a plausible value on a slot the
-  pass never filled, which is exactly what `forward_pass` checks for. It is
-  recoverable by threading the scalar into the GEMV's epilogue; 0.5% did not
-  justify moving that gate.
-- **k-quants anywhere but the dense FFN loader.** Q6_K halves the decode
-  budget and llama.cpp reaches 22.13 tok/s with it on this model; the
-  embedding gather, the LM-head GEMV family and the attention projections all
-  refuse it by name. What a Q6_K *GEMV* would achieve on this card is
-  unmeasured — llama.cpp's own Q6_K row streams 463 GB/s against Q8_0's 538,
-  so the win is smaller than the byte count suggests.
+  Q4_K_M files were measured for speed alone. **Do not ship a requant on the
+  strength of the throughput table.**
+- **Narrowing the activations** (dense GEMV, GDN gates). fp32 activations
+  against int8 weights are the remaining cost: the dense split GEMV block
+  costs 0.51 ms at one token and 0.68 at four for identical weight bytes.
+  **Fixing the GDN-gate Q8_0 alignment is not worth building**: costed at 2x,
+  it is 17% of that kernel's sector budget and ~0.3% of the step. fp16 activations would
+  cost decode its exactness over llama.cpp (Q8_1 activations); not built.
+- **Fusing the dense FFN's SwiGLU and residual add into its GEMVs.** 128
+  launches of a 51.8 ms step, about 0.5%; not taken because it moves the
+  `valid_tokens` gate (AGENTS.md rule 5) that `forward_pass` checks.
+  Recoverable by threading the scalar into the GEMV epilogue.
+- **k-quants outside the dense FFN loader.** Q6_K halves the decode budget
+  (llama.cpp: 22.13 tok/s), but llama.cpp's Q6_K row streams 463 GB/s against
+  Q8_0's 538; a Q6_K GEMV here is unmeasured.

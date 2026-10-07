@@ -859,6 +859,19 @@ sub-block's high and low accumulators at the bit patterns of 1.5×2^31 and
 256h+l, the value `I2F` returns. Splitting the two conversions between the
 pipes raised Q6 prefill about 2%.
 
+Q6 tiles stage the next window while multiplying the current one. Ablating
+the dense Q6 kernel at 2,048 tokens showed no single pipe binding it:
+dropping the FP32 epilogue saved 16%, dropping the epilogue and the MMAs
+together saved no more, and dropping both window barriers (racy; timing
+only) saved 15%. The window's phases ran one after another, and with eight
+warps per SM nothing overlapped them. Weight fragments and scales now reach
+registers before the window's first barrier, which frees the weight buffer,
+and activations alternate between two buffers (58,752 bytes of opted-in
+shared memory). Token warp 0 unpacks the next window's codes before its
+products and token warp 1 after them, so each scheduler pairs a warp on the
+integer unpack with one on the tensor and FP32 pipes, still at two barriers
+per window. Q4's lighter staging loses with the same arrangement (WHY NOT).
+
 Q4's affine minimum multiplies the original activation sum, retaining the
 warp's summation tree. Q6 combines its two sixteen-value subscale dots before
 applying the common activation scale. Both paths add four 32-value terms as
@@ -1978,6 +1991,7 @@ proposed twice.
 | No subtile skip in dense K2 tensor-core tiles | Dense tiles computed every 8-token subtile, padded tail included, so the four subtiles need no per-subtile branch. Same rounds: Q6 **1947.31/1938.97** and **2220.03/2212.80 tok/s** against the skipping kernel's numbers above; Q4 flat (**2500.02/2501.65** and **2769.18/2767.32** against **2508.76/2487.25** and **2766.21/2751.43**). Rejected. |
 | 64-row K2 tensor-core tiles, two blocks per SM | Half the row tile under a two-block launch bound, so a second resident block covers the first one's barriers. Full model on GPU 0, two alternating rounds: Q6 **1658.29/1657.12 tok/s** at 512 tokens and **1893.67/1888.49** at 2,048, against **1994.39/1986.69** and **2276.96/2269.38** for 128 rows at one block; Q4 **2098.68/2092.06** and **2318.56/2316.96** against **2557.57/2563.93** and **2834.84/2829.07**. Every block stages the same 64-token activation window for half as many weight rows, which doubles staging per MMA; the second block does not hide it. Rejected. |
 | Magic conversion in only some K2 Q6 scale groups | The second sub-block of each Q6 term converts through the FP32 pipe in two (or one) of a window's four scale groups and through `I2F` in the rest, to balance the two pipes differently. Full model on GPU 0, two alternating rounds: two groups **2003.09/1997.90 tok/s** at 512 tokens and **2301.05/2297.58** at 2,048; one group **1980.11/1979.35** and **2279.68/2278.83**; all four (the shipped kernel) **2000.75/1981.36** and **2282.43/2266.92** in the same rounds. Two groups sits inside the four-group kernel's own spread; one group loses. The uniform loop stays. |
+| De-phased staging in K2 Q4 tensor-core tiles | Q6's arrangement applied to Q4: weight fragments to registers before the first barrier, double-buffered activations (50,000 bytes of opted-in shared memory), token warp 0 staging the next window before its products and token warp 1 after them. Full model on GPU 0, two alternating rounds: **2590.61/2572.80 tok/s** at 512 tokens and **2872.95/2867.13** at 2,048, against **2661.70/2656.46** and **2942.16/2945.18** single-buffered. Q4's nibble staging is too light to repay the arrangement; Q4 keeps the single-buffered loop. |
 | Q4 sixteen-bit dots using exact half digits | A 64-row/64-token HMMA prototype stages raw Q4 codes and the existing high/low activation bytes as half operands, preserving sixteen-bit codes. At 512 tokens on GPU 0, query calibration takes **1.109–1.208 ms** and routed values **1.955–2.014 ms**, against integer-path calibration **0.620–0.647 / 0.898–0.913 ms**. Two half products avoid integer digit reconstruction but move more shared-memory data and use lower-throughput tensor instructions. Rejected on timing before numerical and model gates; no precision or production-path change. |
 | Interleaved high/low activation words in K2 GEMV | GPU 0 resident Q4 calibration, N=3: explicit `ld.global.v2.u32` loads take **63.3–63.4 us** for the query and **72.3–72.7 us** for routed values. The separate-byte-plane control calibrates at **42.9–43.8 / 53.9–54.5 us**. Packing the two parts reduces load instruction count but doubles the address stride seen by neighbouring scale groups, and adds packing work. Rejected at the narrow calibration; no numerical or model-level claim. |
 | K2 Q6 prefill row tile 128 | GPU 0 resident-tensor calibration at 512 tokens, sixteen-bit activations: the 128-row tile takes **0.997–1.083 ms** for query and **1.458–1.545 ms** for routed values, versus the 64-row control calibration **0.860–0.935 / 1.096–1.130 ms**. The wider tile uses **39,168 shared bytes and 177 registers**, limiting it to one block per SM; relaxing the launch bound does not recover the loss. Rejected before numerical and full-model gates. |

@@ -768,17 +768,27 @@ __device__ __forceinline__ void k2_mma_s8(int* d,unsigned a,unsigned b){asm vola
 // The next 128-value window is loaded into registers while this one is
 // computed. Group terms, (t0+t2)+(t1+t3) windows and the ascending window sum
 // are the fp32 operations of raw_gemm_q4_nibbles and raw_gemm_reuse.
+// Shared memory of one sixteen-bit tile. Q6 double-buffers its activations
+// so half of the warps can stage the next window while the other half still
+// reads the current one.
+template<int Q,int BR> struct K2MmqSmem {
+    unsigned sa[4][BR*(Q==3 ? 4 : 8)+(Q==3 ? 4 : 8)];
+    float2 sw[4][BR];
+    float sd[Q==0 ? BR : 1];
+    uint4 sb[Q==0 ? 2 : 1][4][64*4+4];
+    float4 sm[Q==0 ? 2 : 1][4][32];
+    int flats[64];
+};
+static_assert(sizeof(K2MmqSmem<0,128>)==58752,"Q6 tile shared bytes");
+static_assert(sizeof(K2MmqSmem<3,128>)==31312,"Q4 tile shared bytes");
 template<int Q,int BR,bool ROUTED>
 __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,const uint4* __restrict__ mq,const float2* __restrict__ mm,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned char* __restrict__ w1,float* __restrict__ out1,int rows1,int rb1,const unsigned char* __restrict__ w2,float* __restrict__ out2,int rows2,int rb2) {
     constexpr int BT=64,AW=Q==3 ? 4 : 8,WRS=BR/32,TFS=4,REC=(Q==3 ? 160 : 224)*4;
     constexpr int WT=BR/64>0 ? BR/64 : 1;           // weight tasks per thread (Q4 code chunks: 4*BR)
     // Group pitches are padded so the staging stores spread over all banks.
-    __shared__ __align__(16) unsigned sa[4][BR*AW+AW];
-    __shared__ float2 sw[4][BR];
-    __shared__ float sd[Q==0 ? BR : 1];
-    __shared__ uint4 sb[4][BT*4+4];
-    __shared__ float4 sm[4][BT/2];
-    __shared__ int flats[BT];
+    extern __shared__ uint4 k2_mmq_smem[];
+    K2MmqSmem<Q,BR>& S=*reinterpret_cast<K2MmqSmem<Q,BR>*>(k2_mmq_smem);
+    auto& sa=S.sa;auto& sw=S.sw;auto& sd=S.sd;auto& flats=S.flats;
     int tid=threadIdx.x,lane=tid&31,warp=tid>>5,wr=warp&3,wt=warp>>2;
     int expert=ROUTED ? owners[blockIdx.y] : 0;
     if(expert<0)return;
@@ -827,7 +837,7 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
         for(int i=0;i<4;++i)pb[i]=mq[bo[i]+(j>>3)];
         pm=mm[mo+(j>>5)];
     };
-    auto store=[&](int j) {
+    auto store=[&](int j,int nb) {
         if(Q==3) {
             #pragma unroll
             for(int i=0;i<WT;++i) {
@@ -865,20 +875,17 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
             }
         }
         #pragma unroll
-        for(int i=0;i<4;++i){int task=tid+256*i;sb[(task>>2)&3][(task>>4)*4+(task&3)]=pb[i];}
-        {int t=tid>>2,g=tid&3;float* m=(float*)&sm[g][t>>1];m[t&1]=pm.x;m[2+(t&1)]=pm.y;}
+        for(int i=0;i<4;++i){int task=tid+256*i;S.sb[nb][(task>>2)&3][(task>>4)*4+(task&3)]=pb[i];}
+        {int t=tid>>2,g=tid&3;float* m=(float*)&S.sm[nb][g][t>>1];m[t&1]=pm.x;m[2+(t&1)]=pm.y;}
     };
     float acc[WRS][TFS][2];
     #pragma unroll
     for(int a=0;a<WRS;++a)
         #pragma unroll
         for(int b=0;b<TFS;++b)acc[a][b][0]=acc[a][b][1]=0;
-    load(0);
-    for(int j=0;j<inner;j+=128) {
-        store(j);
-        __syncthreads();
-        if(j+128<inner)load(j+128);
-        unsigned a0[WRS][4],a1[WRS][4];float sc0[WRS][4],sc1[WRS][4],dl[WRS];
+    unsigned a0[WRS][4],a1[WRS][4];float sc0[WRS][4],sc1[WRS][4],dl[WRS];
+    // One window's weight fragments and scales into registers.
+    auto weights=[&]() {
         #pragma unroll
         for(int rs=0;rs<WRS;++rs) {
             int row=wr*(BR/4)+rs*8+(lane>>2);
@@ -890,13 +897,15 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
                 float2 s2=sw[g][row];sc0[rs][g]=s2.x;sc1[rs][g]=s2.y;
             }
         }
+    };
+    auto products=[&](int cb) {
         #pragma unroll
         for(int ts=0;ts<TFS;++ts) {
             int tb=wt*32+ts*8;
             if(flats[tb]>=pairs)continue;
             uint4 b[4];float4 m[4];
             #pragma unroll
-            for(int g=0;g<4;++g){b[g]=sb[g][(tb+(lane>>2))*4+(lane&3)];m[g]=sm[g][(tb>>1)+(lane&3)];}
+            for(int g=0;g<4;++g){b[g]=S.sb[cb][g][(tb+(lane>>2))*4+(lane&3)];m[g]=S.sm[cb][g][(tb>>1)+(lane&3)];}
             #pragma unroll
             for(int rs=0;rs<WRS;++rs) {
                 float p[2][2];
@@ -927,7 +936,33 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
                 acc[rs][ts][0]+=p[0][0]+p[1][0];acc[rs][ts][1]+=p[0][1]+p[1][1];
             }
         }
+    };
+    load(0);
+    if(Q==0) {
+        // Token warp 0 stages the next window before its products and token
+        // warp 1 after them, so each scheduler pairs a warp unpacking Q6 codes
+        // with one multiplying. Weights reach registers before the first
+        // barrier, and activations alternate between two buffers.
+        store(0,0);
         __syncthreads();
+        if(128<inner)load(128);
+        for(int j=0,cb=0;j<inner;j+=128,cb^=1) {
+            weights();
+            __syncthreads();
+            if(wt==0 && j+128<inner){store(j+128,cb^1);if(j+256<inner)load(j+256);}
+            products(cb);
+            if(wt==1 && j+128<inner){store(j+128,cb^1);if(j+256<inner)load(j+256);}
+            __syncthreads();
+        }
+    } else {
+        for(int j=0;j<inner;j+=128) {
+            store(j,0);
+            __syncthreads();
+            if(j+128<inner)load(j+128);
+            weights();
+            products(0);
+            __syncthreads();
+        }
     }
     #pragma unroll
     for(int rs=0;rs<WRS;++rs) {
@@ -1192,12 +1227,12 @@ impl K2Gemm {
             quantize: module.load_function("k2_quantize")?,
             quantize16: module.load_function("k2_quantize16")?,
             mmq16: [
-                module.load_function("k2_mmq16_q4")?,
-                module.load_function("k2_mmq16_q6")?,
+                mmq16_function(&module, "k2_mmq16_q4", ExpertQuant::Q4K)?,
+                mmq16_function(&module, "k2_mmq16_q6", ExpertQuant::Q6K)?,
             ],
             mmq16_dense: [
-                module.load_function("k2_mmq16_dense_q4")?,
-                module.load_function("k2_mmq16_dense_q6")?,
+                mmq16_function(&module, "k2_mmq16_dense_q4", ExpertQuant::Q4K)?,
+                mmq16_function(&module, "k2_mmq16_dense_q6", ExpertQuant::Q6K)?,
             ],
             // Sixteen-bit prefill reads only fragment-ordered activations;
             // decode and the 8/12-bit experiments read the separate planes.
@@ -1770,11 +1805,32 @@ impl K2Gemm {
             b.launch(LaunchConfig {
                 grid_dim: (blocks, batches as u32, 1),
                 block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
+                shared_mem_bytes: mmq16_shared_bytes(quant),
             })?;
         }
         Ok(())
     }
+}
+/// `sizeof(K2MmqSmem<Q,128>)`, which the CUDA source asserts.
+fn mmq16_shared_bytes(quant: ExpertQuant) -> u32 {
+    if quant == ExpertQuant::Q6K {
+        58752
+    } else {
+        31312
+    }
+}
+/// A sixteen-bit tile entry with its shared memory above the 48 KiB default.
+fn mmq16_function(
+    module: &Arc<cudarc::driver::CudaModule>,
+    name: &str,
+    quant: ExpertQuant,
+) -> Result<CudaFunction, MoeError> {
+    let f = module.load_function(name)?;
+    f.set_attribute(
+        cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        mmq16_shared_bytes(quant) as i32,
+    )?;
+    Ok(f)
 }
 fn gcd(a: u32, b: u32) -> u32 {
     if b == 0 { a } else { gcd(b, a % b) }

@@ -29,13 +29,10 @@ paths, and the llama.cpp baseline.
 
 ## Where to start
 
-The crate map is in [AGENTS.md](AGENTS.md#crate-map), and the milestone table
-is in [README.md](README.md#milestones). Work is roughly ordered by that table.
-
-The highest-value work available right now is Gated DeltaNet on the GPU
-(milestone 01). It covers 30 of 40 layers, it is the project's critical path,
-and there is a CPU reference plus a differential harness already waiting for it
-in `llmcuda-kernels`.
+The crate map is in [AGENTS.md](AGENTS.md#crate-map) and the milestone table
+in [docs/MILESTONES.md](docs/MILESTONES.md); milestones 00–08 are done. Open
+performance work is ranked in [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md),
+against the standing in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Design rules that are not up for negotiation
 

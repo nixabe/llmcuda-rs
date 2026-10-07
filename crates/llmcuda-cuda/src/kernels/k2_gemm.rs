@@ -769,7 +769,7 @@ __device__ __forceinline__ void k2_mma_s8(int* d,unsigned a,unsigned b){asm vola
 // computed. Group terms, (t0+t2)+(t1+t3) windows and the ascending window sum
 // are the fp32 operations of raw_gemm_q4_nibbles and raw_gemm_reuse.
 template<int Q,int BR,bool ROUTED>
-__device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,const uint4* __restrict__ mq,const float2* __restrict__ mm,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode) {
+__device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,const uint4* __restrict__ mq,const float2* __restrict__ mm,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned char* __restrict__ w1,float* __restrict__ out1,int rows1,int rb1,const unsigned char* __restrict__ w2,float* __restrict__ out2,int rows2,int rb2) {
     constexpr int BT=64,AW=Q==3 ? 4 : 8,WRS=BR/32,TFS=4,REC=(Q==3 ? 160 : 224)*4;
     constexpr int WT=BR/64>0 ? BR/64 : 1;           // weight tasks per thread (Q4 code chunks: 4*BR)
     // Group pitches are padded so the staging stores spread over all banks.
@@ -782,7 +782,11 @@ __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,con
     int tid=threadIdx.x,lane=tid&31,warp=tid>>5,wr=warp&3,wt=warp>>2;
     int expert=ROUTED ? owners[blockIdx.y] : 0;
     if(expert<0)return;
-    int rq0=blockIdx.x*(BR/4),quads=(rows+3)>>2,groups=inner>>5,records=inner>>8;
+    // A dense launch may cover up to three matrices of the same input, so
+    // their tails share waves: row blocks from rb1 and rb2 take the others.
+    int bx=blockIdx.x;
+    if(!ROUTED){if(bx>=rb2){bx-=rb2;w=w2;out=out2;rows=rows2;}else if(bx>=rb1){bx-=rb1;w=w1;out=out1;rows=rows1;}}
+    int rq0=bx*(BR/4),quads=(rows+3)>>2,groups=inner>>5,records=inner>>8;
     if(tid<BT)flats[tid]=ROUTED ? sorted[blockIdx.y*BT+tid] : blockIdx.y*BT+tid;
     __syncthreads();
     if(flats[0]>=pairs)return;
@@ -947,7 +951,7 @@ GEMV_ENTRY(k2_gemv_q4,3,1,true)
 GEMV_ENTRY(k2_gemv_dense_q4,3,K2_DENSE_TOKENS,false)
 GEMV_ENTRY(k2_gemv_q6,0,1,true)
 GEMV_ENTRY(k2_gemv_dense_q6,0,K2_DENSE_TOKENS,false)
-#define MMQ16_ENTRY(NAME,Q,BR,ROUTED) __global__ __launch_bounds__(256,1) void NAME(const unsigned char* __restrict__ w,const uint4* __restrict__ mq,const float2* __restrict__ mm,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode) {k2_mmq16<Q,BR,ROUTED>(w,mq,mm,sorted,owners,out,inner,rows,pairs,topk,mode);}
+#define MMQ16_ENTRY(NAME,Q,BR,ROUTED) __global__ __launch_bounds__(256,1) void NAME(const unsigned char* __restrict__ w,const uint4* __restrict__ mq,const float2* __restrict__ mm,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned char* __restrict__ w1,float* __restrict__ out1,int rows1,int rb1,const unsigned char* __restrict__ w2,float* __restrict__ out2,int rows2,int rb2) {k2_mmq16<Q,BR,ROUTED>(w,mq,mm,sorted,owners,out,inner,rows,pairs,topk,mode,w1,out1,rows1,rb1,w2,out2,rows2,rb2);}
 MMQ16_ENTRY(k2_mmq16_q4,3,128,true)
 MMQ16_ENTRY(k2_mmq16_dense_q4,3,128,false)
 MMQ16_ENTRY(k2_mmq16_q6,0,128,true)
@@ -970,6 +974,15 @@ pub struct K2Prepared {
     inner: usize,
     len: usize,
     nibbles: bool,
+}
+/// One dense matrix of a [`K2Gemm::project_prepared_dense_group`].
+pub struct K2DenseTarget<'a> {
+    /// Quantized weights, `rows` by the prepared inner width.
+    pub w: &'a CudaSlice<u8>,
+    /// Token-major `[tokens, rows]` output.
+    pub out: &'a mut CudaSlice<f32>,
+    /// Output rows.
+    pub rows: usize,
 }
 static NEXT_WORKSPACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -1351,21 +1364,21 @@ impl K2Gemm {
             stream, w, quant, prepared, out, inner, rows, experts, d, flat_input,
         )
     }
-    /// Contract a previously prepared generation without requantizing.
+    /// The checks every contraction of a prepared generation makes; returns
+    /// `(topk, batches, mode)`.
     #[allow(clippy::too_many_arguments)]
-    pub fn project_prepared(
-        &mut self,
-        stream: &Arc<CudaStream>,
+    fn validate(
+        &self,
         w: &CudaSlice<u8>,
         quant: ExpertQuant,
         prepared: K2Prepared,
-        out: &mut CudaSlice<f32>,
+        out_len: usize,
         inner: usize,
         rows: usize,
         experts: usize,
         d: Option<&K2Dispatch>,
         flat_input: bool,
-    ) -> Result<(), MoeError> {
+    ) -> Result<(usize, usize, i32), MoeError> {
         if self.prepared != Some(prepared)
             || prepared.workspace != self.workspace
             || prepared.inner != inner
@@ -1411,7 +1424,35 @@ impl K2Gemm {
             self.tokens * inner * if flat_input { topk } else { 1 },
             prepared.len,
         )?;
-        check("output", self.tokens * topk * rows, out.len())?;
+        check("output", self.tokens * topk * rows, out_len)?;
+        Ok((topk, batches, mode))
+    }
+    /// Contract a previously prepared generation without requantizing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_prepared(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        w: &CudaSlice<u8>,
+        quant: ExpertQuant,
+        prepared: K2Prepared,
+        out: &mut CudaSlice<f32>,
+        inner: usize,
+        rows: usize,
+        experts: usize,
+        d: Option<&K2Dispatch>,
+        flat_input: bool,
+    ) -> Result<(), MoeError> {
+        let (topk, batches, mode) = self.validate(
+            w,
+            quant,
+            prepared,
+            out.len(),
+            inner,
+            rows,
+            experts,
+            d,
+            flat_input,
+        )?;
         let (inner, rows, pairs, topk) = (
             inner as i32,
             rows as i32,
@@ -1423,7 +1464,19 @@ impl K2Gemm {
         }
         if self.activation_bits == 16 {
             return self.mmq16(
-                stream, w, quant, out, inner, rows, pairs, topk, mode, d, batches,
+                stream,
+                quant,
+                &mut [K2DenseTarget {
+                    w,
+                    out,
+                    rows: rows as usize,
+                }],
+                inner,
+                pairs,
+                topk,
+                mode,
+                d,
+                batches,
             );
         }
         // SAFETY: fixed workspace and geometry checks cover all indices;
@@ -1583,19 +1636,69 @@ impl K2Gemm {
         }
         Ok(())
     }
+    /// [`Self::project_prepared`] of up to three dense matrices that share one
+    /// prepared input and quantization. At sixteen-bit prefill widths they
+    /// run as one grid, so no matrix ends on a partial wave of its own;
+    /// otherwise, and for more matrices, they run in turn. Outputs are
+    /// identical either way.
+    pub fn project_prepared_dense_group(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        quant: ExpertQuant,
+        prepared: K2Prepared,
+        targets: &mut [K2DenseTarget<'_>],
+        inner: usize,
+    ) -> Result<(), MoeError> {
+        if self.tokens < 8 || self.activation_bits != 16 || targets.len() > 3 {
+            for t in targets.iter_mut() {
+                self.project_prepared(
+                    stream, t.w, quant, prepared, t.out, inner, t.rows, 1, None, false,
+                )?;
+            }
+            return Ok(());
+        }
+        let mut batches = 0;
+        for t in targets.iter() {
+            (_, batches, _) = self.validate(
+                t.w,
+                quant,
+                prepared,
+                t.out.len(),
+                inner,
+                t.rows,
+                1,
+                None,
+                false,
+            )?;
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let pairs = self.tokens as i32;
+        self.mmq16(
+            stream,
+            quant,
+            targets,
+            inner as i32,
+            pairs,
+            1,
+            0,
+            None,
+            batches,
+        )
+    }
 }
 impl K2Gemm {
     /// Prefill widths at sixteen bits: 128-row by 64-token int8 tensor-core
-    /// tiles, one per dispatch run for experts.
+    /// tiles, one per dispatch run for experts. A dense launch takes up to
+    /// three matrices of the same input in one grid.
     #[allow(clippy::too_many_arguments)]
     fn mmq16(
         &self,
         stream: &Arc<CudaStream>,
-        w: &CudaSlice<u8>,
         quant: ExpertQuant,
-        out: &mut CudaSlice<f32>,
+        targets: &mut [K2DenseTarget<'_>],
         inner: i32,
-        rows: i32,
         pairs: i32,
         topk: i32,
         mode: i32,
@@ -1608,27 +1711,67 @@ impl K2Gemm {
         } else {
             &self.mmq16_dense[index]
         };
+        // Row-block starts of the second and third matrix; never reached
+        // when absent.
+        let n = targets.len();
+        let (mut rows, mut starts, mut blocks) = ([0i32; 3], [i32::MAX; 2], 0u32);
+        for (i, t) in targets.iter().take(3).enumerate() {
+            if i > 0 {
+                starts[i - 1] = blocks as i32;
+            }
+            rows[i] = t.rows as i32;
+            blocks += (t.rows as u32).div_ceil(128);
+        }
+        let ([t0, rest @ ..], true) = (targets, d.is_none() || n == 1) else {
+            return Err(MoeError::WrongElementCount {
+                which: "K2 grouped matrices",
+                expected: 1,
+                found: n,
+            });
+        };
         // SAFETY: geometry was checked by the caller; rows past `rows`, padded
-        // dispatch slots and dense tails are masked inside the kernel.
+        // dispatch slots and dense tails are masked inside the kernel. Absent
+        // matrices pass the first weights, whose blocks never select them.
         unsafe {
             let mut b = stream.launch_builder(f);
-            b.arg(w).arg(&self.mq).arg(&self.mm);
+            b.arg(t0.w).arg(&self.mq).arg(&self.mm);
             if let Some(d) = d {
                 b.arg(&d.sorted).arg(&d.owners);
             } else {
-                b.arg(w).arg(w);
+                b.arg(t0.w).arg(t0.w);
             }
-            b.arg(out)
+            b.arg(&mut *t0.out)
                 .arg(&inner)
-                .arg(&rows)
+                .arg(&rows[0])
                 .arg(&pairs)
                 .arg(&topk)
-                .arg(&mode)
-                .launch(LaunchConfig {
-                    grid_dim: ((rows as u32).div_ceil(128), batches as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+                .arg(&mode);
+            match rest {
+                [] => {
+                    b.arg(t0.w).arg(t0.w).arg(&rows[0]).arg(&starts[0]);
+                    b.arg(t0.w).arg(t0.w).arg(&rows[0]).arg(&starts[1]);
+                }
+                [t1] => {
+                    b.arg(t1.w).arg(&mut *t1.out).arg(&rows[1]).arg(&starts[0]);
+                    b.arg(t0.w).arg(t0.w).arg(&rows[0]).arg(&starts[1]);
+                }
+                [t1, t2] => {
+                    b.arg(t1.w).arg(&mut *t1.out).arg(&rows[1]).arg(&starts[0]);
+                    b.arg(t2.w).arg(&mut *t2.out).arg(&rows[2]).arg(&starts[1]);
+                }
+                _ => {
+                    return Err(MoeError::WrongElementCount {
+                        which: "K2 grouped matrices",
+                        expected: 3,
+                        found: n,
+                    });
+                }
+            }
+            b.launch(LaunchConfig {
+                grid_dim: (blocks, batches as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
         }
         Ok(())
     }

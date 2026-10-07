@@ -1041,3 +1041,82 @@ fn fused_swiglu_quantization_matches_a_separate_swiglu() {
         }
     }
 }
+
+/// Dense matrices of one prepared input launched as one grid must give each
+/// matrix the bits of its own launch, at gemv and tile widths alike.
+#[test]
+fn grouped_dense_projections_match_separate_launches() {
+    use llmcuda_cuda::kernels::k2_gemm::{K2DenseTarget, K2Gemm};
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver");
+        return;
+    }
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let inner = 512;
+    // A partial row block, several whole ones, and a partial quad.
+    let shapes = [135, 300, 66];
+    for q in [ExpertQuant::Q4K, ExpertQuant::Q6K] {
+        let packed: Vec<_> = shapes
+            .iter()
+            .enumerate()
+            .map(|(m, &rows)| {
+                let source: Vec<f32> = (0..inner * rows)
+                    .map(|i| (i as f32 * 0.071 + m as f32).sin() * 0.03)
+                    .collect();
+                let (bytes, _) = pack(q, &source);
+                let dw = stream.clone_htod(&*to_device_layout(q, &bytes)).unwrap();
+                K2Gemm::repack(&ctx, &stream, &dw, q, inner, rows, 1).unwrap()
+            })
+            .collect();
+        for tokens in [1, 11, 65, 130] {
+            let mut blas = K2Gemm::new_with_activation_bits(
+                &ctx,
+                &stream,
+                tokens,
+                1,
+                1,
+                inner * 300,
+                inner,
+                300,
+                16,
+            )
+            .unwrap();
+            let x: Vec<f32> = (0..tokens * inner)
+                .map(|i| (i as f32 * 0.37).sin() * 3.0)
+                .collect();
+            let dx = stream.clone_htod(&x).unwrap();
+            let prepared = blas
+                .prepare(&stream, &dx, inner, q == ExpertQuant::Q4K)
+                .unwrap();
+            let mut separate: Vec<_> = shapes
+                .iter()
+                .map(|&rows| stream.alloc_zeros::<f32>(tokens * rows).unwrap())
+                .collect();
+            for ((w, out), &rows) in packed.iter().zip(&mut separate).zip(&shapes) {
+                blas.project_prepared(&stream, w, q, prepared, out, inner, rows, 1, None, false)
+                    .unwrap();
+            }
+            let mut grouped: Vec<_> = shapes
+                .iter()
+                .map(|&rows| stream.alloc_zeros::<f32>(tokens * rows).unwrap())
+                .collect();
+            let mut targets: Vec<_> = packed
+                .iter()
+                .zip(&mut grouped)
+                .zip(&shapes)
+                .map(|((w, out), &rows)| K2DenseTarget { w, out, rows })
+                .collect();
+            blas.project_prepared_dense_group(&stream, q, prepared, &mut targets, inner)
+                .unwrap();
+            drop(targets);
+            for (g, s) in grouped.iter().zip(&separate) {
+                same_bits(
+                    &stream.clone_dtoh(g).unwrap(),
+                    &stream.clone_dtoh(s).unwrap(),
+                    "grouped dense projection",
+                );
+            }
+        }
+    }
+}

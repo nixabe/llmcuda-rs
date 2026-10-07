@@ -876,6 +876,10 @@ input, and one pass forms routed plus shared and then adds the residual,
 rounding each add as the separate element-wise launches did. A workspace generation prevents reuse after another input is prepared;
 Q4 consumers declare their need for packed nibble planes. Attention projections
 and gate/up pairs reuse that generation, including during graph capture.
+At prefill widths the attention query, gate and key projections then run as
+one tensor-core grid, its row blocks indexing the three matrices in turn: 72
+row blocks per token tile fill the 72 SMs, where 32, 32 and 8 had each ended
+on a partial wave of their own. Every block computes what its own launch did.
 Rotary coefficients are evaluated in double precision at layer zero, stored
 as fp32, and reused by the remaining heads and layers of that pass. The
 fixed token arena is refreshed from device positions on every graph replay;

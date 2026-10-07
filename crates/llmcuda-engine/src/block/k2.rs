@@ -9,7 +9,7 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr};
 use llmcuda_cuda::kernels::{
     attention::{AttentionKernels, AttnDecodeScratch, STEP_SLOTS},
     k2::{K2Dispatch, K2Kernels},
-    k2_gemm::{K2Gemm, K2Prepared},
+    k2_gemm::{K2DenseTarget, K2Gemm, K2Prepared},
     k2_rope::K2Rope,
     layer_ops::LayerOpsKernels,
     moe::{ExpertQuant, MoeGeometry, to_device_layout},
@@ -408,33 +408,63 @@ impl K2AttentionBlock {
                     .as_ref()
                     .is_some_and(|(p, _)| p.quant == Some(ExpertQuant::Q4K)),
         )?;
-        w.q.prefill_prepared(
-            ops,
-            stream,
-            &sc.normed,
-            &vs.ids,
-            &mut sc.query,
-            &mut vs.gemm,
-            prepared,
-        )?;
-        w.k.prefill_prepared(
-            ops,
-            stream,
-            &sc.normed,
-            &vs.ids,
-            &mut sc.key,
-            &mut vs.gemm,
-            prepared,
-        )?;
-        w.gate.prefill_prepared(
-            ops,
-            stream,
-            &sc.normed,
-            &vs.ids,
-            &mut sc.gate,
-            &mut vs.gemm,
-            prepared,
-        )?;
+        let quant = w.q.quant;
+        if let Some(q) = quant
+            && [&w.k, &w.gate].iter().all(|p| p.quant == quant)
+            && [&w.q, &w.k, &w.gate].iter().all(|p| p.experts == 1)
+        {
+            vs.gemm.project_prepared_dense_group(
+                stream,
+                q,
+                prepared,
+                &mut [
+                    K2DenseTarget {
+                        w: &w.q.bytes,
+                        out: &mut sc.query,
+                        rows: w.q.rows,
+                    },
+                    K2DenseTarget {
+                        w: &w.gate.bytes,
+                        out: &mut sc.gate,
+                        rows: w.gate.rows,
+                    },
+                    K2DenseTarget {
+                        w: &w.k.bytes,
+                        out: &mut sc.key,
+                        rows: w.k.rows,
+                    },
+                ],
+                c.hidden_size as usize,
+            )?;
+        } else {
+            w.q.prefill_prepared(
+                ops,
+                stream,
+                &sc.normed,
+                &vs.ids,
+                &mut sc.query,
+                &mut vs.gemm,
+                prepared,
+            )?;
+            w.k.prefill_prepared(
+                ops,
+                stream,
+                &sc.normed,
+                &vs.ids,
+                &mut sc.key,
+                &mut vs.gemm,
+                prepared,
+            )?;
+            w.gate.prefill_prepared(
+                ops,
+                stream,
+                &sc.normed,
+                &vs.ids,
+                &mut sc.gate,
+                &mut vs.gemm,
+                prepared,
+            )?;
+        }
         if let Some((router, bias)) = &w.router {
             router.prefill_prepared(
                 ops,

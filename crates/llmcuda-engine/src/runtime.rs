@@ -432,6 +432,22 @@ fn choose_prefill_width(
         .unwrap_or_else(|| remaining.min(to_boundary).min(max_batch).max(1))
 }
 
+/// The widest prefill pass a worker can issue, which is the width its
+/// prefill shape is built at.
+///
+/// [`choose_prefill_width`] never lets a piece straddle a retention boundary,
+/// so above the interval a configured chunk is a shape nothing runs: on
+/// K2-Horizon Q6_K the 4096-token default held 2.2 GiB of activations beside
+/// the 2048-token pass that did the work. A decision prompt keeps no
+/// snapshots and runs whole, so a decision model keeps its chunk.
+fn widest_prefill_pass(prefill_chunk: usize, retention_interval: usize, decisions: bool) -> usize {
+    if decisions || retention_interval == 0 {
+        prefill_chunk
+    } else {
+        prefill_chunk.min(retention_interval)
+    }
+}
+
 /// The prebuilt pass for a `width`-token prefill piece — over split borrows
 /// so a caller can hold other runtime fields (the MTP scratch, a sequence's
 /// draft cache) at the same time. [`DeviceRuntime::prefill_pass`] is the
@@ -779,6 +795,8 @@ impl DeviceRuntime {
         if max_batch == 0 {
             return Err(RuntimeError::ZeroBatchWidth);
         }
+        let prefill_chunk =
+            widest_prefill_pass(prefill_chunk, retention_interval, config.decision.is_some());
         let ctx = CudaContext::new(device_ordinal)?;
         let stream = ctx.new_stream()?;
         // SAFETY: this runtime owns the context's serving stream and all
@@ -2707,7 +2725,22 @@ impl DeviceRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::choose_prefill_width;
+    use super::{choose_prefill_width, widest_prefill_pass};
+
+    #[test]
+    fn no_piece_is_wider_than_the_retention_interval_so_no_shape_is_either() {
+        let tails = [4, 8, 16, 32, 64, 128, 256];
+        for position in (0..9000).step_by(97) {
+            for remaining in [1, 3, 255, 2047, 2048, 2049, 4095, 4096, 4097, 9000] {
+                let width =
+                    choose_prefill_width(position, remaining, 4096, 2048, tails.into_iter(), 3);
+                assert!(width <= 2048, "{position}+{remaining} took {width}");
+            }
+        }
+        assert_eq!(widest_prefill_pass(4096, 2048, false), 2048);
+        assert_eq!(widest_prefill_pass(1024, 2048, false), 1024);
+        assert_eq!(widest_prefill_pass(4096, 2048, true), 4096);
+    }
 
     #[test]
     fn ragged_prefill_uses_prebuilt_tail_shapes_not_token_at_a_time() {

@@ -19,7 +19,7 @@ use base64::Engine as _;
 use std::hash::{Hash, Hasher};
 
 use llmcuda_engine::image::{ImagePlacement, SequenceImage};
-use llmcuda_kernels::vision::{preprocess_bounded, smart_resize_bounded};
+use llmcuda_kernels::vision::{PreprocessedImage, preprocess_bounded, smart_resize_bounded};
 use llmcuda_model::VisionConfig;
 
 use super::error::{ApiError, Dialect};
@@ -150,6 +150,28 @@ pub(crate) fn expand_images(
     tokens: Vec<u32>,
     images: &[DecodedImage],
 ) -> Result<(Vec<u32>, Vec<SequenceImage>), ApiError> {
+    expand_images_with(vision, dialect, tokens, images, |vision, image| {
+        Ok(preprocess_bounded(
+            &vision.config,
+            &image.rgb,
+            image.width,
+            image.height,
+            vision.max_tokens,
+        ))
+    })
+}
+
+/// [`expand_images`] with the preprocessing chosen by the caller — the
+/// decision endpoint sizes images as its model's reference processor does
+/// (`llmcuda_kernels::vision::preprocess_hf`). A refusal is a 400 naming the
+/// image's index.
+pub(crate) fn expand_images_with(
+    vision: Option<&VisionServing>,
+    dialect: Dialect,
+    tokens: Vec<u32>,
+    images: &[DecodedImage],
+    preprocess: impl Fn(&VisionServing, &DecodedImage) -> Result<PreprocessedImage, String>,
+) -> Result<(Vec<u32>, Vec<SequenceImage>), ApiError> {
     if images.is_empty() {
         return Ok((tokens, Vec::new()));
     }
@@ -174,14 +196,9 @@ pub(crate) fn expand_images(
                 ),
             ));
         };
+        let preprocessed = preprocess(vision, image)
+            .map_err(|e| ApiError::bad_request(dialect, format!("image {next}: {e}")))?;
         next += 1;
-        let preprocessed = preprocess_bounded(
-            &vision.config,
-            &image.rgb,
-            image.width,
-            image.height,
-            vision.max_tokens,
-        );
         let merge = vision.config.spatial_merge;
         let placement = ImagePlacement {
             start: expanded.len(),

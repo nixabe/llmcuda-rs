@@ -17,8 +17,9 @@
 //! `images` sit between the `STATE:` prefix and the state, as
 //! `_encode_media` places them: one `<|vision_start|><|image_pad|>
 //! <|vision_end|>` per image and a newline, each pad expanded to its image's
-//! merged-patch count. Sizing is this server's — the generation path's
-//! preprocessing and `--image-max-tokens` — not the reference processor's.
+//! merged-patch count. They are sized as the reference's processor sizes
+//! them (`preprocess_hf`: its `smart_resize` and antialiased bicubic
+//! stretch), not as the generation path does, up to `--image-max-tokens`.
 //!
 //! The response body follows the same file's `systemone_answer`.
 
@@ -32,7 +33,11 @@ use llmcuda_engine::image::SequenceImage;
 
 use super::AppState;
 use super::error::{ApiError, Dialect};
-use super::vision::{DecodedImage, IMAGE_MARKER, VisionServing, decode_image_url, expand_images};
+use llmcuda_kernels::vision::preprocess_hf;
+
+use super::vision::{
+    DecodedImage, IMAGE_MARKER, VisionServing, decode_image_url, expand_images_with,
+};
 
 const DIALECT: Dialect = Dialect::OpenAi;
 
@@ -240,7 +245,21 @@ pub(crate) fn media(
     let encoding = tokenizer
         .encode(text, false)
         .map_err(|e| ApiError::internal(DIALECT, format!("tokenizer: {e}")))?;
-    let (tokens, images) = expand_images(vision, DIALECT, encoding.get_ids().to_vec(), images)?;
+    let (tokens, images) = expand_images_with(
+        vision,
+        DIALECT,
+        encoding.get_ids().to_vec(),
+        images,
+        |vision, image| {
+            preprocess_hf(
+                &vision.config,
+                &image.rgb,
+                image.width,
+                image.height,
+                vision.max_tokens,
+            )
+        },
+    )?;
     Ok((tokens.into_iter().map(|t| t as i32).collect(), images))
 }
 
@@ -572,13 +591,14 @@ mod tests {
             max_tokens: 1024,
             image_pad: id(IMAGE_PAD) as u32,
         };
-        // 96x96 -> 3x3 merged tokens; 128x64 -> 4x2.
+        // The processor's 64-token floor grows both: 96x96 -> 256x256, 8x8
+        // merged tokens; 128x64 -> 384x192, 12x6.
         let (media_ids, placed) =
             media(&tok, Some(&vision), &[gray(96, 96), gray(128, 64)]).expect("two images expand");
         let mut want = vec![id(VISION_START)];
-        want.extend([id(IMAGE_PAD); 9]);
+        want.extend([id(IMAGE_PAD); 64]);
         want.extend([id(VISION_END), id(VISION_START)]);
-        want.extend([id(IMAGE_PAD); 8]);
+        want.extend([id(IMAGE_PAD); 72]);
         want.push(id(VISION_END));
         want.extend(tokens(&tok, "\n").unwrap());
         assert_eq!(media_ids, want);
@@ -586,7 +606,11 @@ mod tests {
             .iter()
             .map(|i| (i.placement.start, i.placement.tokens()))
             .collect();
-        assert_eq!(spans, [(1, 9), (12, 8)], "placements relative to the span");
+        assert_eq!(
+            spans,
+            [(1, 64), (67, 72)],
+            "placements relative to the span"
+        );
         assert!(
             media(&tok, None, &[gray(96, 96)]).is_err(),
             "no tower, no images"

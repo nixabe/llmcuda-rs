@@ -702,4 +702,6 @@ projector rows injected and per-token M-RoPE positions, not
 `Forward::run_prefix`, which refuses both. Pieces after the last image go
 back to `run_prefix`. The head reads the image positions' hidden states as
 part of its memory; its lexical prior reads only option spans, which are
-text.
+text. The images themselves are sized by
+`llmcuda_kernels::vision::preprocess_hf`, the reference processor's resize,
+rather than the llama.cpp fit-and-pad the chat path uses.

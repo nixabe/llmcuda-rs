@@ -203,12 +203,13 @@ that scalar positions collapse to `rope::apply_rope` — the same reduction
 `llmcuda-engine`'s text path depends on.
 
 The second preprocessing path, `preprocess_hf` (the Hugging Face
-processor's), is checked against the code it ports, not against llama.cpp:
-`tests/hf_image_golden.rs` replays transformers' own `smart_resize` over
-4,980 size and bound combinations (248 of them refused for aspect ratio) and
-PyTorch's CPU uint8 antialiased bicubic over 84 resizes and 34M values, and
-requires every size and every byte to match. Corrupting the port's tie
-rounding or its weight precision fails the matching gate. Generate with
+processor's, which `/v1/systemone` uses), is checked against
+the code it ports, not against llama.cpp: `tests/hf_image_golden.rs`
+replays transformers' own `smart_resize` over 4,980 size and bound
+combinations (248 of them refused for aspect ratio) and PyTorch's CPU uint8
+antialiased bicubic over 84 resizes and 34M values, and requires every size
+and every byte to match. Corrupting the port's tie rounding or its weight
+precision fails the matching gate. Generate with
 `python tools/oracle/hf_image.py $LLMCUDA_HF_IMAGE_GOLDEN_DIR` (torch,
 numpy, transformers); the test SKIPS without the variable.
 
@@ -310,23 +311,31 @@ its processor built from `Qwen3VLProcessor` and the slow PIL
 processor). One request, four questions and eleven reported probabilities,
 over rendered invoice images whose printed status is PAID or OVERDUE, served
 from `Clef-Flash-Q8_0.gguf` with the Q8_0 mmproj. Token counts match on
-every request. Max |Δp| against the reference:
+every request at a sufficient `--image-max-tokens`. Max |Δp| against the
+reference:
 
 | Images | max \|Δp\| | Same choices |
 | --- | --- | --- |
 | none (the backbone's own gap) | 0.012 | yes |
-| one, 512×384: identical pixels | 0.001, 0.005 | yes |
+| one, 512×384: no resize on either side | 0.001, 0.005 | yes |
 | two, 512×384, in both orders and repeated | 0.014, 0.035, 0.002 | yes |
-| one, 500×300: resized differently | 0.006, 0.017 | yes |
-| 512×384, then 500×300 with the other status | 0.23 | no |
+| one, 500×300: stretched to 512×288 | 0.002, 0.004 | yes |
+| 512×384, then 500×300 with the other status | 0.022 | yes |
+| one, 240×180: grown to the 64-token floor (70 tokens) | 0.002 | yes |
+| one, 1600×1200 (1,875 tokens) at `--image-max-tokens 2048` | 0.006 | yes |
 
 Without an image the model is near even on the printed status; with one it
-puts 0.99 on the right one, as the reference does. The last row is the
-known gap: we fit and pad (llama.cpp's preprocessing), the reference
-stretches with bicubic, and a prompt whose two images contradict each other
-sits where that difference moves the answer most. With the F16 mmproj the
-single-image rows move by under 0.001 and the last reads 0.24; the
-two-image rows were not rerun with it.
+puts 0.99 on the right one, as the reference does. At the default
+`--image-max-tokens 1024` the 1600×1200 image is shrunk to fit — 1,382
+prompt tokens against the reference's 2,310 — and still reads 0.004 here,
+but that is this image, not a bound. Before `/v1/systemone` used the
+processor's resize, the fifth row read 0.23 with the choice flipped: a
+prompt whose images contradict each other sits where the resize moves the
+answer most. The reference's processor here is transformers' PIL backend,
+because torchvision is absent; its default torchvision backend calls the
+PyTorch kernel ported here (torchvision itself was not available to confirm
+it takes the uint8 path). PIL and that kernel differ by at most 2 levels on
+0.35% of values over random images, 1.3% at worst on noise.
 
 ## Serving acceptance status
 

@@ -359,11 +359,16 @@ They go where Cloudflare's `encode_record` puts them — after `STATE:`,
 before the state, then a newline — and count toward `--decision-max-tokens`
 and `usage.input_tokens`; the state is truncated to make room, the images
 and schema never are. `videos` is refused, and so is `media_kwargs`
-alongside images. Sizing is this server's (`--image-max-tokens`, llama.cpp's
-fit-and-pad bilinear resize), not the reference processor's: an image whose
-sides are multiples of 32 and which fits in 64 to `--image-max-tokens`
-tokens is encoded from identical pixels, any other is resized differently
-(see [TESTING.md](TESTING.md#the-decision-model-clef)).
+alongside images.
+
+These images are sized as the reference's own processor sizes them, not as
+chat images are: transformers' `smart_resize`, which grows anything under 64
+tokens, then a stretch with PyTorch's antialiased bicubic, ported
+bit-for-bit. The processor allows 16,384 tokens per image; this server stops
+at `--image-max-tokens` (default 1024, at most 4096) and shrinks a larger
+image to fit, so raise the flag to cover the images you send. JPEGs are
+decoded by the `image` crate rather than PIL, so their pixels can differ
+slightly. See [TESTING.md](TESTING.md#images-against-the-reference).
 
 ## What is refused
 

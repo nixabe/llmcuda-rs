@@ -32,6 +32,10 @@ allocation; they do not add metadata reads or allocation to the inference loop.
   execution support; parsing their dimensions alone does not implement them.
 - Qwen chat/tool marker spellings and pre-tokenizer regex are protocol and
   tokenizer-family semantics. Numeric token IDs are resolved from vocabulary.
+- The Hugging Face processor's pixel bounds (`HF_MIN_PIXELS` 65,536 and
+  `HF_MAX_PIXELS` 16,777,216, its 200:1 aspect limit) come from
+  Cloudflare/clef-flash's `processor_config.json`, the Qwen3-VL processor's
+  defaults. No GGUF carries them; only `/v1/systemone` sizes images by them.
 - CLI defaults (budgets, batch/chunk sizes, image limits) are user-overridable
   resource policies. Reference presets and fixed kernel benchmark fixtures
   intentionally keep the target model geometry for reproducible comparisons.

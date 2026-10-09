@@ -2,10 +2,11 @@
 //! uses integer tensor cores. Per-group scales, affine correction, and the
 //! reduction tree are shared across dense, routed, and flattened shapes.
 //!
-//! Q4 records retain 128 bytes of nibble codes, half d/dmin, eight scale/min
-//! bytes and packed code sums (160 bytes). Q6 records keep 192 bytes of six-bit
+//! Q4 records retain 128 bytes of nibble codes, half d/dmin and eight scale and
+//! eight min bytes ([`Q4_RECORD_BYTES`]). Q6 records keep 192 bytes of six-bit
 //! codes as low-nibble and high-pair words per 32 values, half d and sixteen
-//! signed subscales (224 bytes, padded).
+//! signed subscales, padded to whole 128-byte lines per four rows
+//! ([`Q6_RECORD_BYTES`]).
 //! Dense and expert weights interleave each word across four rows. Repacking
 //! and activation arenas are allocated at construction.
 //!
@@ -24,6 +25,24 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use std::sync::Arc;
+
+/// Resident bytes per 256-value Q4_K record and row: codes, half d/dmin and
+/// the unpacked scale and min bytes. Every field is whole words, so the
+/// four-row interleave keeps each word group 16-byte aligned. The per-group
+/// code sums these records once carried are recomputed by the one reader
+/// that wants them, the 8-bit activation experiment.
+pub const Q4_RECORD_BYTES: usize = 148;
+/// Resident bytes per 256-value Q6_K record and row: 210 bytes of codes, half
+/// d and subscales, padded so a four-row record group is 896 bytes, a whole
+/// number of 128-byte lines. The prefill tile stages 384-byte windows of it;
+/// at 212 or 216 bytes those straddle a fourth line and Q6_K prefill measured
+/// about 1% slower (docs/BENCHMARKS.md, WHY NOT).
+pub const Q6_RECORD_BYTES: usize = 224;
+
+/// The record strides every K2 kernel source is compiled against.
+fn record_defines() -> String {
+    format!("#define K2_Q4_REC {Q4_RECORD_BYTES}\n#define K2_Q6_REC {Q6_RECORD_BYTES}\n")
+}
 
 const REPACK_SRC: &str = r#"
 template<int Q>
@@ -50,10 +69,9 @@ __global__ void k2_repack_q4(const unsigned char* src,unsigned char* dst,long lo
     long long i=((long long)blockIdx.x*blockDim.x+threadIdx.x)*4;if(i>=elems)return;
     int r=i%256,g=r/32,z=(r%32)/4;if(z>=4)return;float scale,minimum;
     unsigned lo=raw_pack4<3>(src,i,&scale,&minimum),hi=raw_pack4<3>(src,i+16,&scale,&minimum);
-    long long row=i/inner;int expert=row/rows,rw=row%rows;unsigned char* out=dst+(((long long)expert*((rows+IR-1)/IR)+rw/IR)*(inner/256)+((i%inner)/256))*160*IR+(rw%IR)*4;*(unsigned*)(out+(z*32+g*4)*IR)=lo|(hi<<4);
+    long long row=i/inner;int expert=row/rows,rw=row%rows;unsigned char* out=dst+(((long long)expert*((rows+IR-1)/IR)+rw/IR)*(inner/256)+((i%inner)/256))*K2_Q4_REC*IR+(rw%IR)*4;*(unsigned*)(out+(z*32+g*4)*IR)=lo|(hi<<4);
     if(r==0){const unsigned char* in=src+(i/256)*144;*(unsigned*)(out+128*IR)=*(const unsigned*)in;}
     if(r%32==0){const unsigned char* in=src+(i/256)*144;int sc,m;moe_scale_min_k4(g,in+4,&sc,&m);out[((132+g)>>2)*(4*IR)+((132+g)&3)]=sc;out[((140+g)>>2)*(4*IR)+((140+g)&3)]=m;}
-    if(r==0){unsigned words[3]={};for(int g=0;g<8;++g){int sum=0;for(int z=0;z<8;++z){float s,m;unsigned p=raw_pack4<3>(src,(i/256)*256+g*32+z*4,&s,&m);int v;asm("dp4a.s32.s32 %0,%1,%2,%3;":"=r"(v):"r"(p),"r"(0x01010101),"r"(sum));sum=v;}unsigned v=sum+0,bit=g*9,shift=bit&31;words[bit/32]|=v<<shift;if(shift>23)words[bit/32+1]|=v>>(32-shift);}for(int n=0;n<3;++n)*(unsigned*)(out+148*IR+n*(4*IR))=words[n];}
 }
 // Each 32-value group keeps six words: four of low nibbles, then two of high
 // bit pairs. Byte b of activation word k (values 4k..4k+3) takes nibble k/4 of
@@ -61,7 +79,7 @@ __global__ void k2_repack_q4(const unsigned char* src,unsigned char* dst,long lo
 __global__ void k2_repack_q6(const unsigned char* src,unsigned char* dst,long long elems,int inner,int rows,int IR) {
     long long i=((long long)blockIdx.x*blockDim.x+threadIdx.x)*4;if(i>=elems || i%32)return;
     int r=i%256,g=r/32;long long row=i/inner;int e=row/rows,rw=row%rows;
-    unsigned char* out=dst+(((long long)e*((rows+IR-1)/IR)+rw/IR)*(inner/256)+((i%inner)/256))*224*IR+(rw%IR)*4;
+    unsigned char* out=dst+(((long long)e*((rows+IR-1)/IR)+rw/IR)*(inner/256)+((i%inner)/256))*K2_Q6_REC*IR+(rw%IR)*4;
     unsigned low[4]={},high[2]={};
     for(int k=0;k<8;++k){float sc,m;unsigned p=raw_pack4<0>(src,i+k*4,&sc,&m);
         for(int b=0;b<4;++b){unsigned c=(unsigned)((int)(signed char)(p>>(b*8))+32);low[k&3]|=(c&15)<<(8*b+4*(k>>2));high[k>>2]|=(c>>4)<<(8*b+2*(k&3));}
@@ -177,13 +195,13 @@ extern "C" __global__ void k2_quantize16(const float* __restrict__ x,const float
 }
 
 template<int Q,int IR=4>
-__device__ __forceinline__ const unsigned char* weight_row(const unsigned char* __restrict__ w,int e,int r,int inner,int rows){return w+((long long)e*((rows+IR-1)/IR)+r/IR)*IR*(inner/256)*(Q==3 ? 160 : 224)+(r%IR)*4;}
+__device__ __forceinline__ const unsigned char* weight_row(const unsigned char* __restrict__ w,int e,int r,int inner,int rows){return w+((long long)e*((rows+IR-1)/IR)+r/IR)*IR*(inner/256)*(Q==3 ? K2_Q4_REC : K2_Q6_REC)+(r%IR)*4;}
 // Native records interleave aligned words across rows. Load d/dmin as one
 // word and Q6 d as one halfword without changing the float conversion.
 __device__ __forceinline__ float k2_half_bits(unsigned short bits){float f;asm("cvt.f32.f16 %0,%1;":"=f"(f):"h"(bits));return f;}
 template<int Q,int IR=4>
 __device__ __forceinline__ unsigned raw_pack4(const unsigned char* __restrict__ w,unsigned i,float* __restrict__ scale,float* __restrict__ minimum) {
-    int r=i&255,g=r>>5,z=(r&31)>>2;const unsigned char* b=w+(i>>8)*(Q==3 ? 160 : 224)*IR;
+    int r=i&255,g=r>>5,z=(r&31)>>2;const unsigned char* b=w+(i>>8)*(Q==3 ? K2_Q4_REC : K2_Q6_REC)*IR;
     if(Q==3){unsigned dm=*(const unsigned*)(b+128*IR);*scale=k2_half_bits((unsigned short)dm)*(float)b[((132+g)>>2)*(4*IR)+((132+g)&3)];*minimum=k2_half_bits((unsigned short)(dm>>16))*(float)b[((140+g)>>2)*(4*IR)+((140+g)&3)];unsigned code=*(const unsigned*)(b+((z%4)*32+g*4)*IR);return (z<4 ? code : code>>4)&0x0f0f0f0f;}
     *scale=k2_half_bits(*(const unsigned short*)(b+192*IR))*(float)((const signed char*)b)[((194+r/16)>>2)*(4*IR)+((194+r/16)&3)];*minimum=0;
     const unsigned char* group=b+g*24*IR;
@@ -221,11 +239,13 @@ __device__ __forceinline__ void raw_imma4(int* d,unsigned a,unsigned b) {
 template<int Q,int IR=4>
 __device__ __forceinline__ int weight_sum(const unsigned char* __restrict__ row,unsigned i){
     if(Q==0){int sum=0;float sc,m;for(int z=0;z<4;++z)sum=raw_dp4a(raw_pack4<Q,IR>(row,i+z*4,&sc,&m),0x01010101,sum);return sum;}
-    const unsigned char* b=row+(i/256)*160*IR;unsigned bit=((i&255)/32)*9,pos=bit>>5,shift=bit&31;
-    const unsigned* p=(const unsigned*)(b+148*IR);unsigned code=p[pos*IR]>>shift;if(shift>23)code|=p[(pos+1)*IR]<<(32-shift);return (int)(code&511);
+    // Q4: the sum of the 32-value group holding i, which records once
+    // carried precomputed and only this 8-bit experiment read.
+    int sum=0;float sc,m;unsigned base=i&~31u;
+    for(int z=0;z<8;++z)sum=raw_dp4a(raw_pack4<Q,IR>(row,base+z*4,&sc,&m),0x01010101,sum);return sum;
 }
-template<int IR> __device__ __forceinline__ float q6_subscale(const unsigned char* __restrict__ row,int i){const unsigned char* b=row+(i/256)*224*IR;int off=194+(i%256)/16;return (float)((const signed char*)b)[(off/4)*(4*IR)+(off%4)];}
-template<int IR> __device__ __forceinline__ float q6_delta(const unsigned char* __restrict__ row,int i){return k2_half_bits(*(const unsigned short*)(row+(i/256)*224*IR+192*IR));}
+template<int IR> __device__ __forceinline__ float q6_subscale(const unsigned char* __restrict__ row,int i){const unsigned char* b=row+(i/256)*K2_Q6_REC*IR;int off=194+(i%256)/16;return (float)((const signed char*)b)[(off/4)*(4*IR)+(off%4)];}
+template<int IR> __device__ __forceinline__ float q6_delta(const unsigned char* __restrict__ row,int i){return k2_half_bits(*(const unsigned short*)(row+(i/256)*K2_Q6_REC*IR+192*IR));}
 // Fixed hidden width removes dynamic address and tail arithmetic only.
 // Every scale group and the fp32 accumulation tree stay in the same order.
 template<int Q,int NT,bool ROUTED,int INNER=0>
@@ -269,7 +289,7 @@ __device__ __forceinline__ void raw_gemv(const unsigned char* __restrict__ w,con
                 }
             }else{
             raw_pack4<Q,IR>(row,g*group,&scale,&minimum);
-            const unsigned char* block=row+(g/(Q==3 ? 8 : 16))*(Q==3 ? 160 : 224)*IR;
+            const unsigned char* block=row+(g/(Q==3 ? 8 : 16))*(Q==3 ? K2_Q4_REC : K2_Q6_REC)*IR;
             #pragma unroll
             for(int z=0;z<4;++z){unsigned packed=*(const unsigned*)(block+((Q==3 ? z*32+(g&7)*4 : (z+((g&1)*4))*32+((g>>1)&7)*4)*IR));
                 #pragma unroll
@@ -406,7 +426,7 @@ __device__ void raw_gemm_reuse(const unsigned char* __restrict__ w,const signed 
             int r=task>>2,gg=task&3;unsigned code[8]={};float s0=0,s1=0,dl=0;
             if(r0+r<rows) {
                 const unsigned char* row=weight_row<Q,IR>(w,expert,r0+r,inner,rows);
-                int i=j+gg*32,gi=(i&255)>>5;const unsigned char* b=row+(i>>8)*224*IR;const unsigned char* grp=b+gi*24*IR;
+                int i=j+gg*32,gi=(i&255)>>5;const unsigned char* b=row+(i>>8)*K2_Q6_REC*IR;const unsigned char* grp=b+gi*24*IR;
                 unsigned low[4],high[2];
                 #pragma unroll
                 for(int k=0;k<4;++k)low[k]=*(const unsigned*)(grp+k*4*IR);
@@ -638,7 +658,7 @@ __device__ __forceinline__ unsigned k2_word(uint4 a,uint4 b,int k){return k<4 ? 
 template<int Q,int NT,bool ROUTED>
 __device__ __forceinline__ void k2_gemv_quads(const unsigned char* __restrict__ w,const signed char* __restrict__ x,const signed char* __restrict__ xl,const float* __restrict__ sx,const float* __restrict__ sums,const int* __restrict__ ids,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,int rq) {
     extern __shared__ float k2_windows[];
-    constexpr int REC=(Q==3 ? 160 : 224)*4;
+    constexpr int REC=(Q==3 ? K2_Q4_REC : K2_Q6_REC)*4;
     int lane=threadIdx.x&31,warp=threadIdx.x>>5;
     int groups=inner>>5,nwin=groups>>2,records=inner>>8,quads=(rows+3)>>2;
     int quad0=(blockIdx.x*(blockDim.x>>5)+warp)*rq;
@@ -783,7 +803,7 @@ static_assert(sizeof(K2MmqSmem<0,128>)==58752,"Q6 tile shared bytes");
 static_assert(sizeof(K2MmqSmem<3,128>)==31312,"Q4 tile shared bytes");
 template<int Q,int BR,bool ROUTED>
 __device__ __forceinline__ void k2_mmq16(const unsigned char* __restrict__ w,const uint4* __restrict__ mq,const float2* __restrict__ mm,const int* __restrict__ sorted,const int* __restrict__ owners,float* __restrict__ out,int inner,int rows,int pairs,int topk,int mode,const unsigned char* __restrict__ w1,float* __restrict__ out1,int rows1,int rb1,const unsigned char* __restrict__ w2,float* __restrict__ out2,int rows2,int rb2) {
-    constexpr int BT=64,AW=Q==3 ? 4 : 8,WRS=BR/32,TFS=4,REC=(Q==3 ? 160 : 224)*4;
+    constexpr int BT=64,AW=Q==3 ? 4 : 8,WRS=BR/32,TFS=4,REC=(Q==3 ? K2_Q4_REC : K2_Q6_REC)*4;
     constexpr int WT=BR/64>0 ? BR/64 : 1;           // weight tasks per thread (Q4 code chunks: 4*BR)
     // Group pitches are padded so the staging stores spread over all banks.
     extern __shared__ uint4 k2_mmq_smem[];
@@ -1058,7 +1078,11 @@ impl K2Gemm {
     /// Resident bytes after packing, including four-row padding.
     pub fn weight_bytes(quant: ExpertQuant, inner: usize, rows: usize, experts: usize) -> usize {
         inner * rows.div_ceil(4) * 4 * experts / 256
-            * if quant == ExpertQuant::Q4K { 160 } else { 224 }
+            * if quant == ExpertQuant::Q4K {
+                Q4_RECORD_BYTES
+            } else {
+                Q6_RECORD_BYTES
+            }
     }
     /// Repack once at upload. Both formats retain their original scales;
     /// Q6 codes stay at six bits with their half delta and signed subscales.
@@ -1095,8 +1119,11 @@ impl K2Gemm {
             .next()
             .unwrap();
         let module = ctx.load_module(
-            compile(&format!("{prologue}\n{REPACK_SRC}"), "k2_repack")
-                .map_err(MoeError::Compile)?,
+            compile(
+                &format!("{}{prologue}\n{REPACK_SRC}", record_defines()),
+                "k2_repack",
+            )
+            .map_err(MoeError::Compile)?,
         )?;
         let f = module.load_function(if quant == ExpertQuant::Q4K {
             "k2_repack_q4"
@@ -1108,7 +1135,8 @@ impl K2Gemm {
         let ir = 4i32;
         let (elems, inner, rows) = (elems as i64, inner as i32, rows as i32);
         // SAFETY: four source elements per thread, masked at elems; every
-        // destination record is 160/224 bytes and header writers are disjoint.
+        // destination record is Q4/Q6_RECORD_BYTES and header writers are
+        // disjoint.
         unsafe {
             stream
                 .launch_builder(&f)
@@ -1191,7 +1219,7 @@ impl K2Gemm {
         let dense_tokens = tokens.min(4);
         let input = tokens * topk * max_inner;
         let tensor = tokens >= 8 && activation_bits == 16;
-        let ptx = compile(&format!("#define K2_DENSE_TOKENS {dense_tokens}\n#define K2_ROUTED_GEMV_ROWS {routed_gemv_rows}\n#define K2_ACTIVATION_BITS {activation_bits}\n#define K2_ROUTED_TILE {route_tile}\n{prologue}\n{SRC}"), "k2_gemm").map_err(MoeError::Compile)?;
+        let ptx = compile(&format!("{}#define K2_DENSE_TOKENS {dense_tokens}\n#define K2_ROUTED_GEMV_ROWS {routed_gemv_rows}\n#define K2_ACTIVATION_BITS {activation_bits}\n#define K2_ROUTED_TILE {route_tile}\n{prologue}\n{SRC}", record_defines()), "k2_gemm").map_err(MoeError::Compile)?;
         let module = ctx.load_module(ptx)?;
         Ok(Self {
             workspace: NEXT_WORKSPACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),

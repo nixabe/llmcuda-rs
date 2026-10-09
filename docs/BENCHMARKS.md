@@ -904,6 +904,26 @@ stored layout. `bench_forward`, 512 tokens, three prompts, driver accounting:
 
 Kernels read the same bytes, so throughput was not measured.
 
+## Residency: a transient must not share the pool with what stays
+
+cudarc allocates from the device's stream-ordered pool. K2's projection upload
+copied each tensor raw, repacked it into a wider record, and freed the copy:
+every free left a hole between resident weights that the next, larger record
+could not reuse and `cuMemPoolTrimTo` could not return, because each hole
+shared a chunk with live data. The pool held 34.81 GiB to serve 32.00 GiB on
+Q6_K. Taking the transient from `cuMemAlloc` instead (`with_unpooled_upload`)
+returns it to the driver on free. One idle card after load, nvidia-smi:
+
+| file | before | after |
+| :--- | ---: | ---: |
+| K2 Q6_K | 35,868 MiB | **32,988 MiB** |
+| K2 Q4_K_M | 27,292 MiB | **25,244 MiB** |
+
+Read VRAM as the pool's `RESERVED_MEM_CURRENT` against `USED_MEM_CURRENT`
+before reading code; nvidia-smi cannot tell fragmentation from allocation.
+The Qwen3.8-27B int8 repack and the attention int8 repack upload the same
+way and have not been measured.
+
 ## The instruction-count bug that looks like a bandwidth bug
 
 Turing issues **4 load/store operations per SM per clock against 64 FMAs**, so

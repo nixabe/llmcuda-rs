@@ -18,6 +18,43 @@ use llmcuda_gguf::{GgmlType, GgufFile};
 use llmcuda_model::{Directory, ModelConfig, Role};
 use std::sync::Arc;
 
+/// Copy `host` to a device buffer allocated outside the stream-ordered pool,
+/// run `f` on it, and free it before returning.
+///
+/// Every quantized projection is uploaded in GGUF layout and repacked into a
+/// new, wider record. Taking that transient copy from the same pool as the
+/// resident weights left a hole behind each one that the next, larger record
+/// could not reuse, and that `cuMemPoolTrimTo` cannot hand back because each
+/// hole shares a chunk with live weights: on Q6_K the pool held 34.81 GiB to
+/// serve 32.00 GiB. `cuMemAlloc` memory returns to the driver on free, so the
+/// pool only ever holds what stays resident.
+fn with_unpooled_upload<T>(
+    stream: &Arc<CudaStream>,
+    host: &[u8],
+    f: impl FnOnce(&CudaSlice<u8>) -> Result<T, MoeBlockError>,
+) -> Result<T, MoeBlockError> {
+    use cudarc::driver::result::{free_sync, malloc_sync};
+    stream.context().bind_to_thread()?;
+    // SAFETY: a fresh allocation of exactly `host.len()` bytes, every one of
+    // which the copy below writes before anything reads it.
+    let ptr = unsafe { malloc_sync(host.len().max(1)) }?;
+    // SAFETY: `ptr` holds `host.len()` bytes, and `leak` below takes it back
+    // before the slice's drop could release it into the pool.
+    let mut source = unsafe { stream.upgrade_device_ptr::<u8>(ptr, host.len()) };
+    let result = stream
+        .memcpy_htod(host, &mut source)
+        .map_err(MoeBlockError::from)
+        .and_then(|()| f(&source));
+    // `f` enqueues reads of `source`; they must finish before it is freed.
+    let synced = stream.synchronize();
+    let ptr = source.leak();
+    // SAFETY: allocated by `malloc_sync` above, no longer referenced by any
+    // pending work after the synchronize.
+    unsafe { free_sync(ptr) }?;
+    synced?;
+    result
+}
+
 /// A projection with its own format; Q6_K uses the MoE padded device layout.
 pub struct Projection {
     bytes: CudaSlice<u8>,
@@ -51,13 +88,19 @@ impl Projection {
             (stream.clone_htod(src)?, None)
         } else {
             let (src, q) = quantized_tensor(file, directory, role, layer, elems)?;
-            {
-                let source = stream.clone_htod(&*to_device_layout(q, src))?;
-                (
-                    K2Gemm::repack(stream.context(), stream, &source, q, inner, rows, experts)?,
-                    Some(q),
-                )
-            }
+            let host = to_device_layout(q, src);
+            let packed = with_unpooled_upload(stream, &host, |source| {
+                Ok(K2Gemm::repack(
+                    stream.context(),
+                    stream,
+                    source,
+                    q,
+                    inner,
+                    rows,
+                    experts,
+                )?)
+            })?;
+            (packed, Some(q))
         };
         Ok(Self {
             bytes,

@@ -192,7 +192,12 @@ llama-mtmd-debug -m <model.gguf> --mmproj <mmproj-F16.gguf> \
 
 Agreement at last check: ≤ 3.2e-4 on output mass, ≤ 5e-3 per printed value —
 the budget covers llama.cpp's f16 GELU table (`GGML_GELU_FP16`) against the
-reference's exact tanh form. Text-side M-RoPE (`mrope`) is ported from
+reference's exact tanh form. A Q8_0 mmproj has no golden of its own; the
+loader is checked against the F16 export of the same checkpoint instead
+(`llmcuda-engine/tests/vision_differential.rs`, `q8_0_mmproj_tracks_its_f16_export`,
+behind `LLMCUDA_MMPROJ_Q8_0` and `LLMCUDA_MMPROJ_F16`): every dequantized
+matrix within 0.6 Q8_0 steps of its F16 twin, then the two device towers on
+one image. Text-side M-RoPE (`mrope`) is ported from
 `ggml_mrope_cache_init`'s `IMROPE` branch and carries a bit-exactness test
 that scalar positions collapse to `rope::apply_rope` — the same reduction
 `llmcuda-engine`'s text path depends on.

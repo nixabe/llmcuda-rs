@@ -390,9 +390,9 @@ kind of thing that misleads a later reader.
 
 Its `mmproj` needs converting too, for a different reason. Ornith publishes
 `mmproj-Ornith-1.5-35B-BF16.gguf`; the loader in `llmcuda-engine`'s `vision`
-module reads F32 and F16 and rejects everything else, so a BF16 mmproj fails
-at load rather than at first image. Rewriting the 110 BF16 tensors as F16 is
-safe by inspection — the largest magnitude anywhere in the tower is 1.45,
+module reads F32, F16 and Q8_0 and rejects everything else, so a BF16 mmproj
+fails at load rather than at first image. Rewriting the 110 BF16 tensors as
+F16 is safe by inspection — the largest magnitude anywhere in the tower is 1.45,
 nowhere near F16's 65504, and F16's wider mantissa means every normal-range
 BF16 value survives exactly; only 0.03% of elements move, all of them in the
 subnormal region below 6.1e-5.
@@ -680,3 +680,19 @@ dequantized at load): 464 MiB of weights, and a workspace sized by
 `--decision-max-tokens` (493 MiB at the default 16,384 positions). Its
 differential test against the scalar oracle in
 `llmcuda_kernels::decision` is `tests/decision_differential.rs`.
+
+## The mmproj
+
+Clef-Flash's vision tower is the shared qwen3vl tower with
+`projection_dim` 4096. Its Q8_0 export (`convert_hf_to_gguf.py --mmproj
+--outtype q8_0`) stores `attn_qkv`, `attn_out`, `ffn_up` and the merger as
+Q8_0, `ffn_down` as F16 (4304 is not a whole number of 32-blocks) and the
+patch conv as F32. The loader dequantizes the Q8_0 matrices to f16 at load,
+exactly as llama.cpp's CUDA `to_fp16` does, so the resident tower is f16
+whichever file it came from: the Q8_0 file saves disk, not VRAM. Against
+the F16 export of the same checkpoint, every Q8_0 matrix is within 0.502
+quantization steps, and the two device towers' embeddings of a 96×96 test
+image agree at cosine 0.999973 (`tests/vision_differential.rs`).
+
+`--mmproj` loads with a `clef` model, but `/v1/systemone` refuses `images`
+and the model generates no text, so nothing can send it an image yet.

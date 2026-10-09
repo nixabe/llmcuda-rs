@@ -115,6 +115,35 @@ fn tiny_weights(cfg: &VisionConfig, seed: u64) -> VisionWeights {
     }
 }
 
+/// The shared qwen3vl tower with the file's one model-dependent width
+/// (see `VisionConfig::for_model`): 2048 for Qwen3.6-35B-A3B, 4096 for
+/// Clef-Flash.
+fn file_cfg(file: &llmcuda_gguf::GgufFile) -> VisionConfig {
+    VisionConfig {
+        projection_dim: file
+            .get_u32("clip.vision.projection_dim")
+            .expect("mmproj declares its projection width"),
+        ..VisionConfig::qwen3_6_35b_a3b()
+    }
+}
+
+/// A 96x96 gradient image through the real preprocessing: 6x6 patch
+/// grid, 9 output tokens.
+fn gradient_image(cfg: &VisionConfig) -> PreprocessedImage {
+    let mut rgb = vec![0u8; 96 * 96 * 3];
+    for y in 0..96u32 {
+        for x in 0..96u32 {
+            let i = ((y * 96 + x) * 3) as usize;
+            rgb[i] = (x * 255 / 95) as u8;
+            rgb[i + 1] = (y * 255 / 95) as u8;
+            rgb[i + 2] = ((x + y) * 255 / 190) as u8;
+        }
+    }
+    let image = preprocess(cfg, &rgb, 96, 96);
+    assert_eq!((image.grid_h, image.grid_w), (6, 6));
+    image
+}
+
 #[test]
 fn device_tower_matches_the_reference_at_a_synthetic_geometry() {
     let Some(ctx) = setup() else { return };
@@ -161,26 +190,13 @@ fn device_tower_matches_the_reference_on_the_real_mmproj() {
         return;
     }
     let file = llmcuda_gguf::GgufFile::open(&path).expect("mmproj parses");
-    let cfg = VisionConfig::qwen3_6_35b_a3b();
+    let cfg = file_cfg(&file);
     let weights = load_vision_weights(&file, &cfg).expect("mmproj loads");
 
     let stream = ctx.default_stream();
     let mut fwd =
         VisionForward::new(&ctx, stream, &cfg, &weights, 256).expect("device tower builds");
-
-    // A 96x96 gradient image through the real preprocessing: 6x6 patch
-    // grid, 9 output tokens.
-    let mut rgb = vec![0u8; 96 * 96 * 3];
-    for y in 0..96u32 {
-        for x in 0..96u32 {
-            let i = ((y * 96 + x) * 3) as usize;
-            rgb[i] = (x * 255 / 95) as u8;
-            rgb[i + 1] = (y * 255 / 95) as u8;
-            rgb[i + 2] = ((x + y) * 255 / 190) as u8;
-        }
-    }
-    let image = preprocess(&cfg, &rgb, 96, 96);
-    assert_eq!((image.grid_h, image.grid_w), (6, 6));
+    let image = gradient_image(&cfg);
 
     let device = fwd.encode_to_host(&image).expect("device encode");
     let reference = encode(&cfg, &weights, &image.patches, image.grid_h, image.grid_w);
@@ -197,4 +213,110 @@ fn device_tower_matches_the_reference_on_the_real_mmproj() {
     // head-offset bug, which push cosine far below 0.99.
     assert!(result.cosine_similarity > 0.999, "cosine degraded");
     assert!(result.max_abs_error < 5e-2, "max_abs degraded");
+}
+
+/// The tower's matrices by name — every tensor a Q8_0 export may quantize.
+fn matrices(w: &VisionWeights) -> Vec<(String, &[f32])> {
+    let mut out: Vec<(String, &[f32])> = w
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(l, b)| {
+            [
+                ("attn_qkv", &b.qkv_w),
+                ("attn_out", &b.out_w),
+                ("ffn_up", &b.up_w),
+                ("ffn_down", &b.down_w),
+            ]
+            .map(|(name, t)| (format!("v.blk.{l}.{name}"), t.as_slice()))
+        })
+        .collect();
+    out.push(("mm.0".into(), &w.fc1_w));
+    out.push(("mm.2".into(), &w.fc2_w));
+    out
+}
+
+/// A Q8_0 mmproj against the f16 export of the same checkpoint.
+///
+/// `device_tower_matches_the_reference_on_the_real_mmproj` cannot see a
+/// loader bug — both of its sides read `load_vision_weights`. Two exports
+/// of one checkpoint can: each dequantized matrix must sit inside Q8_0's
+/// own error bound of its f16 twin, and the towers built from each must
+/// agree on an image. Measured on Clef-Flash's block-5 matrices, a clean
+/// load sits at 0.48 steps; swapping two blocks of one row reads 30-38,
+/// a transposed matrix ~130.
+///
+/// Needs both files: `LLMCUDA_MMPROJ_Q8_0` and `LLMCUDA_MMPROJ_F16` (the
+/// export commands are in docs/MODEL.md's Clef section). The weight
+/// bounds need no device; the tower comparison SKIPS without one.
+#[test]
+fn q8_0_mmproj_tracks_its_f16_export() {
+    let paths = ["LLMCUDA_MMPROJ_Q8_0", "LLMCUDA_MMPROJ_F16"].map(std::env::var_os);
+    let [Some(q8_path), Some(f16_path)] = paths else {
+        println!("SKIPPED: set LLMCUDA_MMPROJ_Q8_0 and LLMCUDA_MMPROJ_F16");
+        return;
+    };
+    let q8_file = llmcuda_gguf::GgufFile::open(&q8_path).expect("q8_0 mmproj parses");
+    let f16_file = llmcuda_gguf::GgufFile::open(&f16_path).expect("f16 mmproj parses");
+    let cfg = file_cfg(&q8_file);
+    assert_eq!(
+        cfg.projection_dim,
+        file_cfg(&f16_file).projection_dim,
+        "the two files are not exports of one tower"
+    );
+    let quantized = (0..cfg.num_layers)
+        .flat_map(|l| {
+            ["attn_qkv", "attn_out", "ffn_up", "ffn_down"].map(|t| format!("v.blk.{l}.{t}.weight"))
+        })
+        .chain(["mm.0.weight".into(), "mm.2.weight".into()])
+        .filter(|n| q8_file.tensor(n).unwrap().ggml_type == llmcuda_gguf::GgmlType::Q8_0)
+        .count();
+    assert!(quantized > 0, "LLMCUDA_MMPROJ_Q8_0 holds no Q8_0 matrix");
+
+    let q8 = load_vision_weights(&q8_file, &cfg).expect("q8_0 mmproj loads");
+    let f16 = load_vision_weights(&f16_file, &cfg).expect("f16 mmproj loads");
+
+    // Q8_0 rounds to the nearest step `d = amax_block / 127`, then stores
+    // `d` as f16: |error| <= d/2 + 127 * 2^-11 * d < 0.57 d, and
+    // d <= amax_tensor / 127. Bound per tensor at 0.6 * amax / 127.
+    let mut worst_ratio = 0.0f32;
+    let mut worst_cosine = 1.0f64;
+    for ((name, a), (_, b)) in matrices(&q8).into_iter().zip(matrices(&f16)) {
+        let amax = b.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let r = compare(a, b);
+        let ratio = r.max_abs_error as f32 / (amax / 127.0);
+        worst_ratio = worst_ratio.max(ratio);
+        worst_cosine = worst_cosine.min(r.cosine_similarity as f64);
+        assert!(
+            ratio < 0.6,
+            "{name}: max_abs {:.3e} is {ratio:.2} Q8_0 steps (amax {amax:.3e})",
+            r.max_abs_error
+        );
+    }
+    println!(
+        "weights: {quantized} Q8_0 matrices; worst max_abs {worst_ratio:.3} steps, \
+         worst cosine {worst_cosine:.7}"
+    );
+
+    let Some(ctx) = setup() else { return };
+    let image = gradient_image(&cfg);
+    let encode_with = |w: &VisionWeights| {
+        VisionForward::new(&ctx, ctx.default_stream(), &cfg, w, 256)
+            .expect("device tower builds")
+            .encode_to_host(&image)
+            .expect("device encode")
+    };
+    let (q8_out, f16_out) = (encode_with(&q8), encode_with(&f16));
+    let r = compare(&q8_out, &f16_out);
+    let amax = f16_out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    println!(
+        "tower q8_0 vs f16: max_abs {:.3e} (of |out| <= {amax:.2})  cosine {:.6}",
+        r.max_abs_error, r.cosine_similarity
+    );
+    // What Q8_0 costs the embeddings, through 27 blocks; the per-matrix
+    // bound above is the sharp layout check. Measured on Clef-Flash's two
+    // exports: max_abs 1.17e-1 against |out| <= 18.7, cosine 0.999973.
+    // Gates leave ~7x on 1 - cosine and ~4x on max_abs.
+    assert!(r.cosine_similarity > 0.9998, "q8_0 tower diverged from f16");
+    assert!(r.max_abs_error < 0.5, "q8_0 tower max_abs degraded");
 }

@@ -20,6 +20,7 @@ use half::f16;
 
 use llmcuda_cuda::kernels::vision::{VisionError, VisionKernels};
 use llmcuda_gguf::GgufFile;
+use llmcuda_kernels::quant::{QK8_0, dequantize_row_q8_0};
 use llmcuda_kernels::vision::tower::{VisionBlockWeights, VisionWeights, resized_pos_embed};
 use llmcuda_kernels::vision::{PreprocessedImage, cell_order_index};
 use llmcuda_model::VisionConfig;
@@ -32,6 +33,15 @@ use llmcuda_model::vision::{VisionRole, VisionWeightSchema};
 /// device sees exactly the file's f16 matrix values. The two temporal
 /// patch-conv slices are summed here — still images feed both the same
 /// frame (see `llmcuda_kernels::vision::tower::VisionWeights`).
+///
+/// Q8_0 matrices (a `convert_hf_to_gguf.py --mmproj --outtype q8_0` export:
+/// `attn_qkv`, `attn_out`, `ffn_up` and the merger; `ffn_down` stays f16
+/// there because 4304 is not a whole number of 32-blocks) dequantize to
+/// ggml's exact `q * d`. That product needs up to 18 significant bits, so
+/// the f16 upload rounds it: at most `127 * 2^-11 * d ≈ 0.06 d`, against
+/// Q8_0's own `d / 2`, and bit-identical to llama.cpp's CUDA `to_fp16`
+/// (`dequantize_block_q8_0_f16`, one correctly rounded `__hmul2`). The
+/// device tower therefore stays f16: a Q8_0 file saves disk, not VRAM.
 pub fn load_vision_weights(file: &GgufFile, cfg: &VisionConfig) -> Result<VisionWeights, String> {
     let schema = VisionWeightSchema::new(cfg);
     if let Err(errors) = schema.resolve(file) {
@@ -68,6 +78,12 @@ pub fn load_vision_weights(file: &GgufFile, cfg: &VisionConfig) -> Result<Vision
                 .iter()
                 .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()),
+            // Blocks run along `ne0`, so a flat dequant is row-major only
+            // when rows are whole blocks; the parser checks just the total
+            // count, ggml (`gguf.cpp`) rejects the rest.
+            llmcuda_gguf::GgmlType::Q8_0 if info.dims[0].is_multiple_of(QK8_0 as u64) => {
+                dequantize_row_q8_0(bytes).map_err(|e| format!("{}: {e}", spec.name))
+            }
             other => Err(format!("{}: unsupported tensor type {other:?}", spec.name)),
         }
     };

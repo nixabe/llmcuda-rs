@@ -799,6 +799,10 @@ impl AttnScratch {
         let a = &config.attention;
         let q_dim = a.q_heads as usize * a.head_dim as usize;
         let kv_dim = a.kv_heads as usize * a.head_dim as usize;
+        // K2-Horizon's mixer (`block::k2`) projects query and gate separately
+        // and norms in place, so it never reads these four; at its 2048-token
+        // pass they were 136 MiB.
+        let gated_attention_only = |len: usize| if config.k2.is_some() { 1 } else { len };
         Ok(Self {
             k2: if config.k2.is_some() {
                 Some(super::k2::K2ValueScratch::new(stream, config, tokens)?)
@@ -807,17 +811,17 @@ impl AttnScratch {
             },
             tokens,
             normed: stream.alloc_zeros::<f32>(tokens * hidden)?,
-            packed: stream.alloc_zeros::<f32>(tokens * 2 * q_dim)?,
+            packed: stream.alloc_zeros::<f32>(gated_attention_only(tokens * 2 * q_dim))?,
             query: stream.alloc_zeros::<f32>(tokens * q_dim)?,
             gate: stream.alloc_zeros::<f32>(tokens * q_dim)?,
-            query_normed: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            query_normed: stream.alloc_zeros::<f32>(gated_attention_only(tokens * q_dim))?,
             query_roped: stream.alloc_zeros::<f32>(tokens * q_dim)?,
             key: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
-            key_normed: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
+            key_normed: stream.alloc_zeros::<f32>(gated_attention_only(tokens * kv_dim))?,
             key_roped: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
             value: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
             pregate: stream.alloc_zeros::<f32>(tokens * q_dim)?,
-            gate_sigmoid: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            gate_sigmoid: stream.alloc_zeros::<f32>(gated_attention_only(tokens * q_dim))?,
             gated: stream.alloc_zeros::<f32>(tokens * q_dim)?,
             projected: stream.alloc_zeros::<f32>(tokens * hidden)?,
             xq: None,

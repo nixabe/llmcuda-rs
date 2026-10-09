@@ -1022,6 +1022,36 @@ Activations are fp32 end to end, every kernel gated against a CPU reference.
 
 `exp2f` in the prefill softmax is an identity (`log2(e)` folded into the score scale), and was still held to the full gate.
 
+## KV cache: q8_0 is capacity, not a default
+
+`-ctk q8_0 -ctv q8_0` stores K2-Horizon's cache in llama.cpp's `block_q8_0` arithmetic, 1,088 bytes per 1,024-element row against 2,048: 192 KiB per token becomes 102, and the Q6_K preflight at `-c 405504` falls from 107.43 to 72.63 GiB. The writers are byte-exact against a port of `quantize_row_q8_0_ref`; the readers turn each code into exactly `f16(q·d)` and meet the 1e-5 gate against CPU attention over the stored values. What remains is the rounding itself. `kv_quality` teacher-forces 2,048 tokens of this repository's docs and compares every position's distribution with the f16 run; the floor is f16 again with 64 decode splits, which only reassociates the softmax:
+
+| K2 | K / V | perplexity | KL vs f16, mean / p99 | top-1 agreement |
+| :--- | :--- | ---: | ---: | ---: |
+| Q4_K_M | f16 / f16 | 5.7454 | — | — |
+| | floor | 5.7376 | 0.0017 / 0.018 | 98.68% |
+| | q8_0 / q8_0 | 5.7364 | 0.0072 / 0.054 | 97.02% |
+| | q8_0 / f16 | 5.7447 | 0.0063 / 0.050 | 96.88% |
+| | f16 / q8_0 | 5.7520 | 0.0051 / 0.046 | 97.22% |
+| Q6_K | f16 / f16 | 5.7411 | — | — |
+| | floor | 5.7333 | 0.0013 / 0.017 | 98.78% |
+| | q8_0 / q8_0 | 5.7364 | 0.0072 / 0.059 | 96.39% |
+
+Perplexity moves less than the floor moves it; the distributions do not. KL is four to six times the floor and one position in thirty picks a different top token instead of one in eighty, with K and V each carrying most of it alone. Expect greedy output to leave f16's path sooner; this measures that it differs, not whether the different text is worse.
+
+Speed is a trade by shape (K2 Q4_K_M, GPU 0, three alternating pairs each, every pair agreeing in sign):
+
+| shape | f16 | q8_0 / q8_0 | pair deltas |
+| :--- | ---: | ---: | :--- |
+| decode, 2K, N=1 | 81.0 | 81.0 | ±0.1% |
+| decode, 2K, N=3 | 141.0 | 149.9 | +5.9 / +6.5 / +6.6% |
+| decode, 32K, N=1 | 42.9 | 41.6 | −3.7 / −3.0 / −2.8% |
+| decode, 32K, N=3 | 53.2 | 58.4 | +9.6 / +10.0 / +10.2% |
+| prefill, 2048 chunk to 2K | 2958.8 | 2922.4 | −2.0 / −1.2 / −0.5% |
+| prefill, 2048 chunk to 8K | 2263.1 | 2203.0 | −3.5 / −2.1 / −2.3% |
+
+Three windows' worth of cache traffic is where halving the bytes pays: `bench_k2_attention` puts batched decode over three windows at 0.82× the f16 time at 8K and 32K. One window pays the conversion instead, and so does every prefill tile: nsys puts the 32K N=1 decode kernel at 248.4 µs against 235.9 in the model (the narrow bench had it at 0.96× — it is not a result there), and prefill attention 9% slower in total. The card also held 1,585 MHz against 1,645 at the same ~240 W under q8_0, so part of the conversion's cost is a clock cost. The format stays opt-in and per half: it buys context, and the price is paid in agreement with f16 before it is paid in speed. llama.cpp's own `q8_0` cache on this card is a [measured reject](#rejected-on-measurement) for the baseline and is unaffected by this.
+
 ## CUDA graph capture: kept for the host, not for throughput
 
 Measured worth: ~0.4% at prefill shape, bounded above by 5.8% on a decode step. Capture cut idle per decode step from 0.97 ms to 0.405 ms and the wall clock did not move: under replay each of ~1,100 decode kernels ran 0.3–0.5 µs slower. On Turing a graph node costs about the launch gap it replaces; Ampere accelerates graph dispatch, so do not generalize forward.

@@ -74,12 +74,17 @@ The architecture is explicitly `k2-horizon`; tensor shapes never select it.
 | Attention gate | separate projection; softplus with beta ln(2) |
 | Router | sigmoid; bias affects selection only; normalize then scale by 2.5 |
 | Value aggregation | SiLU on each selected projection before weighted summation |
-| KV per token, f16 | 192 KiB across all 48 layers |
+| KV per token | 192 KiB across all 48 layers at `f16`; 102 KiB with `--cache-type-k q8_0 --cache-type-v q8_0` |
 | Recurrent state / MTP | none / none |
 | Native context | 524288 tokens; usable context depends on allocated memory |
 
 Serve either file with the usual `--model` flag. Choose a context that fits
-alongside the weights: 8192 tokens require 1.5 GiB of KV per sequence.
+alongside the weights: 8192 tokens require 1.5 GiB of KV per sequence, or
+816 MiB with a `q8_0` cache. Every layer is attention, so K2's KV is about ten
+times Qwen3.6's per token, and a `-c` sized for Qwen3.6 does not fit; the
+preflight's VRAM line says by how much. The `q8_0` cache (K2 only) is what
+buys context back; its cost is measured in
+[BENCHMARKS.md](BENCHMARKS.md#kv-cache-q8_0-is-capacity-not-a-default).
 For example:
 
 ```sh

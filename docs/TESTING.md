@@ -631,6 +631,24 @@ calibrated on that six-token prompt; they are not a broader quality evaluation.
 The six-token oracle's N=3 prefill exercises the tiled and grouped kernels at
 eighteen physical rows.
 
+The `q8_0` KV cache is checked in three layers. `kv_q8_differential` holds both
+writers (`attn_kv_append_kv8` and the batched-decode `k2_rotary_append`) to
+`llmcuda_kernels::quant::quantize_q8_0`, the port of llama.cpp's
+`quantize_row_q8_0_ref`, **byte for byte** — including all-zero blocks,
+round-half-away ties and subnormal scales — and to each other. It holds every
+reader (staged prefill, warp and tensor-core decode, both batched forms) to
+the CPU attention run on exactly the values the cache stores, `f16(q * d)`,
+at the binary16 K2 gate, for each half quantized alone and both together;
+the batched decodes stay bit-identical to serial. `k2_model` runs its whole
+battery on a `q8_0` cache when `LLMCUDA_CACHE_TYPE_K` / `LLMCUDA_CACHE_TYPE_V`
+are set (the oracle thresholds were calibrated on binary16). None of that says
+what quantizing costs the model; the `kv_quality` binary measures that,
+teacher-forcing real text one token at a time and reporting perplexity, KL
+divergence and top-1 agreement against a binary16 cache, with
+`LLMCUDA_KV_QUALITY_FLOOR_SPLITS` adding a binary16 run that only reorders the
+decode sums — the floor any attention perturbation reaches on a model whose
+routes are top-k.
+
 `bench_k2` measures actual GGUF query and value-expert tensors using CUDA events,
 including device dispatch in the grouped timing. Run it with `LLMCUDA_MODEL`
 and optional `LLMCUDA_K2_N=1,3,128,512`. `LLMCUDA_K2_INTEGER_ONLY=1` skips

@@ -123,6 +123,7 @@ Set these on the host or in a `.env` file beside `docker-compose.yml`.
 | `LLMCUDA_API_KEY` | unset | Key callers must present. Passed through only when set. |
 | `LLMCUDA_CACHE_RAM` | unset (full coverage, capped at a quarter of host `MemAvailable`) | Host RAM for pinned prefix snapshots, e.g. `8GiB`, or `full`. Size it generously: below full coverage the arena publishes nothing at all rather than less — see [CLI.md](CLI.md#--cache-ram). Three cards at `-c 405504 -s 3` want ~59.6 GiB for `full`, so `memlock` must be unlimited (it already is in the compose file). |
 | `LLMCUDA_DFLASH` | unset | Path *inside the container* to a DFlash drafter GGUF. |
+| `LLMCUDA_CACHE_TYPE_K`, `LLMCUDA_CACHE_TYPE_V` | unset (`f16`) | KV cache formats, `f16` or `q8_0`; `q8_0` is K2-Horizon only. Passed through from `.env` like the key; see [CLI.md](CLI.md#capacity-and-scheduling). |
 
 `LLMCUDA_API_KEY` is passed through by `env_file` rather than named with a
 default in `environment:`, and the distinction matters: an empty value is not

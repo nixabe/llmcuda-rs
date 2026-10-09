@@ -7,6 +7,12 @@
 //! `resize_bilinear` (align-corners on u8 with truncation). Normalization
 //! order is `tools/mtmd/clip-impl.h`: scale to `[0,1]` first, then
 //! `(x - mean) / std` per channel.
+//!
+//! [`preprocess_hf`] is the second pipeline: the model's Hugging Face
+//! processor (transformers' `Qwen2VLImageProcessor`), which stretches to its
+//! own `smart_resize` target with PyTorch's antialiased bicubic instead of
+//! fitting and padding: the path for a model whose reference *is* that
+//! processor, as Clef-Flash's `joint_schema_model.py` is.
 
 use crate::vision::cell_order_index;
 use llmcuda_model::VisionConfig;
@@ -163,7 +169,12 @@ pub fn preprocess_bounded(
             .copy_from_slice(&scaled[src..src + (new_w * 3) as usize]);
     }
 
-    // Normalize and patchify.
+    patchify(cfg, &canvas, tw, th)
+}
+
+/// Scale to `[0, 1]`, normalize per channel, and patchify a `tw × th`
+/// interleaved RGB8 canvas into cell order.
+fn patchify(cfg: &VisionConfig, canvas: &[u8], tw: u32, th: u32) -> PreprocessedImage {
     let patch = cfg.patch_size;
     let grid_w = tw / patch;
     let grid_h = th / patch;
@@ -193,6 +204,227 @@ pub fn preprocess_bounded(
         grid_h,
         grid_w,
     }
+}
+
+/// The pixel bounds of the Hugging Face processor: `size.shortest_edge` and
+/// `size.longest_edge` in Cloudflare/clef-flash's `processor_config.json`,
+/// the Qwen3-VL processor's own defaults. No GGUF carries them.
+pub const HF_MIN_PIXELS: u64 = 65_536;
+pub const HF_MAX_PIXELS: u64 = 16_777_216;
+
+/// transformers' `smart_resize` (`models/qwen2_vl/image_processing_qwen2_vl.py`),
+/// operation for operation: `round` is Python's, ties to even, so 80 px at a
+/// 32 px factor is 64, not 96; the shrink keeps one factor per edge and the
+/// growth needs none; an aspect ratio past 200 is an error, as there.
+/// Returns `(width, height)`.
+pub fn smart_resize_hf(
+    cfg: &VisionConfig,
+    w: u32,
+    h: u32,
+    min_pixels: u64,
+    max_pixels: u64,
+) -> Result<(u32, u32), String> {
+    let (wf, hf) = (f64::from(w), f64::from(h));
+    let ratio = wf.max(hf) / wf.min(hf);
+    if ratio > 200.0 {
+        return Err(format!(
+            "absolute aspect ratio must be smaller than 200, got {ratio}"
+        ));
+    }
+    let factor = u64::from(align_edge(cfg));
+    let f = factor as f64;
+    let mut h_bar = (hf / f).round_ties_even() as u64 * factor;
+    let mut w_bar = (wf / f).round_ties_even() as u64 * factor;
+    let area = (u64::from(h) * u64::from(w)) as f64;
+    if h_bar * w_bar > max_pixels {
+        let beta = (area / max_pixels as f64).sqrt();
+        h_bar = factor.max((hf / beta / f).floor() as u64 * factor);
+        w_bar = factor.max((wf / beta / f).floor() as u64 * factor);
+    } else if h_bar * w_bar < min_pixels {
+        let beta = (min_pixels as f64 / area).sqrt();
+        h_bar = (hf * beta / f).ceil() as u64 * factor;
+        w_bar = (wf * beta / f).ceil() as u64 * factor;
+    }
+    let edge =
+        |v: u64| u32::try_from(v).map_err(|_| format!("the image resizes to an edge of {v} px"));
+    Ok((edge(w_bar)?, edge(h_bar)?))
+}
+
+/// The antialiased cubic kernel, `a = -0.5` as PIL uses it, in PyTorch's
+/// evaluation order (`HelperInterpCubic::aa_filter`).
+fn aa_cubic(x: f64) -> f64 {
+    const A: f64 = -0.5;
+    let x = x.abs();
+    if x < 1.0 {
+        ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+    } else if x < 2.0 {
+        ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A
+    } else {
+        0.0
+    }
+}
+
+/// One axis of the resample: per output index, the first source index, how
+/// many taps it reads, and those taps in fixed point (rows `taps` wide), at
+/// a precision shared by the axis.
+struct AaAxis {
+    first: Vec<usize>,
+    len: Vec<usize>,
+    weights: Vec<i32>,
+    taps: usize,
+    precision: u32,
+}
+
+/// `_compute_weights_aa` and `_compute_index_ranges_int16_weights`
+/// (aten/src/ATen/native/cpu/UpSampleKernel.cpp): PIL's support and
+/// centering, weights normalized in f64, then rounded to int16 at the
+/// largest precision under which the axis's largest weight still fits.
+fn aa_axis(input: usize, output: usize) -> AaAxis {
+    let scale = input as f64 / output as f64;
+    let support = if scale >= 1.0 { 2.0 * scale } else { 2.0 };
+    let taps = support.ceil() as usize * 2 + 1;
+    let invscale = if scale >= 1.0 { 1.0 / scale } else { 1.0 };
+    let mut first = Vec::with_capacity(output);
+    let mut len = Vec::with_capacity(output);
+    let mut real = vec![0.0f64; output * taps];
+    let mut wt_max = 0.0f64;
+    for i in 0..output {
+        let center = scale * (i as f64 + 0.5);
+        // `as i64` truncates toward zero, as the C++ casts do.
+        let xmin = ((center - support + 0.5) as i64).max(0);
+        let xsize = (((center + support + 0.5) as i64).min(input as i64) - xmin)
+            .clamp(0, taps as i64) as usize;
+        let row = &mut real[i * taps..i * taps + xsize];
+        let mut total = 0.0f64;
+        for (j, w) in row.iter_mut().enumerate() {
+            *w = aa_cubic(((j as i64 + xmin) as f64 - center + 0.5) * invscale);
+            total += *w;
+        }
+        if total != 0.0 {
+            for w in row.iter_mut() {
+                *w /= total;
+                wt_max = wt_max.max(*w);
+            }
+        }
+        first.push(xmin as usize);
+        len.push(xsize);
+    }
+    let mut precision = 0u32;
+    while precision < 22 {
+        if (0.5 + wt_max * f64::from(1u32 << (precision + 1))) as i32 >= 1 << 15 {
+            break;
+        }
+        precision += 1;
+    }
+    let one = f64::from(1u32 << precision);
+    let weights = real
+        .iter()
+        .map(|&w| {
+            let v = w * one;
+            i32::from((if v < 0.0 { v - 0.5 } else { v + 0.5 }) as i16)
+        })
+        .collect();
+    AaAxis {
+        first,
+        len,
+        weights,
+        taps,
+        precision,
+    }
+}
+
+/// Resample interleaved RGB8 along x (`horizontal`) or y, rounding back to
+/// u8 with the kernel's half-up offset and saturation.
+fn aa_pass(src: &[u8], w: usize, h: usize, axis: &AaAxis, horizontal: bool) -> Vec<u8> {
+    let (out_w, out_h) = if horizontal {
+        (axis.first.len(), h)
+    } else {
+        (w, axis.first.len())
+    };
+    let mut out = vec![0u8; out_w * out_h * 3];
+    let half = (1i32 << axis.precision) >> 1;
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let (i, at) = if horizontal { (x, y * w) } else { (y, x) };
+            let taps = &axis.weights[i * axis.taps..i * axis.taps + axis.len[i]];
+            for c in 0..3 {
+                let mut acc = half;
+                for (j, &wt) in taps.iter().enumerate() {
+                    let s = if horizontal {
+                        at + axis.first[i] + j
+                    } else {
+                        (axis.first[i] + j) * w + at
+                    };
+                    acc += i32::from(src[s * 3 + c]) * wt;
+                }
+                out[(y * out_w + x) * 3 + c] = (acc >> axis.precision).clamp(0, 255) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Antialiased bicubic resize of interleaved RGB8, bit-exact with PyTorch's
+/// CPU uint8 kernel (`F.interpolate(mode="bicubic", antialias=True)`): x
+/// first, then y, through a u8 intermediate, each axis only if it changes.
+///
+/// PyTorch leaves one quirk out of this port: an unresized axis one pixel
+/// wide makes it repeat the first row of the other. [`smart_resize_hf`]
+/// never asks for that shape — both target edges are multiples of 32.
+pub fn resize_bicubic_aa(src: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
+    let (w, h, tw, th) = (w as usize, h as usize, tw as usize, th as usize);
+    assert_eq!(src.len(), w * h * 3, "interleaved RGB8 expected");
+    assert!(tw > 0 && th > 0, "empty target");
+    let wide = if tw != w {
+        aa_pass(src, w, h, &aa_axis(w, tw), true)
+    } else {
+        src.to_vec()
+    };
+    if th != h {
+        aa_pass(&wide, tw, h, &aa_axis(h, th), false)
+    } else {
+        wide
+    }
+}
+
+/// Preprocess as the model's Hugging Face processor does: [`smart_resize_hf`]
+/// within [`HF_MIN_PIXELS`] and the lesser of [`HF_MAX_PIXELS`] and
+/// `max_tokens`, a stretch with [`resize_bicubic_aa`] (no padding), then the
+/// same scaling, normalization and patch order as [`preprocess`].
+///
+/// transformers' default backend resizes uint8 tensors with torchvision,
+/// whose CPU bicubic is the PyTorch kernel ported here; its PIL backend
+/// differs from that kernel by at most 2 levels on about 0.35% of values
+/// (1.3% at worst, on noise). Above
+/// `max_tokens` the processor would keep more pixels than the tower was
+/// allocated for, so the image is shrunk to the ceiling instead; a growth
+/// that would overshoot it is refused.
+pub fn preprocess_hf(
+    cfg: &VisionConfig,
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+    max_tokens: u32,
+) -> Result<PreprocessedImage, String> {
+    assert_eq!(rgb.len(), (w * h * 3) as usize, "interleaved RGB8 expected");
+    assert!(w > 0 && h > 0);
+    let token_px = u64::from(align_edge(cfg)).pow(2);
+    let max_px = HF_MAX_PIXELS
+        .min(u64::from(max_tokens.clamp(MIN_IMAGE_TOKENS, MAX_IMAGE_TOKENS)) * token_px);
+    let (tw, th) = smart_resize_hf(cfg, w, h, HF_MIN_PIXELS.min(max_px), max_px)?;
+    if u64::from(tw) * u64::from(th) > max_px {
+        return Err(format!(
+            "the image resizes to {tw}x{th}, {} tokens, over the {} the server allows \
+             (--image-max-tokens)",
+            u64::from(tw) * u64::from(th) / token_px,
+            max_px / token_px
+        ));
+    }
+    Ok(if (tw, th) == (w, h) {
+        patchify(cfg, rgb, tw, th)
+    } else {
+        patchify(cfg, &resize_bicubic_aa(rgb, w, h, tw, th), tw, th)
+    })
 }
 
 #[cfg(test)]
@@ -327,6 +559,63 @@ mod tests {
         let (tw, th) = smart_resize_bounded(&cfg, 96, 96, 1);
         assert!((tw / 32) * (th / 32) <= MIN_IMAGE_TOKENS);
         assert!(tw >= 32 && th >= 32);
+    }
+
+    #[test]
+    fn hf_smart_resize_rounds_ties_to_even_like_python() {
+        // 80/32 = 2.5 and 48/32 = 1.5 both round to 2; half-away-from-zero
+        // would make the first 96.
+        assert_eq!(smart_resize_hf(&cfg(), 80, 48, 0, u64::MAX), Ok((64, 64)));
+    }
+
+    #[test]
+    fn hf_smart_resize_grows_to_the_processor_floor_and_shrinks_to_the_ceiling() {
+        // 100x100: beta = sqrt(65536 / 10000) = 2.56, and 256 is aligned.
+        assert_eq!(
+            smart_resize_hf(&cfg(), 100, 100, HF_MIN_PIXELS, HF_MAX_PIXELS),
+            Ok((256, 256))
+        );
+        // 4000x3000 under 1 MiP: beta = sqrt(12e6 / 2^20) ~ 3.383, so
+        // floor(36.95) and floor(27.71) blocks of 32.
+        assert_eq!(
+            smart_resize_hf(&cfg(), 4000, 3000, HF_MIN_PIXELS, 1 << 20),
+            Ok((1152, 864))
+        );
+        assert!(smart_resize_hf(&cfg(), 200, 1, 0, u64::MAX).is_ok());
+        assert!(smart_resize_hf(&cfg(), 201, 1, 0, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn an_unchanged_size_resizes_to_the_same_bytes() {
+        let src: Vec<u8> = (0..32 * 64 * 3).map(|i| (i * 7 % 251) as u8).collect();
+        assert_eq!(resize_bicubic_aa(&src, 32, 64, 32, 64), src);
+    }
+
+    #[test]
+    fn hf_preprocessing_of_an_aligned_in_range_image_is_the_llama_cpp_one() {
+        // 512x384 is aligned and 192 tokens: neither pipeline resizes, so
+        // the two agree exactly — which is why such images served the same
+        // pixels before this path existed.
+        let cfg = cfg();
+        let rgb: Vec<u8> = (0..512 * 384 * 3).map(|i| (i * 31 % 253) as u8).collect();
+        let hf = preprocess_hf(&cfg, &rgb, 512, 384, 1024).expect("in range");
+        assert_eq!(hf, preprocess_bounded(&cfg, &rgb, 512, 384, 1024));
+    }
+
+    #[test]
+    fn hf_preprocessing_grows_small_images_and_refuses_what_overflows_the_tower() {
+        let cfg = cfg();
+        let img = preprocess_hf(&cfg, &[128u8; 96 * 96 * 3], 96, 96, 1024).unwrap();
+        assert_eq!(
+            (img.grid_w, img.grid_h),
+            (16, 16),
+            "64 tokens, the processor's floor"
+        );
+        // 1x150 grows to 32x3136 = 98 tokens; a 64-token ceiling cannot
+        // hold it, and shrinking it would no longer be the processor's image.
+        let thin = vec![0u8; 150 * 3];
+        assert!(preprocess_hf(&cfg, &thin, 1, 150, 1024).is_ok());
+        assert!(preprocess_hf(&cfg, &thin, 1, 150, 64).is_err());
     }
 
     #[test]

@@ -202,6 +202,16 @@ one image. Text-side M-RoPE (`mrope`) is ported from
 that scalar positions collapse to `rope::apply_rope` — the same reduction
 `llmcuda-engine`'s text path depends on.
 
+The second preprocessing path, `preprocess_hf` (the Hugging Face
+processor's), is checked against the code it ports, not against llama.cpp:
+`tests/hf_image_golden.rs` replays transformers' own `smart_resize` over
+4,980 size and bound combinations (248 of them refused for aspect ratio) and
+PyTorch's CPU uint8 antialiased bicubic over 84 resizes and 34M values, and
+requires every size and every byte to match. Corrupting the port's tie
+rounding or its weight precision fails the matching gate. Generate with
+`python tools/oracle/hf_image.py $LLMCUDA_HF_IMAGE_GOLDEN_DIR` (torch,
+numpy, transformers); the test SKIPS without the variable.
+
 ## The dense architecture (`qwen35`)
 
 Qwen3.8-27B shares every kernel with Qwen3.6-35B-A3B except the feed-forward

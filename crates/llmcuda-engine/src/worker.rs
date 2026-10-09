@@ -505,6 +505,7 @@ impl Worker {
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<crate::image::SequenceImage>,
         spans: crate::decision::DecisionSpans,
     ) -> Result<RequestId, WorkerExecutionError> {
         self.validate_pending(req, &prompt, None)?;
@@ -517,7 +518,7 @@ impl Worker {
             PendingSequence {
                 request: req,
                 prompt,
-                images: Vec::new(),
+                images,
                 snapshot: None,
                 sampling: SamplingParams::GREEDY,
                 constraint: None,
@@ -589,6 +590,7 @@ impl Worker {
                     _ if pending.decision.is_some() => runtime.admit_decision(
                         pending.request,
                         pending.prompt,
+                        pending.images,
                         pending.decision.expect("guarded by the arm"),
                     )?,
                     Some(snapshot) => runtime.admit_restored(

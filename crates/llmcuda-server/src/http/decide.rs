@@ -80,6 +80,7 @@ pub(crate) async fn decide(state: &AppState, record: &EncodedRecord) -> Result<V
             max_output_tokens: 0,
         },
         record.tokens.clone(),
+        Vec::new(),
         spans(record),
     );
     state.submit_waiters.fetch_sub(1, Ordering::AcqRel);

@@ -611,7 +611,7 @@ impl DeviceRuntimeHandle {
                                 } => {
                                     let result = match (snapshot, decision) {
                                         (_, Some(spans)) => {
-                                            runtime.admit_decision(req, prompt, spans)
+                                            runtime.admit_decision(req, prompt, images, spans)
                                         }
                                         (Some(snapshot), None) => runtime.admit_restored(
                                             req, prompt, images, snapshot, sampling, constraint,
@@ -692,12 +692,13 @@ impl DeviceRuntimeHandle {
         &self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<SequenceImage>,
         spans: DecisionSpans,
     ) -> Result<(), RuntimeError> {
         self.request(|reply| RuntimeCommand::Admit {
             req,
             prompt,
-            images: Vec::new(),
+            images,
             snapshot: None,
             sampling: SamplingParams::GREEDY,
             constraint: None,
@@ -1290,10 +1291,16 @@ impl DeviceRuntime {
     /// Admit a decision request: the prompt is prefilled with retention off,
     /// every position's final hidden state is kept, and the decision head
     /// scores the spans once the last chunk lands. Never decodes.
+    ///
+    /// `images` take the generation path's route — encoded here, injected
+    /// and rotated per token in prefill — and their positions' hidden states
+    /// enter the head's memory like any other; the reference reads every
+    /// unmasked position (`ClefModel.forward` in `joint_schema_model.py`).
     pub fn admit_decision(
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<SequenceImage>,
         spans: DecisionSpans,
     ) -> Result<(), RuntimeError> {
         if req.max_output_tokens != 0 {
@@ -1310,7 +1317,7 @@ impl DeviceRuntime {
             .validate(prompt.len())
             .map_err(RuntimeError::Decision)?;
         let hidden = self.stream.alloc_zeros::<f32>(prompt.len() * self.hidden)?;
-        self.admit(req, prompt, Vec::new(), SamplingParams::GREEDY, None)?;
+        self.admit(req, prompt, images, SamplingParams::GREEDY, None)?;
         let seq = self
             .sequences
             .get_mut(&req.id)
@@ -2465,22 +2472,28 @@ impl DeviceRuntime {
             // A decision prompt is scored once and never resumed, so it has
             // no retention boundary to stop at and no reason to be cut into
             // prebuilt widths: each piece runs whole, as a prefix of the
-            // narrowest pass that holds it (`Forward::run_prefix`).
+            // narrowest pass that holds it (`Forward::run_prefix`). A piece
+            // holding image rows takes the prebuilt widths instead: those
+            // passes are the generation path's, and `run_prefix` refuses
+            // staged rows and per-token positions, which have not been
+            // checked at a partial width.
             let whole = remaining.min(self.prefill_chunk);
-            let (width, pass_width) =
-                if seq.decision.is_some() && self.prefix_pass_width(whole) != whole {
-                    (whole, self.prefix_pass_width(whole))
-                } else {
-                    let width = choose_prefill_width(
-                        position,
-                        remaining,
-                        self.prefill_chunk,
-                        self.retention_interval,
-                        self.prefill_tails.iter().map(|(width, _)| *width),
-                        self.max_batch,
-                    );
-                    (width, width)
-                };
+            let (width, pass_width) = if seq.decision.is_some()
+                && self.prefix_pass_width(whole) != whole
+                && !chunk_overlaps_images(&seq.images, position, whole)
+            {
+                (whole, self.prefix_pass_width(whole))
+            } else {
+                let width = choose_prefill_width(
+                    position,
+                    remaining,
+                    self.prefill_chunk,
+                    self.retention_interval,
+                    self.prefill_tails.iter().map(|(width, _)| *width),
+                    self.max_batch,
+                );
+                (width, width)
+            };
             let piece = &work[offset..offset + width];
 
             // Image-bearing sequences: fix the rotary base for this chunk,

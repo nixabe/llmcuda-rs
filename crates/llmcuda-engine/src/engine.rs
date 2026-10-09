@@ -470,14 +470,24 @@ impl Engine {
     /// states the worker's decision head scores. It is routed like any
     /// request but never matched against the prefix cache — a restored
     /// prefix has no hidden states for the head to read — and it publishes
-    /// no snapshots of its own.
+    /// no snapshots of its own. `images` are placed as
+    /// [`Self::place_tokens`] places them.
     pub fn place_decision(
         &self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<crate::image::SequenceImage>,
         spans: crate::decision::DecisionSpans,
     ) -> Result<Placement, EngineExecutionError> {
         debug_assert_eq!(req.max_output_tokens, 0, "a decision generates nothing");
+        debug_assert!(
+            crate::image::validate_placements(
+                &images.iter().map(|i| i.placement).collect::<Vec<_>>(),
+                prompt.len()
+            )
+            .is_ok(),
+            "image placements must be validated at the server boundary"
+        );
         let budget = self
             .workers
             .first()
@@ -494,7 +504,7 @@ impl Engine {
         let request = self
             .worker(worker)
             .expect("router returned an existing worker")
-            .admit_decision(req, prompt, spans)
+            .admit_decision(req, prompt, images, spans)
             .map_err(|source| EngineExecutionError::Worker { worker, source })?;
         Ok(Placement {
             worker,

@@ -165,7 +165,9 @@ struct Args {
     )]
     cache_type_v: KvCacheType,
 
-    /// Prefill chunk size in tokens (also -pc)
+    /// Widest prefill pass in tokens (also -pc). Passes stop at every
+    /// snapshot retention boundary, so above the retention interval only a
+    /// decision model uses the extra width
     #[arg(long, default_value_t = 4096)]
     prefill_chunk: usize,
 
@@ -826,6 +828,14 @@ fn main() -> std::process::ExitCode {
         sched.block_size(),
         sched.max_concurrent_decodes()
     );
+    let retention = cache.gdn_retention_interval() as usize;
+    if !decisions && args.prefill_chunk > retention {
+        info!(
+            "                 prefill chunk {} → {retention}: a pass stops at every retention \
+             boundary, so nothing wider is built",
+            args.prefill_chunk
+        );
+    }
     if sched.prefill_slice() == 0 {
         warn!(
             "                 prefill slice 0 — one session takes the whole step and the \

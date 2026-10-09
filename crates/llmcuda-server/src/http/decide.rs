@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use llmcuda_engine::image::SequenceImage;
 use llmcuda_engine::{DecisionSpans, Engine};
 use llmcuda_kernels::decision::{OptionSpan, QuestionSpan, QuestionType};
 use llmcuda_sched::request::{NewRequest, RequestId};
@@ -61,8 +62,13 @@ fn spans(record: &EncodedRecord) -> DecisionSpans {
     DecisionSpans { questions, options }
 }
 
-/// Run one decision; one score per option in prompt order.
-pub(crate) async fn decide(state: &AppState, record: &EncodedRecord) -> Result<Vec<f32>, ApiError> {
+/// Run one decision; one score per option in prompt order. `images` carry
+/// absolute placements in `record.tokens`.
+pub(crate) async fn decide(
+    state: &AppState,
+    record: &EncodedRecord,
+    images: Vec<SequenceImage>,
+) -> Result<Vec<f32>, ApiError> {
     let prompt_tokens = u32::try_from(record.tokens.len())
         .map_err(|_| ApiError::bad_request(DIALECT, "the prompt is too long"))?;
     let id = RequestId(state.next_id.fetch_add(1, Ordering::Relaxed));
@@ -80,7 +86,7 @@ pub(crate) async fn decide(state: &AppState, record: &EncodedRecord) -> Result<V
             max_output_tokens: 0,
         },
         record.tokens.clone(),
-        Vec::new(),
+        images,
         spans(record),
     );
     state.submit_waiters.fetch_sub(1, Ordering::AcqRel);

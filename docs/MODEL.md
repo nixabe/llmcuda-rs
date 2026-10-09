@@ -694,5 +694,12 @@ the F16 export of the same checkpoint, every Q8_0 matrix is within 0.502
 quantization steps, and the two device towers' embeddings of a 96×96 test
 image agree at cosine 0.999973 (`tests/vision_differential.rs`).
 
-`--mmproj` loads with a `clef` model, but `/v1/systemone` refuses `images`
-and the model generates no text, so nothing can send it an image yet.
+With `--mmproj`, `/v1/systemone` takes `images` (see
+[API.md](API.md#image-input)). An image-bearing decision prompt runs as the
+generation path runs one: the tower encodes each image at admission, and a
+prefill piece that overlaps an image takes the prebuilt widths with the
+projector rows injected and per-token M-RoPE positions, not
+`Forward::run_prefix`, which refuses both. Pieces after the last image go
+back to `run_prefix`. The head reads the image positions' hidden states as
+part of its memory; its lexical prior reads only option spans, which are
+text.

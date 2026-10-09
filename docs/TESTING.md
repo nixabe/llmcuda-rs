@@ -272,6 +272,7 @@ everything above. The head, and the path that feeds it, are gated by these:
 | `llmcuda-kernels` `decision` unit tests | The reference's GELU is the exact erf form, not the tanh approximation, and its `erf` matches known values | nothing |
 | `llmcuda-engine/tests/decision_differential.rs` | The device head against the f64 scalar oracle (`llmcuda_kernels::decision::joint_schema_head`): a synthetic head written into an in-memory GGUF in mixed storage formats, scored on several prompt shapes and through every LM-head format the lexical gather reads, gated at 8x the worst observed error; requests outside the limits refused before anything is launched; and, behind `LLMCUDA_CLEF_MODEL`, the real head on random normed hidden states | a device; the file for the real-head case, which SKIPS without the variable |
 | `llmcuda-engine/tests/prefix_pass.rs` | The row above in the dense section. Its default model is Clef, because a decision prompt is the only thing the runtime runs as a prefix of a wider pass | a dense file, a device |
+| `llmcuda-server` `http::systemone` tests | `images` must be `data:` URLs; `videos`, and `media_kwargs` beside images, are refused. Behind `LLMCUDA_CLEF_MODEL`, on the real vocabulary: the media span is `encode_record`'s (one marker per image, each pad expanded, then a newline), it sits between the prefix and the state, every question and option span moves by its length, and a short limit truncates the state but never the images | nothing; the file for the layout case, which SKIPS without the variable |
 
 ### End to end, against the reference and llama.cpp
 
@@ -290,6 +291,32 @@ implementation. Over the 24 requests of the benchmark sets (99 questions):
 The figures are in [BENCHMARKS.md](BENCHMARKS.md#clef-flash-clef). The
 servers report probabilities to four decimals, so differences under 5e-5
 are rounding, not a measurement.
+
+### Images, against the reference
+
+Same method, with images: Cloudflare's `systemone` in fp16 on one RTX 8000,
+its processor built from `Qwen3VLProcessor` and the slow PIL
+`Qwen2VLImageProcessor` (`AutoProcessor` demands torchvision for the video
+processor). One request, four questions and eleven reported probabilities,
+over rendered invoice images whose printed status is PAID or OVERDUE, served
+from `Clef-Flash-Q8_0.gguf` with the Q8_0 mmproj. Token counts match on
+every request. Max |Δp| against the reference:
+
+| Images | max \|Δp\| | Same choices |
+| --- | --- | --- |
+| none (the backbone's own gap) | 0.012 | yes |
+| one, 512×384: identical pixels | 0.001, 0.005 | yes |
+| two, 512×384, in both orders and repeated | 0.014, 0.035, 0.002 | yes |
+| one, 500×300: resized differently | 0.006, 0.017 | yes |
+| 512×384, then 500×300 with the other status | 0.23 | no |
+
+Without an image the model is near even on the printed status; with one it
+puts 0.99 on the right one, as the reference does. The last row is the
+known gap: we fit and pad (llama.cpp's preprocessing), the reference
+stretches with bicubic, and a prompt whose two images contradict each other
+sits where that difference moves the answer most. With the F16 mmproj the
+single-image rows move by under 0.001 and the last reads 0.24; the
+two-image rows were not rerun with it.
 
 ## Serving acceptance status
 

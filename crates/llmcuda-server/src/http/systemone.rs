@@ -14,6 +14,12 @@
 //! implementation detail. llama.cpp's `systemone` template in the GGUF
 //! encodes the same layout.
 //!
+//! `images` sit between the `STATE:` prefix and the state, as
+//! `_encode_media` places them: one `<|vision_start|><|image_pad|>
+//! <|vision_end|>` per image and a newline, each pad expanded to its image's
+//! merged-patch count. Sizing is this server's — the generation path's
+//! preprocessing and `--image-max-tokens` — not the reference processor's.
+//!
 //! The response body follows the same file's `systemone_answer`.
 
 use axum::body::Bytes;
@@ -22,8 +28,11 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 use tokenizers::Tokenizer;
 
+use llmcuda_engine::image::SequenceImage;
+
 use super::AppState;
 use super::error::{ApiError, Dialect};
+use super::vision::{DecodedImage, IMAGE_MARKER, VisionServing, decode_image_url, expand_images};
 
 const DIALECT: Dialect = Dialect::OpenAi;
 
@@ -73,6 +82,8 @@ pub(crate) struct EncodedQuestion {
 pub(crate) struct EncodedRecord {
     pub tokens: Vec<i32>,
     pub questions: Vec<EncodedQuestion>,
+    /// Where the media tokens [`encode`] was given begin in `tokens`.
+    pub media_start: usize,
 }
 
 /// `json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)`.
@@ -171,11 +182,75 @@ fn tokens(tokenizer: &Tokenizer, text: &str) -> Result<Vec<i32>, String> {
     Ok(encoding.get_ids().iter().map(|&t| t as i32).collect())
 }
 
-/// `encode_record` for a text-only request.
+/// The request's `images`, decoded; refuses what this server does not
+/// serve rather than ignoring it.
+///
+/// `images` is an array of base64 `data:` URLs. `videos` is refused, and so
+/// is `media_kwargs` alongside images — the reference hands it to its
+/// processor, so ignoring it would answer a different question.
+pub(crate) fn request_images(request: &Map<String, Value>) -> Result<Vec<DecodedImage>, String> {
+    let present = |key: &str| {
+        request
+            .get(key)
+            .is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()))
+    };
+    if present("videos") {
+        return Err("\"videos\" is not supported by this server".into());
+    }
+    let images = match request.get("images") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err("\"images\" must be an array of data: URLs".into()),
+    };
+    if !images.is_empty()
+        && request
+            .get("media_kwargs")
+            .is_some_and(|v| !v.is_null() && v.as_object().is_none_or(|o| !o.is_empty()))
+    {
+        return Err(
+            "\"media_kwargs\" is not supported by this server; images are sized by \
+             --image-max-tokens"
+                .into(),
+        );
+    }
+    images
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let Value::String(url) = item else {
+                return Err(format!("images[{i}]: must be a data: URL string"));
+            };
+            decode_image_url(url).map_err(|e| format!("images[{i}]: {e}"))
+        })
+        .collect()
+}
+
+/// `_encode_media`: the token span `images` occupy, with placements
+/// relative to its first token. Empty, without even the newline, for no
+/// images.
+pub(crate) fn media(
+    tokenizer: &Tokenizer,
+    vision: Option<&VisionServing>,
+    images: &[DecodedImage],
+) -> Result<(Vec<i32>, Vec<SequenceImage>), ApiError> {
+    if images.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let text = format!("{}\n", IMAGE_MARKER.repeat(images.len()));
+    let encoding = tokenizer
+        .encode(text, false)
+        .map_err(|e| ApiError::internal(DIALECT, format!("tokenizer: {e}")))?;
+    let (tokens, images) = expand_images(vision, DIALECT, encoding.get_ids().to_vec(), images)?;
+    Ok((tokens.into_iter().map(|t| t as i32).collect(), images))
+}
+
+/// `encode_record`, with `media` (see [`media`]) between the prefix and the
+/// state.
 pub(crate) fn encode(
     tokenizer: &Tokenizer,
     request: &Map<String, Value>,
     max_length: usize,
+    media: &[i32],
 ) -> Result<EncodedRecord, String> {
     let state = request
         .get("state")
@@ -185,14 +260,6 @@ pub(crate) fn encode(
     };
     if questions.is_empty() {
         return Err("\"questions\" must be a non-empty object".into());
-    }
-    for key in ["images", "videos"] {
-        if request
-            .get(key)
-            .is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()))
-        {
-            return Err(format!("\"{key}\" is not supported by this server"));
-        }
     }
 
     let mut schema = tokens(tokenizer, "\n\nSCHEMA FIELDS:\n")?;
@@ -259,14 +326,15 @@ pub(crate) fn encode(
         "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:",
     )?;
     let mut state_ids = tokens(tokenizer, &render(state))?;
-    let fixed = prefix.len() + schema.len() + suffix.len();
+    let fixed = prefix.len() + media.len() + schema.len() + suffix.len();
     if fixed > max_length {
         return Err(format!(
             "schema requires {fixed} tokens before state; maximum is {max_length}"
         ));
     }
     state_ids.truncate(max_length - fixed);
-    let offset = prefix.len() + state_ids.len();
+    let media_start = prefix.len();
+    let offset = media_start + media.len() + state_ids.len();
     for q in &mut encoded {
         q.span = (q.span.0 + offset, q.span.1 + offset);
         for (_, s) in &mut q.options {
@@ -274,12 +342,14 @@ pub(crate) fn encode(
         }
     }
     let mut all = prefix;
+    all.extend_from_slice(media);
     all.extend(state_ids);
     all.extend(schema);
     all.extend(suffix);
     Ok(EncodedRecord {
         tokens: all,
         questions: encoded,
+        media_start,
     })
 }
 
@@ -413,9 +483,19 @@ async fn systemone_inner(state: &AppState, body: &[u8]) -> Result<Value, ApiErro
             "the request must be a JSON object",
         ));
     };
-    let record = encode(&state.tokenizer, &request, state.decision_max_length)
-        .map_err(|e| ApiError::bad_request(DIALECT, e))?;
-    let scores = super::decide::decide(state, &record).await?;
+    let images = request_images(&request).map_err(|e| ApiError::bad_request(DIALECT, e))?;
+    let (media, mut images) = media(&state.tokenizer, state.vision.as_deref(), &images)?;
+    let record = encode(
+        &state.tokenizer,
+        &request,
+        state.decision_max_length,
+        &media,
+    )
+    .map_err(|e| ApiError::bad_request(DIALECT, e))?;
+    for image in &mut images {
+        image.placement.start += record.media_start;
+    }
+    let scores = super::decide::decide(state, &record, images).await?;
     let answers =
         answers(&request, &record, &scores).map_err(|e| ApiError::internal(DIALECT, e))?;
     let model = request
@@ -433,6 +513,116 @@ async fn systemone_inner(state: &AppState, body: &[u8]) -> Result<Value, ApiErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::vision::{IMAGE_PAD, VISION_END, VISION_START};
+
+    /// A 1x1 red PNG.
+    const PNG_1X1: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ\
+                           AAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn images_of(request: Value) -> Result<Vec<DecodedImage>, String> {
+        request_images(request.as_object().unwrap())
+    }
+
+    #[test]
+    fn images_are_data_urls_and_unserved_media_is_refused() {
+        let q = json!({"q": {"type": "noul"}});
+        for absent in [json!({}), json!({"images": null}), json!({"images": []})] {
+            assert!(images_of(absent).unwrap().is_empty());
+        }
+        let one = images_of(json!({"images": [PNG_1X1]})).unwrap();
+        assert_eq!((one.len(), one[0].width, one[0].height), (1, 1, 1));
+
+        let err = |r: Value| images_of(r).expect_err("refused");
+        assert!(err(json!({"images": PNG_1X1})).contains("array"));
+        assert!(err(json!({"images": [PNG_1X1, 7]})).starts_with("images[1]"));
+        assert!(err(json!({"images": ["https://example.com/a.png"]})).contains("does not fetch"));
+        assert!(err(json!({"videos": [[1]], "questions": q})).contains("videos"));
+        // `media_kwargs` changes what the reference's processor does, so it
+        // is refused beside images and, as there, ignored without them.
+        assert!(
+            err(json!({"images": [PNG_1X1], "media_kwargs": {"max_pixels": 1}}))
+                .contains("media_kwargs")
+        );
+        assert!(images_of(json!({"media_kwargs": {"max_pixels": 1}})).is_ok());
+        assert!(images_of(json!({"images": [PNG_1X1], "media_kwargs": {}})).is_ok());
+    }
+
+    fn gray(width: u32, height: u32) -> DecodedImage {
+        DecodedImage {
+            rgb: vec![128u8; (width * height * 3) as usize],
+            width,
+            height,
+        }
+    }
+
+    /// The layout `encode_record` gives a record with images, on the real
+    /// vocabulary: the media span sits between the prefix and the state,
+    /// every span moves by its length, and only the state gives way to a
+    /// short limit. SKIPS without `LLMCUDA_CLEF_MODEL`.
+    #[test]
+    fn images_sit_between_the_prefix_and_the_state() {
+        let Some(path) = std::env::var_os("LLMCUDA_CLEF_MODEL") else {
+            eprintln!("SKIPPED: set LLMCUDA_CLEF_MODEL to a clef GGUF");
+            return;
+        };
+        let tok = crate::tokenizer::from_gguf(std::path::Path::new(&path)).expect("tokenizer");
+        let id = |s: &str| tok.token_to_id(s).expect("vision token") as i32;
+        let vision = VisionServing {
+            config: llmcuda_model::VisionConfig::qwen3_6_35b_a3b(),
+            max_tokens: 1024,
+            image_pad: id(IMAGE_PAD) as u32,
+        };
+        // 96x96 -> 3x3 merged tokens; 128x64 -> 4x2.
+        let (media_ids, placed) =
+            media(&tok, Some(&vision), &[gray(96, 96), gray(128, 64)]).expect("two images expand");
+        let mut want = vec![id(VISION_START)];
+        want.extend([id(IMAGE_PAD); 9]);
+        want.extend([id(VISION_END), id(VISION_START)]);
+        want.extend([id(IMAGE_PAD); 8]);
+        want.push(id(VISION_END));
+        want.extend(tokens(&tok, "\n").unwrap());
+        assert_eq!(media_ids, want);
+        let spans: Vec<(usize, usize)> = placed
+            .iter()
+            .map(|i| (i.placement.start, i.placement.tokens()))
+            .collect();
+        assert_eq!(spans, [(1, 9), (12, 8)], "placements relative to the span");
+        assert!(
+            media(&tok, None, &[gray(96, 96)]).is_err(),
+            "no tower, no images"
+        );
+
+        let request = json!({
+            "state": "the account is overdue",
+            "questions": {"q": {"type": "choice", "criteria": {"a": "x", "b": "y"}}},
+        });
+        let request = request.as_object().unwrap();
+        let text = encode(&tok, request, 16384, &[]).unwrap();
+        let with = encode(&tok, request, 16384, &media_ids).unwrap();
+        let (at, n) = (text.media_start, media_ids.len());
+        assert_eq!(with.media_start, at);
+        assert_eq!(with.tokens[..at], text.tokens[..at]);
+        assert_eq!(with.tokens[at..at + n], media_ids[..]);
+        assert_eq!(with.tokens[at + n..], text.tokens[at..]);
+        for (a, b) in text.questions.iter().zip(&with.questions) {
+            assert_eq!(b.span, (a.span.0 + n, a.span.1 + n));
+            for ((_, sa), (_, sb)) in a.options.iter().zip(&b.options) {
+                assert_eq!(*sb, (sa.0 + n, sa.1 + n));
+            }
+        }
+
+        let state_len = tokens(&tok, "the account is overdue").unwrap().len();
+        assert!(state_len > 1);
+        let limit = with.tokens.len() - state_len + 1;
+        let cut = encode(&tok, request, limit, &media_ids).unwrap();
+        assert_eq!(cut.tokens.len(), limit, "one state token survives");
+        assert_eq!(
+            cut.tokens[at..at + n],
+            media_ids[..],
+            "images are never cut"
+        );
+        assert!(encode(&tok, request, limit - 2, &media_ids).is_err());
+    }
 
     #[test]
     fn json_is_compact_sorted_and_keeps_non_ascii() {
@@ -479,6 +669,7 @@ mod tests {
         });
         let record = EncodedRecord {
             tokens: vec![],
+            media_start: 0,
             questions: vec![
                 EncodedQuestion {
                     id: "c".into(),

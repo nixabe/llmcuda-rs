@@ -346,6 +346,25 @@ toward context and admission like any others, and
 
 Without `--mmproj`, an image part is refused with a 400 that names the flag.
 
+A decision model (`clef`) takes images on `/v1/systemone` instead, as a
+top-level `images` array of `data:` URLs:
+
+```json
+{"model": "clef-flash", "state": {"task": "Review the attached invoice."},
+ "images": ["data:image/png;base64,..."],
+ "questions": {"paid": {"type": "noul", "instructions": "Is the invoice paid?"}}}
+```
+
+They go where Cloudflare's `encode_record` puts them — after `STATE:`,
+before the state, then a newline — and count toward `--decision-max-tokens`
+and `usage.input_tokens`; the state is truncated to make room, the images
+and schema never are. `videos` is refused, and so is `media_kwargs`
+alongside images. Sizing is this server's (`--image-max-tokens`, llama.cpp's
+fit-and-pad bilinear resize), not the reference processor's: an image whose
+sides are multiples of 32 and which fits in 64 to `--image-max-tokens`
+tokens is encoded from identical pixels, any other is resized differently
+(see [TESTING.md](TESTING.md#the-decision-model-clef)).
+
 ## What is refused
 
 *Refused with `400`*, because honouring them halfway would answer a different

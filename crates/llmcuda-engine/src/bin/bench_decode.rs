@@ -50,7 +50,7 @@ use tracing::{debug, error, info, warn};
 use llmcuda_cuda::arena::memory_info;
 use llmcuda_cuda::device::{DeviceInfo, driver_available};
 use llmcuda_engine::DeviceWeights;
-use llmcuda_engine::forward::{Forward, arena_holds_model_entry};
+use llmcuda_engine::forward::{Forward, arena_holds_model_entry, host_holds};
 use llmcuda_gguf::GgufFile;
 use llmcuda_model::config::ModelConfig;
 use llmcuda_model::weights::WeightSchema;
@@ -147,11 +147,15 @@ fn main() -> ExitCode {
 
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).expect("schema resolves");
-    let (weights, load) =
-        DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |role, ty| {
-            arena_holds_model_entry(&config, role, ty)
-        })
-        .expect("weight load");
+    let (weights, load) = DeviceWeights::load_placed(
+        &ctx,
+        &stream,
+        &file,
+        &directory,
+        |role, ty| arena_holds_model_entry(&config, role, ty),
+        |role| host_holds(&config, role),
+    )
+    .expect("weight load");
     debug!(
         "arena {:.3} GiB in {:.1} s",
         load.bytes as f64 / (1u64 << 30) as f64,

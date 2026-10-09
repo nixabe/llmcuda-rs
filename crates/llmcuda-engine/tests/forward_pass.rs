@@ -58,7 +58,7 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use llmcuda_cuda::arena::memory_info;
 use llmcuda_cuda::device::{DeviceInfo, driver_available};
 use llmcuda_engine::DeviceWeights;
-use llmcuda_engine::forward::{Forward, arena_holds_entry};
+use llmcuda_engine::forward::{Forward, arena_holds_entry, host_holds};
 use llmcuda_gguf::GgufFile;
 use llmcuda_kernels::compare::{ComparisonResult, compare};
 use llmcuda_model::config::{LayerKind, ModelConfig};
@@ -326,11 +326,15 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
         .resolve(&file)
         .expect("the schema must resolve against the model file");
     let started = Instant::now();
-    let (weights, report) =
-        DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |role, ty| {
-            arena_holds_entry(config.ffn, role, ty)
-        })
-        .expect("weight load");
+    let (weights, report) = DeviceWeights::load_placed(
+        &ctx,
+        &stream,
+        &file,
+        &directory,
+        |role, ty| arena_holds_entry(config.ffn, role, ty),
+        |role| host_holds(&config, role),
+    )
+    .expect("weight load");
     println!(
         "arena: {} of {} tensors, {:.3} GiB in {:.1} s ({:.2} GB/s)",
         report.tensors,

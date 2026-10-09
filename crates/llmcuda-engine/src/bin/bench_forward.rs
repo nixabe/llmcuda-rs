@@ -46,7 +46,7 @@ use std::time::Instant;
 use cudarc::driver::{CudaContext, CudaStream, Profiler};
 use llmcuda_cuda::arena::memory_info;
 use llmcuda_cuda::device::{DeviceInfo, driver_available};
-use llmcuda_engine::forward::{Forward, arena_holds_model_entry};
+use llmcuda_engine::forward::{Forward, arena_holds_model_entry, host_holds};
 use llmcuda_engine::weights::DeviceWeights;
 use llmcuda_gguf::GgufFile;
 use llmcuda_model::config::ModelConfig;
@@ -139,11 +139,15 @@ fn main() {
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).expect("schema resolves");
     let load = Instant::now();
-    let (weights, report) =
-        DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |role, ty| {
-            arena_holds_model_entry(&config, role, ty)
-        })
-        .expect("weight load");
+    let (weights, report) = DeviceWeights::load_placed(
+        &ctx,
+        &stream,
+        &file,
+        &directory,
+        |role, ty| arena_holds_model_entry(&config, role, ty),
+        |role| host_holds(&config, role),
+    )
+    .expect("weight load");
     info!(
         "arena:  {:.3} GiB in {:.1} s ({:.2} GB/s)\n",
         report.bytes as f64 / (1u64 << 30) as f64,

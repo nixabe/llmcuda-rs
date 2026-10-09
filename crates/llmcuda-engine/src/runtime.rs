@@ -28,7 +28,7 @@ use crate::block::mtp::{MtpBlock, MtpBlockError};
 use crate::decision::DecisionSpans;
 use crate::dflash::{DFlashDraftCache, DFlashError, DFlashForward, load_dflash_weights};
 use crate::forward::{
-    BatchStepGraph, Forward, ForwardError, WaypointStage, arena_holds_model_entry,
+    BatchStepGraph, Forward, ForwardError, WaypointStage, arena_holds_model_entry, host_holds,
 };
 use crate::image::{
     ImagePlacement, SequenceImage, chunk_overlaps_images, fill_mrope_triples, rope_delta_at,
@@ -849,10 +849,14 @@ impl DeviceRuntime {
         let directory = schema
             .resolve(&file)
             .map_err(|errors| RuntimeError::Schema(format!("{errors:?}")))?;
-        let (weights, _) =
-            DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |role, ty| {
-                arena_holds_model_entry(&config, role, ty)
-            })?;
+        let (weights, _) = DeviceWeights::load_placed(
+            &ctx,
+            &stream,
+            &file,
+            &directory,
+            |role, ty| arena_holds_model_entry(&config, role, ty),
+            |role| host_holds(&config, role),
+        )?;
         debug!(
             device = device_ordinal,
             elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,

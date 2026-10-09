@@ -28,7 +28,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DriverError};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DriverError, result, sys};
 use llmcuda_cuda::arena::{ALIGNMENT, Allocation, ArenaError, DeviceArena, memory_info};
 use llmcuda_gguf::{GgmlType, GgufFile};
 use llmcuda_model::weights::{Directory, Role};
@@ -45,8 +45,12 @@ pub struct TensorPlacement {
     pub ggml_type: GgmlType,
     /// Dimensions in GGUF order.
     pub dims: Vec<u64>,
-    /// Byte range within the arena.
+    /// Byte range within the arena, or within the host slab when
+    /// [`Self::on_host`].
     pub alloc: Allocation,
+    /// Held in pinned host memory the device reads over PCIe rather than in
+    /// the arena: see [`DeviceWeights::load_placed`].
+    pub on_host: bool,
 }
 
 /// Something that went wrong loading weights.
@@ -224,8 +228,65 @@ impl<T> ResidentTensor<'_, T> {
 /// The model, resident on one device.
 pub struct DeviceWeights {
     arena: DeviceArena,
+    host: Option<HostSlab>,
     placements: Vec<TensorPlacement>,
     index: HashMap<(Role, Option<u32>), usize>,
+}
+
+/// Pinned host memory mapped into one device's address space, for tensors a
+/// kernel reads a few rows of per pass.
+struct HostSlab {
+    host: *mut u8,
+    device: sys::CUdeviceptr,
+    len: usize,
+    ctx: Arc<CudaContext>,
+}
+
+// SAFETY: the slab is plain bytes written once, before any kernel is launched
+// on it, and freed only on drop; nothing else holds the host pointer.
+unsafe impl Send for HostSlab {}
+// SAFETY: as above — after construction the host side is only read.
+unsafe impl Sync for HostSlab {}
+
+impl HostSlab {
+    fn new(ctx: &Arc<CudaContext>, len: usize) -> Result<Self, DriverError> {
+        ctx.bind_to_thread()?;
+        // Write-combined: the host only writes it, once, and the device's
+        // reads then bypass the CPU caches' snoop.
+        let flags = sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_WRITECOMBINED;
+        // SAFETY: a fresh allocation of `len` bytes; it is filled before any
+        // read, and `device` is its mapping into this context.
+        unsafe {
+            let host = result::malloc_host(len.max(1), flags)?.cast::<u8>();
+            let mut device = 0;
+            if let Err(e) = sys::cuMemHostGetDevicePointer_v2(&mut device, host.cast(), 0).result()
+            {
+                let _ = result::free_host(host.cast());
+                return Err(e);
+            }
+            Ok(Self {
+                host,
+                device,
+                len,
+                ctx: Arc::clone(ctx),
+            })
+        }
+    }
+
+    fn bytes(&self, alloc: &Allocation) -> &[u8] {
+        assert!(alloc.offset + alloc.len <= self.len);
+        // SAFETY: in bounds, and the slab outlives the borrow.
+        unsafe { std::slice::from_raw_parts(self.host.add(alloc.offset), alloc.len) }
+    }
+}
+
+impl Drop for HostSlab {
+    fn drop(&mut self) {
+        // A kernel may still be reading it; the driver frees it either way.
+        let _ = self.ctx.synchronize();
+        // SAFETY: allocated by `malloc_host` in `new` and freed only here.
+        let _ = unsafe { result::free_host(self.host.cast()) };
+    }
 }
 
 impl DeviceWeights {
@@ -258,9 +319,13 @@ impl DeviceWeights {
     }
 
     /// K2 resident weights: global arena alignment, fp32 norm/bias vectors,
-    /// and the integer kernels' packed projection layout. Excludes scratch.
+    /// and the integer kernels' packed projection layout. Excludes scratch,
+    /// and the input embedding, which K2 reads from mapped host memory
+    /// ([`crate::forward::host_holds`]).
     pub fn k2_required_bytes(directory: &Directory<'_>) -> u64 {
-        let globals = Self::required_bytes_where(directory, Role::is_global);
+        let globals = Self::required_bytes_where(directory, |role| {
+            role.is_global() && role != Role::TokenEmbedding
+        });
         globals
             + directory
                 .entries()
@@ -342,7 +407,30 @@ impl DeviceWeights {
         directory: &Directory<'_>,
         keep: impl Fn(Role, GgmlType) -> bool,
     ) -> Result<(Self, LoadReport), LoadError> {
-        let capacity = Self::required_bytes_where_entry(directory, &keep);
+        Self::load_placed(ctx, stream, file, directory, keep, |_| false)
+    }
+
+    /// As [`Self::load_where_entry`], with the kept roles `on_host` accepts
+    /// held in pinned host memory mapped into the device's address space
+    /// instead of in the arena.
+    ///
+    /// Their aliases are device pointers like any other, so every reader
+    /// works unchanged; each read crosses PCIe. That suits a table a pass
+    /// reads one row per token of — K2-Horizon's input embedding
+    /// (`crate::forward::host_holds`) — and nothing a pass streams whole.
+    pub fn load_placed(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        file: &GgufFile,
+        directory: &Directory<'_>,
+        keep: impl Fn(Role, GgmlType) -> bool,
+        on_host: impl Fn(Role) -> bool,
+    ) -> Result<(Self, LoadReport), LoadError> {
+        let capacity = Self::required_bytes_where_entry(directory, |role, ty| {
+            keep(role, ty) && !on_host(role)
+        });
+        let host_capacity =
+            Self::required_bytes_where_entry(directory, |role, ty| keep(role, ty) && on_host(role));
         let (free_before, _) = memory_info(ctx)?;
 
         // Leave the driver room for its own allocations; a request that
@@ -371,6 +459,12 @@ impl DeviceWeights {
 
         let started = Instant::now();
         let mut arena = DeviceArena::new(stream, capacity as usize)?;
+        let mut host = if host_capacity > 0 {
+            Some(HostSlab::new(ctx, host_capacity as usize)?)
+        } else {
+            None
+        };
+        let mut host_used = 0usize;
         let mut placements = Vec::with_capacity(directory.len());
         let mut index = HashMap::with_capacity(directory.len());
         let mut bytes = 0u64;
@@ -387,7 +481,28 @@ impl DeviceWeights {
                     name: name.to_string(),
                     expected: entry.info.n_bytes,
                 })?;
-            let alloc = arena.push(stream, data)?;
+            let placed_on_host = host.is_some() && on_host(entry.spec.role);
+            let alloc = match host.as_mut() {
+                Some(slab) if placed_on_host => {
+                    let alloc = Allocation {
+                        offset: host_used,
+                        len: data.len(),
+                    };
+                    host_used += data.len().next_multiple_of(ALIGNMENT);
+                    assert!(host_used <= slab.len, "host slab sized from the directory");
+                    // SAFETY: in bounds by the assertion; nothing reads the
+                    // slab until this load returns.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            slab.host.add(alloc.offset),
+                            data.len(),
+                        );
+                    }
+                    alloc
+                }
+                _ => arena.push(stream, data)?,
+            };
             bytes += data.len() as u64;
             // Per-tensor, so `trace`. 753 lines is the point: it is the only
             // way to see which tensor a load failed on, or that a role was
@@ -407,6 +522,7 @@ impl DeviceWeights {
                 ggml_type: entry.info.ggml_type,
                 dims: entry.info.dims.clone(),
                 alloc,
+                on_host: placed_on_host,
             });
         }
 
@@ -435,10 +551,18 @@ impl DeviceWeights {
             bytes as f64 / 1e9 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
             free_after as f64 / (1u64 << 30) as f64,
         );
+        if host_used > 0 {
+            debug!(
+                "device {}: {:.3} GiB of it in mapped host memory",
+                ctx.ordinal(),
+                host_used as f64 / (1u64 << 30) as f64,
+            );
+        }
 
         Ok((
             Self {
                 arena,
+                host,
                 placements,
                 index,
             },
@@ -479,14 +603,14 @@ impl DeviceWeights {
         role: Role,
         layer: Option<u32>,
     ) -> Option<ResidentTensor<'_, u8>> {
-        let alloc = self.find(role, layer)?.alloc;
-        // SAFETY: `alloc` came from this arena's bump allocator, so
-        // `[offset, offset + len)` is inside the slab and was written by the
-        // upload; `u8` has no invalid bit patterns and no alignment
-        // requirement. The result is wrapped in a `ManuallyDrop` below, so the
-        // driver is never asked to free an address it did not hand out, and
-        // the returned lifetime keeps it inside the arena's.
-        Some(unsafe { self.alias(stream, &alloc, alloc.len) })
+        let placement = self.find(role, layer)?;
+        // SAFETY: `alloc` came from this arena's bump allocator (or the host
+        // slab's), so `[offset, offset + len)` is inside the slab and was
+        // written by the upload; `u8` has no invalid bit patterns and no
+        // alignment requirement. The result is wrapped in a `ManuallyDrop`
+        // below, so the driver is never asked to free an address it did not
+        // hand out, and the returned lifetime keeps it inside the arena's.
+        Some(unsafe { self.alias(stream, placement, placement.alloc.len) })
     }
 
     /// A zero-copy alias of one resident tensor, read as `f32`.
@@ -505,30 +629,32 @@ impl DeviceWeights {
         if placement.ggml_type != GgmlType::F32 || !placement.alloc.len.is_multiple_of(4) {
             return None;
         }
-        let alloc = placement.alloc;
         // SAFETY: as `bytes_of`, plus: every arena offset is a multiple of
         // `ALIGNMENT` (256) and so satisfies `f32`'s 4-byte alignment, the
         // length is a whole number of `f32`s, and the stored type was checked
         // to be `f32` — so the bytes are a valid little-endian `f32` array on
         // the little-endian hosts this crate supports.
-        Some(unsafe { self.alias(stream, &alloc, alloc.len / 4) })
+        Some(unsafe { self.alias(stream, placement, placement.alloc.len / 4) })
     }
 
-    /// Wrap `[alloc.offset, alloc.offset + alloc.len)` of the slab as `len`
-    /// elements of `T`.
+    /// Wrap `[alloc.offset, alloc.offset + alloc.len)` of the slab that holds
+    /// `placement` as `len` elements of `T`.
     ///
     /// # Safety
     ///
-    /// `alloc` must be a reservation from this arena and `len * size_of::<T>()`
-    /// must be at most `alloc.len`; the bytes must be a valid `[T]`.
+    /// `placement` must be one of this load's and `len * size_of::<T>()` must
+    /// be at most its `alloc.len`; the bytes must be a valid `[T]`.
     unsafe fn alias<T>(
         &self,
         stream: &Arc<CudaStream>,
-        alloc: &Allocation,
+        placement: &TensorPlacement,
         len: usize,
     ) -> ResidentTensor<'_, T> {
-        let (base, _sync) = self.arena.slab().device_ptr(stream);
-        let ptr = base + alloc.offset as u64;
+        let base = match (&self.host, placement.on_host) {
+            (Some(slab), true) => slab.device,
+            _ => self.arena.slab().device_ptr(stream).0,
+        };
+        let ptr = base + placement.alloc.offset as u64;
         // SAFETY: the caller guarantees the range and the element type; the
         // slice is immediately sealed in a `ManuallyDrop`.
         let slice = unsafe { stream.upgrade_device_ptr::<T>(ptr, len) };
@@ -573,7 +699,10 @@ impl DeviceWeights {
                     name: name.to_string(),
                     expected: entry.info.n_bytes,
                 })?;
-            let found = self.arena.read(stream, &placement.alloc)?;
+            let found = match (&self.host, placement.on_host) {
+                (Some(slab), true) => slab.bytes(&placement.alloc).to_vec(),
+                _ => self.arena.read(stream, &placement.alloc)?,
+            };
 
             if let Some(offset) = first_difference(expected, &found) {
                 return Err(LoadError::Mismatch {

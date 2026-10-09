@@ -183,6 +183,39 @@ __device__ __forceinline__ float load_half_le(const unsigned char* p) {
     return f;
 }
 
+// Copy one table row into shared memory before reading it. K2-Horizon's table
+// is mapped host memory (`forward::host_holds`), where every read crosses
+// PCIe, and the gather reads a row byte by byte over dependent loop
+// iterations: one round trip each. Here every thread issues all of its word
+// loads before storing any, so each 4 * blockDim words cost one round trip.
+// A row that is not whole aligned words, or is longer than the stage, is read
+// in place; the condition is uniform across the block.
+#define EMBED_STAGE_WORDS 4096
+__device__ __forceinline__ const unsigned char* embed_stage_row(
+    const unsigned char* row, long long row_bytes, unsigned int* stage
+) {
+    if ((row_bytes & 3) || row_bytes > EMBED_STAGE_WORDS * 4 || ((unsigned long long)row & 3)) {
+        return row;
+    }
+    int words = (int)(row_bytes >> 2);
+    const unsigned int* src = (const unsigned int*)row;
+    for (int base = 0; base < words; base += 4 * (int)blockDim.x) {
+        unsigned int v[4];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            int w = base + (int)threadIdx.x + k * (int)blockDim.x;
+            if (w < words) v[k] = src[w];
+        }
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            int w = base + (int)threadIdx.x + k * (int)blockDim.x;
+            if (w < words) stage[w] = v[k];
+        }
+    }
+    __syncthreads();
+    return (const unsigned char*)stage;
+}
+
 // out[t][j] = dequantize(token_embd)[ids[t]][j] -- ggml's `get_rows` over a
 // Q8_0 table, which is what `model.input_embed` is.
 //
@@ -286,7 +319,8 @@ __global__ void fwd_embed_quant(
         case FWD_EMBED_Q5_K: row_bytes = (long long)(hidden / 256) * 176; break;
         default:             row_bytes = (long long)hidden * 2;           break;
     }
-    const unsigned char* row = table + (long long)ids[t] * row_bytes;
+    __shared__ unsigned int stage[EMBED_STAGE_WORDS];
+    const unsigned char* row = embed_stage_row(table + (long long)ids[t] * row_bytes, row_bytes, stage);
     float* dst = out + (long long)t * hidden;
 
     for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
@@ -690,6 +724,20 @@ pub fn arena_holds_model_entry(config: &ModelConfig, role: Role, ty: GgmlType) -
     } else {
         arena_holds_entry(config.ffn, role, ty)
     }
+}
+
+/// Whether the engine holds `role` in pinned host memory the device reads over
+/// PCIe ([`DeviceWeights::load_placed`]) instead of in VRAM.
+///
+/// Only K2-Horizon's input embedding. A pass gathers one row of it per token,
+/// so a decode step pays one PCIe round trip, about 20 us: inside K2's
+/// 14.6 ms step, where its 192 KiB per token of KV makes VRAM the binding
+/// limit, but 0.2-0.4% of a Qwen3.6 decode step, which keeps its table on the
+/// card (docs/BENCHMARKS.md). llama.cpp keeps the table on the CPU for every
+/// model. Every model this engine serves has an untied LM head; a tied one
+/// would stream this table whole every step and must not be placed here.
+pub fn host_holds(config: &ModelConfig, role: Role) -> bool {
+    config.k2.is_some() && role == Role::TokenEmbedding
 }
 
 /// [`arena_holds_for`] at the routed architecture.

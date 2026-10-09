@@ -8,7 +8,7 @@ use cudarc::driver::CudaContext;
 use llmcuda_cuda::device::driver_available;
 use llmcuda_engine::{
     DeviceWeights,
-    forward::{Forward, arena_holds_model_entry},
+    forward::{Forward, arena_holds_model_entry, host_holds},
 };
 use llmcuda_gguf::GgufFile;
 use llmcuda_kernels::compare::compare;
@@ -72,9 +72,14 @@ fn k2_full_model() {
     println!("KV cache K={} V={}", config.kv_cache.k, config.kv_cache.v);
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).unwrap();
-    let (weights, _) = DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |r, t| {
-        arena_holds_model_entry(&config, r, t)
-    })
+    let (weights, _) = DeviceWeights::load_placed(
+        &ctx,
+        &stream,
+        &file,
+        &directory,
+        |r, t| arena_holds_model_entry(&config, r, t),
+        |role| host_holds(&config, role),
+    )
     .unwrap();
     println!("building {}-token K2 pass", tokens.len());
     let mut pass = Forward::new(

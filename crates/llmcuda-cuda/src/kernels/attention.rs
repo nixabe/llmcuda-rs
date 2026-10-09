@@ -2712,7 +2712,7 @@ __device__ __forceinline__ void attn_k2_warp_body(const float* __restrict__ q,co
                 vw[jj][2] = vq.z; vw[jj][3] = vq.w;
             } else {
                 #pragma unroll
-                for (int p = 0; p < (ATTN_MAXD >> 1); ++p) {
+                for (int p = 0; p < MAXD / 2; ++p) {
                     kw[jj][p] = (live && p < wpl) ? kp[wpl * lane + p] : 0u;
                     vw[jj][p] = (live && p < wpl) ? vp[wpl * lane + p] : 0u;
                 }
@@ -2723,7 +2723,7 @@ __device__ __forceinline__ void attn_k2_warp_body(const float* __restrict__ q,co
         if (j0 + jj >= end) break;
         float kk[MAXD], vv[MAXD];
         #pragma unroll
-        for (int p = 0; p < (ATTN_MAXD >> 1); ++p) {
+        for (int p = 0; p < MAXD / 2; ++p) {
             if (p < wpl) {
                 h2f2(kw[jj][p], &kk[2 * p], &kk[2 * p + 1]);
                 h2f2(vw[jj][p], &vv[2 * p], &vv[2 * p + 1]);

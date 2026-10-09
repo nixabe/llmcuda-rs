@@ -1,7 +1,7 @@
 # llmcuda-rs
 
-A single-process CUDA inference engine in Rust, built for `Qwen3.6-35B-A3B`
-on 3× Quadro RTX 8000 (sm_75).
+A single-process CUDA inference engine with cross-GPU prefix-cache sharing,
+optimized for Turing (sm_75) and limited models.
 
 > **Experimental.** This project was built entirely by AI agents. It is not
 > production-ready and has been tested on one machine only. Expect bugs.
@@ -26,10 +26,10 @@ inferred from tensor shapes.
 
 | Model | Architecture | Notes |
 | --- | --- | --- |
-| Qwen3.6-35B-A3B | `qwen35moe` | The tuned target, `unsloth` `UD-Q6_K_XL` |
-| Qwen3.8-27B | `qwen35` | Dense sibling |
+| [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | `qwen35moe` | The tuned target, `unsloth` `UD-Q6_K_XL` |
+| [Qwen3.8-27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | `qwen35` | Dense sibling |
 | [K2-Horizon-MoVA-36B-A4B](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B-GGUF) | `k2-horizon` | Q4_K_M and Q6_K; see [MODEL.md](docs/MODEL.md#k2-horizon) |
-| Clef-Flash | `clef` | Decision model, served on `/v1/systemone` only |
+| [Clef-Flash](https://huggingface.co/ggml-org/Clef-Flash-GGUF) | `clef` | Decision model, served on `/v1/systemone` only |
 
 ## Why one process
 
@@ -70,7 +70,7 @@ path.
 | | |
 | --- | --- |
 | GPUs | 3× Quadro RTX 8000: 48 GB, sm_75 (Turing), 672 GB/s |
-| Host | 125 GB RAM, 12 vCPU |
+| Host | 125 GB RAM, 20 vCPU |
 | CUDA | 12.4 |
 
 Turing has no `cp.async`, so double-buffering is done by hand. Its tensor

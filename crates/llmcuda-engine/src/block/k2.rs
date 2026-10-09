@@ -262,12 +262,13 @@ impl K2ValueScratch {
         let top = k.values_per_token as usize;
         let rows = (c.attention.kv_heads * c.attention.head_dim) as usize;
         Ok(Self {
-            rotary: K2Rope::new(
+            rotary: K2Rope::with_kv_formats(
                 stream.context(),
                 stream,
                 t,
                 c.attention.head_dim as usize,
                 c.attention.rope_dim as usize,
+                super::attention::kv_formats(c),
             )?,
             dispatch: K2Dispatch::new_gemm(stream, t, top, k.value_experts as usize)?,
             batch_decode: if t <= STEP_SLOTS {
@@ -384,11 +385,12 @@ impl K2AttentionKernels {
     ) -> Result<Self, AttentionBlockError> {
         Ok(Self {
             ops: Arc::new(K2Kernels::new(ctx)?),
-            attention: AttentionKernels::new(
+            attention: AttentionKernels::with_kv_formats(
                 ctx,
                 c.attention.q_heads as usize,
                 c.attention.kv_heads as usize,
                 c.attention.head_dim as usize,
+                super::attention::kv_formats(c),
             )?,
             add: LayerOpsKernels::new(ctx)?,
         })

@@ -122,7 +122,9 @@ fn main() {
         .unwrap_or(5);
 
     let file = GgufFile::open(&path).expect("valid GGUF v3");
-    let config = ModelConfig::from_gguf(&file).expect("a supported architecture");
+    let mut config = ModelConfig::from_gguf(&file).expect("a supported architecture");
+    config.kv_cache = llmcuda_model::KvCacheTypes::from_env().expect("cache type");
+    info!("KV cache K={} V={}", config.kv_cache.k, config.kv_cache.v);
     let stream = ctx.default_stream();
     let (free_at_start, total) = memory_info(&ctx).expect("memory info");
 

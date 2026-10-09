@@ -107,7 +107,9 @@ use cudarc::driver::{
 };
 
 use llmcuda_cuda::arena::ArenaError;
-use llmcuda_cuda::kernels::attention::{AttentionError, AttentionKernels, AttnDecodeScratch};
+use llmcuda_cuda::kernels::attention::{
+    AttentionError, AttentionKernels, AttnDecodeScratch, KvFormat, KvFormats,
+};
 use llmcuda_cuda::kernels::hgemm::{HalfWeight, HgemmError, bf16_half_exponent};
 use llmcuda_cuda::kernels::layer_ops::{GateShape, LayerOpsError, LayerOpsKernels};
 use llmcuda_cuda::kernels::lm_head::{
@@ -115,7 +117,7 @@ use llmcuda_cuda::kernels::lm_head::{
 };
 use llmcuda_cuda::kernels::mma::{MMA_SPLIT_TOKENS, MmaError, MmaKernels};
 use llmcuda_gguf::{GgmlType, GgufFile};
-use llmcuda_model::config::ModelConfig;
+use llmcuda_model::config::{KvCacheType, ModelConfig};
 use llmcuda_model::weights::{Directory, Role};
 
 use crate::weights::DeviceWeights;
@@ -368,18 +370,38 @@ impl AttentionKernelSet {
 ///
 /// # Size
 ///
-/// `2 * kv_heads * head_dim * 4` bytes per position per layer — 4 KiB for
+/// `2 * kv_heads * head_dim * 2` bytes per position per layer at binary16 — 2 KiB for
 /// Qwen3.6, whose 2 KV heads are the entire reason a 256-wide head dimension
 /// is affordable. Ten attention layers of forty makes 40 KiB per token, so a
 /// 32,768-token sequence costs 1.25 GiB. The other thirty layers are Gated
 /// DeltaNet and carry a fixed-size recurrent state instead, which is what
 /// [`GdnState`](crate::block::gdn::GdnState) holds and why this model's cache does not grow the way a
 /// forty-layer dense model's would.
+///
+/// Each half is binary16 or, for K2 with `--cache-type-k/-v q8_0`, q8_0 rows
+/// (`KvFormat`): still a `u16` buffer, `row_words` words per position, so the
+/// pointer plumbing is unchanged and only the kernels that know the format
+/// read it.
 pub struct KvCache {
     pub(crate) k: CudaSlice<u16>,
     pub(crate) v: CudaSlice<u16>,
-    kv_dim: usize,
+    formats: KvFormats,
+    /// `u16` words one position occupies in each half.
+    k_row: usize,
+    v_row: usize,
     pub(crate) max_seq: usize,
+}
+
+/// The kernel crate's view of a model's cache formats.
+pub fn kv_formats(config: &ModelConfig) -> KvFormats {
+    let format = |t| match t {
+        KvCacheType::F16 => KvFormat::F16,
+        KvCacheType::Q8_0 => KvFormat::Q8_0,
+    };
+    KvFormats {
+        k: format(config.kv_cache.k),
+        v: format(config.kv_cache.v),
+    }
 }
 
 /// Capacity for one attention layer's retention-interval delta. A snapshot
@@ -402,7 +424,7 @@ impl KvCache {
         max_seq: usize,
     ) -> Result<Self, AttentionBlockError> {
         let kv_dim = config.attention.kv_heads as usize * config.attention.head_dim as usize;
-        Self::with_kv_dim(stream, kv_dim, max_seq)
+        Self::with_formats(stream, kv_dim, max_seq, kv_formats(config))
     }
 
     /// [`Self::new`] for a cache whose per-token width is not the target
@@ -413,12 +435,38 @@ impl KvCache {
         kv_dim: usize,
         max_seq: usize,
     ) -> Result<Self, AttentionBlockError> {
+        Self::with_formats(stream, kv_dim, max_seq, KvFormats::F16)
+    }
+
+    /// A cache of `max_seq` positions of `kv_dim` elements in `formats`.
+    ///
+    /// Zeroed in either format: a zero q8_0 code with a zero scale reads back
+    /// as +0, the same value a zeroed binary16 slot holds.
+    pub fn with_formats(
+        stream: &Arc<CudaStream>,
+        kv_dim: usize,
+        max_seq: usize,
+        formats: KvFormats,
+    ) -> Result<Self, AttentionBlockError> {
+        let (k_row, v_row) = (formats.k.row_words(kv_dim), formats.v.row_words(kv_dim));
         Ok(Self {
-            k: stream.alloc_zeros::<u16>(max_seq * kv_dim)?,
-            v: stream.alloc_zeros::<u16>(max_seq * kv_dim)?,
-            kv_dim,
+            k: stream.alloc_zeros::<u16>(max_seq * k_row)?,
+            v: stream.alloc_zeros::<u16>(max_seq * v_row)?,
+            formats,
+            k_row,
+            v_row,
             max_seq,
         })
+    }
+
+    /// The format each half is stored in.
+    pub fn formats(&self) -> KvFormats {
+        self.formats
+    }
+
+    /// `u16` words per position in the key and value halves.
+    pub fn row_words(&self) -> (usize, usize) {
+        (self.k_row, self.v_row)
     }
 
     /// Positions this cache can hold.
@@ -428,17 +476,18 @@ impl KvCache {
 
     /// Device bytes held, both halves.
     ///
-    /// binary16, which is 20 KiB per token at this model's geometry rather than
-    /// 40 — 2.53 GiB at 131,072 positions instead of 5.06. It is also the dtype
-    /// llama.cpp's cache uses, and the one `llmcuda-cache`'s planner has always
-    /// assumed (`DEFAULT_ELEM_SIZE = 2`), which this makes true rather than
-    /// aspirational.
+    /// binary16 by default, which is 20 KiB per token at Qwen3.6's geometry
+    /// rather than 40 — 2.53 GiB at 131,072 positions instead of 5.06, and the
+    /// dtype llama.cpp's cache uses. A q8_0 half is 17/32 of its binary16
+    /// size; `ModelConfig::kv_cache_bytes_per_token` is the planner's side of
+    /// the same arithmetic.
     pub fn bytes(&self) -> u64 {
-        2 * (self.max_seq * self.kv_dim * size_of::<u16>()) as u64
+        (self.max_seq * (self.k_row + self.v_row) * size_of::<u16>()) as u64
     }
 
-    /// The cached keys, `[max_seq][kv_heads][head_dim]`, rotary already
-    /// applied. Positions at or above the sequence length are zero.
+    /// The cached keys, `[max_seq][kv_heads][head_dim]` at binary16 (or that
+    /// row's q8_0 codes and scales), rotary already applied. Positions at or
+    /// above the sequence length are zero.
     pub fn keys(&self) -> &CudaSlice<u16> {
         &self.k
     }
@@ -465,9 +514,12 @@ impl KvCache {
     ) -> Result<(), DriverError> {
         assert!(start <= positions);
         assert!(positions <= self.max_seq);
-        let first = start * self.kv_dim;
-        let elements = (positions - start) * self.kv_dim;
-        for (device, host) in [(&self.k, &mut prefix.k), (&self.v, &mut prefix.v)] {
+        for (device, host, row) in [
+            (&self.k, &mut prefix.k, self.k_row),
+            (&self.v, &mut prefix.v, self.v_row),
+        ] {
+            // Whole rows: a q8_0 position's codes and scales are contiguous.
+            let (first, elements) = (start * row, (positions - start) * row);
             assert!(elements <= host.len());
             // SAFETY: the bounded view is used only on this stream. Keep the
             // pinned allocation's event guard until its copy is enqueued;
@@ -490,9 +542,11 @@ impl KvCache {
     ) -> Result<(), DriverError> {
         assert!(start <= positions);
         assert!(positions <= self.max_seq);
-        let first = start * self.kv_dim;
-        let elements = (positions - start) * self.kv_dim;
-        for (device, host) in [(&mut self.k, &prefix.k), (&mut self.v, &prefix.v)] {
+        for (device, host, row) in [
+            (&mut self.k, &prefix.k, self.k_row),
+            (&mut self.v, &prefix.v, self.v_row),
+        ] {
+            let (first, elements) = (start * row, (positions - start) * row);
             assert!(elements <= host.len());
             // SAFETY: capture initialized exactly this prefix. Its pinned
             // event orders the read after capture, including across streams;
@@ -2553,6 +2607,56 @@ impl From<llmcuda_cuda::kernels::moe::MoeError> for AttentionBlockError {
 mod tests {
     use super::*;
     use llmcuda_model::config::LayerKind;
+
+    #[test]
+    fn snapshots_copy_each_half_in_its_own_row_width() {
+        if !llmcuda_cuda::device::driver_available() {
+            println!("SKIPPED: no CUDA driver present");
+            return;
+        }
+        let Ok(ctx) = CudaContext::new(0) else {
+            println!("SKIPPED: could not create CUDA context");
+            return;
+        };
+        let stream = ctx.default_stream();
+        // One q8_0 block per position: 32 codes and one scale are 17 words,
+        // against 32 for the binary16 half.
+        let formats = KvFormats {
+            k: KvFormat::Q8_0,
+            v: KvFormat::F16,
+        };
+        let (kv_dim, max_seq) = (32, 8);
+        let mut source = KvCache::with_formats(&stream, kv_dim, max_seq, formats).unwrap();
+        let mut destination = KvCache::with_formats(&stream, kv_dim, max_seq, formats).unwrap();
+        assert_eq!(source.row_words(), (17, 32));
+        assert_eq!(source.bytes(), (max_seq * (17 + 32) * 2) as u64);
+        let keys: Vec<u16> = (0..max_seq * 17).map(|i| i as u16 + 7).collect();
+        let values: Vec<u16> = (0..max_seq * 32).map(|i| i as u16 + 3000).collect();
+        stream.memcpy_htod(&keys, &mut source.k).unwrap();
+        stream.memcpy_htod(&values, &mut source.v).unwrap();
+        // SAFETY: snapshot_range_into writes every element that is read.
+        let mut prefix = unsafe {
+            HostKvPrefix {
+                k: ctx.alloc_pinned::<u16>(max_seq * 17).unwrap(),
+                v: ctx.alloc_pinned::<u16>(max_seq * 32).unwrap(),
+            }
+        };
+        let (start, positions) = (2, 7);
+        source
+            .snapshot_range_into(&stream, start, positions, &mut prefix)
+            .unwrap();
+        destination
+            .restore_prefix(&stream, &prefix, start, positions)
+            .unwrap();
+        for (device, expected, row) in [(&destination.k, &keys, 17), (&destination.v, &values, 32)]
+        {
+            let actual = stream.clone_dtoh(device).unwrap();
+            let live = start * row..positions * row;
+            assert_eq!(&actual[live.clone()], &expected[live.clone()]);
+            assert!(actual[..live.start].iter().all(|&w| w == 0));
+            assert!(actual[live.end..].iter().all(|&w| w == 0));
+        }
+    }
 
     #[test]
     fn partial_snapshot_copies_only_live_kv_and_keeps_cross_stream_ordering() {

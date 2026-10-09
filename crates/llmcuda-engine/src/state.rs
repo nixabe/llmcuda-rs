@@ -252,8 +252,12 @@ impl<T> std::ops::DerefMut for Lease<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SnapshotLayout {
     attention_layers: usize,
-    kv_dim: usize,
-    attention_elements_per_half: usize,
+    /// Positions one snapshot can carry: the retention interval.
+    positions: usize,
+    /// `u16` words one position occupies in the key and value halves, in
+    /// the model's cache formats (q8_0 rows are 17/32 of binary16's).
+    k_row: usize,
+    v_row: usize,
     gdn_layers: usize,
     conv_elements: usize,
     recurrent_elements: usize,
@@ -268,12 +272,14 @@ impl SnapshotLayout {
             .count();
         let gdn_layers = config.num_layers as usize - attention_layers;
         let kv_dim = config.attention.kv_heads as usize * config.attention.head_dim as usize;
+        let formats = crate::block::attention::kv_formats(config);
         let conv_dim = (2 * config.gdn.qk_heads as usize + config.gdn.value_heads as usize)
             * config.gdn.head_dim as usize;
         Self {
             attention_layers,
-            kv_dim,
-            attention_elements_per_half: retention_interval * kv_dim,
+            positions: retention_interval,
+            k_row: formats.k.row_words(kv_dim),
+            v_row: formats.v.row_words(kv_dim),
             gdn_layers,
             conv_elements: conv_dim * (config.gdn.conv_kernel as usize - 1),
             recurrent_elements: config.gdn.value_heads as usize
@@ -283,7 +289,7 @@ impl SnapshotLayout {
     }
 
     fn attention_bytes(self) -> usize {
-        self.attention_layers * 2 * self.attention_elements_per_half * size_of::<u16>()
+        self.attention_layers * self.positions * (self.k_row + self.v_row) * size_of::<u16>()
     }
 
     fn gdn_bytes(self) -> usize {
@@ -320,8 +326,8 @@ impl SnapshotArena {
             let mut attention = Vec::with_capacity(layout.attention_layers);
             for _ in 0..layout.attention_layers {
                 // SAFETY: capture initializes the used prefix before publication.
-                let k = unsafe { ctx.alloc_pinned(layout.attention_elements_per_half)? };
-                let v = unsafe { ctx.alloc_pinned(layout.attention_elements_per_half)? };
+                let k = unsafe { ctx.alloc_pinned(layout.positions * layout.k_row)? };
+                let v = unsafe { ctx.alloc_pinned(layout.positions * layout.v_row)? };
                 attention.push(HostKvPrefix { k, v });
             }
             let mut gdn = Vec::with_capacity(layout.gdn_layers);
@@ -366,7 +372,8 @@ impl SnapshotArena {
 pub struct SequenceSnapshot {
     position: usize,
     start: usize,
-    kv_dim: usize,
+    /// `u16` words per position across both halves of one layer.
+    row_words: usize,
     buffers: Lease<SnapshotBuffers>,
     next_token: Option<i32>,
     parent: Option<Arc<SequenceSnapshot>>,
@@ -388,9 +395,8 @@ impl SequenceSnapshot {
 
     pub fn attention_bytes(&self) -> usize {
         let own = self.buffers.attention.len()
-            * 2
             * (self.position - self.start)
-            * self.kv_dim
+            * self.row_words
             * size_of::<u16>();
         own + self
             .parent
@@ -499,12 +505,11 @@ impl SequenceState {
         if start > self.position {
             return Err(StateError::SnapshotShape);
         }
-        if self.position - start
-            > arena.layout.attention_elements_per_half
-                / (self
-                    .kv
-                    .first()
-                    .map_or(1, |cache| cache.keys().len() / cache.max_seq()))
+        if self.position - start > arena.layout.positions
+            || self
+                .kv
+                .first()
+                .is_some_and(|cache| cache.row_words() != (arena.layout.k_row, arena.layout.v_row))
         {
             return Err(StateError::SnapshotShape);
         }
@@ -526,7 +531,7 @@ impl SequenceState {
         Ok(SequenceSnapshot {
             position: self.position,
             start,
-            kv_dim: arena.layout.kv_dim,
+            row_words: arena.layout.k_row + arena.layout.v_row,
             buffers,
             next_token: None,
             parent,
@@ -654,6 +659,23 @@ mod snapshot_tests {
         assert_eq!(layout.attention_bytes(), 40 * 1024 * 1024);
         assert_eq!(layout.gdn_bytes(), 65_863_680);
         assert_eq!(layout.attention_bytes() + layout.gdn_bytes(), 107_806_720);
+    }
+
+    #[test]
+    fn q8_kv_snapshots_shrink_with_the_cache() {
+        use llmcuda_model::{KvCacheType, KvCacheTypes};
+        let f16 = ModelConfig::k2_horizon_36b_a4b();
+        // 48 layers x 2048 positions x 2 halves x 2 KiB.
+        assert_eq!(snapshot_bytes_per_slot(&f16, 2048), 384 << 20);
+        let q8 = ModelConfig {
+            kv_cache: KvCacheTypes {
+                k: KvCacheType::Q8_0,
+                v: KvCacheType::Q8_0,
+            },
+            ..f16
+        };
+        // The same rows at 1088 bytes per half, 17/32 of binary16.
+        assert_eq!(snapshot_bytes_per_slot(&q8, 2048), 48 * 2048 * 2 * 1088);
     }
 
     #[test]

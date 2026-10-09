@@ -1123,6 +1123,15 @@ impl Forward {
         gdn_int8: Option<Arc<Vec<Option<GdnLayerInt8>>>>,
         shared_attention: Option<Arc<Vec<Arc<AttentionLayerWeights>>>>,
     ) -> Result<Self, ForwardError> {
+        // Only K2's attention kernels read a q8_0 cache. Every other
+        // architecture's kernels would read its rows as binary16, so the
+        // combination is refused here rather than at the first launch.
+        if config.kv_cache.is_quantized() && config.k2.is_none() {
+            return Err(ForwardError::Mixer(AttentionError::UnsupportedKvFormat {
+                kv: crate::block::attention::kv_formats(&config),
+                what: "a q8_0 KV cache is implemented for k2-horizon only",
+            }));
+        }
         let hidden = config.hidden_size as usize;
         let owns_attention_weights = shared_attention.is_none();
         let vocab = config.vocab_size as usize;

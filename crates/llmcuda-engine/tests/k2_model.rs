@@ -1,5 +1,6 @@
 //! Real K2 weights: oracle logits, chunking, decode, batching and graph replay.
 //! Set LLMCUDA_K2_MODEL and optionally LLMCUDA_K2_GOLDEN (tools/oracle/capture.cpp).
+//! LLMCUDA_CACHE_TYPE_K / LLMCUDA_CACHE_TYPE_V select the KV cache formats.
 #[path = "golden.rs"]
 mod golden;
 
@@ -63,8 +64,12 @@ fn k2_full_model() {
     unsafe { ctx.disable_event_tracking() };
     let stream = ctx.new_stream().unwrap();
     let file = GgufFile::open(path).unwrap();
-    let config = ModelConfig::from_gguf(&file).unwrap();
+    let mut config = ModelConfig::from_gguf(&file).unwrap();
     assert_eq!(config.architecture, "k2-horizon");
+    // The server's own variables, so one setting runs every check below on a
+    // q8_0 cache. Oracle thresholds were calibrated on binary16 caches.
+    config.kv_cache = llmcuda_model::KvCacheTypes::from_env().unwrap();
+    println!("KV cache K={} V={}", config.kv_cache.k, config.kv_cache.v);
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).unwrap();
     let (weights, _) = DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |r, t| {

@@ -1,7 +1,8 @@
 //! K2 attention at independent decode windows, CUDA-event timings.
-//! LLMCUDA_DEC_MMA_SPLITS selects fixed tensor-core split geometry.
+//! LLMCUDA_DEC_MMA_SPLITS selects fixed tensor-core split geometry;
+//! LLMCUDA_CACHE_TYPE_K / LLMCUDA_CACHE_TYPE_V (f16, q8_0) the cache formats.
 use cudarc::driver::{CudaContext, CudaStream, DevicePtr, sys::CUevent_flags};
-use llmcuda_cuda::kernels::attention::{AttentionKernels, AttnDecodeScratch};
+use llmcuda_cuda::kernels::attention::{AttentionKernels, AttnDecodeScratch, KvFormat, KvFormats};
 use std::sync::Arc;
 use tracing::{error, info};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -24,14 +25,48 @@ fn time(
     end.synchronize()?;
     Ok(start.elapsed_ms(&end)? * 10.0)
 }
+/// `LLMCUDA_CACHE_TYPE_{half}`, binary16 when unset.
+fn format(half: &str) -> Result<KvFormat> {
+    match std::env::var(format!("LLMCUDA_CACHE_TYPE_{half}")).as_deref() {
+        Err(_) | Ok("f16") => Ok(KvFormat::F16),
+        Ok("q8_0") => Ok(KvFormat::Q8_0),
+        Ok(other) => Err(format!("LLMCUDA_CACHE_TYPE_{half}={other}: expected f16 or q8_0").into()),
+    }
+}
+/// `rows` positions of 1024 elements in `format`: binary16 sines, or q8_0
+/// codes spanning the int8 range under a finite scale.
+fn cache_words(format: KvFormat, rows: usize, salt: usize) -> Vec<u16> {
+    match format {
+        KvFormat::F16 => (0..rows * 1024)
+            .map(|j| half::f16::from_f32(((j + salt) as f32 * 0.017).sin()).to_bits())
+            .collect(),
+        KvFormat::Q8_0 => {
+            let scale = half::f16::from_f32(1.0 / 127.0).to_bits();
+            let mut words = Vec::with_capacity(rows * 544);
+            for r in 0..rows {
+                for pair in 0..512 {
+                    let code = |j: usize| (((r * 1024 + 2 * pair + j + salt) * 37) % 255) as u16;
+                    words.push(code(0) | (code(1) << 8));
+                }
+                words.extend(std::iter::repeat_n(scale, 32));
+            }
+            words
+        }
+    }
+}
 fn run() -> Result<()> {
+    let formats = KvFormats {
+        k: format("K")?,
+        v: format("V")?,
+    };
+    info!("KV cache K={} V={}", formats.k.name(), formats.v.name());
     let ctx = CudaContext::new(0)?;
     // SAFETY: all buffers and launches use this single stream.
     unsafe {
         ctx.disable_event_tracking();
     }
     let stream = ctx.default_stream();
-    let ops = AttentionKernels::new(&ctx, 32, 8, 128)?;
+    let ops = AttentionKernels::with_kv_formats(&ctx, 32, 8, 128, formats)?;
     for depth in [512, 2048, 8192, 32768] {
         for n in [1, 3] {
             let mut p = Vec::new();
@@ -48,11 +83,8 @@ fn run() -> Result<()> {
             let mut dec = AttnDecodeScratch::new_batch(&stream, 32, 128, n)?;
             for i in 0..n {
                 p.push(stream.clone_htod(&[depth as i32])?);
-                let kv: Vec<u16> = (0..(depth + 1) * 8 * 128)
-                    .map(|j| half::f16::from_f32(((j + i * 101) as f32 * 0.017).sin()).to_bits())
-                    .collect();
-                k.push(stream.clone_htod(&kv)?);
-                v.push(stream.clone_htod(&kv)?);
+                k.push(stream.clone_htod(&cache_words(formats.k, depth + 1, i * 101))?);
+                v.push(stream.clone_htod(&cache_words(formats.v, depth + 1, i * 101))?);
                 qs.push(stream.clone_htod(&q[i * 4096..(i + 1) * 4096])?);
                 os.push(stream.alloc_zeros::<f32>(4096)?);
                 ds.push(AttnDecodeScratch::new(&stream, 32, 128)?);

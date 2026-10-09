@@ -224,7 +224,12 @@ fn main() -> ExitCode {
     let model = match GgufFile::open(&path)
         .map_err(|e| e.to_string())
         .and_then(|f| ModelConfig::from_gguf(&f).map_err(|e| e.to_string()))
-    {
+        .and_then(|model| {
+            Ok(ModelConfig {
+                kv_cache: llmcuda_model::KvCacheTypes::from_env()?,
+                ..model
+            })
+        }) {
         Ok(model) => model,
         Err(error) => {
             error!("{}: {error}", path.display());

@@ -263,6 +263,66 @@ const DECODE_KEY_TILE: usize = 8;
 /// exponential phase gives one key slot to one lane.
 const GQA_KEY_TILE: usize = 8;
 
+/// The q8_0 KV-cache device helpers, verbatim as [`ATTENTION_SRC`] carries
+/// them, for other modules that write the same cache (`k2_rope`'s batched
+/// decode append). A test pins the two copies together.
+pub(crate) const KV_Q8_HELPERS: &str = r#"// q8_0 KV cache (KV_KQ8 / KV_VQ8, set per half by the K2 kernel set).
+// One position's row of n = kv_heads * head_dim elements is n int8 codes
+// followed by n / 32 binary16 scales; block b covers elements
+// [32b, 32b + 32). That is llama.cpp's block_q8_0 arithmetic in a layout
+// whose codes stay 16-byte aligned per head. Every reader sees the binary16
+// rounding of q * d, so the tensor-core and scalar kernels read the same
+// number, and the CPU reference can build it exactly.
+#ifndef KV_KQ8
+#define KV_KQ8 0
+#endif
+#ifndef KV_VQ8
+#define KV_VQ8 0
+#endif
+__device__ __forceinline__ long long kvq8_row_bytes(int n) { return (long long)n + (n >> 4); }
+// Four codes (one little-endian word) times one scale, as two packed binary16
+// pairs. Exact up to one rounding: 0x64XX is 1024 + XX in binary16, so
+// (q ^ 0x80) under that exponent is 1152 + q, subtracting 1152 is exact, and
+// mul.rn rounds the exact product q * d once -- f16(q * d), no I2F.
+__device__ __forceinline__ void kvq8_dequant4(unsigned codes, unsigned short d, unsigned* lo, unsigned* hi) {
+    unsigned x = codes ^ 0x80808080u;
+    unsigned a = __byte_perm(x, 0x64646464u, 0x4140);
+    unsigned b = __byte_perm(x, 0x64646464u, 0x4342);
+    unsigned dd = (unsigned)d | ((unsigned)d << 16);
+    asm("{ sub.rn.f16x2 %0, %2, %4; mul.rn.f16x2 %0, %0, %5;\n"
+        "  sub.rn.f16x2 %1, %3, %4; mul.rn.f16x2 %1, %1, %5; }"
+        : "=&r"(*lo), "=&r"(*hi) : "r"(a), "r"(b), "r"(0x64806480u), "r"(dd));
+}
+// Codes in bytes 0 and 1 of `codes`, each with its own scale: the packed
+// binary16 key pair a tensor-core V operand wants.
+__device__ __forceinline__ unsigned kvq8_dequant2(unsigned codes, unsigned short d0, unsigned short d1) {
+    unsigned a = __byte_perm(codes ^ 0x8080u, 0x64646464u, 0x4140);
+    unsigned dd = (unsigned)d0 | ((unsigned)d1 << 16);
+    unsigned r;
+    asm("{ sub.rn.f16x2 %0, %1, %2; mul.rn.f16x2 %0, %0, %3; }"
+        : "=&r"(r) : "r"(a), "r"(0x64806480u), "r"(dd));
+    return r;
+}
+// llama.cpp's quantize_row_q8_0_ref (ggml-quants.c) for the block whose 32
+// elements this warp's lanes hold, one each: d = amax / 127, q = round(x / d)
+// computed as x * (1 / d), d stored as binary16. fmaxf is exact and
+// commutative, so the butterfly order cannot change amax. Every lane must be
+// live. Returns this lane's code in the low byte; *d_bits gets the scale.
+__device__ __forceinline__ unsigned kvq8_quantize(float x, unsigned short* d_bits) {
+    float amax = fabsf(x);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    }
+    float d = __fdiv_rn(amax, 127.0f);
+    float id = d != 0.0f ? __fdiv_rn(1.0f, d) : 0.0f;
+    unsigned short h;
+    asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(d));
+    *d_bits = h;
+    return (unsigned)(int)roundf(__fmul_rn(x, id)) & 0xffu;
+}
+"#;
+
 /// CUDA C++ baseline exposed for differential CUDA-event benchmarks.
 pub const ATTENTION_SRC: &str = r#"
 extern "C" {
@@ -296,6 +356,61 @@ __device__ __forceinline__ unsigned short f2h(float f) {
     unsigned short h;
     asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(f));
     return h;
+}
+// q8_0 KV cache (KV_KQ8 / KV_VQ8, set per half by the K2 kernel set).
+// One position's row of n = kv_heads * head_dim elements is n int8 codes
+// followed by n / 32 binary16 scales; block b covers elements
+// [32b, 32b + 32). That is llama.cpp's block_q8_0 arithmetic in a layout
+// whose codes stay 16-byte aligned per head. Every reader sees the binary16
+// rounding of q * d, so the tensor-core and scalar kernels read the same
+// number, and the CPU reference can build it exactly.
+#ifndef KV_KQ8
+#define KV_KQ8 0
+#endif
+#ifndef KV_VQ8
+#define KV_VQ8 0
+#endif
+__device__ __forceinline__ long long kvq8_row_bytes(int n) { return (long long)n + (n >> 4); }
+// Four codes (one little-endian word) times one scale, as two packed binary16
+// pairs. Exact up to one rounding: 0x64XX is 1024 + XX in binary16, so
+// (q ^ 0x80) under that exponent is 1152 + q, subtracting 1152 is exact, and
+// mul.rn rounds the exact product q * d once -- f16(q * d), no I2F.
+__device__ __forceinline__ void kvq8_dequant4(unsigned codes, unsigned short d, unsigned* lo, unsigned* hi) {
+    unsigned x = codes ^ 0x80808080u;
+    unsigned a = __byte_perm(x, 0x64646464u, 0x4140);
+    unsigned b = __byte_perm(x, 0x64646464u, 0x4342);
+    unsigned dd = (unsigned)d | ((unsigned)d << 16);
+    asm("{ sub.rn.f16x2 %0, %2, %4; mul.rn.f16x2 %0, %0, %5;\n"
+        "  sub.rn.f16x2 %1, %3, %4; mul.rn.f16x2 %1, %1, %5; }"
+        : "=&r"(*lo), "=&r"(*hi) : "r"(a), "r"(b), "r"(0x64806480u), "r"(dd));
+}
+// Codes in bytes 0 and 1 of `codes`, each with its own scale: the packed
+// binary16 key pair a tensor-core V operand wants.
+__device__ __forceinline__ unsigned kvq8_dequant2(unsigned codes, unsigned short d0, unsigned short d1) {
+    unsigned a = __byte_perm(codes ^ 0x8080u, 0x64646464u, 0x4140);
+    unsigned dd = (unsigned)d0 | ((unsigned)d1 << 16);
+    unsigned r;
+    asm("{ sub.rn.f16x2 %0, %1, %2; mul.rn.f16x2 %0, %0, %3; }"
+        : "=&r"(r) : "r"(a), "r"(0x64806480u), "r"(dd));
+    return r;
+}
+// llama.cpp's quantize_row_q8_0_ref (ggml-quants.c) for the block whose 32
+// elements this warp's lanes hold, one each: d = amax / 127, q = round(x / d)
+// computed as x * (1 / d), d stored as binary16. fmaxf is exact and
+// commutative, so the butterfly order cannot change amax. Every lane must be
+// live. Returns this lane's code in the low byte; *d_bits gets the scale.
+__device__ __forceinline__ unsigned kvq8_quantize(float x, unsigned short* d_bits) {
+    float amax = fabsf(x);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    }
+    float d = __fdiv_rn(amax, 127.0f);
+    float id = d != 0.0f ? __fdiv_rn(1.0f, d) : 0.0f;
+    unsigned short h;
+    asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(d));
+    *d_bits = h;
+    return (unsigned)(int)roundf(__fmul_rn(x, id)) & 0xffu;
 }
 
 // Deinterleave the packed query/gate tensor.
@@ -1190,19 +1305,46 @@ __global__ void __launch_bounds__(256,1) attn_flash_causal_mma_k2s(const float* 
     int vdim=tid&127,vslice=tid>>7;
     const unsigned short* vd=v+(long long)kvh*128+vdim;
     long long vrow=(long long)kv_heads*128;
-    uint4 kreg[2];unsigned vreg[8];
+#if KV_KQ8
+    // q8_0 K: the same eight dimensions as one uint4 of binary16, as eight
+    // codes and their block's scale, held raw across the multiply like kreg
+    // and converted at the shared store.
+    long long krow8=kvq8_row_bytes(kv_heads*128);
+    uint2 kq8[2];unsigned short kd8[2];
+#else
+    uint4 kreg[2];
+#endif
+#if KV_VQ8
+    // q8_0 V: vreg packs the two keys' codes in bytes 0 and 1; vds their scales.
+    long long vrow8=kvq8_row_bytes(kv_heads*128);
+    const unsigned char* vc8=(const unsigned char*)v+(long long)kvh*128+vdim;
+    const unsigned char* vs8=(const unsigned char*)v+vrow+2LL*(kvh*4+(vdim>>5));
+    unsigned vds[8];
+#endif
+    unsigned vreg[8];
     auto prefetch=[&](long long j) {
         #pragma unroll
         for(int i=0;i<2;++i) {
             int t=tid+256*i,r=t>>4;long long key=j+r;
+#if KV_KQ8
+            kq8[i]=make_uint2(0u,0u);kd8[i]=0;
+            if(key<n_block){const unsigned char* row=(const unsigned char*)k+key*krow8;kq8[i]=((const uint2*)(row+kvh*128))[t&15];kd8[i]=((const unsigned short*)(row+kv_heads*128))[kvh*4+((t&15)>>2)];}
+#else
             kreg[i]=make_uint4(0u,0u,0u,0u);
             if(key<n_block)kreg[i]=((const uint4*)(k+(key*(long long)kv_heads+kvh)*128LL))[t&15];
+#endif
         }
         #pragma unroll
         for(int u=0;u<8;++u) {
             long long k0=j+2*(vslice*8+u);
+#if KV_VQ8
+            unsigned lo=k0<n_block ? vc8[k0*vrow8] : 0u,hi=k0+1<n_block ? vc8[(k0+1)*vrow8] : 0u;
+            unsigned dlo=k0<n_block ? *(const unsigned short*)(vs8+k0*vrow8) : 0u,dhi=k0+1<n_block ? *(const unsigned short*)(vs8+(k0+1)*vrow8) : 0u;
+            vreg[u]=lo|(hi<<8);vds[u]=dlo|(dhi<<16);
+#else
             unsigned lo=k0<n_block ? vd[k0*vrow] : 0u,hi=k0+1<n_block ? vd[(k0+1)*vrow] : 0u;
             vreg[u]=lo|(hi<<16);
+#endif
         }
     };
     prefetch(0);
@@ -1210,9 +1352,17 @@ __global__ void __launch_bounds__(256,1) attn_flash_causal_mma_k2s(const float* 
     for(long long j0=0;j0<n_block;j0+=K2S_SK) {
         __syncthreads();
         #pragma unroll
+#if KV_KQ8
+        for(int i=0;i<2;++i){int t=tid+256*i;uint4 h;kvq8_dequant4(kq8[i].x,kd8[i],&h.x,&h.y);kvq8_dequant4(kq8[i].y,kd8[i],&h.z,&h.w);*(uint4*)(k_sh+(t>>4)*K2S_KSTRIDE+4*(t&15))=h;}
+#else
         for(int i=0;i<2;++i){int t=tid+256*i;*(uint4*)(k_sh+(t>>4)*K2S_KSTRIDE+4*(t&15))=kreg[i];}
+#endif
         #pragma unroll
+#if KV_VQ8
+        for(int u=0;u<8;++u)v_sh[vdim*K2S_VSTRIDE+vslice*8+u]=kvq8_dequant2(vreg[u],(unsigned short)vds[u],(unsigned short)(vds[u]>>16));
+#else
         for(int u=0;u<8;++u)v_sh[vdim*K2S_VSTRIDE+vslice*8+u]=vreg[u];
+#endif
         __syncthreads();
         if(j0+K2S_SK<n_block)prefetch(j0+K2S_SK);
         #pragma unroll
@@ -2015,7 +2165,7 @@ __global__ void attn_flash_decode_combine(
 // attn_flash_decode_warp at a 131,072-key window, diagnosed as one resident
 // block per SM against Turing's ~64 KiB shared-memory budget with nothing
 // else to hide the K/V staging latency behind.
-#define ATTN_DECODE_MMA(NAME, WPO, COMP_P, MAX_DIM, EXTRA_ARGS, SETUP)                                                \
+#define ATTN_DECODE_MMA(NAME, WPO, COMP_P, MAX_DIM, KQ8, VQ8, EXTRA_ARGS, SETUP)                                      \
 __global__ void NAME(                                                            \
     const float* __restrict__ q,                                                \
     const unsigned short* __restrict__ k,                                       \
@@ -2139,31 +2289,50 @@ __global__ void NAME(                                                           
     for (long long j0 = begin; j0 < end; j0 += (8 * (WPO))) {                  \
         __syncthreads();                                                       \
         {                                                                       \
-            uint4 kreg[8];                                                     \
-            _Pragma("unroll")                                                  \
-            for (int i = 0; i < 8; ++i) {                                      \
-                int t = tid + i * nthr;                                        \
-                kreg[i] = make_uint4(0u, 0u, 0u, 0u);                          \
-                if (t < (8 * (WPO)) * kw4) {                                   \
-                    int r = t / kw4;                                           \
-                    long long key = j0 + r;                                    \
-                    if (key < end) {                                          \
-                        const uint4* kp = (const uint4*)(                     \
-                            k + (key * (long long)kv_heads + kvh)             \
-                                    * (long long)head_dim);                   \
-                        kreg[i] = kp[t - r * kw4];                            \
-                    }                                                         \
-                }                                                              \
-            }                                                                  \
-            _Pragma("unroll")                                                  \
-            for (int i = 0; i < 8; ++i) {                                      \
-                int t = tid + i * nthr;                                        \
-                if (t < (8 * (WPO)) * kw4) {                                   \
-                    int r = t / kw4;                                           \
+            uint4 kreg[8];                                                      \
+            uint2 kc8[8];                                                       \
+            unsigned short kd8[8];                                              \
+            _Pragma("unroll")                                                   \
+            for (int i = 0; i < 8; ++i) {                                       \
+                int t = tid + i * nthr;                                         \
+                kreg[i] = make_uint4(0u, 0u, 0u, 0u);                           \
+                kc8[i] = make_uint2(0u, 0u);                                    \
+                kd8[i] = 0;                                                     \
+                if (t < (8 * (WPO)) * kw4) {                                    \
+                    int r = t / kw4;                                            \
+                    long long key = j0 + r;                                     \
+                    if (key < end) {                                            \
+                        if (KQ8) {                                              \
+                            /* q8_0: the uint4's eight dims as eight codes */   \
+                            /* and their block scale, converted at the store */ \
+                            const unsigned char* kr = (const unsigned char*)k   \
+                                + key * kvq8_row_bytes(kv_heads * head_dim);    \
+                            int c = t - r * kw4;                                \
+                            kc8[i] = ((const uint2*)(kr + kvh * head_dim))[c];  \
+                            kd8[i] = ((const unsigned short*)(kr + kv_heads * head_dim)) \
+                                [kvh * (head_dim >> 5) + (c >> 2)];             \
+                        } else {                                                \
+                        const uint4* kp = (const uint4*)(                       \
+                            k + (key * (long long)kv_heads + kvh)               \
+                                    * (long long)head_dim);                     \
+                        kreg[i] = kp[t - r * kw4];                              \
+                        }                                                       \
+                    }                                                           \
+                }                                                               \
+            }                                                                   \
+            _Pragma("unroll")                                                   \
+            for (int i = 0; i < 8; ++i) {                                       \
+                int t = tid + i * nthr;                                         \
+                if (t < (8 * (WPO)) * kw4) {                                    \
+                    int r = t / kw4;                                            \
+                    if (KQ8) {                                                  \
+                        kvq8_dequant4(kc8[i].x, kd8[i], &kreg[i].x, &kreg[i].y); \
+                        kvq8_dequant4(kc8[i].y, kd8[i], &kreg[i].z, &kreg[i].w); \
+                    }                                                           \
                     *(uint4*)(k_sh + r * qstride + 4 * (t - r * kw4)) = kreg[i]; \
-                }                                                              \
-            }                                                                  \
-        }                                                                      \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
         __syncthreads();                                                       \
                                                                                 \
         /* Q K^T. Warp `warp` takes key octet `warp` of the tile; the two */   \
@@ -2238,35 +2407,57 @@ __global__ void NAME(                                                           
         /* K is dead after Q K^T and softmax. Reuse its shared arena for V */   \
         /* so WPO=2 fits four resident blocks per SM instead of three. */       \
         {                                                                       \
-            unsigned short vlo[256 / ((WPO) * 32)][4 * (WPO)];                 \
-            unsigned short vhi[256 / ((WPO) * 32)][4 * (WPO)];                 \
-            _Pragma("unroll")                                                  \
-            for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                  \
-                int vd_col = ds * nthr + tid;                                  \
-                bool active = ds < dstripes;                                   \
-                _Pragma("unroll")                                              \
-                for (int i = 0; i < 4 * (WPO); ++i) {                          \
-                    long long k0 = j0 + 2 * i;                                 \
-                    vlo[ds][i] = (active && k0 < end)                          \
+            unsigned short vlo[256 / ((WPO) * 32)][4 * (WPO)];                  \
+            unsigned short vhi[256 / ((WPO) * 32)][4 * (WPO)];                  \
+            unsigned vq8c[256 / ((WPO) * 32)][4 * (WPO)];                     \
+            unsigned vq8d[256 / ((WPO) * 32)][4 * (WPO)];                     \
+            _Pragma("unroll")                                                   \
+            for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                   \
+                int vd_col = ds * nthr + tid;                                   \
+                bool active = ds < dstripes;                                    \
+                _Pragma("unroll")                                               \
+                for (int i = 0; i < 4 * (WPO); ++i) {                           \
+                    long long k0 = j0 + 2 * i;                                  \
+                    if (VQ8) {                                                  \
+                        /* q8_0: each key's code byte and block scale */        \
+                        const unsigned char* vb = (const unsigned char*)v;      \
+                        long long rb = kvq8_row_bytes(kv_heads * head_dim);     \
+                        long long cat = (long long)kvh * head_dim + vd_col;     \
+                        long long sat = (long long)kv_heads * head_dim          \
+                            + 2LL * (kvh * (head_dim >> 5) + (vd_col >> 5));    \
+                        bool lo = active && k0 < end, hi = active && k0 + 1 < end; \
+                        /* Packed at the load, two keys to a word, so q8 */    \
+                        /* staging holds as many registers as binary16's. */     \
+                        unsigned c0 = lo ? vb[k0 * rb + cat] : 0u;              \
+                        unsigned c1 = hi ? vb[(k0 + 1) * rb + cat] : 0u;        \
+                        unsigned d0 = lo ? *(const unsigned short*)(vb + k0 * rb + sat) : 0u; \
+                        unsigned d1 = hi ? *(const unsigned short*)(vb + (k0 + 1) * rb + sat) : 0u; \
+                        vq8c[ds][i] = c0 | (c1 << 8);                           \
+                        vq8d[ds][i] = d0 | (d1 << 16);                          \
+                    } else {                                                    \
+                    vlo[ds][i] = (active && k0 < end)                           \
                         ? v[(k0 * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
-                        : (unsigned short)0;                                   \
-                    vhi[ds][i] = (active && k0 + 1 < end)                      \
+                        : (unsigned short)0;                                    \
+                    vhi[ds][i] = (active && k0 + 1 < end)                       \
                         ? v[((k0 + 1) * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
-                        : (unsigned short)0;                                   \
-                }                                                              \
-            }                                                                  \
-            _Pragma("unroll")                                                  \
-            for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                  \
-                int vd_col = ds * nthr + tid;                                  \
-                if (ds < dstripes) {                                           \
-                    _Pragma("unroll")                                          \
-                    for (int i = 0; i < 4 * (WPO); ++i) {                      \
-                        v_sh[vd_col * vstride + i] =                           \
-                            (unsigned)vlo[ds][i] | ((unsigned)vhi[ds][i] << 16); \
-                    }                                                          \
-                }                                                              \
-            }                                                                  \
-        }                                                                      \
+                        : (unsigned short)0;                                    \
+                    }                                                           \
+                }                                                               \
+            }                                                                   \
+            _Pragma("unroll")                                                   \
+            for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                   \
+                int vd_col = ds * nthr + tid;                                   \
+                if (ds < dstripes) {                                            \
+                    _Pragma("unroll")                                           \
+                    for (int i = 0; i < 4 * (WPO); ++i) {                       \
+                        v_sh[vd_col * vstride + i] = (VQ8)                      \
+                            ? kvq8_dequant2(vq8c[ds][i], (unsigned short)vq8d[ds][i], \
+                                            (unsigned short)(vq8d[ds][i] >> 16)) \
+                            : (unsigned)vlo[ds][i] | ((unsigned)vhi[ds][i] << 16); \
+                    }                                                           \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
         __syncthreads();                                                       \
                                                                                 \
         /* P V. The dead second half of this operand is zero. */                \
@@ -2324,12 +2515,12 @@ __global__ void NAME(                                                           
 }
 
 
-ATTN_DECODE_MMA(attn_flash_decode_mma_wpo4, 4, false, 256, , )
-ATTN_DECODE_MMA(attn_flash_decode_mma_wpo2, 2, false, 256, , )
-ATTN_DECODE_MMA(attn_flash_decode_mma_k2_wpo2, 2, true, 256, , )
-ATTN_DECODE_MMA(attn_flash_decode_mma_k2_wpo4, 4, true, 256, , )
-ATTN_DECODE_MMA(attn_flash_decode_mma_k2_128_wpo2, 2, true, 128, , )
-ATTN_DECODE_MMA(attn_flash_decode_mma_k2_128_wpo4, 4, true, 128, , )
+ATTN_DECODE_MMA(attn_flash_decode_mma_wpo4, 4, false, 256, 0, 0, , )
+ATTN_DECODE_MMA(attn_flash_decode_mma_wpo2, 2, false, 256, 0, 0, , )
+ATTN_DECODE_MMA(attn_flash_decode_mma_k2_wpo2, 2, true, 256, 0, 0, , )
+ATTN_DECODE_MMA(attn_flash_decode_mma_k2_wpo4, 4, true, 256, 0, 0, , )
+ATTN_DECODE_MMA(attn_flash_decode_mma_k2_128_wpo2, 2, true, 128, KV_KQ8, KV_VQ8, , )
+ATTN_DECODE_MMA(attn_flash_decode_mma_k2_128_wpo4, 4, true, 128, KV_KQ8, KV_VQ8, , )
 
 __global__ void attn_flash_causal_t1(
     const float* __restrict__ q,
@@ -2490,6 +2681,42 @@ __global__ void attn_kv_append(
     }
 }
 
+// attn_kv_append with either half in q8_0 (`kq8` / `vq8` nonzero). One thread
+// per element as above, so with `row` a multiple of 32 and 256-thread blocks
+// each warp holds exactly one 32-element block of one half of one position:
+// `span` and `2 * span` are multiples of 32, so the early return, the K/V
+// choice and the format choice are all warp-uniform and kvq8_quantize sees
+// all 32 lanes. A binary16 half is written exactly as attn_kv_append does.
+__global__ void attn_kv_append_kv8(
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    unsigned short* __restrict__ k_cache,
+    unsigned short* __restrict__ v_cache,
+    const int* __restrict__ position,
+    int span,
+    int row,
+    int kq8,
+    int vq8
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 2 * span) return;
+    bool is_k = i < span;
+    int j = is_k ? i : i - span;
+    float x = is_k ? key[j] : value[j];
+    unsigned short* cache = is_k ? k_cache : v_cache;
+    long long pos = (long long)(*position) + j / row;
+    int e = j % row;
+    if (!(is_k ? kq8 : vq8)) {
+        cache[pos * (long long)row + e] = f2h(x);
+        return;
+    }
+    unsigned short d;
+    unsigned code = kvq8_quantize(x, &d);
+    unsigned char* dst = (unsigned char*)cache + pos * kvq8_row_bytes(row);
+    dst[e] = (unsigned char)code;
+    if ((e & 31) == 0) *(unsigned short*)(dst + row + 2 * (e >> 5)) = d;
+}
+
 // The decode step's per-sequence rotary and cache append, batched over the
 // launch: one grid advances every sequence's query and key through
 // `attn_rope_partial_neox`'s arithmetic and appends the roped key and the
@@ -2619,8 +2846,8 @@ __global__ void attn_decode_rope_append_batch(
     key_offset=(const int*)attn_slot(seq,p0,p1,p2,p3,p4,p5,p6,p7); \
     k=(const unsigned short*)attn_slot(seq,k0,k1,k2,k3,k4,k5,k6,k7); \
     v=(const unsigned short*)attn_slot(seq,v0,v1,v2,v3,v4,v5,v6,v7);
-ATTN_DECODE_MMA(attn_flash_decode_mma_k2_batch_wpo2, 2, true, 128, K2_MMA_SLOTS, K2_MMA_SETUP)
-ATTN_DECODE_MMA(attn_flash_decode_mma_k2_batch_wpo4, 4, true, 128, K2_MMA_SLOTS, K2_MMA_SETUP)
+ATTN_DECODE_MMA(attn_flash_decode_mma_k2_batch_wpo2, 2, true, 128, KV_KQ8, KV_VQ8, K2_MMA_SLOTS, K2_MMA_SETUP)
+ATTN_DECODE_MMA(attn_flash_decode_mma_k2_batch_wpo4, 4, true, 128, KV_KQ8, KV_VQ8, K2_MMA_SLOTS, K2_MMA_SETUP)
 #undef K2_MMA_SLOTS
 #undef K2_MMA_SETUP
 } // extern C
@@ -2700,6 +2927,33 @@ __device__ __forceinline__ void attn_k2_warp_body(const float* __restrict__ q,co
             // same eight binary16 dimensions `[8l, 8l+8)` it read before as
             // four strided words. Identical data, one instruction, and the warp
             // now covers 512 contiguous bytes with every sector fully consumed.
+#if KV_KQ8 || KV_VQ8
+            // A q8_0 half at head_dim 128: lane `l` owns dimensions
+            // [4l, 4l + 4), one word of codes and block l / 8's scale, held
+            // in the two slots its binary16 words would use and converted
+            // with the arithmetic below.
+            if (HD == 128) {
+                long long rb = kvq8_row_bytes(kv_heads * 128);
+                long long cat = (long long)kvh * 128 + 4 * lane;
+                long long sat = (long long)kv_heads * 128 + 2 * (kvh * 4 + (lane >> 3));
+                const unsigned char* kr = (const unsigned char*)k + key * rb;
+                const unsigned char* vr = (const unsigned char*)v + key * rb;
+                if (KV_KQ8) {
+                    kw[jj][0] = live ? *(const unsigned*)(kr + cat) : 0u;
+                    kw[jj][1] = live ? (unsigned)*(const unsigned short*)(kr + sat) : 0u;
+                } else {
+                    kw[jj][0] = live ? kp[2 * lane] : 0u;
+                    kw[jj][1] = live ? kp[2 * lane + 1] : 0u;
+                }
+                if (KV_VQ8) {
+                    vw[jj][0] = live ? *(const unsigned*)(vr + cat) : 0u;
+                    vw[jj][1] = live ? (unsigned)*(const unsigned short*)(vr + sat) : 0u;
+                } else {
+                    vw[jj][0] = live ? vp[2 * lane] : 0u;
+                    vw[jj][1] = live ? vp[2 * lane + 1] : 0u;
+                }
+            } else
+#endif
             if (wpl == 4) {
                 const uint4* kp4 = (const uint4*)kp;
                 const uint4* vp4 = (const uint4*)vp;
@@ -2722,12 +2976,25 @@ __device__ __forceinline__ void attn_k2_warp_body(const float* __restrict__ q,co
         for (int jj = 0; jj < DEC_KB; ++jj) {
         if (j0 + jj >= end) break;
         float kk[MAXD], vv[MAXD];
+#if KV_KQ8 || KV_VQ8
+        if (HD == 128) {
+            unsigned kx[2] = {kw[jj][0], kw[jj][1]}, vx[2] = {vw[jj][0], vw[jj][1]};
+            if (KV_KQ8) kvq8_dequant4(kw[jj][0], (unsigned short)kw[jj][1], &kx[0], &kx[1]);
+            if (KV_VQ8) kvq8_dequant4(vw[jj][0], (unsigned short)vw[jj][1], &vx[0], &vx[1]);
+            h2f2(kx[0], &kk[0], &kk[1]);
+            h2f2(kx[1], &kk[2], &kk[3]);
+            h2f2(vx[0], &vv[0], &vv[1]);
+            h2f2(vx[1], &vv[2], &vv[3]);
+        } else
+#endif
+        {
         #pragma unroll
         for (int p = 0; p < MAXD / 2; ++p) {
             if (p < wpl) {
                 h2f2(kw[jj][p], &kk[2 * p], &kk[2 * p + 1]);
                 h2f2(vw[jj][p], &vv[2 * p], &vv[2 * p + 1]);
             }
+        }
         }
         #pragma unroll
         for (int hh = 0; hh < MAXG; ++hh) {
@@ -2869,6 +3136,55 @@ const APPEND_THREADS: u32 = 256;
 /// kernel's pointer-slot count (`ATTN_STEP_SLOTS`).
 pub const STEP_SLOTS: usize = 8;
 
+/// Element format of one half of the KV cache, as the kernels address it.
+///
+/// `Q8_0` is the row layout `ATTENTION_SRC` documents beside
+/// `kvq8_row_bytes`: a position's `n` codes, then its `n / 32` binary16
+/// scales. This crate does not see `llmcuda_model::KvCacheType`; the engine
+/// maps one onto the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvFormat {
+    #[default]
+    F16,
+    Q8_0,
+}
+
+impl KvFormat {
+    /// `u16` words one position's row of `elements` values occupies.
+    /// `elements` must be a multiple of 32 for `Q8_0`.
+    pub const fn row_words(self, elements: usize) -> usize {
+        match self {
+            Self::F16 => elements,
+            Self::Q8_0 => (elements + elements / 16) / 2,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Q8_0 => "q8_0",
+        }
+    }
+}
+
+/// The K and V halves' formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KvFormats {
+    pub k: KvFormat,
+    pub v: KvFormat,
+}
+
+impl KvFormats {
+    pub const F16: Self = Self {
+        k: KvFormat::F16,
+        v: KvFormat::F16,
+    };
+
+    pub const fn is_quantized(self) -> bool {
+        !matches!(self.k, KvFormat::F16) || !matches!(self.v, KvFormat::F16)
+    }
+}
+
 /// Something went wrong compiling or launching an attention kernel.
 #[derive(Debug)]
 pub enum AttentionError {
@@ -2908,6 +3224,8 @@ pub enum AttentionError {
         n_query: usize,
         n_keys: usize,
     },
+    /// A KV cache format this kernel set or path cannot read or write.
+    UnsupportedKvFormat { kv: KvFormats, what: &'static str },
 }
 
 impl std::fmt::Display for AttentionError {
@@ -2944,6 +3262,9 @@ impl std::fmt::Display for AttentionError {
                 "query rows at offset {key_offset}..{} run past the {n_keys}-key window",
                 key_offset + n_query,
             ),
+            Self::UnsupportedKvFormat { kv, what } => {
+                write!(f, "KV cache K={} V={}: {what}", kv.k.name(), kv.v.name(),)
+            }
         }
     }
 }
@@ -3035,9 +3356,13 @@ pub struct AttentionKernels {
     decode_combine: CudaFunction,
     flash_t1: CudaFunction,
     append: CudaFunction,
+    /// `attn_kv_append_kv8`, the append when either half is q8_0.
+    append_kv8: CudaFunction,
     /// `attn_decode_rope_append_batch`: rope q, rope k and the cache append
     /// for every sequence of a decode step under one grid.
     rope_append_batch: CudaFunction,
+    /// The cache formats this kernel set was compiled to read and write.
+    kv: KvFormats,
     q_heads: usize,
     kv_heads: usize,
     head_dim: usize,
@@ -3099,13 +3424,47 @@ impl AttentionKernels {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self, AttentionError> {
+        Self::with_kv_formats(ctx, q_heads, kv_heads, head_dim, KvFormats::F16)
+    }
+
+    /// [`Self::new`] for a cache whose halves may be q8_0.
+    ///
+    /// Binary16 on both halves compiles exactly [`ATTENTION_SRC`], so it
+    /// shares the PTX cache entry with every other kernel set. A q8_0 half
+    /// prepends `KV_KQ8`/`KV_VQ8`, which only K2's compensated kernels read:
+    /// `attn_flash_causal_mma_k2s`, the head_dim-128 decode tensor-core and
+    /// warp kernels and their batched forms. Every other path either keeps
+    /// reading binary16 or is refused at launch, so q8_0 needs that geometry:
+    /// head_dim 128 and four query heads per KV head.
+    pub fn with_kv_formats(
+        ctx: &Arc<CudaContext>,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        kv: KvFormats,
+    ) -> Result<Self, AttentionError> {
         if head_dim == 0 || !head_dim.is_multiple_of(32) || head_dim > 32 * ATTN_MAXD {
             return Err(AttentionError::UnsupportedHeadDim { head_dim });
         }
         if kv_heads == 0 || !q_heads.is_multiple_of(kv_heads) {
             return Err(AttentionError::UnevenGqaGrouping { q_heads, kv_heads });
         }
-        let ptx = compile(ATTENTION_SRC, "attention").map_err(AttentionError::Compile)?;
+        if kv.is_quantized() && (head_dim != 128 || q_heads != 4 * kv_heads) {
+            return Err(AttentionError::UnsupportedKvFormat {
+                kv,
+                what: "a q8_0 cache needs head_dim 128 and four query heads per KV head",
+            });
+        }
+        let source = if kv.is_quantized() {
+            std::borrow::Cow::Owned(format!(
+                "#define KV_KQ8 {}\n#define KV_VQ8 {}\n{ATTENTION_SRC}",
+                u8::from(kv.k == KvFormat::Q8_0),
+                u8::from(kv.v == KvFormat::Q8_0),
+            ))
+        } else {
+            std::borrow::Cow::Borrowed(ATTENTION_SRC)
+        };
+        let ptx = compile(&source, "attention").map_err(AttentionError::Compile)?;
         let module = ctx.load_module(ptx)?;
         #[cfg(feature = "rust-kernels")]
         let migrated = ctx.load_module(cudarc::nvrtc::Ptx::from_src(include_str!(
@@ -3177,7 +3536,9 @@ impl AttentionKernels {
             decode_combine: module.load_function("attn_flash_decode_combine")?,
             flash_t1: module.load_function("attn_flash_causal_t1")?,
             append: module.load_function("attn_kv_append")?,
+            append_kv8: module.load_function("attn_kv_append_kv8")?,
             rope_append_batch: module.load_function("attn_decode_rope_append_batch")?,
+            kv,
             q_heads,
             kv_heads,
             head_dim,
@@ -3791,11 +4152,24 @@ impl AttentionKernels {
     ) -> Result<(), AttentionError> {
         Self::expect_len("attention position", positions.len(), 1)?;
         let q_elems = n_query * self.q_heads * self.head_dim;
-        let kv_elems = max_keys * self.kv_heads * self.head_dim;
+        let row = self.kv_heads * self.head_dim;
         Self::expect_len("query", q.len(), q_elems)?;
-        Self::expect_at_least("key", k.len(), kv_elems)?;
-        Self::expect_at_least("value", v.len(), kv_elems)?;
+        Self::expect_at_least("key", k.len(), max_keys * self.kv.k.row_words(row))?;
+        Self::expect_at_least("value", v.len(), max_keys * self.kv.v.row_words(row))?;
         Self::expect_len("output", out.len(), q_elems)?;
+        // A q8_0 cache is read only by K2's compensated kernels; the
+        // single-tile oracle lever and every other shape read binary16.
+        if self.kv.is_quantized()
+            && (!canonical_shallow
+                || self
+                    .k2_single_tile
+                    .load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(AttentionError::UnsupportedKvFormat {
+                kv: self.kv,
+                what: "q8_0 is read only by K2's staged prefill and compensated decode",
+            });
+        }
 
         // A partial tile costs its empty rows in full: the score loop runs a
         // multiply-add and a shuffle reduction per row per key whether or not
@@ -4055,6 +4429,11 @@ impl AttentionKernels {
             }
         } else if warp_split && compensated && self.head_dim == 128 && self.gqa_ratio() == 4 {
             &self.decode_warp_k2_128
+        } else if self.kv.is_quantized() {
+            return Err(AttentionError::UnsupportedKvFormat {
+                kv: self.kv,
+                what: "q8_0 decode needs the K2 warp or tensor-core split kernels",
+            });
         } else if warp_split {
             &self.decode_warp
         } else {
@@ -4104,6 +4483,11 @@ impl AttentionKernels {
         // `n_query == 1`, which the caller checked.
         unsafe { builder.launch(combine_cfg) }?;
         Ok(())
+    }
+
+    /// The cache formats this kernel set reads and writes.
+    pub fn kv_formats(&self) -> KvFormats {
+        self.kv
     }
 
     /// K2's compensated 128-dimensional tensor-core decode selection.
@@ -4342,8 +4726,16 @@ impl AttentionKernels {
         let span = n_tokens * row;
         Self::expect_len("append key", key.len(), span)?;
         Self::expect_len("append value", value.len(), span)?;
-        Self::expect_at_least("append key cache", k_cache.len(), max_keys * row)?;
-        Self::expect_at_least("append value cache", v_cache.len(), max_keys * row)?;
+        Self::expect_at_least(
+            "append key cache",
+            k_cache.len(),
+            max_keys * self.kv.k.row_words(row),
+        )?;
+        Self::expect_at_least(
+            "append value cache",
+            v_cache.len(),
+            max_keys * self.kv.v.row_words(row),
+        )?;
 
         let cfg = LaunchConfig {
             grid_dim: ((2 * span).div_ceil(APPEND_THREADS as usize) as u32, 1, 1),
@@ -4352,7 +4744,15 @@ impl AttentionKernels {
         };
         let span_i = span as i32;
         let row_i = row as i32;
-        let mut builder = stream.launch_builder(&self.append);
+        let (kq8, vq8) = (
+            i32::from(self.kv.k == KvFormat::Q8_0),
+            i32::from(self.kv.v == KvFormat::Q8_0),
+        );
+        let mut builder = stream.launch_builder(if self.kv.is_quantized() {
+            &self.append_kv8
+        } else {
+            &self.append
+        });
         builder
             .arg(key)
             .arg(value)
@@ -4361,6 +4761,11 @@ impl AttentionKernels {
             .arg(positions)
             .arg(&span_i)
             .arg(&row_i);
+        if self.kv.is_quantized() {
+            // A whole warp per q8_0 block: `row` is a multiple of 32 (the
+            // constructor holds head_dim at 128) and APPEND_THREADS of 32.
+            builder.arg(&kq8).arg(&vq8);
+        }
         // SAFETY: every thread past `2 * span` returns, both sources hold
         // exactly `span` floats, and the deepest destination index is
         // `positions[0] * row + span - 1` — inside `max_keys * row`, which
@@ -4726,6 +5131,8 @@ mod tests {
         // compile, run, and silently spill.
         assert_eq!(32 * ATTN_MAXD, 256);
         assert!(ATTENTION_SRC.contains("#define ATTN_MAXD 8"));
+        // k2_rope compiles its q8_0 append against this copy.
+        assert!(ATTENTION_SRC.contains(KV_Q8_HELPERS));
         assert!(
             ATTENTION_SRC.contains("float qr[QT][ATTN_MAXD];"),
             "the query tile is no longer a register array",

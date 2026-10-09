@@ -1,7 +1,11 @@
 //! K2 rotary coefficients shared by the heads and layers of a fixed pass.
 //! The double-precision frequency and angle evaluation matches `attention`
 //! exactly; only the resulting fp32 sine/cosine values are cached.
-use super::{compile, moe::MoeError};
+use super::{
+    attention::{KV_Q8_HELPERS, KvFormat, KvFormats},
+    compile,
+    moe::MoeError,
+};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -9,6 +13,17 @@ use std::sync::Arc;
 const SRC: &str = r#"
 __device__ __forceinline__ unsigned long long slot(int n,unsigned long long p0,unsigned long long p1,unsigned long long p2,unsigned long long p3,unsigned long long p4,unsigned long long p5,unsigned long long p6,unsigned long long p7){switch(n){case 0:return p0;case 1:return p1;case 2:return p2;case 3:return p3;case 4:return p4;case 5:return p5;case 6:return p6;default:return p7;}}
 __device__ __forceinline__ unsigned short half_bits(float v){unsigned short h;asm("cvt.rn.f16.f32 %0,%1;":"=h"(h):"f"(v));return h;}
+#if KV_KQ8 || KV_VQ8
+// Element e of position pos's row of `row` elements: binary16 as the other
+// branch writes it, or a q8_0 code plus, from each block's first lane, its
+// scale. All 32 lanes of the warp must call it together (kvq8_quantize).
+__device__ __forceinline__ void kv8_store(unsigned short* cache,int q8,long long pos,int row,int e,float x){
+ if(!q8){cache[pos*row+e]=half_bits(x);return;}
+ unsigned short d;unsigned code=kvq8_quantize(x,&d);
+ unsigned char* dst=(unsigned char*)cache+pos*kvq8_row_bytes(row);
+ dst[e]=(unsigned char)code;if((e&31)==0)*(unsigned short*)(dst+row+2*(e>>5))=d;
+}
+#endif
 extern "C" {
 __global__ void k2_rotary_prepare(float* coefficients,int chunk,int rope_dim,float theta,int offset,
  unsigned long long p0,unsigned long long p1,unsigned long long p2,unsigned long long p3,unsigned long long p4,unsigned long long p5,unsigned long long p6,unsigned long long p7){
@@ -38,11 +53,33 @@ __global__ void k2_rotary_append(const float* q,float* qr,const float* k,float* 
  const float* in=is_q ? q : k;float* out=is_q ? qr : kr;long long base=((long long)seq*heads+hh)*dim;
  unsigned short* kc=0;unsigned short* vc=0;long long at=0;
  if(!is_q){const int* pos=(const int*)slot(seq,ap0,ap1,ap2,ap3,ap4,ap5,ap6,ap7);kc=(unsigned short*)slot(seq,kc0,kc1,kc2,kc3,kc4,kc5,kc6,kc7);vc=(unsigned short*)slot(seq,vc0,vc1,vc2,vc3,vc4,vc5,vc6,vc7);at=(long long)*pos*kh*dim+(long long)hh*dim;}
- int half=rope_dim/2;if(d>=rope_dim){float x=in[base+d];out[base+d]=x;if(!is_q){kc[at+d]=half_bits(x);vc[at+d]=half_bits(v[base+d]);}return;}if(d>=half)return;
+ int half=rope_dim/2;
+#if KV_KQ8 || KV_VQ8
+ // A q8_0 half quantizes 32-element blocks, so the appended key and value
+ // rows are staged in shared memory first: the rotary arithmetic and the
+ // query/rotated-key outputs are exactly the binary16 branch's, and then
+ // thread d appends element d with attn_kv_append_kv8's per-warp quantizer,
+ // which is what keeps the two writers bit-identical.
+ __shared__ float krow[1024],vrow[1024];
+ if(d>=rope_dim){float x=in[base+d];out[base+d]=x;if(!is_q){krow[d]=x;vrow[d]=v[base+d];}}
+ else if(d<half){
+  float sin_a=coefficients[(long long)seq*rope_dim+2*d],cos_a=coefficients[(long long)seq*rope_dim+2*d+1];
+  float x0=in[base+d],x1=in[base+d+half],y0=x0*cos_a-x1*sin_a,y1=x0*sin_a+x1*cos_a;
+  out[base+d]=y0;out[base+d+half]=y1;
+  if(!is_q){krow[d]=y0;krow[d+half]=y1;vrow[d]=v[base+d];vrow[d+half]=v[base+d+half];}
+ }
+ if(is_q)return;
+ __syncthreads();
+ int row=kh*dim,e=hh*dim+d;long long pos=at/row;
+ kv8_store(kc,KV_KQ8,pos,row,e,krow[d]);
+ kv8_store(vc,KV_VQ8,pos,row,e,vrow[d]);
+#else
+ if(d>=rope_dim){float x=in[base+d];out[base+d]=x;if(!is_q){kc[at+d]=half_bits(x);vc[at+d]=half_bits(v[base+d]);}return;}if(d>=half)return;
  float sin_a=coefficients[(long long)seq*rope_dim+2*d],cos_a=coefficients[(long long)seq*rope_dim+2*d+1];
  float x0=in[base+d],x1=in[base+d+half],y0=x0*cos_a-x1*sin_a,y1=x0*sin_a+x1*cos_a;
  out[base+d]=y0;out[base+d+half]=y1;
  if(!is_q){kc[at+d]=half_bits(y0);kc[at+d+half]=half_bits(y1);vc[at+d]=half_bits(v[base+d]);vc[at+d+half]=half_bits(v[base+d+half]);}
+#endif
 }
 }
 "#;
@@ -65,6 +102,21 @@ impl K2Rope {
         dim: usize,
         rope_dim: usize,
     ) -> Result<Self, MoeError> {
+        Self::with_kv_formats(ctx, stream, tokens, dim, rope_dim, KvFormats::F16)
+    }
+
+    /// [`Self::new`] whose batched decode append writes `kv`'s formats.
+    /// Binary16 compiles this module's source unchanged; a q8_0 half prepends the shared
+    /// quantizer, so `k2_rotary_append` stays bit-identical to
+    /// `attn_kv_append_kv8`.
+    pub fn with_kv_formats(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        tokens: usize,
+        dim: usize,
+        rope_dim: usize,
+        kv: KvFormats,
+    ) -> Result<Self, MoeError> {
         if tokens == 0
             || dim == 0
             || dim > 1024
@@ -79,7 +131,23 @@ impl K2Rope {
                 found: rope_dim,
             });
         }
-        let module = ctx.load_module(compile(SRC, "k2_rotary").map_err(MoeError::Compile)?)?;
+        if kv.is_quantized() && !dim.is_multiple_of(32) {
+            return Err(MoeError::WrongElementCount {
+                which: "K2 q8_0 cache head width",
+                expected: dim.next_multiple_of(32),
+                found: dim,
+            });
+        }
+        let source = if kv.is_quantized() {
+            std::borrow::Cow::Owned(format!(
+                "#define KV_KQ8 {}\n#define KV_VQ8 {}\n{KV_Q8_HELPERS}{SRC}",
+                u8::from(kv.k == KvFormat::Q8_0),
+                u8::from(kv.v == KvFormat::Q8_0),
+            ))
+        } else {
+            std::borrow::Cow::Borrowed(SRC)
+        };
+        let module = ctx.load_module(compile(&source, "k2_rotary").map_err(MoeError::Compile)?)?;
         Ok(Self {
             prepare: module.load_function("k2_rotary_prepare")?,
             apply: module.load_function("k2_rotary_apply")?,
@@ -193,7 +261,8 @@ impl K2Rope {
     ///
     /// # Safety
     /// Position slots must address live i32 values. Cache slots must be
-    /// distinct live f16 arrays covering those positions and these heads.
+    /// distinct live caches, in the formats this rope was built for,
+    /// covering those positions and these heads.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn append_raw(
         &self,

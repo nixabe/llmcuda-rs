@@ -26,8 +26,8 @@ pub mod vision;
 pub mod weights;
 
 pub use config::{
-    AttentionConfig, DecisionConfig, DenseFfnConfig, FfnConfig, GdnConfig, K2Config, LayerKind,
-    ModelConfig, MoeConfig, UnknownArchitecture,
+    AttentionConfig, DecisionConfig, DenseFfnConfig, FfnConfig, GdnConfig, K2Config, KvCacheType,
+    KvCacheTypes, LayerKind, ModelConfig, MoeConfig, UnknownArchitecture,
 };
 pub use dflash::DFlashConfig;
 pub use vision::VisionConfig;

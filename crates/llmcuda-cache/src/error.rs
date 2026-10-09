@@ -33,9 +33,6 @@ pub enum CacheConfigError {
         retention_interval: u32,
         attention_block_size: u32,
     },
-    /// `elem_size` (bytes per KV element) was zero.
-    #[error("elem_size must be non-zero")]
-    ZeroElemSize,
 }
 
 /// A block allocator with no free blocks left.

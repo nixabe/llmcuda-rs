@@ -35,8 +35,6 @@ use llmcuda_sched::config::SchedulerConfig;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
-/// f16 KV cache, matching the baseline's `-ctk f16 -ctv f16`.
-const KV_ELEM_BYTES_F16: u64 = 2;
 const DEFAULT_MODEL_PATH: &str = "models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 /// `--token-budget` when it is not given, for every model but a decision one.
 const DEFAULT_TOKEN_BUDGET: u32 = 4096;
@@ -888,7 +886,6 @@ fn main() -> std::process::ExitCode {
         &model,
         u64::from(args.total_context),
         args.slots_per_worker,
-        KV_ELEM_BYTES_F16,
         weights_bytes,
     );
     let usable = devices[0].total_memory;

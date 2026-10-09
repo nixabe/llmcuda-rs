@@ -95,9 +95,10 @@ impl VramBudget {
 /// aggregate token capacity; it does not reserve `context_tokens` worth of
 /// pages per slot up front (that would be the page-geometry mistake
 /// `AGENTS.md` rule 1 warns about, applied to slots instead of cache
-/// groups). `context_tokens` here *is* that aggregate capacity — for the
-/// reference configuration (393,216 tokens, f16 KV) it is exactly
-/// `20,480 B/token * 393,216 = 7.5 GiB`.
+/// groups). `context_tokens` here *is* that aggregate capacity, at the
+/// bytes per token [`ModelConfig::kv_cache_bytes_per_token`] gives for the
+/// cache formats `cfg` carries — for the reference configuration (393,216
+/// tokens, f16 KV) it is exactly `20,480 B/token * 393,216 = 7.5 GiB`.
 ///
 /// # Why `gdn_state` *is* multiplied by `slots`
 ///
@@ -110,12 +111,11 @@ pub fn vram_budget(
     cfg: &ModelConfig,
     context_tokens: u64,
     slots: u32,
-    kv_elem_bytes: u64,
     weights_bytes: u64,
 ) -> VramBudget {
     VramBudget {
         weights_bytes,
-        kv_pool_bytes: cfg.kv_bytes_per_token(kv_elem_bytes) * context_tokens,
+        kv_pool_bytes: cfg.kv_cache_bytes_per_token() * context_tokens,
         gdn_state_bytes: cfg.gdn_state_bytes_per_sequence() * u64::from(slots),
         compute_buffer_bytes: COMPUTE_BUFFER_BYTES,
         cuda_context_overhead_bytes: CUDA_CONTEXT_OVERHEAD_BYTES,
@@ -254,7 +254,7 @@ mod tests {
 
     /// Reference configuration: aggregate context 393,216, 3 slots, f16 KV.
     fn reference_vram(weights_bytes: u64) -> VramBudget {
-        vram_budget(&cfg(), 393_216, 3, 2, weights_bytes)
+        vram_budget(&cfg(), 393_216, 3, weights_bytes)
     }
 
     #[test]

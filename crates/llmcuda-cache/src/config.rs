@@ -24,9 +24,6 @@ pub const DEFAULT_ATTENTION_BLOCK_SIZE: u32 = 256;
 /// for why this is not derived from the attention block size.
 pub const DEFAULT_GDN_RETENTION_INTERVAL: u32 = 2048;
 
-/// Bytes per KV element. f16, the model's native cache dtype.
-pub const DEFAULT_ELEM_SIZE: u64 = 2;
-
 /// Per-group page geometry for one model.
 ///
 /// Holds exactly the two independent parameters AGENTS.md rules 1 and 2
@@ -41,15 +38,15 @@ pub struct CacheConfig {
     attention_block_size: u32,
     /// Tokens between retained GDN snapshots (`R`).
     gdn_retention_interval: u32,
-    /// Bytes per KV element (e.g. 2 for f16).
-    elem_size: u64,
 }
 
 impl CacheConfig {
     /// Build a validated cache configuration.
     ///
-    /// Rejects a zero block size, a zero or misaligned retention interval,
-    /// and a zero element size. The alignment check exists so that
+    /// Rejects a zero block size and a zero or misaligned retention interval.
+    /// The KV element format is the model's own
+    /// ([`ModelConfig::kv_cache`]), so page bytes follow it rather than a
+    /// separate element size that could disagree. The alignment check exists so that
     /// [`crate::radix::RadixTree::match_prefix`] can truncate a matched
     /// prefix down to a retained snapshot boundary with plain integer
     /// division — see AGENTS.md rule 2.
@@ -57,16 +54,12 @@ impl CacheConfig {
         model: ModelConfig,
         attention_block_size: u32,
         gdn_retention_interval: u32,
-        elem_size: u64,
     ) -> Result<Self, CacheConfigError> {
         if attention_block_size == 0 {
             return Err(CacheConfigError::ZeroAttentionBlockSize);
         }
         if gdn_retention_interval == 0 {
             return Err(CacheConfigError::ZeroRetentionInterval);
-        }
-        if elem_size == 0 {
-            return Err(CacheConfigError::ZeroElemSize);
         }
         if !gdn_retention_interval.is_multiple_of(attention_block_size) {
             return Err(CacheConfigError::RetentionNotBlockAligned {
@@ -78,18 +71,16 @@ impl CacheConfig {
             model,
             attention_block_size,
             gdn_retention_interval,
-            elem_size,
         })
     }
 
-    /// [`CacheConfig::new`] with the project defaults for block size,
-    /// retention interval, and element size.
+    /// [`CacheConfig::new`] with the project defaults for block size and
+    /// retention interval.
     pub fn with_defaults(model: ModelConfig) -> Result<Self, CacheConfigError> {
         Self::new(
             model,
             DEFAULT_ATTENTION_BLOCK_SIZE,
             DEFAULT_GDN_RETENTION_INTERVAL,
-            DEFAULT_ELEM_SIZE,
         )
     }
 
@@ -105,16 +96,12 @@ impl CacheConfig {
         self.gdn_retention_interval
     }
 
-    pub fn elem_size(&self) -> u64 {
-        self.elem_size
-    }
-
     /// Bytes held by one attention block: `block_size` tokens' worth of KV
     /// across every attention layer. This is the attention group's natural
     /// page size — never padded to the GDN group's page size (AGENTS.md
     /// rule 1).
     pub fn attention_page_bytes(&self) -> u64 {
-        self.model.kv_bytes_per_token(self.elem_size) * u64::from(self.attention_block_size)
+        self.model.kv_cache_bytes_per_token() * u64::from(self.attention_block_size)
     }
 
     /// Bytes held by one GDN snapshot: the full recurrent state across every
@@ -152,8 +139,8 @@ impl CacheConfig {
     /// too-small an `R`). Lower `R` trades snapshot memory for finer GDN
     /// reuse granularity; this ratio quantifies that trade.
     pub fn snapshot_to_kv_ratio(&self) -> f64 {
-        let kv_bytes_over_interval = self.model.kv_bytes_per_token(self.elem_size) as f64
-            * f64::from(self.gdn_retention_interval);
+        let kv_bytes_over_interval =
+            self.model.kv_cache_bytes_per_token() as f64 * f64::from(self.gdn_retention_interval);
         self.gdn_page_bytes() as f64 / kv_bytes_over_interval
     }
 }
@@ -210,9 +197,30 @@ mod tests {
     }
 
     #[test]
+    fn attention_page_bytes_follow_the_models_kv_cache_formats() {
+        use llmcuda_model::{KvCacheType, KvCacheTypes};
+        let f16 = ModelConfig::k2_horizon_36b_a4b();
+        let q8 = ModelConfig {
+            kv_cache: KvCacheTypes {
+                k: KvCacheType::Q8_0,
+                v: KvCacheType::Q8_0,
+            },
+            ..f16.clone()
+        };
+        let page = |m: ModelConfig| {
+            CacheConfig::with_defaults(m)
+                .unwrap()
+                .attention_page_bytes()
+        };
+        // 256 tokens x 48 layers x 2 halves x 2048 B, then 1088 B per half.
+        assert_eq!(page(f16), 48 << 20);
+        assert_eq!(page(q8), 256 * 48 * 2 * 1088);
+    }
+
+    #[test]
     fn zero_block_size_is_rejected() {
         assert_eq!(
-            CacheConfig::new(model(), 0, 2048, 2),
+            CacheConfig::new(model(), 0, 2048),
             Err(CacheConfigError::ZeroAttentionBlockSize)
         );
     }
@@ -220,7 +228,7 @@ mod tests {
     #[test]
     fn zero_retention_interval_is_rejected() {
         assert_eq!(
-            CacheConfig::new(model(), 256, 0, 2),
+            CacheConfig::new(model(), 256, 0),
             Err(CacheConfigError::ZeroRetentionInterval)
         );
     }
@@ -229,7 +237,7 @@ mod tests {
     fn misaligned_retention_interval_is_rejected() {
         // 2000 is not a multiple of 256.
         assert_eq!(
-            CacheConfig::new(model(), 256, 2000, 2),
+            CacheConfig::new(model(), 256, 2000),
             Err(CacheConfigError::RetentionNotBlockAligned {
                 retention_interval: 2000,
                 attention_block_size: 256,
@@ -299,7 +307,7 @@ mod tests {
     #[test]
     fn tiny_retention_interval_would_make_snapshots_dominate_the_pool_regression() {
         let default_cfg = CacheConfig::with_defaults(model()).unwrap();
-        let worst_case_cfg = CacheConfig::new(model(), 256, 256, 2).unwrap();
+        let worst_case_cfg = CacheConfig::new(model(), 256, 256).unwrap();
 
         let default_ratio = default_cfg.snapshot_to_kv_ratio();
         let worst_ratio = worst_case_cfg.snapshot_to_kv_ratio();

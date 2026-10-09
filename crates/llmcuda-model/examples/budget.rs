@@ -52,7 +52,6 @@ fn main() {
         &cfg,
         REFERENCE_CONTEXT_TOKENS,
         REFERENCE_SLOTS,
-        KV_ELEM_BYTES_F16,
         WEIGHTS_BYTES,
     );
 

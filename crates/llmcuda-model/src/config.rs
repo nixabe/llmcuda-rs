@@ -256,6 +256,110 @@ impl fmt::Display for UnknownArchitecture {
 
 impl core::error::Error for UnknownArchitecture {}
 
+/// Element format of one half (K or V) of the attention cache.
+///
+/// `F16` stores every element as binary16. `Q8_0` stores llama.cpp's
+/// `block_q8_0` arithmetic — 32 int8 codes sharing one binary16 scale,
+/// `d = amax / 127`, `q = round(x / d)` — but not its interleaved byte order:
+/// each position's row is all of its codes followed by all of its scales, so
+/// a head's 128 codes stay 16-byte aligned for vector loads. A row of `n`
+/// elements is therefore `n + n / 16` bytes, 53% of binary16's `2n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvCacheType {
+    #[default]
+    F16,
+    Q8_0,
+}
+
+impl KvCacheType {
+    /// Every format, in the order the CLI lists them.
+    pub const ALL: [Self; 2] = [Self::F16, Self::Q8_0];
+
+    /// Bytes one position's row of `elements` values occupies.
+    ///
+    /// `elements` must be a multiple of 32 for `Q8_0`; every head width this
+    /// engine serves is.
+    pub const fn row_bytes(self, elements: u64) -> u64 {
+        match self {
+            Self::F16 => 2 * elements,
+            Self::Q8_0 => elements + elements / 32 * 2,
+        }
+    }
+
+    /// The name llama.cpp's `--cache-type-k`/`-v` uses for the same format.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Q8_0 => "q8_0",
+        }
+    }
+}
+
+impl fmt::Display for KvCacheType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl core::str::FromStr for KvCacheType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|t| t.name() == s)
+            .ok_or_else(|| {
+                let names: Vec<_> = Self::ALL.iter().map(|t| t.name()).collect();
+                format!(
+                    "unknown KV cache type `{s}`; expected one of {}",
+                    names.join(", ")
+                )
+            })
+    }
+}
+
+/// The attention cache's element format for K and V, chosen independently.
+///
+/// A serving choice rather than a property of the file: `from_gguf` and every
+/// preset leave both halves at `F16`, and the server sets this from
+/// `--cache-type-k`/`--cache-type-v`. It lives on [`ModelConfig`] because that
+/// is the one value already carried to every site that allocates, copies or
+/// reads the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KvCacheTypes {
+    pub k: KvCacheType,
+    pub v: KvCacheType,
+}
+
+impl KvCacheTypes {
+    /// Both halves at binary16, the default.
+    pub const F16: Self = Self {
+        k: KvCacheType::F16,
+        v: KvCacheType::F16,
+    };
+
+    /// `LLMCUDA_CACHE_TYPE_K` / `LLMCUDA_CACHE_TYPE_V`, the server's own
+    /// variables, each binary16 when unset: for the benches and tests that
+    /// build a [`ModelConfig`] without the server.
+    pub fn from_env() -> Result<Self, String> {
+        let half = |name: &str| match std::env::var(name) {
+            Ok(value) => value
+                .parse::<KvCacheType>()
+                .map_err(|e| format!("{name}: {e}")),
+            Err(_) => Ok(KvCacheType::F16),
+        };
+        Ok(Self {
+            k: half("LLMCUDA_CACHE_TYPE_K")?,
+            v: half("LLMCUDA_CACHE_TYPE_V")?,
+        })
+    }
+
+    /// Whether either half is stored in anything but binary16.
+    pub const fn is_quantized(self) -> bool {
+        !matches!((self.k, self.v), (KvCacheType::F16, KvCacheType::F16))
+    }
+}
+
 /// K2-Horizon semantics, separate from Qwen's hybrid geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct K2Config {
@@ -350,6 +454,9 @@ pub struct ModelConfig {
     pub k2: Option<K2Config>,
     /// A decision head in place of text generation (`clef`).
     pub decision: Option<DecisionConfig>,
+    /// The attention cache's element format. A serving choice; see
+    /// [`KvCacheTypes`].
+    pub kv_cache: KvCacheTypes,
 }
 
 impl ModelConfig {
@@ -391,6 +498,7 @@ impl ModelConfig {
             has_mtp: true,
             k2: None,
             decision: None,
+            kv_cache: KvCacheTypes::F16,
         }
     }
 
@@ -448,6 +556,7 @@ impl ModelConfig {
             has_mtp: true,
             k2: None,
             decision: None,
+            kv_cache: KvCacheTypes::F16,
         }
     }
 
@@ -501,6 +610,7 @@ impl ModelConfig {
                 route_scale_bits: 2.5f32.to_bits(),
             }),
             decision: None,
+            kv_cache: KvCacheTypes::F16,
         }
     }
 
@@ -621,6 +731,17 @@ impl ModelConfig {
     /// bandwidth past roughly 100K context. See `docs/MODEL.md`.
     pub const fn kv_bytes_per_token(&self, elem_size: u64) -> u64 {
         self.attention.kv_bytes_per_token_per_layer(elem_size) * self.num_attention_layers() as u64
+    }
+
+    /// Bytes of KV cache per token across all attention layers, in the
+    /// formats [`Self::kv_cache`] selects.
+    ///
+    /// Equal to `kv_bytes_per_token(2)` when both halves are binary16; with
+    /// both at `Q8_0` it is 17/32 of that.
+    pub const fn kv_cache_bytes_per_token(&self) -> u64 {
+        let row = self.attention.kv_heads as u64 * self.attention.head_dim as u64;
+        (self.kv_cache.k.row_bytes(row) + self.kv_cache.v.row_bytes(row))
+            * self.num_attention_layers() as u64
     }
 
     /// Bytes of recurrent state held per sequence across all GDN layers.
@@ -825,6 +946,42 @@ mod tests {
     fn kv_per_token_is_20480_bytes_at_f16() {
         // 10 layers x 2 KV heads x 256 head dim x 2 (K and V) x 2 bytes.
         assert_eq!(cfg().kv_bytes_per_token(2), 20_480);
+    }
+
+    #[test]
+    fn typed_kv_bytes_match_binary16_by_default_and_shrink_per_half() {
+        let k2 = ModelConfig::k2_horizon_36b_a4b();
+        // 48 layers x 8 KV heads x 128 x 2 halves x 2 bytes = 192 KiB.
+        assert_eq!(k2.kv_cache_bytes_per_token(), k2.kv_bytes_per_token(2));
+        assert_eq!(k2.kv_cache_bytes_per_token(), 196_608);
+        // A 1024-element Q8_0 row is 1024 codes and 32 binary16 scales.
+        assert_eq!(KvCacheType::Q8_0.row_bytes(1024), 1088);
+        let k_only = ModelConfig {
+            kv_cache: KvCacheTypes {
+                k: KvCacheType::Q8_0,
+                v: KvCacheType::F16,
+            },
+            ..k2.clone()
+        };
+        assert_eq!(k_only.kv_cache_bytes_per_token(), 48 * (1088 + 2048));
+        let both = ModelConfig {
+            kv_cache: KvCacheTypes {
+                k: KvCacheType::Q8_0,
+                v: KvCacheType::Q8_0,
+            },
+            ..k2
+        };
+        assert_eq!(both.kv_cache_bytes_per_token() * 32, 196_608 * 17);
+        assert!(both.kv_cache.is_quantized() && !KvCacheTypes::F16.is_quantized());
+    }
+
+    #[test]
+    fn kv_cache_type_names_round_trip_and_reject_unknown_formats() {
+        for t in KvCacheType::ALL {
+            assert_eq!(t.name().parse::<KvCacheType>(), Ok(t));
+        }
+        let err = "q4_0".parse::<KvCacheType>().unwrap_err();
+        assert!(err.contains("q4_0") && err.contains("f16, q8_0"), "{err}");
     }
 
     #[test]

@@ -261,6 +261,7 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
         has_mtp: mtp == 1,
         k2,
         decision,
+        kv_cache: crate::config::KvCacheTypes::F16,
     };
     let recurrent_key = key("attention.recurrent_layers");
     if file.get(&recurrent_key).is_some() {

@@ -1340,6 +1340,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
+ "cudarc",
  "image",
  "llmcuda-cache",
  "llmcuda-cuda",

@@ -29,6 +29,8 @@ llmcuda-grammar.workspace = true
 # so a rendered tool schema keeps the key order the caller sent.
 minijinja = { version = "2", features = ["json", "preserve_order"] }
 llmcuda-cuda.workspace = true
+# The same spec as llmcuda-engine's, for `kv_quality`'s context and stream.
+cudarc = { version = "0.19.9", features = ["driver", "nvrtc", "fallback-dynamic-loading", "cuda-12040"] }
 llmcuda-gguf.workspace = true
 llmcuda-kernels.workspace = true
 rustc-hash.workspace = true

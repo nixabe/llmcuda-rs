@@ -30,7 +30,7 @@ use llmcuda_engine::{
     snapshot_bytes_per_slot,
 };
 use llmcuda_model::budget;
-use llmcuda_model::{ModelConfig, verify};
+use llmcuda_model::{KvCacheType, KvCacheTypes, ModelConfig, verify};
 use llmcuda_sched::config::SchedulerConfig;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
@@ -145,6 +145,25 @@ struct Args {
     /// Total context across slots, matching the baseline's -c 393216
     #[arg(short = 'c', long, default_value_t = 393_216)]
     total_context: u32,
+
+    /// KV cache format for keys (also -ctk): f16, or q8_0 at 17/32 the
+    /// bytes. q8_0 is implemented for k2-horizon only
+    #[arg(
+        long,
+        env = "LLMCUDA_CACHE_TYPE_K",
+        default_value = "f16",
+        value_parser = kv_cache_type_parser()
+    )]
+    cache_type_k: KvCacheType,
+
+    /// KV cache format for values (also -ctv), chosen independently of keys
+    #[arg(
+        long,
+        env = "LLMCUDA_CACHE_TYPE_V",
+        default_value = "f16",
+        value_parser = kv_cache_type_parser()
+    )]
+    cache_type_v: KvCacheType,
 
     /// Prefill chunk size in tokens (also -pc)
     #[arg(long, default_value_t = 4096)]
@@ -327,7 +346,14 @@ struct Args {
 fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
     args.into_iter()
         .map(|arg| {
-            for (short, long) in [("-pc", "--prefill-chunk"), ("-tb", "--token-budget")] {
+            for (short, long) in [
+                ("-pc", "--prefill-chunk"),
+                ("-tb", "--token-budget"),
+                // llama.cpp's spellings. Without this clap would read `-ctk`
+                // as `-c tk`, the total context.
+                ("-ctk", "--cache-type-k"),
+                ("-ctv", "--cache-type-v"),
+            ] {
                 if arg == short {
                     return long.to_owned();
                 }
@@ -340,6 +366,13 @@ fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
             arg
         })
         .collect()
+}
+
+/// `--cache-type-k`/`-v` values, listed in `--help` by their llama.cpp names.
+fn kv_cache_type_parser() -> impl clap::builder::TypedValueParser<Value = KvCacheType> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::PossibleValuesParser::new(KvCacheType::ALL.map(KvCacheType::name))
+        .map(|name| name.parse::<KvCacheType>().expect("listed by name"))
 }
 
 /// llama.cpp's range for every `--spec-ngram-*` size argument.
@@ -628,7 +661,7 @@ fn main() -> std::process::ExitCode {
     //    engine serves have the same tensor *names* for the mixer and would
     //    otherwise fail deep in the weight resolver with a wall of shape
     //    mismatches instead of one line naming the architecture.
-    let (model, file_name, mtp_available, weights_bytes) = match model_config_for(&args.model) {
+    let (mut model, file_name, mtp_available, weights_bytes) = match model_config_for(&args.model) {
         Ok(m) => m,
         Err(e) => {
             error!("model            FAIL — {e}");
@@ -699,7 +732,21 @@ fn main() -> std::process::ExitCode {
     };
 
     // 2. Cache geometry. Construction enforces that the retention interval is
-    //    block-aligned; the two page sizes are never unified.
+    //    block-aligned; the two page sizes are never unified. The KV formats
+    //    are set first: page bytes, the VRAM budget, snapshot sizes and every
+    //    worker's cache all follow `model.kv_cache`.
+    model.kv_cache = KvCacheTypes {
+        k: args.cache_type_k,
+        v: args.cache_type_v,
+    };
+    if model.kv_cache.is_quantized() && !is_k2 {
+        error!(
+            "cache            FAIL — --cache-type-k {} --cache-type-v {}: a q8_0 KV cache is \
+             implemented for k2-horizon only; {} reads its cache as f16",
+            args.cache_type_k, args.cache_type_v, model.architecture
+        );
+        return std::process::ExitCode::FAILURE;
+    }
     let cache = match CacheConfig::with_defaults(model.clone()) {
         Ok(c) => c,
         Err(e) => {
@@ -711,6 +758,12 @@ fn main() -> std::process::ExitCode {
         "\ncache            attention block {} tokens → {:.2} MiB/page",
         cache.attention_block_size(),
         cache.attention_page_bytes() as f64 / (1024.0 * 1024.0)
+    );
+    info!(
+        "                 KV formats K {} V {} → {:.2} KiB/token",
+        model.kv_cache.k,
+        model.kv_cache.v,
+        model.kv_cache_bytes_per_token() as f64 / 1024.0
     );
     info!(
         "                 GDN retention R = {} tokens → {:.2} MiB/snapshot",

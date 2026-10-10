@@ -75,6 +75,7 @@ The architecture is explicitly `k2-horizon`; tensor shapes never select it.
 | Router | sigmoid; bias affects selection only; normalize then scale by 2.5 |
 | Value aggregation | SiLU on each selected projection before weighted summation |
 | KV per token | 192 KiB across all 48 layers at `f16`; 102 KiB with `--cache-type-k q8_0 --cache-type-v q8_0` |
+| Resident after load | one idle card at default flags: 22.7 GiB (Q4_K_M) or 31.6 GiB (Q6_K), before any KV; the input embedding is read from mapped host memory |
 | Recurrent state / MTP | none / none |
 | Native context | 524288 tokens; usable context depends on allocated memory |
 

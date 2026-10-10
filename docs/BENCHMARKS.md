@@ -110,7 +110,7 @@ Latency in ms; mean ranges span the process means, p95 ranges each process's
 
 Q6_K prefill at 2,048 won its pairs by only +2.1%, +1.5% and +0.7%: parity to
 keep. The engine uses sixteen-bit activation codes, the publisher `q8_1`.
-N=3 decode peaks at **26.90 GiB** (Q4_K_M) and **34.90 GiB** (Q6_K) at 2K.
+N=3 decode peaks at **22.65 GiB** (Q4_K_M) and **31.46 GiB** (Q6_K) at 2K.
 Both quants pass the publisher capture's gates at all 48 block boundaries and
 final logits ([TESTING.md](TESTING.md#k2-projection-and-routing-gates)). Not
 measured: HTTP time to first token, mixed contention, three-card serving,
@@ -924,6 +924,33 @@ before reading code; nvidia-smi cannot tell fragmentation from allocation.
 The Qwen3.8-27B int8 repack and the attention int8 repack upload the same
 way and have not been measured.
 
+## Residency: a shape nothing runs is still resident
+
+A pass never straddles a retention boundary, so outside a decision model no
+prefill pass is wider than the retention interval (2048). The default
+`--prefill-chunk 4096` still built a 4096-token pass at startup that nothing
+chose: on K2 Q6_K its activation scratch was 2.20 GiB, by the pool's counters
+around `Forward::build`. The runtime now builds its prefill shape at the
+narrower of the two, which took 2,276 MiB off an idle card on either K2 quant
+and 1,414 MiB on Qwen3.6. K2 also stopped allocating four gated-attention buffers
+its mixer never reads, 136 MiB at 2048 tokens.
+
+K2 keeps its input embedding in pinned host memory mapped into the device
+(`forward::host_holds`): a step gathers one row per token across PCIe, and
+the arena loses 0.49 GiB (Q6_K) or 0.34 GiB (Q4_K_M). A decode step pays one
+round trip, about 20 us: within ±0.2% on K2's 14.6 ms Q6_K step over three
+pairs, but Qwen3.6 lost 0.2–0.4% at N=1 and 0.3% at N=3 in every pair, so
+its table stays on the card (WHY NOT).
+
+One idle card after load at default flags, nvidia-smi, these two changes with
+K2's narrower Q4_K records (Layout, below):
+
+| file | before | after |
+| :--- | ---: | ---: |
+| K2 Q4_K_M | 27,488 MiB | **23,292 MiB** |
+| K2 Q6_K | 35,264 MiB | **32,316 MiB** |
+| Qwen3.6-35B-A3B Q6_K_XL | 34,670 MiB | **33,256 MiB** |
+
 ## The instruction-count bug that looks like a bandwidth bug
 
 Turing issues **4 load/store operations per SM per clock against 64 FMAs**, so
@@ -942,6 +969,12 @@ left them **bit-identical**, because it reassociates nothing.
   fields for wide loads and superblocks on sectors (212 aligns only the
   loads). It costs 6.7% more sector traffic on two tensors, a trade prefill
   can afford and decode cannot.
+- **K2's records are whole words, and Q6_K's are whole lines.** Q4_K records
+  dropped the per-group code sums only the 8-bit activation experiment read:
+  148 bytes per 256 values and row instead of 160, 1,408 MiB less on an idle
+  Q4_K_M card and 2.5–2.7% faster decode at 2K. Q6_K's 224 is not slack: four interleaved rows make 896
+  bytes, seven 128-byte lines, and the prefill tile's 384-byte windows land
+  on three lines each. At 212 or 216 they straddle a fourth (WHY NOT).
 - **Q8_0 puts a row's quants at byte `b * 34 + 2`**: fifteen warp reads in
   sixteen straddle a 32-byte sector, discarding half of every fetch. The split
   repack fixes it; reading in place, two aligned 16-bit loads recover four
@@ -1150,6 +1183,8 @@ Each row gives the decisive measurement and why it lost.
 | Zero-centered Q8_1 arithmetic for K2 projections | Passes six-token captures, fails the 26-token science capture: Q4 logit **max-abs 0.9601** (gate **0.75**), Q6 block 28 **max-abs/RMS 0.4033** (gate **0.3**). Matching MMQ's sum tree still fails (Q4 **0.9264**; Q6 final-norm **cosine 0.9992134**, gate **0.9995**). Half Q4 coefficients fail even six tokens (**0.4350**). Rejected as production precision. |
 | K2 routed token tile 128 instead of 64 | GPU 1, three pairs, 64-row/128-token vs 128-row/64-token: Q4 routed values at 512 tokens **2.6729 / 2.6539 / 2.6241 ms** vs **1.0065 / 1.0413 / 1.0066 ms**; at 2K **4.7136 / 4.8219 / 4.7916** vs **2.5676 / 2.6749 / 2.6096 ms**. One resident CTA, and sparse expert runs pad more. Rejected. |
 | Predicate Q4 nibble staging on live rows and load coefficients separately | Three alternating GPU 0 pairs, 512 tokens, ordinary → candidate: query **0.6678 / 0.6999 / 0.6978 → 0.6929 / 0.7170 / 0.7253 ms**; routed values **0.9289 / 0.9687 / 0.9732 → 1.0271 / 1.0497 / 1.0670 ms**. Fewer redundant metadata loads lose every pair. Rejected before the full-model gate. |
+| Qwen3.6's input embedding in mapped host memory | 0.50 GiB of VRAM. Three alternating GPU 0 pairs, `bench_worker_decode` at 2K: N=1 **−0.5 / −0.2 / −0.1%**, and with each row first staged through shared memory so a gather is one PCIe round trip, N=1 **−0.4 / −0.2 / −0.2%** and N=3 **−0.3%** in all three. The cost is the round trip on the step's critical path, not the gather's loads; it vanishes in K2's longer step, so only K2 does it. |
+| K2 Q6_K records at 212 or 216 bytes (from 224) | 1.56 GiB less idle on Q6_K at 212 (1.05 GiB at 216 by the record arithmetic). Three rotated rounds, GPU 0: decode at 2K **+0.9–1.0%** (N=1) and **+1.3–1.9%** (N=3) at 212, but prefill to 8K **−0.5 to −0.9%** at both, and the standing cell's shapes at 212 **−0.0 to −1.4%** (512) and **−0.5 to −1.5%** (2,048) — the thin Q6_K 2K cell. Alignment to 32-byte sectors (216) did not help, 128-byte lines did: the prefill tile stages 384-byte windows of a four-row record group. Kept at 224. |
 | Expanding K2 Q6 weights to byte codes | 304-byte records hold **44.57 GiB** at 512-token prefill on a 47.27 GiB card, vs **36.51 GiB** for the 240-byte packed format, leaving little cache capacity. Do not trade the context pool for an unpacking shortcut without an end-to-end measurement. |
 | Tiny tensor-core K2 dense decode | GPU 2, Q4 query: eight-token/32-row MMA tiles take **161 / 172 us** at one/three tokens vs vector **31 / 47 us**. Most columns are padding; tensor-core setup cannot be amortized. Rejected. |
 | DP2A for K2 sixteen-bit activation digits | Q4 query **33.3 / 65.5 us** at one/three tokens vs DP4A **31.1 / 46.6 us**; correctness gates pass. The wider packed operand does not repay its unpacking and instruction cost. |

@@ -25,6 +25,10 @@ For options that also read an environment variable, the order is:
 2. the environment variable,
 3. the built-in default.
 
+A variable that is set but empty counts as unset, so `LLMCUDA_MMPROJ=""`
+serves text only and `LLMCUDA_TEMP=""` takes the default.
+`LLMCUDA_API_KEY` is the exception: an empty key is still a key (see below).
+
 `LLMCUDA_MODEL` selects the model when `--model` is absent. The combined
 `host:port` variable is no longer supported; use `LLMCUDA_HOST` and
 `LLMCUDA_PORT`.
@@ -32,6 +36,9 @@ For options that also read an environment variable, the order is:
 `--api-key` is the exception to preferring the flag: an argument is visible in
 `ps` output to every user on the host, so prefer `LLMCUDA_API_KEY`. Neither
 the value nor the variable's contents appear in `--help` or in any log line.
+An empty `LLMCUDA_API_KEY` is not read as unset: it is a key that happens to be
+the empty string, and callers must present it, so a key that failed to load
+does not quietly become "accept every caller".
 
 ## Options
 

@@ -57,11 +57,10 @@ prints it as `transferring context`, and that number is the check.
 **Images are on by default**, because `LLMCUDA_MMPROJ` is set. That loads the
 vision tower on every worker; a server started without it allocates nothing
 for vision and serves the text path unchanged, and image parts get a 400.
-Serving text only means commenting the `LLMCUDA_MMPROJ` line out of
-`docker-compose.yml`; there is no value that means "off", because an empty
-path is still a path and preflight will reject it. Preflight does fail fast
-and by name when the projector is not a file, which is what you want from a
-typo.
+Serving text only means blanking the line in `docker-compose.yml`
+(`LLMCUDA_MMPROJ: ""`) or commenting it out: the server reads an empty
+`LLMCUDA_*` variable as unset. A path that is set but wrong still fails
+preflight fast and by name, which is what you want from a typo.
 
 ## The default command
 

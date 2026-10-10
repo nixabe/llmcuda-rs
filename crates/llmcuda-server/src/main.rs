@@ -22,7 +22,7 @@ mod http;
 mod size;
 mod tokenizer;
 
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use llmcuda_cache::config::CacheConfig;
 use llmcuda_cuda::{check_gate, device};
 use llmcuda_engine::{
@@ -32,6 +32,7 @@ use llmcuda_engine::{
 use llmcuda_model::budget;
 use llmcuda_model::{KvCacheType, KvCacheTypes, ModelConfig, verify};
 use llmcuda_sched::config::SchedulerConfig;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -343,6 +344,38 @@ struct Args {
     top_k: u32,
 }
 
+/// Parse the command line, reading an empty `LLMCUDA_*` variable as unset.
+fn parse_args(argv: Vec<String>) -> Args {
+    let command = unset_empty_env(Args::command(), |name| std::env::var_os(name));
+    let mut matches = command.get_matches_from(argv);
+    Args::from_arg_matches_mut(&mut matches)
+        .unwrap_or_else(|e| e.format(&mut Args::command()).exit())
+}
+
+/// Detach every flag whose variable is set but empty from that variable, so
+/// the flag falls back to its default. A compose file blanks a variable to
+/// switch its feature off (`LLMCUDA_MMPROJ: ""` for a model with no
+/// projector), and clap would otherwise take the blank as the flag's value
+/// and reject it as an empty path, number or choice.
+///
+/// `LLMCUDA_API_KEY` keeps its empty value: a key that failed to load must
+/// not quietly become "accept every caller".
+fn unset_empty_env(
+    command: clap::Command,
+    var: impl Fn(&OsStr) -> Option<OsString>,
+) -> clap::Command {
+    command.mut_args(|arg| {
+        let empty = arg.get_env().is_some_and(|name| {
+            name != "LLMCUDA_API_KEY" && var(name).is_some_and(|value| value.is_empty())
+        });
+        if empty {
+            arg.env(None::<&'static str>)
+        } else {
+            arg
+        }
+    })
+}
+
 /// Rewrite the two-letter shorts clap cannot express (`-pc`, `-tb`) into
 /// their long forms before parsing. Both bare and `=value` forms are handled.
 fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
@@ -617,7 +650,7 @@ fn model_config_for(
 
 fn main() -> std::process::ExitCode {
     let rest = llmcuda_log::init_from_args();
-    let mut args = Args::parse_from(expand_two_letter_shorts(rest));
+    let mut args = parse_args(expand_two_letter_shorts(rest));
 
     info!("llmcuda preflight\n");
 
@@ -1238,6 +1271,28 @@ mod tests {
         assert_eq!(underscore_aliases.top_k, 20);
         assert_eq!(underscore_aliases.top_p, 0.9);
         assert_eq!(underscore_aliases.min_p, 0.05);
+    }
+
+    #[test]
+    fn an_empty_variable_reads_as_unset_except_the_api_key() {
+        let blank = |name: &OsStr| {
+            ["LLMCUDA_MMPROJ", "LLMCUDA_TEMP", "LLMCUDA_API_KEY"]
+                .iter()
+                .any(|blanked| name == *blanked)
+                .then(OsString::new)
+        };
+        let command = unset_empty_env(Args::command(), blank);
+        let env = |id: &str| {
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .and_then(|arg| arg.get_env())
+                .map(|name| name.to_owned())
+        };
+        assert_eq!(env("mmproj"), None);
+        assert_eq!(env("temperature"), None);
+        assert_eq!(env("api_key"), Some("LLMCUDA_API_KEY".into()));
+        assert_eq!(env("spec_dflash"), Some("LLMCUDA_DFLASH".into()));
     }
 
     #[test]

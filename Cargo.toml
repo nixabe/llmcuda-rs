@@ -8,6 +8,7 @@ members = [
     "crates/llmcuda-kernels",
     "crates/llmcuda-log",
     "crates/llmcuda-cuda",
+    "crates/llmcuda-trt",
     "crates/llmcuda-grammar",
     "crates/llmcuda-engine",
     "crates/llmcuda-server",

@@ -56,21 +56,32 @@ passes; llama.cpp's include its cold first pass, so its column is high):
 
 | work | llmcuda-rs | llama.cpp 12688 |
 | :--- | ---: | ---: |
-| routed experts, gate/up with SwiGLU | 345.9 | 223.5 |
-| routed experts, down | 223.2 | 107.5 |
+| routed experts, gate/up with SwiGLU | 354.5 | 341.4 |
+| routed experts, down | 223.2 | 186.4 |
 | expert dispatch, weighting and combine | 101.0 | 53.5 |
-| MoE router | 97.4 | ≤ 30.9 |
+| MoE router | 97.4 | ≤ 31.0 |
 | GDN recurrence | 235.2 | 194.6 |
-| Q8_0 projections with their activation quantize | 440.5 | 584.8 |
+| Q8_0 projections with every activation quantize | 437.7 | 401.8 |
 | every kernel | 1,675 | 1,458 |
 
-The routed experts are the cell: 670 ms against 385, more than the whole
-difference, with the router and the recurrence adding to it and the engine's
-dense projections giving 144 ms back. llama.cpp's router is three cuBLAS
-`sgemm` shapes that the profile does not separate from its other fp32
-GEMMs, hence the bound; its `concat_non_cont` (41.3 ms) is in neither row.
-Its down projection runs 64-token tiles chosen from the mean tokens per
-expert (`mmq.cu`, `J_best`), the engine's two compiled bucket widths do not.
+No single kernel is the cell. The engine is behind in every row, by 13 to
+66 ms, and the two smallest pieces of work in the layer cost the most: the
+router, 2.44 ms a layer against about 0.5 for the cuBLAS `sgemm` llama.cpp
+calls, and the per-token combine, 1.91 ms a layer against 0.88 for llama.cpp's
+`moe_weighted_reduction_f32`. llama.cpp's router is three `sgemm` shapes that
+the profile does not separate from its other fp32 GEMMs, hence the bound; its
+`concat_non_cont` (41.3 ms) is in no row. Its expert activation quantize
+(14.0 ms) is in the projections row, while the engine's is inside its expert
+kernels.
+
+The two columns do not run the same shapes. llama.cpp at `-ub 4096` splits
+the 6,144 tokens into a 4,096-token and a 2,048-token pass, so its experts see
+128 and 64 tokens each on average and it picks 128- and 64-token tiles for them
+(`mmq.cu`, `ggml_cuda_mmq_get_J_best`); the engine runs one 6,138-token pass
+through 64-slot blocks. Read llama.cpp's rows by the launch grid as well as
+the kernel name: its routed down projection and its dense projections are the
+same `mul_mat_q<Q8_0, 128>` instantiation, and a table that splits them by
+name alone credits the 2,048-token pass's gate/up to the down projection.
 
 The † rows were taken on a different host: one RTX 8000, 31 GB RAM, driver
 595.99. Processes alternated rather than paired within a process: three

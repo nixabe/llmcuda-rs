@@ -305,18 +305,17 @@ fn weight_row(file: &GgufFile, name: &str, row: usize) -> Vec<f32> {
     }
 }
 
-/// `ggml_l2_norm`: `scale = 1 / max(sqrt(sum(x^2)), eps)`.
+/// The GDN q/k norm: `scale = 1 / sqrt(sum(x^2) + eps)`.
 ///
-/// Note this is **not** `1 / sqrt(sum + eps)`. ggml's CPU form is
-/// `1.0f/fmaxf(sqrtf(sum), eps)` and its CUDA form
-/// `rsqrtf(fmaxf(sum, eps*eps))` — the epsilon floors the norm rather than
-/// being added under the root, and at `eps = 1e-6` it never binds. Both GDN
-/// kernels use `1/sqrt(sum + 1e-6)` instead;
-/// [`the_mixer_kernels_l2_epsilon_is_a_different_formula_than_ggmls`] measures
-/// what that costs on this data.
-fn l2_norm_ggml(x: &[f32]) -> Vec<f32> {
+/// This is flash-linear-attention's `l2norm`, which llama.cpp builds as
+/// `build_gdn_l2_norm` since `5fdfa6282`. It is **not** `ggml_l2_norm`'s
+/// `1 / max(sqrt(sum), eps)`, which llama.cpp called here before that commit
+/// and which never binds;
+/// [`the_capture_normalizes_q_and_k_with_the_epsilon_under_the_root`] checks
+/// which of the two the capture on disk was made with.
+fn l2_norm_gdn(x: &[f32]) -> Vec<f32> {
     let sum: f32 = x.iter().map(|v| v * v).sum();
-    let scale = 1.0 / sum.sqrt().max(1e-6);
+    let scale = 1.0 / (sum + 1e-6).sqrt();
     x.iter().map(|v| v * scale).collect()
 }
 
@@ -909,7 +908,7 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
 
         // q and k leave the block un-normalized — the mixer kernels normalize
         // internally — so the comparison against `*_conv_predelta` applies
-        // ggml's own l2 norm on the host, per (token, query/key head). The
+        // the reference's l2 norm on the host, per (token, query/key head). The
         // split emits exactly the capture's `[head_dim, qk_heads, tokens]`, so
         // there is nothing to broadcast on either side.
         for (tag, buf) in [("q_conv_predelta", &d_q), ("k_conv_predelta", &d_k)] {
@@ -919,7 +918,7 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
             for chunk in 0..tokens * geo.qk_heads {
                 let base = chunk * geo.head_dim;
                 normed[base..base + geo.head_dim]
-                    .copy_from_slice(&l2_norm_ggml(&raw[base..base + geo.head_dim]));
+                    .copy_from_slice(&l2_norm_gdn(&raw[base..base + geo.head_dim]));
             }
             let r = report(tag, &normed, fx.golden.f32(&named(tag)));
             gate(tag, &r, &ANCHORED_ELEMENTWISE);
@@ -995,16 +994,19 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
 
         // --- 7/8. the delta rule, then final_output-N ------------------------
         //
-        // Fed llama.cpp's already-L2-normalized q/k, at their own 16 heads —
-        // the kernels pair value head `h` with query/key head `h % 16`
-        // themselves. The mixer normalizes again, which is idempotent to about
-        // 5e-7 on a unit vector, and folds in the `1/sqrt(head_dim)` output
-        // scale that llama.cpp applies at the end instead.
+        // Fed llama.cpp's q/k from before its L2 norm, at their own 16 heads
+        // — the kernels pair value head `h` with query/key head `h % 16`
+        // themselves. Not `*_conv_predelta`: the mixer normalizes, and this
+        // norm is not idempotent. Its epsilon sits under the root, so a
+        // second pass over an already-normalized vector undoes most of the
+        // shrinkage the first one applied (up to 2.1e-4 here). The mixer
+        // also folds in the `1/sqrt(head_dim)` output scale that llama.cpp
+        // applies at the end instead.
         let core = mix_recurrently(
             &mut block,
             &stream,
-            gold("q_conv_predelta"),
-            gold("k_conv_predelta"),
+            gold("q_conv"),
+            gold("k_conv"),
             gold("v_conv_predelta"),
             gold("gate"),
             gold("beta_sigmoid"),
@@ -1387,61 +1389,57 @@ fn the_chunked_prefill_kernel_overflows_on_this_models_decay_rates() {
     );
 }
 
-/// What the mixer kernels' L2 epsilon costs, measured on real activations.
+/// Which L2 norm the capture on disk was made with.
 ///
-/// `ggml_l2_norm` scales by `1 / max(sqrt(sum), eps)` — the epsilon floors the
-/// norm and never binds. Both GDN kernels use `1 / sqrt(sum + 1e-6)` instead,
-/// which is a different formula, not a different constant. To first order the
-/// resulting relative difference in the scale is `eps / (2 * sum)`, so it grows
-/// as the activations shrink.
+/// llama.cpp normalized q and k with `ggml_l2_norm`, `1 / max(sqrt(sum),
+/// eps)`, until its commit `5fdfa6282`, and with the reference's
+/// `1 / sqrt(sum + eps)` since. The two differ by `eps / (2 * sum)` in the
+/// scale, which on this model's smallest q and k is about 2e-4 — far above
+/// what the gates in this file allow, and far below what anyone would notice
+/// in generated text. The kernels implement the reference's form, so a
+/// capture from an older llama.cpp fails the mixer gates for a reason that
+/// has nothing to do with the kernels; this test says so by name.
 ///
-/// Recorded here as a measured cost of a landed kernel's choice rather than
-/// left to be rediscovered downstream: it is small, but it is systematic
-/// shrinkage of the smallest-norm q and k vectors, not round-off.
+/// It uses nothing but captured tensors: `q_conv-N` before the norm and
+/// `q_conv_predelta-N` after it.
 #[test]
-fn the_mixer_kernels_l2_epsilon_is_a_different_formula_than_ggmls() {
+fn the_capture_normalizes_q_and_k_with_the_epsilon_under_the_root() {
     let Some(fx) = setup() else { return };
     let geo = fx.geometry;
     let tokens = fx.golden.n_tokens();
 
-    let mut worst_rel = 0.0f32;
+    let mut worst_additive = 0.0f32;
+    let mut worst_floor = 0.0f32;
     let mut smallest_sum = f32::INFINITY;
     for layer in LAYERS {
         for tag in ["q_conv", "k_conv"] {
             let raw = fx.golden.f32(&format!("{tag}-{layer}"));
+            let normed = fx.golden.f32(&format!("{tag}_predelta-{layer}"));
             for chunk in 0..tokens * geo.qk_heads {
                 let base = chunk * geo.head_dim;
                 let x = &raw[base..base + geo.head_dim];
+                let y = &normed[base..base + geo.head_dim];
                 let sum: f32 = x.iter().map(|v| v * v).sum();
                 smallest_sum = smallest_sum.min(sum);
-                // The two scales, as each side computes them.
-                let ggml = 1.0 / sum.sqrt().max(1e-6);
-                let kernel = 1.0 / (sum + 1e-6).sqrt();
-                worst_rel = worst_rel.max(((ggml - kernel) / ggml).abs());
+                let additive = 1.0 / (sum + 1e-6).sqrt();
+                let floor = 1.0 / sum.sqrt().max(1e-6);
+                for (xv, yv) in x.iter().zip(y) {
+                    worst_additive = worst_additive.max((xv * additive - yv).abs());
+                    worst_floor = worst_floor.max((xv * floor - yv).abs());
+                }
             }
         }
     }
-    let predicted = 1e-6 / (2.0 * smallest_sum);
     println!(
-        "l2 norm over blocks {LAYERS:?}: smallest sum of squares {smallest_sum:.4e}, \
-         worst relative scale difference between ggml's 1/sqrt(sum) and the kernels' \
-         1/sqrt(sum + 1e-6) = {worst_rel:.4e} (first-order prediction eps/(2*sum) = \
-         {predicted:.4e})",
+        "l2 norm over blocks {LAYERS:?}: smallest sum of squares {smallest_sum:.4e}; the          capture's q/k_conv_predelta are within {worst_additive:.3e} of x/sqrt(sum + 1e-6)          and within {worst_floor:.3e} of x/max(sqrt(sum), 1e-6)",
     );
-
-    // The mechanism, asserted rather than described: if the measured difference
-    // stopped tracking `eps / (2 * sum)` the explanation above would be wrong.
     assert!(
-        (worst_rel - predicted).abs() < 0.05 * predicted,
-        "the difference no longer matches eps/(2*sum): measured {worst_rel:.4e}, \
-         predicted {predicted:.4e}",
+        worst_additive < worst_floor,
+        "this capture normalizes q and k by flooring the norm ({worst_floor:.3e} against          {worst_additive:.3e} for the reference's form): it was made by a llama.cpp older          than 5fdfa6282. Re-capture it (docs/ORACLE.md).",
     );
-    // And a ceiling, so a future layer whose q or k came close to the epsilon
-    // would say so here rather than three steps downstream.
     assert!(
-        worst_rel < 5e-4,
-        "the mixer kernels' L2 epsilon has started to bind: worst relative scale \
-         difference {worst_rel:.4e} on a smallest sum of squares of {smallest_sum:.4e}",
+        worst_additive < 2e-6,
+        "the capture's normalized q/k are {worst_additive:.3e} from x/sqrt(sum + 1e-6)",
     );
 }
 

@@ -107,8 +107,8 @@ use cudarc::driver::{
 
 use super::compile;
 
-/// The epsilon inside the L2 normalization — a floor on the norm, as
-/// `ggml_l2_norm` has it.
+/// The epsilon inside the L2 normalization — added to the sum of squares,
+/// as flash-linear-attention's `l2norm` has it.
 ///
 /// The same `1e-6` as [`super::gdn::L2_EPS`] and as
 /// `llmcuda_kernels::gdn::recurrent::recurrent_forward`. Duplicated as a
@@ -236,15 +236,14 @@ __global__ void gdn_chunk_normalize_qk(
     float k_sq = block_reduce_sum(kv * kv, scratch);
     __syncthreads();
 
-    // `1/max(sqrt(sum), eps)`, ggml_l2_norm's formula verbatim — the epsilon
-    // floors the norm and never binds in normal operation. See
-    // `super::gdn`'s normalizer for the measurement that rejected
-    // `1/sqrt(sum + eps)`.
+    // `1/sqrt(sum + eps)`, flash-linear-attention's l2norm — the epsilon is
+    // added under the root. See `super::gdn`'s normalizer for the sources and
+    // for what the form that floors the norm instead costs.
     //
-    // 1.0f/sqrtf rather than rsqrtf, matching the reference's division, so
-    // that the disagreement stays attributable to the reduction order alone.
-    q_out[base + j] = qv * (1.0f / fmaxf(sqrtf(q_sq), eps)) * scale;
-    k_out[base + j] = kv * (1.0f / fmaxf(sqrtf(k_sq), eps));
+    // 1.0f/sqrtf rather than rsqrtf, so that the disagreement with the CPU
+    // reference stays attributable to the reduction order alone.
+    q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;
+    k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));
 }
 
 // The whole sequence as a sequential scan, with the state in registers.
@@ -1701,12 +1700,15 @@ mod tests {
     }
 
     #[test]
-    fn the_l2_epsilon_floors_the_norm_rather_than_being_added_to_the_sum() {
+    fn the_l2_epsilon_is_added_to_the_sum_rather_than_flooring_the_norm() {
         // Same invariant as the recurrent normalizer's, and the same reason:
-        // `ggml_l2_norm` is `1/max(sqrt(sum), eps)` and `1/sqrt(sum + eps)`
-        // shrinks the smallest-norm q/k by 2.148e-4 relative on this model.
-        assert!(!GDN_CHUNKED_SRC.contains("q_sq + eps"));
-        assert!(!GDN_CHUNKED_SRC.contains("k_sq + eps"));
+        // the reference is `x * rsqrt(sum + eps)`, and flooring the norm
+        // instead moves the smallest-norm q/k by 2.148e-4 relative on this
+        // model. The two normalizers must also agree with each other, or a
+        // prefilled state and a decoded one diverge.
+        assert!(!GDN_CHUNKED_SRC.contains("fmaxf(sqrtf("));
+        assert!(GDN_CHUNKED_SRC.contains("sqrtf(q_sq + eps)"));
+        assert!(GDN_CHUNKED_SRC.contains("sqrtf(k_sq + eps)"));
     }
 
     #[test]
@@ -1738,12 +1740,9 @@ mod tests {
         // Same invariant as the recurrent kernel's: on both, or on neither,
         // and every GDN layer's output is off by 11.3x or its square.
         assert!(
-            GDN_CHUNKED_SRC
-                .contains("q_out[base + j] = qv * (1.0f / fmaxf(sqrtf(q_sq), eps)) * scale;")
+            GDN_CHUNKED_SRC.contains("q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;")
         );
-        assert!(
-            GDN_CHUNKED_SRC.contains("k_out[base + j] = kv * (1.0f / fmaxf(sqrtf(k_sq), eps));")
-        );
+        assert!(GDN_CHUNKED_SRC.contains("k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));"));
     }
 
     #[test]

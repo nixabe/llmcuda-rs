@@ -63,16 +63,17 @@ use super::compile;
 
 /// The epsilon inside the L2 normalization.
 ///
-/// It is a **floor on the norm**, not a term added to the sum of squares — see
-/// the `gdn_normalize_qk` source. `ggml_l2_norm` is
-/// `scale = 1/max(sqrt(sum), eps)` on the CPU
-/// (`ggml/src/ggml-cpu/ops.cpp:4204`) and `rsqrt(max(sum, eps*eps))` on CUDA
-/// (`ggml/src/ggml-cuda/norm.cu:273`), which is the same value; llama.cpp
-/// passes `hparams.f_norm_rms_eps` into it at `src/models/qwen35moe.cpp:456`.
-/// Under that form the epsilon only binds on a vector whose norm is below it,
-/// so its exact value is immaterial in normal operation and `1e-6` — FLA's
-/// value, and the one
-/// `llmcuda_kernels::gdn::recurrent::l2_normalize` uses — is safe to keep.
+/// It is **added to the sum of squares, under the root** — see the
+/// `gdn_normalize_qk` source. That is flash-linear-attention's `l2norm`,
+/// the norm the model was trained with; transformers hardcodes `1e-6` for it
+/// (`modeling_qwen3_5_moe.py`, `l2norm(query, dim=-1, eps=1e-6)`) and
+/// llama.cpp passes `hparams.f_norm_rms_eps`, which is `1e-6` on every
+/// `qwen35`/`qwen35moe` file, to `build_gdn_l2_norm`
+/// (`src/models/models.h`).
+///
+/// Under this form the value matters: it moves every q and k by
+/// `eps/(2*sum)`. `llmcuda_kernels::gdn::recurrent::l2_normalize` is called
+/// with the same constant.
 pub const L2_EPS: f32 = 1e-6;
 
 /// Warps per block of the recurrent step kernel — one warp per state row.
@@ -142,21 +143,19 @@ __global__ void gdn_normalize_qk(
     float k_sq = block_reduce_sum(kv * kv, scratch);
     __syncthreads();
 
-    // `1/max(sqrt(sum), eps)`, which is ggml_l2_norm's formula verbatim
-    // (ggml-cpu/ops.cpp:4204; the CUDA path's rsqrt(max(sum, eps*eps)) is the
-    // same value). The epsilon FLOORS the norm rather than being added to the
-    // sum of squares, so it guards a zero vector from dividing by zero and
-    // otherwise never binds. `1/sqrt(sum + eps)` — the form this kernel used
-    // until it was measured against the real q_conv/k_conv of blocks 0/4/20 —
-    // instead shrinks every vector by eps/(2*sum): at the smallest observed
-    // sum of squares, 2.327e-3, that is 2.148e-4 relative, three orders of
-    // magnitude above this kernel's agreement with its reference.
+    // `1/sqrt(sum + eps)`: the epsilon is ADDED to the sum of squares, which
+    // is flash-linear-attention's l2norm and transformers' (`x * rsqrt(sum +
+    // eps)`), and llama.cpp's since 5fdfa6282 (`build_gdn_l2_norm`). The form
+    // that floors the norm instead, `1/max(sqrt(sum), eps)`, is
+    // ggml_l2_norm's; this kernel had it while llama.cpp's graph did, and on
+    // the real q_conv/k_conv of blocks 0/4/20 the two differ by up to
+    // 2.148e-4 relative (smallest sum of squares 2.327e-3).
     //
-    // rsqrtf would be faster and is not IEEE-exact; the reference divides by
-    // sqrtf, and matching it keeps the disagreement attributable to the
-    // reduction order alone.
-    q_out[base + j] = qv * (1.0f / fmaxf(sqrtf(q_sq), eps)) * scale;
-    k_out[base + j] = kv * (1.0f / fmaxf(sqrtf(k_sq), eps));
+    // rsqrtf would be faster and is not IEEE-exact; dividing by sqrtf keeps
+    // this kernel bit-comparable with its CPU reference up to the reduction
+    // order.
+    q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;
+    k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));
 }
 
 // Sum across one warp, leaving the total in every lane.
@@ -603,26 +602,26 @@ mod tests {
     fn the_scale_is_folded_into_q_only() {
         // Folding it into k as well would square it; folding it into neither
         // scales every GDN layer's output by 11.3x.
-        assert!(
-            GDN_SRC.contains("q_out[base + j] = qv * (1.0f / fmaxf(sqrtf(q_sq), eps)) * scale;")
-        );
-        assert!(GDN_SRC.contains("k_out[base + j] = kv * (1.0f / fmaxf(sqrtf(k_sq), eps));"));
+        assert!(GDN_SRC.contains("q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;"));
+        assert!(GDN_SRC.contains("k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));"));
     }
 
     #[test]
-    fn the_l2_epsilon_floors_the_norm_rather_than_being_added_to_the_sum() {
-        // `ggml_l2_norm` is `1/max(sqrt(sum), eps)`, so eps guards a zero
-        // vector and otherwise never binds. `1/sqrt(sum + eps)` looks
-        // equivalent and is not: it shrinks every vector by eps/(2*sum),
-        // measured at 2.148e-4 relative on the smallest-norm q/k of the real
-        // model's blocks 0/4/20. Asserted structurally because no synthetic
-        // input at a realistic scale distinguishes the two above the noise
-        // floor of the differential gate.
+    fn the_l2_epsilon_is_added_to_the_sum_rather_than_flooring_the_norm() {
+        // The reference norm is `x * rsqrt(sum + eps)` (flash-linear-attention,
+        // transformers, llama.cpp since 5fdfa6282). `1/max(sqrt(sum), eps)`
+        // looks equivalent and is not: it never binds, so it leaves out a
+        // shrinkage of eps/(2*sum) that the model was trained with, measured
+        // at 2.148e-4 relative on the smallest-norm q/k of the real model's
+        // blocks 0/4/20. Asserted structurally because no synthetic input at
+        // a realistic scale distinguishes the two above the noise floor of
+        // the differential gate.
         assert!(
-            !GDN_SRC.contains("q_sq + eps"),
-            "the L2 epsilon reverted to being added to the sum of squares",
+            !GDN_SRC.contains("fmaxf(sqrtf("),
+            "the L2 epsilon reverted to flooring the norm",
         );
-        assert!(!GDN_SRC.contains("k_sq + eps"));
+        assert!(GDN_SRC.contains("sqrtf(q_sq + eps)"));
+        assert!(GDN_SRC.contains("sqrtf(k_sq + eps)"));
     }
 
     #[test]

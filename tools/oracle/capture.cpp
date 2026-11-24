@@ -92,6 +92,7 @@ struct cb_state {
     std::vector<uint8_t> raw;
     std::vector<float>   flat;
     int matched = 0;
+    int n_tokens = 0;      // set before llama_decode
 };
 
 static float read_scalar(const uint8_t * d, ggml_type type, size_t off) {
@@ -106,26 +107,9 @@ static float read_scalar(const uint8_t * d, ggml_type type, size_t off) {
     }
 }
 
-static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
-    auto * st = (cb_state *) user_data;
-
-    bool match = false;
-    for (const auto & re : st->filters) {
-        if (std::regex_match(t->name, re)) { match = true; break; }
-    }
-
-    if (ask) {
-        // Returning false means the scheduler will not call back with the data.
-        return match;
-    }
-    if (!match) {
-        return true;
-    }
-    if (ggml_is_quantized(t->type)) {
-        fprintf(stderr, "skipping quantized tensor %s (%s)\n", t->name, ggml_type_name(t->type));
-        return true;
-    }
-
+// Flatten `t` into `st->flat` in ne[0]-fastest order and return its element
+// count.
+static uint64_t flatten(cb_state * st, const struct ggml_tensor * t) {
     const size_t nbytes = ggml_nbytes(t);
     const uint8_t * src;
     if (ggml_backend_buffer_is_host(t->buffer)) {
@@ -148,17 +132,96 @@ static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     for (int64_t i0 = 0; i0 < ne[0]; i0++) {
         st->flat[o++] = read_scalar(src, t->type, i3*nb[3] + i2*nb[2] + i1*nb[1] + i0*nb[0]);
     }
+    return n_elem;
+}
 
+static void emit(cb_state * st, const std::string & name, const char * type_name,
+                 const int64_t ne[4], const float * data, uint64_t n_elem) {
     double sum = 0.0;
-    for (uint64_t i = 0; i < n_elem; i++) sum += st->flat[i];
-
-    st->w->record(t->name, 0, ne, st->flat.data(), n_elem);
-    st->matched++;
+    for (uint64_t i = 0; i < n_elem; i++) sum += data[i];
+    st->w->record(name, 0, ne, data, n_elem);
     printf("captured %-28s type=%-5s ne=[%lld,%lld,%lld,%lld] n=%llu sum=%.6f\n",
-           t->name, ggml_type_name(t->type),
+           name.c_str(), type_name,
            (long long) ne[0], (long long) ne[1], (long long) ne[2], (long long) ne[3],
            (unsigned long long) n_elem, sum);
     fflush(stdout);
+}
+
+// The gated-norm output that feeds a GDN block's output projection.
+//
+// llama.cpp named this node `final_output-N` until it stopped calling its
+// callback on it; the tensor is still there, as the activation operand of the
+// MUL_MAT that produces `linear_attn_out-N`. It is read while that node's
+// callback runs, which is before the scheduler can hand its buffer to anything
+// else: the node that consumed it has only just finished.
+static const struct ggml_tensor * projection_input(const struct ggml_tensor * t) {
+    const struct ggml_tensor * mm = t;
+    for (int hop = 0; hop < 2 && mm && mm->op != GGML_OP_MUL_MAT; hop++) {
+        mm = mm->src[0];
+    }
+    if (!mm || mm->op != GGML_OP_MUL_MAT) return nullptr;
+    return mm->src[1];
+}
+
+static bool cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * st = (cb_state *) user_data;
+
+    bool match = false;
+    for (const auto & re : st->filters) {
+        if (std::regex_match(t->name, re)) { match = true; break; }
+    }
+
+    if (ask) {
+        // Returning false means the scheduler will not call back with the data.
+        return match;
+    }
+    if (!match) {
+        return true;
+    }
+    if (ggml_is_quantized(t->type)) {
+        fprintf(stderr, "skipping quantized tensor %s (%s)\n", t->name, ggml_type_name(t->type));
+        return true;
+    }
+
+    const std::string name = t->name;
+    const int64_t * ne = t->ne;
+
+    // `final_output-N` first, so the container keeps the graph's own order.
+    if (name.rfind("linear_attn_out-", 0) == 0) {
+        const struct ggml_tensor * in = projection_input(t);
+        if (!in || ggml_is_quantized(in->type)) {
+            fprintf(stderr, "%s: no MUL_MAT activation operand to capture as final_output\n", t->name);
+            exit(1);
+        }
+        const uint64_t n_in = flatten(st, in);
+        emit(st, "final_output-" + name.substr(strlen("linear_attn_out-")),
+             ggml_type_name(in->type), in->ne, st->flat.data(), n_in);
+        st->matched++;
+    }
+
+    const uint64_t n_elem = flatten(st, t);
+
+    // Every position is an output position in this capture (see main), so the
+    // final norm and the logits arrive as `[n, n_tokens]`. The container has
+    // always carried them for the last position alone, with the full final
+    // norm under `h_nextn`; llama.cpp names one tensor both `h_nextn` and
+    // `result_norm` when nothing is cropped between them, and the second name
+    // wins, so both records are cut from it here.
+    const bool per_token = st->n_tokens > 1 && ne[1] == st->n_tokens && ne[2] == 1 && ne[3] == 1;
+    if (per_token && (name == "result_norm" || name == "result_output")) {
+        if (name == "result_norm") {
+            emit(st, "h_nextn", ggml_type_name(t->type), ne, st->flat.data(), n_elem);
+            st->matched++;
+        }
+        const int64_t last[4] = { ne[0], 1, 1, 1 };
+        emit(st, name, ggml_type_name(t->type), last,
+             st->flat.data() + (uint64_t) ne[0] * (st->n_tokens - 1), (uint64_t) ne[0]);
+        st->matched++;
+        return true;
+    }
+
+    emit(st, name, ggml_type_name(t->type), ne, st->flat.data(), n_elem);
+    st->matched++;
     return true;
 }
 
@@ -232,10 +295,25 @@ int main(int argc, char ** argv) {
     }
     fflush(stdout);
 
-    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), n)) != 0) {
+    // Every position is requested as an output. With only the last one
+    // requested, llama.cpp crops the last block to that row before its
+    // residual add, and `attn_residual-39` onward would hold one position
+    // instead of the prompt.
+    st.n_tokens = n;
+    llama_batch batch = llama_batch_init(n, 0, 1);
+    for (int i = 0; i < n; i++) {
+        batch.token[i]     = tokens[i];
+        batch.pos[i]       = i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = 1;
+    }
+    batch.n_tokens = n;
+    if (llama_decode(ctx, batch) != 0) {
         fprintf(stderr, "decode failed\n");
         return 1;
     }
+    llama_batch_free(batch);
 
     // Final logits for the last prompt position, straight from the public API.
     // Captured independently of the graph callback so the two can be

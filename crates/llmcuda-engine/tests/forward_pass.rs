@@ -152,7 +152,8 @@ const NORM_MIN_COSINE: f32 = 1.0 - 5e-3;
 /// in direction while being scaled wrong would still fail.
 const LOGITS_MIN_COSINE: f32 = 1.0 - 5e-3;
 
-/// How far the winning logit may sit from llama.cpp's 19.902241.
+/// How far the winning logit may sit from llama.cpp's own (19.910334 in the
+/// current capture; see docs/ORACLE.md).
 ///
 /// A logit is a dot product of a 2048-vector with |h| of order 10 and weights
 /// of order 0.03, so an absolute bound is the meaningful one; the relative

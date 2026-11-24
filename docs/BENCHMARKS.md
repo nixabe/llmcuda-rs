@@ -927,6 +927,7 @@ not depend on:
 - The GDN projection read its weights once per token, 512× at prefill width.
 - `gdn_chunk_inter` re-read the recurrent state per token.
 - The MoE router loaded 2.1 GB per layer to cover 6 MB.
+- The MoE combine split each token's row over eight blocks and every one recomputed the shared expert's gate: 400 MB a layer of repeat reads at 6,138 tokens. From 288 tokens one block walks the row. Bit-identical, and 1.012–1.025× in every one of eighteen `bench_forward` pairs at 512, 2,048 and 6,138 tokens (`LLMCUDA_BENCH_AB=LLMCUDA_COMBINE_ROW`).
 - Prefill attention gridded on 16 query heads re-streamed 2 KV heads' K/V;
   gridding on the KV head cut traffic 4–8×.
 - The GDN scan gives a warp four value columns sharing q/k, decay and beta.

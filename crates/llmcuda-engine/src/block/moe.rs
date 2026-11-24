@@ -225,6 +225,23 @@ fn router_wide_min_tokens_from_env() -> usize {
     }
 }
 
+/// Token count from which the combine launches one block per token instead
+/// of splitting each token's row over eight.
+///
+/// Four blocks to an SM on this card: below that the split is what keeps the
+/// card busy. The two launch shapes are bit-identical, so unlike the router's
+/// this threshold is purely a throughput choice.
+pub const COMBINE_ROW_MIN_TOKENS: usize = 288;
+
+/// [`COMBINE_ROW_MIN_TOKENS`], or never with `LLMCUDA_COMBINE_ROW=0` (for
+/// `bench_forward`'s `LLMCUDA_BENCH_AB`). Read once, at construction.
+fn combine_row_min_tokens_from_env() -> usize {
+    match std::env::var("LLMCUDA_COMBINE_ROW").as_deref() {
+        Ok("0") => usize::MAX,
+        _ => COMBINE_ROW_MIN_TOKENS,
+    }
+}
+
 /// RMS epsilon when the file does not carry one.
 ///
 /// llama.cpp reads `f_norm_rms_eps` from
@@ -650,13 +667,24 @@ ROUTER_LOGITS_WIDE(moe_block_router_logits_wide_w8, 8)
 // order and `moe_reduce`'s order alike, and the result is still written out
 // because `ffn_moe_out-N` is a golden waypoint `tests/moe_block.rs` gates on.
 //
-// grid: (max_tokens, ceil(hidden / blockDim.x)). The second dimension is not
-// decoration: this kernel now moves `top_k * hidden` floats per token, and one
-// block per token would put 64 KiB of that on a single one of the card's 72
-// SMs -- the failure mode `moe_reduce` had before it was split the same way.
-// The price is that all `gridDim.y` blocks recompute the gate's dot product;
-// it reads the same 16 KiB every time, so it is an L2 hit rather than a second
-// trip to DRAM, and it is cheaper than the launch it replaces.
+// grid: (max_tokens, Y), where the `Y` blocks of a token share its row
+// between them: block `y` takes the elements `y * blockDim.x + threadIdx.x`
+// and then every `Y * blockDim.x` after that. Two shapes are launched.
+//
+// - `Y = ceil(hidden / blockDim.x)` at decode width: one trip a block. This
+//   kernel moves `top_k * hidden` floats per token, and one block per token
+//   would put 64 KiB of that on a single one of the card's 72 SMs -- the
+//   failure mode `moe_reduce` had before it was split the same way. The
+//   price is that all `Y` blocks recompute the gate's dot product; it reads
+//   the same 16 KiB every time, so it is an L2 hit rather than a second trip
+//   to DRAM, and it is cheaper than the launch it replaces.
+// - `Y = 1` at prefill width, where there are more tokens than SMs and the
+//   split buys no parallelism: one block walks the whole row and the gate is
+//   computed once. Seven of the eight gate reads were 400 MB a layer at
+//   6,138 tokens on a kernel that is bound by its traffic.
+//
+// The two are bit-identical: the gate's lanes and reduction do not depend on
+// `Y`, and every output element is the same expression of the same operands.
 __global__ void moe_block_gate_and_combine(
     const float* __restrict__ w,
     const float* __restrict__ normed,
@@ -708,14 +736,15 @@ __global__ void moe_block_gate_and_combine(
     if (threadIdx.x == 0 && blockIdx.y == 0) gate[t] = g;
 
     long long pbase = (long long)t * top_k * hidden;
-    int j = blockIdx.y * blockDim.x + threadIdx.x;
-    if (j >= hidden) return;
-    float r = 0.0f;
-    for (int k = 0; k < top_k; ++k) r += partial[pbase + (long long)k * hidden + j];
-    float v = r + shexp[base + j] * g;
-    routed[base + j] = r;
-    ffn_out[base + j] = v;
-    l_out[base + j]   = v + residual[base + j];
+    int step = gridDim.y * blockDim.x;
+    for (int j = blockIdx.y * blockDim.x + threadIdx.x; j < hidden; j += step) {
+        float r = 0.0f;
+        for (int k = 0; k < top_k; ++k) r += partial[pbase + (long long)k * hidden + j];
+        float v = r + shexp[base + j] * g;
+        routed[base + j] = r;
+        ffn_out[base + j] = v;
+        l_out[base + j]   = v + residual[base + j];
+    }
 }
 
 }
@@ -1138,6 +1167,7 @@ pub struct MoeBlock {
     router_wide_min_tokens: usize,
     router_wide_full_min_tokens: usize,
     combine_fn: CudaFunction,
+    combine_row_min_tokens: usize,
     buffers: MoeBuffers,
     normed: CudaSlice<f32>,
     logits: CudaSlice<f32>,
@@ -1208,6 +1238,7 @@ impl MoeBlock {
             router_wide_min_tokens: router_wide_min_tokens_from_env(),
             router_wide_full_min_tokens: ROUTER_WIDE_FULL_MIN_TOKENS,
             combine_fn: module.load_function("moe_block_gate_and_combine")?,
+            combine_row_min_tokens: combine_row_min_tokens_from_env(),
             moe,
             layer_ops,
             buffers,
@@ -1263,6 +1294,13 @@ impl MoeBlock {
     pub fn set_router_wide_min_tokens(&mut self, wide: usize, full: usize) {
         self.router_wide_min_tokens = wide;
         self.router_wide_full_min_tokens = full;
+    }
+
+    /// Move the width from which the combine launches one block per token.
+    ///
+    /// For the test that checks the two launch shapes agree bit for bit.
+    pub fn set_combine_row_min_tokens(&mut self, tokens: usize) {
+        self.combine_row_min_tokens = tokens;
     }
 
     /// Whether a pass at this geometry routes through the tiled GEMM.
@@ -1625,17 +1663,20 @@ impl MoeBlock {
         //    fused multiply-add per element the combine was going to read
         //    anyway. Still `block_reduce_sum`, so it still needs one float
         //    per warp.
-        // The row is split over `gridDim.y` blocks because this kernel reads
-        // `top_k * hidden` floats per token; one block per token would put
-        // 64 KiB of that on one of the card's 72 SMs. `COMBINE_THREADS` is
-        // `MOE_GATE_LANES`, which is what keeps the gate's reduction the
-        // shape `tests/forward_pass.rs` gated on.
+        // At decode width the row is split over `gridDim.y` blocks, because
+        // this kernel reads `top_k * hidden` floats per token and one block
+        // per token would put 64 KiB of that on one of the card's 72 SMs. At
+        // prefill width one block walks the row: there are already more
+        // blocks than SMs, and the split only repeats the gate.
+        // `COMBINE_THREADS` is `MOE_GATE_LANES`, which is what keeps the
+        // gate's reduction the shape `tests/forward_pass.rs` gated on.
+        let row_blocks = if g.max_tokens >= self.combine_row_min_tokens {
+            1
+        } else {
+            (g.hidden as u32).div_ceil(COMBINE_THREADS)
+        };
         let cfg = LaunchConfig {
-            grid_dim: (
-                g.max_tokens as u32,
-                (g.hidden as u32).div_ceil(COMBINE_THREADS),
-                1,
-            ),
+            grid_dim: (g.max_tokens as u32, row_blocks, 1),
             block_dim: (COMBINE_THREADS, 1, 1),
             shared_mem_bytes: ((COMBINE_THREADS as usize).div_ceil(32) * size_of::<f32>()) as u32,
         };

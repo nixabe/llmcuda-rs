@@ -1934,6 +1934,89 @@ fn the_wide_router_is_the_hosts_mul_add_chain_bit_for_bit() {
     );
 }
 
+/// The combine's two launch shapes against each other: eight blocks sharing
+/// a token's row (decode width) and one block walking it (prefill width).
+///
+/// They are meant to be bit-identical — the shared expert's gate is reduced
+/// by the same lanes in the same order whatever the grid is, and every
+/// output element is the same expression of the same operands — and that is
+/// what lets the width that switches between them be a throughput choice
+/// with no accuracy side to it. This is what checks it, on a real layer's
+/// weights and through the whole block, at a width that is not a multiple of
+/// anything.
+#[test]
+fn the_combine_is_the_same_bits_with_one_block_a_token_or_eight() {
+    use llmcuda_engine::block::moe::{MoeBlock, MoeLayerWeights};
+
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+    let eps = MoeBlock::eps_from(&config, &file);
+    let hidden = config.hidden_size as usize;
+
+    const MAX: usize = 77;
+    const LIVE: usize = 71;
+    let g = MoeBlock::geometry_for(&config, BLOCK_SIZE, MAX).expect("the routed model");
+    let mut block = MoeBlock::new(&ctx, &stream, g, eps).expect("block builds");
+    let weights =
+        MoeLayerWeights::upload(&stream, &file, &directory, LAYER, &g).expect("weights upload");
+
+    let mut rng = Xorshift64Star::new(0x_5EED_BB06);
+    let residual = rng.vec_f32(MAX * hidden, -1.0, 1.0);
+    assert_carries_signal("residual", &residual);
+    let d_residual = stream.clone_htod(&residual).expect("upload residual");
+
+    let mut run = |row_min_tokens: usize| -> [Vec<f32>; 4] {
+        block.set_combine_row_min_tokens(row_min_tokens);
+        let mut ffn_out = stream.alloc_zeros::<f32>(MAX * hidden).expect("ffn_out");
+        let mut l_out = stream.alloc_zeros::<f32>(MAX * hidden).expect("l_out");
+        block
+            .forward(
+                &stream,
+                &weights,
+                &d_residual,
+                LIVE,
+                &mut ffn_out,
+                &mut l_out,
+            )
+            .expect("moe forward");
+        stream.synchronize().expect("sync");
+        let out = [
+            stream.clone_dtoh(&ffn_out).expect("ffn_out back"),
+            stream.clone_dtoh(&l_out).expect("l_out back"),
+            stream.clone_dtoh(block.routed()).expect("routed back"),
+            stream.clone_dtoh(block.shared_gate()).expect("gate back"),
+        ];
+        stream.synchronize().expect("sync");
+        out
+    };
+
+    let split = run(usize::MAX);
+    let whole = run(0);
+    assert_carries_signal("ffn_out", &split[0][..LIVE * hidden]);
+    assert_carries_signal("routed", &split[2][..LIVE * hidden]);
+    assert_carries_signal("gate", &split[3][..LIVE]);
+    for (name, a, b) in [
+        ("ffn_out", &split[0], &whole[0]),
+        ("l_out", &split[1], &whole[1]),
+        ("routed", &split[2], &whole[2]),
+        ("gate", &split[3], &whole[3]),
+    ] {
+        println!(
+            "combine, eight blocks a token vs one, {name}: {}",
+            compare(a, b)
+        );
+        assert_eq!(
+            a, b,
+            "{name} differs between the combine's two launch shapes",
+        );
+    }
+}
+
 /// The routed geometry of the model these differential tests target.
 ///
 /// `ModelConfig::ffn` became an enum when the dense `qwen35` architecture

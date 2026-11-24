@@ -170,6 +170,61 @@ const ROUTER_ET: u32 = 8;
 /// per-thread summation order, which the router cannot afford to change.
 const ROUTER_JC: u32 = THREADS;
 
+/// Tokens, experts and contraction one wide router block stages. Mirror
+/// `ROUTER_WIDE_TT`, `ROUTER_WIDE_ET` and `ROUTER_WIDE_KC`.
+const ROUTER_WIDE_TT: u32 = 64;
+const ROUTER_WIDE_ET: u32 = 32;
+const ROUTER_WIDE_KC: u32 = 16;
+/// Warps in the wide router's every-expert block. Mirrors the `EW` of
+/// `moe_block_router_logits_wide_w8`.
+const ROUTER_WIDE_FULL_WARPS: u32 = 8;
+/// Token count from which the router runs as a tiled GEMM
+/// (`moe_block_router_logits_wide`) instead of the register-tiled kernel.
+///
+/// The wide kernel pads its token tile to 64 and walks the whole contraction
+/// in one block, which takes about 0.35 ms however few blocks there are, so
+/// a narrow pass is faster on the register-tiled kernel. `bench_router`, ms a
+/// launch on an idle RTX 8000, three alternating rounds:
+///
+/// | tokens | register-tiled | one warp | eight warps |
+/// | ---: | ---: | ---: | ---: |
+/// | 512 | 0.19 | 0.34–0.45 | 0.60 |
+/// | 768 | 0.36 | 0.47 | 0.62 |
+/// | 1,024 | 0.35–0.37 | 0.34–0.38 | 0.47–0.50 |
+/// | 1,536 | 0.54–0.59 | 0.36–0.39 | 0.48–0.53 |
+/// | 2,048 | 0.69–0.79 | 0.40–0.44 | 0.49–0.52 |
+/// | 3,072 | 1.12–1.20 | 0.58–0.60 | 0.52–0.54 |
+/// | 4,096 | 1.46–1.59 | 0.64–0.66 | 0.53–0.55 |
+/// | 6,138 | 2.15–2.26 | 1.10–1.14 | 0.89–0.95 |
+/// | 8,192 | 3.13–3.21 | 1.29–1.30 | 0.98–1.00 |
+///
+/// It also has to stay above the routed experts' own tensor-core threshold:
+/// below that a pass may be a decode or a verify step, whose router must
+/// stay bit-identical across widths.
+pub const ROUTER_WIDE_MIN_TOKENS: usize = 1024;
+/// Token count from which a wide router block is eight warps covering every
+/// expert rather than one warp covering 32. See [`ROUTER_WIDE_MIN_TOKENS`]
+/// for the measurement.
+pub const ROUTER_WIDE_FULL_MIN_TOKENS: usize = 2560;
+
+/// The width from which a pass routes through the tiled GEMM, as
+/// `LLMCUDA_ROUTER_WIDE` leaves it. Read once, at construction.
+///
+/// - unset, or anything else: [`ROUTER_WIDE_MIN_TOKENS`].
+/// - `0`: never. Every width stays on the register-tiled kernels, for
+///   `bench_forward`'s `LLMCUDA_BENCH_AB` and as the way back to one router
+///   order at every width.
+/// - `force`: at every width that runs prefill arithmetic at all, so the
+///   19-token golden prompt exercises the wide order through the whole model
+///   (`tests/forward_pass.rs`), which the default threshold never lets it.
+fn router_wide_min_tokens_from_env() -> usize {
+    match std::env::var("LLMCUDA_ROUTER_WIDE").as_deref() {
+        Ok("0") => usize::MAX,
+        Ok("force") => 0,
+        _ => ROUTER_WIDE_MIN_TOKENS,
+    }
+}
+
 /// RMS epsilon when the file does not carry one.
 ///
 /// llama.cpp reads `f_norm_rms_eps` from
@@ -380,6 +435,187 @@ __global__ void NAME(                                                          \
 ROUTER_LOGITS(moe_block_router_logits,    8)
 ROUTER_LOGITS(moe_block_router_logits_t3, 3)
 ROUTER_LOGITS(moe_block_router_logits_t1, 1)
+
+// The same logits for a prefill-width pass, as a tiled GEMM.
+//
+// The kernels above keep one accumulator per (expert, token, thread), which
+// is what fixes their summation order and also what bounds them: a thread
+// has room for about 64 accumulators, so a block can share one pass over the
+// contraction between 8 experts and 8 tokens and no more. It moves
+// `(8 + 8) * hidden` floats to do `8 * 8 * hidden` multiply-adds, a byte of
+// traffic per multiply-add, and at prefill width that is what it is bound
+// by: 3.1 GB a layer through L2 for 6,138 tokens.
+//
+// This one keeps one accumulator per (expert, token) and nothing else, so a
+// thread's 64 accumulators are an 8x8 patch of the output and a warp covers
+// 64 tokens by 32 experts. The contraction is staged through shared memory
+// `ROUTER_WIDE_KC` at a time, each staged value is read by eight threads,
+// and the block moves `(64 + 32) * hidden` floats for `64 * 32 * hidden`
+// multiply-adds: a fifth of the traffic.
+//
+// # The summation order, which is not the narrow kernels'
+//
+// `logits[t][e]` is a single chain over `j` ascending from zero,
+// `acc = fma(w[e][j], x[t][j], acc)`. That is a different association from
+// the narrow kernels' 256 chains of eight, so the two families do not agree
+// to the last bit and are not meant to. What this kernel keeps is that the
+// order is the same for every token at every width and every tile position,
+// so a token's logits do not depend on what else is in the pass, and the
+// host reproduces it exactly with `f32::mul_add`.
+//
+// It is selected only where the routed experts already run their integer
+// tensor-core path, which is not bit-identical with decode either. A
+// decode step and a speculative verify window never reach it.
+//
+// # Layout
+//
+// One warp per block and no barrier: lane `l` owns tokens `8 * (l / 4)` to
+// `+ 7` and experts `8 * (l % 4)` to `+ 7` of the block's tile.
+//
+// Both staged tiles are row-major with a row stride of `ROUTER_WIDE_KC + 1`
+// floats, and both hold their rows in a permuted order. Each choice removes
+// a specific cost, and the first one was measured: staging the same tiles
+// contraction-major, each lane loading its own row sixteen bytes at a time,
+// spent 0.55 ms of a 1.25 ms launch at 6,138 tokens on loads that touched 32
+// cache lines an instruction.
+//
+// - **Row-major**, so a staging load is half a warp reading sixteen
+//   consecutive floats of one row and the other half sixteen of another: two
+//   coalesced 64-byte reads an instruction.
+// - **Stride 17**, so the eight lanes that read eight different rows at the
+//   same `kk` in the arithmetic land on eight different banks: `17 * i mod
+//   32` is distinct for `i < 32`. At stride 16 they would all share one.
+// - **Experts at `q = 4 * (e % 8) + e / 8`** and **tokens at
+//   `p = 8 * (t % 8) + t / 8`**, so those eight (or four) rows are
+//   consecutive positions `q + (l % 4)` and `p + (l / 4)`.
+// - The two rows one staging instruction stores are 16 positions apart,
+//   which is 16 banks apart at this stride, so the store is conflict-free
+//   as well.
+//
+// grid: (num_experts / ROUTER_WIDE_ET, ceil(max_tokens / ROUTER_WIDE_TT)) —
+// never the live token count. block: one warp.
+#define ROUTER_WIDE_TT 64
+#define ROUTER_WIDE_ET 32
+#define ROUTER_WIDE_KC 16
+#define ROUTER_WIDE_STRIDE (ROUTER_WIDE_KC + 1)
+
+} // extern "C"
+
+// `EW` warps, each with its own 32 experts, over one staged 64-token tile.
+// The tile and each warp's arithmetic are the same at any `EW`, so the two
+// instantiations below agree bit for bit.
+template<int EW>
+__device__ __forceinline__ void router_logits_wide_impl(
+    const float* __restrict__ w,
+    const float* __restrict__ x,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int num_experts,
+    int max_tokens,
+    float* __restrict__ logits
+) {
+    int lane = threadIdx.x & 31;
+    int wi   = threadIdx.x >> 5;
+    float* sw = llmcuda_moe_block_shared + wi * (ROUTER_WIDE_ET * ROUTER_WIDE_STRIDE);
+    float* sx = llmcuda_moe_block_shared + EW * (ROUTER_WIDE_ET * ROUTER_WIDE_STRIDE);
+
+    int live = *valid_tokens;
+    int t0 = blockIdx.y * ROUTER_WIDE_TT;
+    if (t0 >= live) return;
+    int e0 = (blockIdx.x * EW + wi) * ROUTER_WIDE_ET;
+
+    int ti = lane >> 2;
+    int ei = lane & 3;
+    // Staging: which of an instruction's two rows this lane loads, and which
+    // of its sixteen floats.
+    int half = lane >> 4;
+    int col  = lane & 15;
+
+    // A lane whose eight tokens are all past the live count stages its share
+    // (other lanes read it) and skips the arithmetic.
+    bool compute = t0 + ti * 8 < live;
+
+    float acc[8][8];
+    #pragma unroll
+    for (int u = 0; u < 8; ++u)
+        #pragma unroll
+        for (int v = 0; v < 8; ++v) acc[u][v] = 0.0f;
+
+    for (int k0 = 0; k0 < hidden; k0 += ROUTER_WIDE_KC) {
+        // This warp's own expert tile.
+        #pragma unroll
+        for (int s = 0; s < ROUTER_WIDE_ET / 2; ++s) {
+            int q = s + 16 * half;
+            int e = e0 + (q & 3) * 8 + (q >> 2);
+            sw[q * ROUTER_WIDE_STRIDE + col] = w[(long long)e * hidden + k0 + col];
+        }
+        // The token tile, its 32 row pairs dealt round the block's warps.
+        #pragma unroll
+        for (int i = 0; i < ROUTER_WIDE_TT / 2 / EW; ++i) {
+            int s = wi + i * EW;
+            int p = (s < 16 ? s : s + 16) + 16 * half;
+            int t = t0 + (p & 7) * 8 + (p >> 3);
+            if (t >= max_tokens) t = max_tokens - 1;
+            sx[p * ROUTER_WIDE_STRIDE + col] = x[(long long)t * hidden + k0 + col];
+        }
+        if (EW == 1) __syncwarp(); else __syncthreads();
+
+        if (compute) {
+            #pragma unroll
+            for (int kk = 0; kk < ROUTER_WIDE_KC; ++kk) {
+                float wv[8];
+                #pragma unroll
+                for (int v = 0; v < 8; ++v) {
+                    wv[v] = sw[(v * 4 + ei) * ROUTER_WIDE_STRIDE + kk];
+                }
+                #pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    float xv = sx[(u * 8 + ti) * ROUTER_WIDE_STRIDE + kk];
+                    #pragma unroll
+                    for (int v = 0; v < 8; ++v) {
+                        acc[u][v] = fmaf(wv[v], xv, acc[u][v]);
+                    }
+                }
+            }
+        }
+        if (EW == 1) __syncwarp(); else __syncthreads();
+    }
+
+    #pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        int t = t0 + ti * 8 + u;
+        if (t < live) {
+            #pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                logits[(long long)t * num_experts + e0 + ei * 8 + v] = acc[u][v];
+            }
+        }
+    }
+}
+
+extern "C" {
+
+#define ROUTER_LOGITS_WIDE(NAME, EW)                                           \
+__global__ void __launch_bounds__(32 * EW) NAME(                               \
+    const float* __restrict__ w,                                               \
+    const float* __restrict__ x,                                               \
+    const int* __restrict__ valid_tokens,                                      \
+    int hidden,                                                                \
+    int num_experts,                                                           \
+    int max_tokens,                                                            \
+    float* __restrict__ logits                                                 \
+) {                                                                            \
+    router_logits_wide_impl<EW>(w, x, valid_tokens, hidden, num_experts,       \
+                                max_tokens, logits);                           \
+}
+
+// One warp a block from 1,024 tokens: 32 experts a block, eight blocks a
+// token tile, which is what spreads a mid-width pass over the card. Eight
+// warps a block from 2,560: every expert in one block, so each activation
+// row is read from global memory once a launch instead of eight times, which
+// is what the one-warp shape is bound by at depth.
+ROUTER_LOGITS_WIDE(moe_block_router_logits_wide,    1)
+ROUTER_LOGITS_WIDE(moe_block_router_logits_wide_w8, 8)
 
 // The shared expert's gate and the combine that consumes it, in one launch.
 //
@@ -898,6 +1134,9 @@ pub struct MoeBlock {
     router_logits_fn: CudaFunction,
     router_logits_t3_fn: CudaFunction,
     router_logits_t1_fn: CudaFunction,
+    router_logits_wide_fn: [CudaFunction; 2],
+    router_wide_min_tokens: usize,
+    router_wide_full_min_tokens: usize,
     combine_fn: CudaFunction,
     buffers: MoeBuffers,
     normed: CudaSlice<f32>,
@@ -962,6 +1201,12 @@ impl MoeBlock {
             router_logits_fn: module.load_function("moe_block_router_logits")?,
             router_logits_t3_fn: module.load_function("moe_block_router_logits_t3")?,
             router_logits_t1_fn: module.load_function("moe_block_router_logits_t1")?,
+            router_logits_wide_fn: [
+                module.load_function("moe_block_router_logits_wide")?,
+                module.load_function("moe_block_router_logits_wide_w8")?,
+            ],
+            router_wide_min_tokens: router_wide_min_tokens_from_env(),
+            router_wide_full_min_tokens: ROUTER_WIDE_FULL_MIN_TOKENS,
             combine_fn: module.load_function("moe_block_gate_and_combine")?,
             moe,
             layer_ops,
@@ -1007,6 +1252,143 @@ impl MoeBlock {
     /// Whether the MoE GEMMs will take the integer tensor-core path.
     pub fn tensor_cores_enabled(&self) -> bool {
         self.moe.tensor_cores_enabled()
+    }
+
+    /// Move the widths from which the router runs as a tiled GEMM, and from
+    /// which that GEMM's blocks cover every expert.
+    ///
+    /// For `bench_router`, which measures both crossovers, and for tests that
+    /// need a wide kernel on a narrow pass or the narrow one on a wide pass.
+    /// `usize::MAX` for the first never selects a wide kernel.
+    pub fn set_router_wide_min_tokens(&mut self, wide: usize, full: usize) {
+        self.router_wide_min_tokens = wide;
+        self.router_wide_full_min_tokens = full;
+    }
+
+    /// Whether a pass at this geometry routes through the tiled GEMM.
+    ///
+    /// Only where the routed experts are on their prefill arithmetic too —
+    /// tensor cores on, not the exact decode regime — and only at a shape the
+    /// kernel's fixed tiles divide.
+    pub fn router_is_wide(&self) -> bool {
+        let g = self.geometry;
+        g.max_tokens >= self.router_wide_min_tokens
+            && self.moe.prefill_arithmetic()
+            && g.num_experts.is_multiple_of(ROUTER_WIDE_ET as usize)
+            && g.hidden.is_multiple_of(ROUTER_WIDE_KC as usize)
+    }
+
+    /// Warps in a wide router block at this geometry: eight, covering every
+    /// expert, when the pass is deep enough and the expert count is eight
+    /// 32-expert tiles' worth; otherwise one.
+    fn router_wide_warps(&self) -> u32 {
+        let g = self.geometry;
+        let full = ROUTER_WIDE_ET as usize * ROUTER_WIDE_FULL_WARPS as usize;
+        if g.max_tokens >= self.router_wide_full_min_tokens && g.num_experts.is_multiple_of(full) {
+            ROUTER_WIDE_FULL_WARPS
+        } else {
+            1
+        }
+    }
+
+    /// The router projection alone: logits for the rows of `x`, into
+    /// [`Self::router_logits`]. `router` is a layer's `ffn_gate_inp`,
+    /// `[num_experts][hidden]`; `x` is `[max_tokens][hidden]`, and the rows
+    /// written are the ones [`Self::publish_tokens`] last declared live.
+    pub fn route_logits(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        router: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+    ) -> Result<(), MoeBlockError> {
+        let g = self.geometry;
+        check_len("router", g.num_experts * g.hidden, router.len())?;
+        check_len("x", g.max_tokens * g.hidden, x.len())?;
+        self.launch_router(stream, router, Some(x))
+    }
+
+    /// Launch the router kernel this geometry selects, over `x` or over the
+    /// block's own normalized rows.
+    fn launch_router(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        router: &CudaSlice<f32>,
+        x: Option<&CudaSlice<f32>>,
+    ) -> Result<(), MoeBlockError> {
+        let g = self.geometry;
+        let hidden_i32 = g.hidden as i32;
+        let experts_i32 = g.num_experts as i32;
+        let max_tokens_i32 = g.max_tokens as i32;
+        let wide = self.router_is_wide();
+        // Exact N=3 avoids computing the last token five extra times in the
+        // wide TT=8 tile.
+        let tt = if g.max_tokens == 1 {
+            1
+        } else if g.max_tokens == ROUTER_TT_N3 as usize {
+            ROUTER_TT_N3
+        } else {
+            ROUTER_TT
+        };
+        let (f, cfg) = if wide {
+            let warps = self.router_wide_warps();
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    g.num_experts as u32 / (ROUTER_WIDE_ET * warps),
+                    (g.max_tokens as u32).div_ceil(ROUTER_WIDE_TT),
+                    1,
+                ),
+                block_dim: (32 * warps, 1, 1),
+                shared_mem_bytes: ((ROUTER_WIDE_KC + 1) as usize
+                    * (ROUTER_WIDE_ET * warps + ROUTER_WIDE_TT) as usize
+                    * size_of::<f32>()) as u32,
+            };
+            let f = &self.router_logits_wide_fn[usize::from(warps != 1)];
+            (f, cfg)
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (g.num_experts as u32).div_ceil(ROUTER_ET),
+                    (g.max_tokens as u32).div_ceil(tt),
+                    1,
+                ),
+                // The block width *is* the contraction stride: that equality
+                // is what preserves the untiled kernel's per-thread summation
+                // order, and what makes the activation tile private to each
+                // thread.
+                block_dim: (ROUTER_JC, 1, 1),
+                shared_mem_bytes: ((THREADS.div_ceil(32) * ROUTER_ET * tt) as usize
+                    * size_of::<f32>()) as u32,
+            };
+            let f = match tt {
+                1 => &self.router_logits_t1_fn,
+                ROUTER_TT_N3 => &self.router_logits_t3_fn,
+                _ => &self.router_logits_fn,
+            };
+            (f, cfg)
+        };
+        let mut builder = stream.launch_builder(f);
+        builder
+            .arg(router)
+            .arg(x.unwrap_or(&self.normed))
+            .arg(self.buffers.valid_tokens())
+            .arg(&hidden_i32)
+            .arg(&experts_i32)
+            .arg(&max_tokens_i32)
+            .arg(&mut self.logits);
+        // SAFETY: `router` holds `num_experts * hidden` floats and `x`
+        // `max_tokens * hidden` — checked at upload and at `new` for the
+        // forward path, and in `route_logits` for a caller's buffers. Both
+        // kernels clamp their token index to `max_tokens - 1`. The narrow
+        // one returns for `e >= num_experts`; the wide ones are selected only
+        // when their expert tile (32, or 256 for the eight-warp block)
+        // divides `num_experts` and their 16-float stage divides `hidden`,
+        // so `e * hidden + j` and `t * hidden + j` are in range for
+        // `j < hidden` in all three. `logits` holds
+        // `max_tokens * num_experts` and is written only for
+        // `t < valid_tokens`. The shared request covers the narrow kernel's
+        // per-warp partials and the wide kernel's two staged tiles.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
     }
 
     /// The geometry this block was compiled for.
@@ -1135,53 +1517,7 @@ impl MoeBlock {
         // Recording at the shared-expert call site instead would capture
         // the whole routed path into the fork and overlap nothing.
         // 2. router logits, then softmax + top-k + renormalize on the device.
-        let hidden_i32 = g.hidden as i32;
-        let experts_i32 = g.num_experts as i32;
-        let max_tokens_i32 = g.max_tokens as i32;
-        // Exact N=3 avoids computing the last token five extra times in the
-        // wide TT=8 tile.
-        let tt = if g.max_tokens == 1 {
-            1
-        } else if g.max_tokens == ROUTER_TT_N3 as usize {
-            ROUTER_TT_N3
-        } else {
-            ROUTER_TT
-        };
-        let cfg = LaunchConfig {
-            grid_dim: (
-                (g.num_experts as u32).div_ceil(ROUTER_ET),
-                (g.max_tokens as u32).div_ceil(tt),
-                1,
-            ),
-            // The block width *is* the contraction stride: that equality is
-            // what preserves the untiled kernel's per-thread summation order,
-            // and what makes the activation tile private to each thread.
-            block_dim: (ROUTER_JC, 1, 1),
-            shared_mem_bytes: ((THREADS.div_ceil(32) * ROUTER_ET * tt) as usize * size_of::<f32>())
-                as u32,
-        };
-        let f = match tt {
-            1 => &self.router_logits_t1_fn,
-            ROUTER_TT_N3 => &self.router_logits_t3_fn,
-            _ => &self.router_logits_fn,
-        };
-        let mut builder = stream.launch_builder(f);
-        builder
-            .arg(&w.router)
-            .arg(&self.normed)
-            .arg(self.buffers.valid_tokens())
-            .arg(&hidden_i32)
-            .arg(&experts_i32)
-            .arg(&max_tokens_i32)
-            .arg(&mut self.logits);
-        // SAFETY: `w.router` was checked to hold `num_experts * hidden` floats
-        // and `normed` `max_tokens * hidden`. The kernel returns for
-        // `e >= num_experts` and clamps its token index to `max_tokens - 1`,
-        // so `e * hidden + j` and `t * hidden + j` are both in range for
-        // `j < hidden`. `logits` holds `max_tokens * num_experts` and is
-        // written only for `t < valid_tokens`. The warp reduction uses no
-        // shared memory.
-        unsafe { builder.launch(cfg) }?;
+        self.launch_router(stream, &w.router, None)?;
 
         self.moe
             .route_and_dispatch(stream, &mut self.buffers, &self.logits)?;
@@ -1304,6 +1640,7 @@ impl MoeBlock {
             shared_mem_bytes: ((COMBINE_THREADS as usize).div_ceil(32) * size_of::<f32>()) as u32,
         };
         let top_k_i32 = g.experts_per_token as i32;
+        let hidden_i32 = g.hidden as i32;
         let mut builder = stream.launch_builder(&self.combine_fn);
         builder
             .arg(&w.shared_gate_inp)
@@ -1372,6 +1709,49 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_wide_router_is_one_ascending_chain_and_mirrors_its_constants() {
+        // The wide kernels promise one order: a single fused multiply-add
+        // chain per logit, ascending over the hidden index. The differential
+        // test checks the bits; this pins the line that makes them, so a
+        // rewrite into `acc += w * x` (which the compiler may or may not
+        // contract) or into split accumulators fails here by name.
+        assert!(
+            GLUE_SRC.contains("acc[u][v] = fmaf(wv[v], xv, acc[u][v]);"),
+            "the wide router no longer accumulates with an explicit fma",
+        );
+        for (name, value) in [
+            ("ROUTER_WIDE_TT", ROUTER_WIDE_TT),
+            ("ROUTER_WIDE_ET", ROUTER_WIDE_ET),
+            ("ROUTER_WIDE_KC", ROUTER_WIDE_KC),
+        ] {
+            assert!(
+                GLUE_SRC.contains(&format!("#define {name} {value}\n")),
+                "the kernel's {name} no longer mirrors the Rust constant",
+            );
+        }
+        assert!(GLUE_SRC.contains(&format!(
+            "ROUTER_LOGITS_WIDE(moe_block_router_logits_wide_w8, {ROUTER_WIDE_FULL_WARPS})"
+        )));
+        // The staged row stride has to be odd for the eight rows a warp
+        // reads at one `kk` to land on eight banks.
+        assert!(GLUE_SRC.contains("#define ROUTER_WIDE_STRIDE (ROUTER_WIDE_KC + 1)"));
+        assert_eq!((ROUTER_WIDE_KC + 1) % 2, 1);
+        // A lane's 8x8 patch: four expert octets and eight token octets a warp.
+        assert_eq!(ROUTER_WIDE_ET, 4 * 8);
+        assert_eq!(ROUTER_WIDE_TT, 8 * 8);
+    }
+
+    #[test]
+    fn the_wide_router_is_never_the_default_at_a_decode_or_verify_width() {
+        // Below the routed experts' tensor-core threshold a pass may be a
+        // decode step or a speculative verify window, and those need the
+        // register-tiled kernels' width-independent bits. The widest such
+        // pass is a few sequences times a few draft tokens.
+        const { assert!(ROUTER_WIDE_MIN_TOKENS >= 256) };
+        const { assert!(ROUTER_WIDE_FULL_MIN_TOKENS >= ROUTER_WIDE_MIN_TOKENS) };
+    }
 
     fn config() -> ModelConfig {
         ModelConfig::qwen3_6_35b_a3b()
@@ -1452,13 +1832,14 @@ mod tests {
     #[test]
     fn every_launch_shape_comes_from_the_geometry_and_the_token_count_from_the_device() {
         // AGENTS.md rule 5: nothing on this path may be sized by a host-side
-        // value. All three glue kernels must take the device scalar and act on
-        // it.
+        // value. Every glue kernel must take the device scalar and act on it:
+        // the register-tiled router's macro, the wide router's body and the
+        // macro that wraps it, and the combine.
         assert_eq!(
             GLUE_SRC
                 .matches("const int* __restrict__ valid_tokens")
                 .count(),
-            2
+            4
         );
         // *Reading* it, not one particular spelling of the guard. The router
         // early-returned on it until it was tiled; now a warp carries eight
@@ -1466,7 +1847,7 @@ mod tests {
         // Asserting the `return` form would have made a correct rewrite look
         // like a rule-5 violation, which is the opposite of what this test is
         // for.
-        assert_eq!(GLUE_SRC.matches("*valid_tokens").count(), 2);
+        assert_eq!(GLUE_SRC.matches("*valid_tokens").count(), 3);
         // What rule 5 actually forbids: a launch bound the host had to know.
         // `max_tokens` may size a grid — it is a geometry constant — but no
         // kernel may compare against a *count* passed by value.

@@ -1796,6 +1796,144 @@ fn router_t1_and_tiled_isolate_the_same_row() {
     }
 }
 
+/// The prefill-width router (`moe_block_router_logits_wide`, one warp and
+/// eight) against the order it promises: `logits[t][e]` is one chain over the
+/// hidden index ascending from zero, `acc = fma(w[e][j], x[t][j], acc)`,
+/// which the host reproduces exactly with `f32::mul_add`.
+///
+/// Bit-identity, not a tolerance. The router's output is consumed by a top-8
+/// selection over 256 experts, so the property worth having is that a
+/// token's logits are a fixed function of its own row — the same at either
+/// block shape, at any tile position, and whatever else is in the pass — and
+/// an exact reference is the only gate that checks it.
+///
+/// The width is deliberately not a multiple of the 64-token tile and the
+/// live count is below it, so the last tile's clamped rows and the rows past
+/// the live count are both exercised. Synthetic operands: no model file.
+///
+/// The register-tiled kernel is compared too, at a tolerance: it sums the
+/// same products in a different association (256 chains of eight), and the
+/// two families are not meant to agree to the last bit.
+#[test]
+fn the_wide_router_is_the_hosts_mul_add_chain_bit_for_bit() {
+    use llmcuda_engine::block::moe::{DEFAULT_RMS_EPS, MoeBlock};
+
+    let Some(ctx) = device() else { return };
+    let stream = ctx.default_stream();
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let hidden = config.hidden_size as usize;
+
+    const MAX: usize = 150;
+    const LIVE: usize = 137;
+    let g = MoeBlock::geometry_for(&config, BLOCK_SIZE, MAX).expect("the routed model");
+    let mut block = MoeBlock::new(&ctx, &stream, g, DEFAULT_RMS_EPS).expect("block builds");
+    assert!(
+        block.tensor_cores_enabled(),
+        "sm_75 has integer tensor cores"
+    );
+
+    let mut rng = Xorshift64Star::new(0x_5EED_BB05);
+    // The real router's scale: weights of a few hundredths against
+    // normalized activations of a few units.
+    let w = rng.vec_f32(g.num_experts * hidden, -0.05, 0.05);
+    let x = rng.vec_f32(MAX * hidden, -4.0, 4.0);
+    assert_carries_signal("router weights", &w);
+    assert_carries_signal("activations", &x);
+    let d_w = stream.clone_htod(&w).expect("upload w");
+    let d_x = stream.clone_htod(&x).expect("upload x");
+    block.publish_tokens(&stream, LIVE).expect("publish");
+
+    let mut reference = vec![0.0f32; MAX * g.num_experts];
+    for t in 0..LIVE {
+        for e in 0..g.num_experts {
+            let mut acc = 0.0f32;
+            for j in 0..hidden {
+                acc = w[e * hidden + j].mul_add(x[t * hidden + j], acc);
+            }
+            reference[t * g.num_experts + e] = acc;
+        }
+    }
+    assert_carries_signal("reference logits", &reference[..LIVE * g.num_experts]);
+
+    let mut run = |wide: usize, full: usize| -> Vec<f32> {
+        block.set_router_wide_min_tokens(wide, full);
+        block
+            .route_logits(&stream, &d_w, &d_x)
+            .expect("router launch");
+        stream.synchronize().expect("sync");
+        let logits = stream
+            .clone_dtoh(block.router_logits())
+            .expect("logits back");
+        stream.synchronize().expect("sync");
+        logits
+    };
+
+    // The register-tiled kernel first: it leaves rows past the live count
+    // alone too, so the buffer the wide kernels then write into still holds
+    // its zeros there.
+    let narrow = run(usize::MAX, usize::MAX);
+    let one_warp = run(0, usize::MAX);
+    let eight_warps = run(0, 0);
+
+    for (name, got) in [("one warp", &one_warp), ("eight warps", &eight_warps)] {
+        let differing = got
+            .iter()
+            .zip(&reference)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!(
+            "wide router, {name}: {} of {} logits differ from the host chain ({})",
+            differing,
+            got.len(),
+            compare(got, &reference),
+        );
+        assert_eq!(
+            differing, 0,
+            "wide router ({name}) is not the host's mul_add chain",
+        );
+        assert!(
+            got[LIVE * g.num_experts..].iter().all(|&v| v == 0.0),
+            "wide router ({name}) wrote a row past the live token count",
+        );
+    }
+
+    let live = LIVE * g.num_experts;
+    let result = compare(&narrow[..live], &reference[..live]);
+    println!("register-tiled router vs the wide order: {result}");
+    let scale = reference[..live].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let worst = narrow[..live]
+        .iter()
+        .zip(&reference[..live])
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        worst <= 1e-5 * scale,
+        "the two router families differ by {worst:e} on logits up to {scale:e}: more than \
+         reassociating 2,048 fp32 products explains",
+    );
+    assert_ne!(
+        narrow[..live],
+        reference[..live],
+        "the register-tiled router matched the wide order bit for bit, so this test's \
+         operands no longer tell the two associations apart",
+    );
+
+    // And the selection: forcing the threshold to zero must not move a pass
+    // that is on decode arithmetic.
+    block.set_router_wide_min_tokens(0, 0);
+    assert!(block.router_is_wide());
+    block.set_exact_decode_regime(true);
+    assert!(
+        !block.router_is_wide(),
+        "a verify window routed through the prefill-order kernel",
+    );
+    block.set_exact_decode_regime(false);
+    block.disable_tensor_cores();
+    assert!(
+        !block.router_is_wide(),
+        "the fp32 regime routed through the prefill-order kernel",
+    );
+}
+
 /// The routed geometry of the model these differential tests target.
 ///
 /// `ModelConfig::ffn` became an enum when the dense `qwen35` architecture

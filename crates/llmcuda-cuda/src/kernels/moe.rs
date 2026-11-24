@@ -5466,6 +5466,17 @@ impl MoeKernels {
         self.mma.is_some()
     }
 
+    /// Whether a pass at this geometry runs prefill arithmetic: tensor cores
+    /// on, wide enough for them, and not pinned to the exact decode regime.
+    ///
+    /// This is the condition under which the routed experts stop being
+    /// bit-identical with a one-token decode, so it is also the condition
+    /// under which a caller's own kernels are free to pick a different
+    /// summation order from decode's.
+    pub fn prefill_arithmetic(&self) -> bool {
+        self.mma.is_some() && !self.exact_regime && self.geometry.max_tokens >= MMA_MIN_TOKENS
+    }
+
     /// Publish this step's token count into the device scalar the kernels
     /// gate on.
     ///

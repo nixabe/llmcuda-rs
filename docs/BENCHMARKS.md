@@ -1120,7 +1120,18 @@ Two decision-model defaults (Clef long set, three alternating pairs each, all th
 Activations are fp32 end to end, every kernel gated against a CPU reference.
 
 - **Decode `Q K^T` splits `Q`.** One fp16 rounding of `Q` for `m16n8k8` breaks the 1e-5 gate at `n_keys = 61`. Rows `g` and `g+8` carry `f16(q[g])` and `f16(q[g] - f32(q_hi[g]))`, so `D[g] + D[g+8]` is `Q K^T` at roughly `2^-22`. It costs 2× the tensor-core issue count, a permanent tax against llama.cpp's shape.
-- **The router cannot reassociate.** A last-bit difference changes the top-8 of 256 experts, so the tiled router reproduces the untiled index order exactly, at a cost of 1.1%. A faster wrong version was caught by the golden test's error-growth guard.
+- **The router cannot reassociate at decode width, and has one fixed order of its own at prefill width.** A last-bit difference changes the top-8 of 256 experts. The decode and verify kernels reproduce the untiled index order exactly at every width, at a cost of 1.1%; a faster wrong version was caught by the golden test's error-growth guard. That order needs one accumulator per (expert, token, thread), which caps a block at 8 experts by 8 tokens and a byte of L2 traffic per multiply-add: 2.17–2.33 ms a layer at 6,138 tokens. From 1,024 tokens, where the routed experts are already on int8 arithmetic that decode does not share, the router is a tiled GEMM with one accumulator per logit: a single `fma` chain ascending over the hidden index, the same for every token at any width or tile position, and bit-identical to the host's `f32::mul_add` (`moe_differential`). It differs from the decode order by up to 2.1e-5 on logits of a few units. `bench_router`, ms a launch, three rotated rounds:
+
+  | tokens | register-tiled | one warp, 32 experts | eight warps, all experts |
+  | ---: | ---: | ---: | ---: |
+  | 512 | **0.25** | 0.47 | 0.60 |
+  | 1,024 | 0.35 | **0.34–0.36** | 0.46–0.48 |
+  | 2,048 | 0.70–0.75 | **0.40–0.43** | 0.48–0.51 |
+  | 4,096 | 1.51–1.65 | 0.64–0.71 | **0.54–0.55** |
+  | 6,138 | 2.17–2.33 | 1.09–1.21 | **0.92–0.99** |
+  | 8,192 | 3.14–3.43 | 1.30–1.40 | **0.99–1.03** |
+
+  In the model (`bench_forward`, `LLMCUDA_BENCH_AB=LLMCUDA_ROUTER_WIDE`, one sequence, six alternating pairs): 3,258.8 → 3,336.7 tok/s at 2,048 tokens (1.017–1.028×) and 3,496.2 → 3,614.1 at 6,138 (1.030–1.037×). The two orders' last-token logits differ by 0.27 and 0.15 max-abs on the synthetic prompt with the argmax agreeing, which is a smoke check; the gate is `forward_pass` with `LLMCUDA_ROUTER_WIDE=force`, which passes on the 19-token golden. Staging the tiles contraction-major, each lane loading its own row sixteen bytes at a time, cost 0.55 ms of a 1.25 ms launch: 32 cache lines an instruction.
 
 `exp2f` in the prefill softmax is an identity (`log2(e)` folded into the score scale), and was still held to the full gate.
 

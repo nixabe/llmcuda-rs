@@ -35,7 +35,7 @@ which has its own pairs and the single-sequence numbers.
 | cell | llmcuda-rs tok/s | llama.cpp tok/s | margin |
 | :--- | ---: | ---: | ---: |
 | prefill 512 | 3,281.0 ± 8.6 | 3,007.5 | **+9.1%** |
-| prefill 2K † | 3,649.3–3,652.7 | 4,111–4,159 | **−11% to −12%** |
+| prefill 2K † | 3,838.7–3,848.6 | 4,111–4,159 | **−6.4% to −7.7%** |
 | prefill 8K | 3,665.5 ± 16.8 | 3,201.8 | **+14.5%** |
 | prefill 32K | 2,790.3 ± 5.8 | 2,655.1 | **+5.1%** |
 | prefill 65K | 2,226.0 ± 0.2 | 2,142.8 | **+3.9%** |
@@ -56,23 +56,21 @@ passes; llama.cpp's include its cold first pass, so its column is high):
 
 | work | llmcuda-rs | llama.cpp 12688 |
 | :--- | ---: | ---: |
-| routed experts, gate/up with SwiGLU | 354.5 | 341.4 |
-| routed experts, down | 223.2 | 186.4 |
-| expert dispatch, weighting and combine | 101.0 | 53.5 |
-| MoE router | 97.4 | ≤ 31.0 |
-| GDN recurrence | 235.2 | 194.6 |
-| Q8_0 projections with every activation quantize | 437.7 | 401.8 |
-| every kernel | 1,675 | 1,458 |
+| routed experts, gate/up with SwiGLU | 353.2 | 341.4 |
+| routed experts, down | 222.9 | 186.4 |
+| expert dispatch, weighting and combine | 73.1 | 53.5 |
+| MoE router | 38.5 | ≤ 31.0 |
+| GDN recurrence | 234.8 | 194.6 |
+| Q8_0 projections with every activation quantize | 438.4 | 401.8 |
+| every kernel | 1,588 | 1,458 |
 
-No single kernel is the cell. The engine is behind in every row, by 13 to
-66 ms, and the two smallest pieces of work in the layer cost the most: the
-router, 2.44 ms a layer against about 0.5 for the cuBLAS `sgemm` llama.cpp
-calls, and the per-token combine, 1.91 ms a layer against 0.88 for llama.cpp's
-`moe_weighted_reduction_f32`. llama.cpp's router is three `sgemm` shapes that
-the profile does not separate from its other fp32 GEMMs, hence the bound; its
-`concat_non_cont` (41.3 ms) is in no row. Its expert activation quantize
-(14.0 ms) is in the projections row, while the engine's is inside its expert
-kernels.
+No single kernel is the cell: the engine is behind in every row. What is left
+is in the four large ones, the two routed-expert GEMMs, the recurrence and
+the dense projections, 12 to 41 ms each. llama.cpp's router is three cuBLAS
+`sgemm` shapes that the profile does not separate from its other fp32 GEMMs,
+hence the bound; its `concat_non_cont` (41.3 ms) is in no row. Its expert
+activation quantize (14.0 ms) is in the projections row, while the engine's
+is inside its expert kernels.
 
 The two columns do not run the same shapes. llama.cpp at `-ub 4096` splits
 the 6,144 tokens into a 4,096-token and a 2,048-token pass, so its experts see
@@ -85,13 +83,16 @@ name alone credits the 2,048-token pass's gate/up to the down projection.
 
 The † rows were taken on a different host: one RTX 8000, 31 GB RAM, driver
 595.99. Processes alternated rather than paired within a process: three
-`bench_forward` processes (3,652.7 ± 13.7, 3,650.0 ± 8.1, 3,649.3 ± 14.9) and
+`bench_forward` processes (3,848.6 ± 12.4, 3,838.7 ± 19.0, 3,844.3 ± 12.0) and
 two `bench_decode_batch` processes for the engine, four `llama-batched-bench`
 processes at `-npl 3,1,3,1,3,1,3,1 -npp 2048 -ntg 128`, two per `-ub`. The
 llama.cpp ranges are each process's third and fourth N=3 rows: its first row
 is a cold start and its decode is still rising at the fourth (190 → 205 → 208
 → 210 tok/s), so the decode margin is a ceiling. `-ub 2048` and `-ub 4096`
-agree within 1% at this depth. At N=1 on the same runs: decode 115.6 against
+agree within 1% at this depth. Its prefill is still rising then too: a process
+given only four N=3 passes reads 3,261 → 3,764 → 3,873 on the second to
+fourth, so the range in the table is its warmed figure and a shorter run
+flatters the engine. At N=1 on the same runs: decode 115.6 against
 104.4–104.8 tok/s (**+10%**); llama.cpp prefills 2K at 3,990–4,060 tok/s and
 the engine's N=1 prefill was not measured.
 

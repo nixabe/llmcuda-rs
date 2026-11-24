@@ -415,7 +415,9 @@ is `[q_h0, gate_h0, q_h1, gate_h1, …]` at stride `head_dim * 2`, as
 
 ## 7. Fidelity of the capture
 
-Three properties were measured, not assumed. All three matter because the whole
+Three properties were measured, not assumed. **The first two were measured on
+the `fd6863a69` capture and have not been repeated on the current one**; the
+third is asserted by `golden.rs` on every run. All three matter because the whole
 value of an oracle is that it is the same computation the engine must match.
 
 ### The callback does not perturb the result

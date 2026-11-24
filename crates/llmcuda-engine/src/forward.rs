@@ -94,7 +94,7 @@ use cudarc::driver::sys;
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, DriverError,
-    LaunchConfig, PushKernelArg,
+    LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 
 use llmcuda_cuda::kernels::attention::AttentionError;
@@ -123,6 +123,50 @@ use crate::block::mixer::{
 };
 use crate::block::moe::MoeBlockError;
 use crate::state::{SequenceState, StateError};
+
+/// One vocabulary row of logits on the host, in page-locked memory.
+///
+/// A sampled or grammar-masked token needs its whole logits row on the host:
+/// 993 KiB per sequence per token. Into pageable memory the driver stages
+/// that copy through a buffer of its own; page-locked, it lands directly.
+/// Allocated once, when the runtime is built, and reused for every row.
+#[derive(Default)]
+pub struct HostLogits {
+    row: Option<PinnedHostSlice<f32>>,
+}
+
+impl HostLogits {
+    /// A buffer for rows of `vocab` logits.
+    pub fn new(stream: &Arc<CudaStream>, vocab: usize) -> Result<Self, DriverError> {
+        // SAFETY: only ever read after a device copy has filled every
+        // element — `Self::row` hands the buffer to that copy and nothing
+        // else writes or reads it first.
+        let row = unsafe { stream.context().alloc_pinned::<f32>(vocab)? };
+        Ok(Self { row: Some(row) })
+    }
+
+    /// The buffer to copy a `vocab`-wide row into, allocating it if this is
+    /// a default value or was sized for another vocabulary. A serving
+    /// runtime builds it with [`Self::new`], so that branch is a test's.
+    fn row(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        vocab: usize,
+    ) -> Result<&mut PinnedHostSlice<f32>, DriverError> {
+        if self.row.as_ref().is_none_or(|row| row.len() != vocab) {
+            *self = Self::new(stream, vocab)?;
+        }
+        Ok(self.row.as_mut().expect("allocated above"))
+    }
+
+    /// The row last copied in; empty before the first copy.
+    pub fn as_mut_slice(&mut self) -> Result<&mut [f32], DriverError> {
+        match self.row.as_mut() {
+            Some(row) => row.as_mut_slice(),
+            None => Ok(&mut []),
+        }
+    }
+}
 use crate::weights::DeviceWeights;
 
 /// Elements per Q8_0 block, and its serialized size.
@@ -1658,15 +1702,14 @@ impl Forward {
     ///
     /// Synchronizes, exactly as [`Self::sample_argmax`] does and for the same
     /// reason: the caller is about to choose the next token from these
-    /// values. `host` is caller-owned and resized here so a serving runtime
-    /// can pre-allocate it once and reuse it (AGENTS.md rule 6).
+    /// values. `host` is caller-owned so a serving runtime can pre-allocate
+    /// it once and reuse it (AGENTS.md rule 6).
     pub fn read_logits_into(
         &self,
         stream: &Arc<CudaStream>,
-        host: &mut Vec<f32>,
+        host: &mut HostLogits,
     ) -> Result<(), ForwardError> {
-        host.resize(self.vocab, 0.0);
-        stream.memcpy_dtoh(&self.logits, host.as_mut_slice())?;
+        stream.memcpy_dtoh(&self.logits, host.row(stream, self.vocab)?)?;
         stream.synchronize()?;
         Ok(())
     }
@@ -1682,7 +1725,7 @@ impl Forward {
         &self,
         stream: &Arc<CudaStream>,
         row: usize,
-        host: &mut Vec<f32>,
+        host: &mut HostLogits,
     ) -> Result<(), ForwardError> {
         let logits = self
             .batch_logits
@@ -1700,8 +1743,7 @@ impl Forward {
         // `self.tokens * vocab` elements, allocated by `enable_batch_decode`,
         // so the view is in bounds and outlived by the buffer.
         let view = unsafe { crate::viewslice::subslice(stream, logits, row * vocab, vocab) };
-        host.resize(vocab, 0.0);
-        stream.memcpy_dtoh(&*view, host.as_mut_slice())?;
+        stream.memcpy_dtoh(&*view, host.row(stream, vocab)?)?;
         stream.synchronize()?;
         Ok(())
     }

@@ -11,9 +11,11 @@
 //! have to re-earn: the filtering pipeline is plain code with unit tests
 //! rather than a kernel needing a differential harness, per-request RNG state
 //! lives in ordinary structs instead of graph-stable device buffers, and the
-//! captured decode graph does not change shape at all. If sampling ever
-//! dominates a profile, the WHY NOT table is where the measured case for a
-//! device sampler belongs.
+//! captured decode graph does not change shape at all. Measured, the price
+//! is 2.7% of a token at one session and 4.3% at three, once the top-k
+//! selection stopped materializing the vocabulary and the row landed in
+//! page-locked memory (`docs/BENCHMARKS.md`, "Sampling"); it was 10.7% and
+//! 19.0% before. A device sampler would be competing for what is left.
 //!
 //! # Distribution semantics
 //!
@@ -169,20 +171,17 @@ impl Sampler {
             !logits.is_empty(),
             "cannot sample from an empty logit vector"
         );
-        scratch.clear();
-        scratch.extend(logits.iter().enumerate().map(|(index, &logit)| {
-            let logit = if logit.is_finite() {
-                logit
-            } else {
-                f32::NEG_INFINITY
-            };
-            (logit, index as u32)
-        }));
-
         let top_k = self.params.top_k as usize;
-        if top_k > 0 && top_k < scratch.len() {
-            scratch.select_nth_unstable_by(top_k - 1, |a, b| b.0.total_cmp(&a.0));
-            scratch.truncate(top_k);
+        if top_k > 0 && top_k < logits.len() {
+            top_k_into(logits, top_k, scratch);
+        } else {
+            scratch.clear();
+            scratch.extend(
+                logits
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &logit)| (finite_or_floor(logit), index as u32)),
+            );
         }
 
         // Every survivor at -inf means every logit was non-finite; sampling
@@ -262,9 +261,155 @@ impl Sampler {
     }
 }
 
+/// A non-finite logit can never be chosen: it sorts below every real one.
+fn finite_or_floor(logit: f32) -> f32 {
+    if logit.is_finite() {
+        logit
+    } else {
+        f32::NEG_INFINITY
+    }
+}
+
+/// Leave the `k` largest logits in `scratch`, as `(logit, token)`, in no
+/// particular order. `0 < k < logits.len()`.
+///
+/// One pass over the row against the smallest survivor so far, kept at the
+/// root of a `k`-entry min-heap. Almost every one of a vocabulary's logits
+/// loses that single comparison, so the pass costs a read and a predictable
+/// branch per token. Materializing every `(logit, token)` pair and
+/// partitioning them — what this replaced — wrote 2 MiB and moved it around
+/// to keep twenty entries, and was most of what a sampled token cost over a
+/// greedy one.
+fn top_k_into(logits: &[f32], k: usize, scratch: &mut Vec<(f32, u32)>) {
+    debug_assert!(k > 0 && k < logits.len());
+    scratch.clear();
+    scratch.extend(
+        logits[..k]
+            .iter()
+            .enumerate()
+            .map(|(index, &logit)| (finite_or_floor(logit), index as u32)),
+    );
+    let heap = scratch.as_mut_slice();
+    for root in (0..k / 2).rev() {
+        sift_down(heap, root);
+    }
+    let mut floor = heap[0].0;
+    for (index, &logit) in logits.iter().enumerate().skip(k) {
+        // `NaN > floor` is false and `+inf` is excluded by hand, which is
+        // `finite_or_floor` without the store; `-inf` never beats a floor.
+        if logit > floor && logit < f32::INFINITY {
+            heap[0] = (logit, index as u32);
+            sift_down(heap, 0);
+            floor = heap[0].0;
+        }
+    }
+}
+
+/// Restore the min-heap property below `root`.
+fn sift_down(heap: &mut [(f32, u32)], mut root: usize) {
+    loop {
+        let left = 2 * root + 1;
+        if left >= heap.len() {
+            return;
+        }
+        let right = left + 1;
+        let child = if right < heap.len() && heap[right].0 < heap[left].0 {
+            right
+        } else {
+            left
+        };
+        if heap[root].0 <= heap[child].0 {
+            return;
+        }
+        heap.swap(root, child);
+        root = child;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The partition `top_k_into` replaced, kept as its reference.
+    fn top_k_by_partition(logits: &[f32], k: usize) -> Vec<(f32, u32)> {
+        let mut all: Vec<(f32, u32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(index, &logit)| (finite_or_floor(logit), index as u32))
+            .collect();
+        all.select_nth_unstable_by(k - 1, |a, b| b.0.total_cmp(&a.0));
+        all.truncate(k);
+        all
+    }
+
+    fn noise(n: usize, seed: u64) -> Vec<f32> {
+        let mut rng = Xoshiro256pp::new(seed);
+        (0..n)
+            .map(|_| (rng.next_f64() * 40.0 - 20.0) as f32)
+            .collect()
+    }
+
+    #[test]
+    fn the_heap_keeps_the_same_tokens_the_partition_did() {
+        // Every `k` leaves the three floored entries out, so the survivors
+        // are distinct finite values and the two selections must agree.
+        for (seed, k) in [(1, 1), (2, 2), (3, 20), (4, 64), (5, 999), (6, 4000)] {
+            let mut logits = noise(4096, seed);
+            // Values a real row can carry and none may ever be chosen for.
+            logits[7] = f32::NAN;
+            logits[4000] = f32::INFINITY;
+            logits[9] = f32::NEG_INFINITY;
+            let mut got = Vec::new();
+            top_k_into(&logits, k, &mut got);
+            let mut want = top_k_by_partition(&logits, k);
+            got.sort_unstable_by_key(|&(_, token)| token);
+            want.sort_unstable_by_key(|&(_, token)| token);
+            assert_eq!(got, want, "k = {k}");
+        }
+    }
+
+    #[test]
+    fn non_finite_logits_among_the_first_k_are_floored_not_kept() {
+        let mut logits = noise(64, 9);
+        logits[0] = f32::NAN;
+        logits[1] = f32::INFINITY;
+        let mut got = Vec::new();
+        top_k_into(&logits, 4, &mut got);
+        assert!(
+            got.iter()
+                .all(|&(logit, token)| logit.is_finite() && token > 1)
+        );
+    }
+
+    /// Not a gate: prints what one sampled token costs the host at this
+    /// vocabulary, old selection against new. `--nocapture` to read it.
+    #[test]
+    fn top_k_selection_cost_at_vocabulary_width() {
+        let logits = noise(248_320, 11);
+        let mut scratch = Vec::with_capacity(logits.len());
+        let rounds = 200;
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            scratch.clear();
+            scratch.extend(
+                logits
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &logit)| (finite_or_floor(logit), index as u32)),
+            );
+            scratch.select_nth_unstable_by(19, |a, b| b.0.total_cmp(&a.0));
+            scratch.truncate(20);
+            std::hint::black_box(&scratch);
+        }
+        let partition = started.elapsed() / rounds;
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            top_k_into(std::hint::black_box(&logits), 20, &mut scratch);
+            std::hint::black_box(&scratch);
+        }
+        let heap = started.elapsed() / rounds;
+        println!("top-20 of 248,320: partition {partition:?}, heap {heap:?}");
+    }
 
     fn sampler(temperature: f32, top_k: u32, top_p: f32, seed: u64) -> Sampler {
         Sampler::new(SamplingParams {

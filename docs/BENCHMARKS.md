@@ -1134,6 +1134,21 @@ Nine sessions across three cards failed to run concurrently for four reasons, no
 - **Workers step independently**, one lock and driver thread each: 4.7–12.1% on aggregate decode and 0.6–16.2% on aggregate prefill across the nine-session table.
 - **Routing stays atomic.** Without a lock across score-and-admit, concurrent handlers picked the same idle card: nine 64K sessions placed 4/2/3, the fourth waiting 150 s to first token against 113 s. The routing lock is never held over a GPU step.
 
+## Sampling: select on the way past, and land the row in pinned memory
+
+Greedy decode picks its token on the device, inside the captured graph. A sampled or grammar-masked token needs its 993 KiB logits row on the host, and every benchmark above is greedy, so what that costs was never in a table. Served at the shipped sampler settings (temperature 1.0, top-p 0.95, top-k 20) it was **+10.7%** on a token at one session and **+19.0%** at three: 0.9 ms per sequence per token.
+
+Over half was choosing twenty logits out of 248,320. The sampler materialized every `(logit, token)` pair, 2 MiB, and partitioned them: 632 µs. One pass against the smallest survivor so far, held at the root of a `top_k`-entry heap, is 109 µs and keeps the same tokens (`the_heap_keeps_the_same_tokens_the_partition_did`). Most of the rest was the copy: into pageable memory the driver stages the row through a buffer of its own, and into a page-locked one, allocated when the runtime is built, it lands directly.
+
+One card, `-c 405504 -s 3`, 200 tokens after a ~2K prompt, median inter-token latency in ms; three rounds per arm with greedy and sampled alternating inside each, one server process per column:
+
+| sessions | greedy | sampled, before | heap selection | and a pinned row |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 8.75–8.87 | 9.82 (+10.7%) | 9.18 (+4.8%) | **8.98** (+2.7%) |
+| 3 | 14.02–14.11 | 16.80 (+19.0%) | 15.25 (+8.7%) | **14.62** (+4.3%) |
+
+Rounds agree within 0.04 ms at one session and 0.13 ms at three. A sampled token is 9.3% and 14.9% faster than it was. What remains is one row copy and one synchronize per sampled sequence per step; `top_k = 0` still takes the full-vocabulary path. The serving tables above were taken at temperature 1.0 before this, so their decode rows carry the old cost.
+
 ## Speculative decode: exact arithmetic before acceptance
 
 Seven drafters (five n-gram policies, MTP, DFlash) feed one batched verify pass, and acceptance requires equality with the target, so verify reproduces decode arithmetic at every width: exact four-row GDN projection slices, FP32 attention projections, and per-query decode attention even past prefill thresholds. Regression tests cover three 49-row windows, mixed acceptance and recurrent rollback.

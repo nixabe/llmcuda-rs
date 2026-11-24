@@ -596,7 +596,7 @@ pub struct DeviceRuntime {
     /// One logits row copied back for host-side sampling, and the candidate
     /// scratch the sampler filters in. Both are pre-sized at load so the
     /// sampling path allocates nothing per token (AGENTS.md rule 6).
-    host_logits: Vec<f32>,
+    host_logits: crate::forward::HostLogits,
     sample_scratch: Vec<(f32, u32)>,
     eos_tokens: SmallVec<[i32; 2]>,
     /// The vision tower, present iff an mmproj was configured.
@@ -1216,6 +1216,7 @@ impl DeviceRuntime {
             None
         };
 
+        let host_logits = crate::forward::HostLogits::new(&stream, config.vocab_size as usize)?;
         let mut this = Self {
             ctx,
             stream,
@@ -1240,7 +1241,7 @@ impl DeviceRuntime {
             retention_interval,
             snapshot_arena,
             sampled: Vec::with_capacity(max_batch),
-            host_logits: Vec::with_capacity(config.vocab_size as usize),
+            host_logits,
             sample_scratch: Vec::with_capacity(config.vocab_size as usize),
             eos_tokens,
             vision,
@@ -1780,7 +1781,19 @@ impl DeviceRuntime {
                         self.sample_scratch = scratch;
                         return Err(error.into());
                     }
-                    outputs[row] = owned[index].1.choose(&mut host, &mut scratch);
+                    let chosen = host
+                        .as_mut_slice()
+                        .map(|logits| owned[index].1.choose(logits, &mut scratch));
+                    match chosen {
+                        Ok(token) => outputs[row] = token,
+                        Err(error) => {
+                            outputs.clear();
+                            self.sampled = outputs;
+                            self.host_logits = host;
+                            self.sample_scratch = scratch;
+                            return Err(error.into());
+                        }
+                    }
                 }
                 self.host_logits = host;
                 self.sample_scratch = scratch;
@@ -2142,7 +2155,13 @@ impl DeviceRuntime {
                     // that arms here did not get to constrain the rows after
                     // it, which the verify pass computed in one shot.
                     let was_masking = seq.is_masking();
-                    let token = seq.choose(&mut host, &mut scratch);
+                    let token = match host.as_mut_slice() {
+                        Ok(logits) => seq.choose(logits, &mut scratch),
+                        Err(error) => {
+                            result = Err(error.into());
+                            break;
+                        }
+                    };
                     seq.observe(token);
                     emit.push(token);
                     if j >= d_real || token != seq.draft[j] || (!was_masking && seq.is_masking()) {
@@ -2516,10 +2535,11 @@ impl DeviceRuntime {
         let drawn = self
             .prefill_pass(width)
             .read_logits_into(&stream, &mut host)
-            .map(|()| sampler.sample(&host, &mut scratch));
+            .map_err(RuntimeError::from)
+            .and_then(|()| Ok(sampler.sample(host.as_mut_slice()?, &mut scratch)));
         self.host_logits = host;
         self.sample_scratch = scratch;
-        Ok(drawn?)
+        drawn
     }
 
     fn execute_prefill(

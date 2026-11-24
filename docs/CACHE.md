@@ -121,6 +121,53 @@ matters more than it looks like it should.
 Regression test:
 `gdn_reuse_truncates_to_retained_snapshot_boundary_not_full_match_length_regression`.
 
+### A state is kept where a request can resume, and nowhere else
+
+The two halves of a snapshot are read at different densities. Restoring a
+prefix copies the attention rows of *every* snapshot behind the resume point
+— each holds only its own retention interval — and the recurrent state of the
+resume point alone. So an attention interval has to stay wherever a later
+resume point depends on it, while a recurrent state is read only by a request
+that resumes exactly there.
+
+The arena therefore holds them in two pools at their natural sizes (rule 1):
+one attention interval per `R` tokens of restorable context, and a much
+smaller number of recurrent states, `SNAPSHOT_STATES_PER_SEQUENCE` (8) per
+serving sequence. A snapshot is still taken at every boundary, with a state.
+What changes is which states survive:
+
+| State | Why a request resumes there | Kept |
+| --- | --- | --- |
+| A sequence's newest | The sequence itself, continued verbatim | held |
+| Last boundary inside the prompt | The conversation's next turn forks here, because the template re-renders the reply (see Known limitations) | held |
+| Where the prompt left a prefix the tree had and no state survived for | Two requests reaching one boundary is a fork point: a system prompt, a shared document | held |
+| Anything resumed from | It was a fork point once | held |
+| Every other boundary a sequence has moved past | Only a request diverging inside the next `R` tokens | yielded |
+
+A *yielded* state is still restored from while it lasts; it is the first to be
+handed to a new snapshot when the pool has no free one, least recently used
+first. A *held* state is given up only when its entry leaves the shared cache
+(next section), and never under a request that has been told it can resume
+there and is still waiting in its worker's queue (`ResumeHold`).
+
+The cost is a recomputation the dense arena did not have: the *second*
+request to share a prefix that no earlier request forked at finds attention
+rows and no state, prefills through the shared part, and holds the state it
+takes at the boundary where the match ended. The third hits it. vLLM
+(`enable_mamba_shared_prefix_checkpoint`, `MambaManager`) and SGLang
+(`unified_cache/components/mamba.py`, `branching_checkpoint_depth`) make the
+same trade; unlike theirs it is paid here only once the state pool is full,
+because yielding is lazy.
+
+A match can now be deeper than its deepest surviving state, so the engine
+walks the matched boundaries back to the deepest one that still holds a state
+(`Engine::resume_candidates`) rather than trusting the tree's deepest marker.
+
+Tests: `a_yielded_state_is_reassigned_only_when_none_is_free`,
+`a_resumed_state_outlives_a_later_yield`,
+`a_state_released_under_a_waiting_request_goes_when_it_settles`,
+`a_budget_buys_states_for_its_sequences_and_intervals_with_the_rest`.
+
 ## The prefix tree
 
 A radix tree over token-block hashes, held in host RAM behind an `RwLock` and
@@ -172,17 +219,20 @@ publish rather than share a prefix it cannot vouch for.
 
 ### Why the shared snapshot cache yields
 
-A published snapshot pins at least one of its worker's 24 arena slots — often
-several, since a snapshot holds an `Arc` to its parent for everything before
-its own interval. Those are the same slots live sequences snapshot into, and
+A published snapshot pins at least one of its worker's attention intervals —
+often several, since a snapshot holds an `Arc` to its parent for everything
+before its own interval — and a recurrent state for as long as it holds one.
+Those are the same pools live sequences snapshot into, and
 running out is not a soft failure: the runtime answers `SnapshotArenaExhausted`
 by switching that sequence's retention off *permanently*. Holding a snapshot
 against a future hit therefore costs a present one.
 
 So before a worker publishes, the cache drops that worker's least recently used
-entries until its arena has one free slot per concurrent sequence — enough that
-every live sequence can still take its next snapshot — and declines to publish
-if it cannot get there. Recency counts actual reuse rather than insertion,
+entries until its arena has one free interval and one obtainable state per
+concurrent sequence — enough that every live sequence can still take its next
+snapshot — and declines to publish if it cannot get there. A dropped entry
+gives its recurrent state back at once, even while a later snapshot of the
+same sequence keeps its attention rows alive. Recency counts actual reuse rather than insertion,
 because a shared system prompt is old by construction and is exactly the entry
 worth keeping.
 
@@ -203,22 +253,20 @@ When the best-matching worker is saturated, the prefix is looked up in the host
 tree, copied to a less-loaded worker, and only the tail is prefilled.
 
 Staging goes through a **pre-allocated pinned arena** — pageable
-host-to-device transfers roughly halve effective bandwidth. Each slot keeps
-the two natural geometries separate: 40 MiB of attention KV for one 2,048-token
-interval and 62.8125 MiB of GDN state, or 102.8125 MiB in total.
+host-to-device transfers roughly halve effective bandwidth. The arena keeps
+the two natural geometries in separate pools: 40 MiB of attention KV per
+2,048-token interval, and 62.8125 MiB per recurrent state.
 
-Each worker owns 24 slots by default (2.41 GiB), so the three-worker process
-reserves 7.23 GiB of pinned host memory at startup. `--cache-ram` sets that
-budget across all workers, and preflight prints the slot count it bought; see
-[CLI.md](CLI.md#--cache-ram).
+`--cache-ram` sets the budget across all workers, and preflight prints the
+intervals and states it bought; see [CLI.md](CLI.md#--cache-ram). Without it
+a worker's arena covers its whole context, capped at a quarter of host
+`MemAvailable` and floored at 24 intervals with a state each (2.41 GiB).
 
-A snapshot holds its slot for as long as it or any child snapshot remains
-reachable. If all slots are retained, the request that reaches the next
-boundary stops publishing further snapshots but continues inference. It does
-not later publish a delta spanning the missed boundary. One chain can
-therefore retain at most 49,152 tokens at the default interval and slot count
-when it owns every slot; this is bounded storage, not full 128K retention
-coverage.
+A snapshot holds its interval for as long as it or any child snapshot remains
+reachable. If every interval is retained, or every state is held, the request
+that reaches the next boundary stops publishing further snapshots but
+continues inference. It does not later publish a delta spanning the missed
+boundary.
 
 Note what `--cache-ram` does *not* buy. It sets how many snapshots are kept,
 never how far apart they are taken: retention granularity is `R`, so a match

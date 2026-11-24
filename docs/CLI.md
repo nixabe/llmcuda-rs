@@ -129,8 +129,9 @@ llmcuda --cache-ram 0         # retain nothing; no prefix sharing
 
 `full` (spelled `max` or `-1` too, the last because llama.cpp's `-cram -1`
 means the same thing) sizes the arena from the serving configuration instead
-of a byte budget: `--slots-per-worker` slots, each needing one snapshot per
-retention interval of its share of `--total-context`. That is what the
+of a byte budget: `--slots-per-worker` slots, each needing one attention
+interval per retention interval of its share of `--total-context`, plus eight
+recurrent states per slot. That is what the
 default computes as well, capped at a quarter of the host's `MemAvailable`
 so the arena cannot displace the page cache the weights are read through.
 
@@ -148,17 +149,22 @@ spellings of each). A number with an unrecognised unit is refused rather than
 read as bytes, because a budget silently taken as a thousandth of what was
 meant would surface as a puzzling cache miss rate rather than a message.
 
-The budget is divided by the worker count and then by the size of one
-snapshot, and preflight prints what it bought:
+The budget is divided by the worker count, and preflight prints what it
+bought:
 
 ```
-cache ram        7.93 GiB pinned — 79 snapshots per worker at 102.81 MiB each
+cache ram        8.00 GiB pinned — per worker, 167 intervals at 40.00 MiB and 24 recurrent states at 62.81 MiB
 ```
 
-One snapshot is one GDN retention interval of KV plus the full recurrent
-state — 102.8125 MiB for this model at the default `R`. Sizing is per worker
-because the arenas are per worker; a snapshot pinned on one card's arena is no
-use to another.
+The two are bought separately because they are needed at different densities.
+An *interval* is one GDN retention interval of attention KV (40 MiB for this
+model at the default `R`), and a slot needs one for every `R` tokens it can
+restore. A *recurrent state* (62.8125 MiB) is needed only where a request
+resumes, so a worker keeps eight per slot whatever the context depth, and the
+rest of the budget is intervals; [CACHE.md](CACHE.md#a-state-is-kept-where-a-request-can-resume-and-nowhere-else)
+has which states are kept. A budget too small for eight states a slot buys as
+many as it can pair with an interval. Sizing is per worker because the arenas
+are per worker; a snapshot pinned on one card's arena is no use to another.
 
 Preflight also states the number that predicts whether a conversation keeps
 hitting — how far into its context a slot can restore from:
@@ -466,7 +472,7 @@ server never comes up. In particular:
 
 `--cache-ram` is the one that cannot fail: every value it accepts is
 servable, so an unhelpfully small one is a preflight *warning* rather than an
-error. Read those warnings — `0 snapshots per worker` is a working server with
+error. Read those warnings — `0 intervals` is a working server with
 the prefix cache switched off, and nothing later will remind you.
 
 ## `--log-level`

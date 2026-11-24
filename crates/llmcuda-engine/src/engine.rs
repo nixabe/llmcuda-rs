@@ -25,7 +25,7 @@ use crate::prefix::{SequenceChain, SharedSnapshots};
 use crate::router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
 use crate::runtime::{DeviceStep, RuntimeError};
 use crate::sampling::SamplingParams;
-use crate::state::SequenceSnapshot;
+use crate::state::{ResumeHold, SequenceSnapshot};
 use crate::worker::{ServingConfig, Worker, WorkerExecutionError, WorkerId};
 use llmcuda_grammar::ToolConstraint;
 
@@ -147,6 +147,9 @@ pub struct Engine {
     placement: Mutex<()>,
     max_prefix_nodes: usize,
     block_size: u32,
+    /// Tokens between retention boundaries, the only places a recurrent
+    /// state is ever taken.
+    retention_interval: u32,
     /// Snapshot slots each worker must keep free for its own live sequences.
     ///
     /// One per concurrent sequence, which is exactly enough that every live
@@ -195,6 +198,7 @@ impl Engine {
             placement: Mutex::new(()),
             max_prefix_nodes: attention_blocks_per_worker as usize,
             block_size: cache.attention_block_size(),
+            retention_interval: cache.gdn_retention_interval(),
             slot_reserve: gdn_slots_per_worker as usize,
         }
     }
@@ -225,20 +229,70 @@ impl Engine {
     /// tree, and is already truncated to a retention boundary.
     pub fn score_workers(&self, req: &NewRequest, block_hashes: &[BlockHash]) -> Vec<WorkerLoad> {
         let matched = self.prefix_tree.match_prefix(block_hashes);
-        // Credit `gdn_matched_tokens`, not `matched_tokens`. The attention
-        // match may run further, but recurrent state is only resumable at a
-        // retained snapshot boundary, and 30 of 40 layers hold recurrent
-        // state — so prefill genuinely restarts at the snapshot. Scoring the
-        // longer attention match would overstate the saving and route toward
-        // a worker that cannot actually deliver it. See `docs/CACHE.md`.
-        let usable = matched
-            .gdn_snapshot_hash
-            .filter(|&hash| self.snapshots.read().contains(hash))
-            .map_or(0, |_| matched.gdn_matched_tokens);
+        // Credit the resume point, not `matched_tokens`. The attention match
+        // may run further, but recurrent state is only resumable where a
+        // snapshot still holds one, and 30 of 40 layers hold recurrent
+        // state — so prefill genuinely restarts there. Scoring the longer
+        // attention match would overstate the saving and route toward a
+        // worker that cannot actually deliver it. See `docs/CACHE.md`.
+        let usable = {
+            let snapshots = self.snapshots.read();
+            self.resume_candidates(block_hashes, matched.blocks.len())
+                .find(|&(_, hash)| snapshots.peek(hash).is_some_and(|s| s.has_state()))
+                .map_or(0, |(tokens, _)| tokens)
+        };
         self.workers
             .iter()
             .map(|worker| worker.lock().load_for(usable, req))
             .collect()
+    }
+
+    fn retention_floor(&self, tokens: u32) -> u32 {
+        match self.retention_interval {
+            0 => 0,
+            interval => tokens / interval * interval,
+        }
+    }
+
+    /// Every place a request matching `matched_blocks` of `hashes` could
+    /// resume, deepest first, as `(tokens, hash of the block ending there)`.
+    ///
+    /// The tree marks the snapshot each publication ended on, but a snapshot
+    /// keeps its attention rows longer than its recurrent state, and the
+    /// deepest marked node is often one that has given its state up. Walking
+    /// the boundaries back finds the deepest that has not, rather than
+    /// treating one stale marker as no match at all.
+    fn resume_candidates<'a>(
+        &self,
+        hashes: &'a [BlockHash],
+        matched_blocks: usize,
+    ) -> impl Iterator<Item = (u32, BlockHash)> + 'a {
+        let block = self.block_size.max(1);
+        let interval = self.retention_interval;
+        (1..=matched_blocks.min(hashes.len()))
+            .rev()
+            .map(move |blocks| (blocks as u32 * block, hashes[blocks - 1]))
+            .filter(move |&(tokens, _)| interval > 0 && tokens.is_multiple_of(interval))
+    }
+
+    /// Claim the deepest snapshot this prompt can resume from, holding its
+    /// recurrent state so it can be neither reassigned nor released before
+    /// the restore — which happens when the worker starts the request, not
+    /// when it is admitted.
+    fn claim_resume_point(
+        &self,
+        hashes: &[BlockHash],
+        matched_blocks: usize,
+    ) -> Option<ResumeHold> {
+        let mut snapshots = self.snapshots.write();
+        self.resume_candidates(hashes, matched_blocks)
+            .find_map(|(_, hash)| {
+                // Held before it is counted as use: a snapshot without its
+                // state is not a hit, and must not look recently used.
+                let hold = ResumeHold::new(Arc::clone(snapshots.peek(hash)?))?;
+                snapshots.take_for_reuse(hash);
+                Some(hold)
+            })
     }
 
     /// Cap a caller's speculative output ceiling at one slot's share.
@@ -414,25 +468,31 @@ impl Engine {
                 "output ceiling exceeds one slot's share; capping the reservation"
             );
         }
-        let chain = SequenceChain::new(self.block_size, &prompt, &placements);
+        let mut chain = SequenceChain::new(self.block_size, &prompt, &placements);
         // Claiming a snapshot for reuse is part of the same decision as
         // choosing a worker, so it is inside the routing lock too: two
         // handlers that both matched the same prefix must not both take it.
         let _routing = self.placement.lock();
         let matched = self.prefix_tree.match_prefix(chain.hashes());
-        let snapshot = matched
-            .gdn_snapshot_hash
-            .and_then(|hash| self.snapshots.write().take_for_reuse(hash))
+        let snapshot = self
+            .claim_resume_point(chain.hashes(), matched.blocks.len())
             // A snapshot covering the *whole* prompt supplies the first
             // output token through its recorded `next_token`. That inherited
             // token is only right when this request is greedy and the
             // recording sequence was too (a sampled producer records none) —
             // otherwise fall back to prefilling, which recomputes the final
             // logits so the token can be chosen properly.
-            .filter(|snapshot| {
-                snapshot.position() < prompt.len()
-                    || (sampling.is_greedy() && snapshot.next_token().is_some())
+            .filter(|hold| {
+                hold.snapshot().position() < prompt.len()
+                    || (sampling.is_greedy() && hold.snapshot().next_token().is_some())
             });
+        // Where the attention match outruns the resume point, this sequence
+        // is about to recompute a prefix someone else already had.
+        let resumed = snapshot
+            .as_ref()
+            .map_or(0, |hold| hold.snapshot().position());
+        let shared = self.retention_floor(matched.matched_tokens) as usize;
+        chain.set_junction((shared > resumed).then_some(shared));
         let loads = self.score_workers(&req, chain.hashes());
         let Routed {
             worker,
@@ -601,13 +661,21 @@ impl Engine {
         // that sequence's retention off permanently.
         if let Some(slots) = slots {
             let reserve = self.slot_reserve;
-            if !self
-                .snapshots
-                .write()
-                .reclaim_for(worker, reserve, || slots.available())
-            {
+            if !self.snapshots.write().reclaim_for(
+                worker,
+                reserve,
+                || slots.available(),
+                // An entry leaving the cache is one nothing resumes from
+                // again, but a later snapshot of the same sequence may keep
+                // it alive for its attention rows. Its recurrent state is
+                // what the next live sequence is waiting for.
+                |dropped| dropped.release_state(),
+            ) {
                 return Ok(false);
             }
+        }
+        if chain.junction() == Some(position) {
+            snapshot.keep_state();
         }
 
         let blocks = hashes.len();
@@ -628,7 +696,9 @@ impl Engine {
             let evicted = self.prefix_tree.evict_unreferenced_entries(excess);
             let mut snapshots = self.snapshots.write();
             for entry in evicted {
-                snapshots.remove(entry.hash);
+                if let Some(dropped) = snapshots.remove(entry.hash) {
+                    dropped.release_state();
+                }
             }
         }
         Ok(true)

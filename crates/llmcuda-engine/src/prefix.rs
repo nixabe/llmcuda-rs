@@ -66,6 +66,9 @@ pub(crate) struct SequenceChain {
     /// The prompt's image spans, sorted and validated by the engine.
     /// Generated tokens are always past `prompt_len` and never in a span.
     images: Vec<ImagePlacement>,
+    /// The retention boundary where this sequence left a prefix another
+    /// request had cached — see [`Self::set_junction`].
+    junction: Option<usize>,
     /// Absolute index of the next token [`Self::push`] will see.
     next_index: usize,
 }
@@ -80,10 +83,28 @@ impl SequenceChain {
             pending: Vec::with_capacity(block_size),
             prompt_len: prompt.len(),
             images: images.to_vec(),
+            junction: None,
             next_index: 0,
         };
         chain.extend(prompt.iter().copied());
         chain
+    }
+
+    /// Record where this sequence's prompt stopped following a cached
+    /// prefix it could not resume from.
+    ///
+    /// The shared tree matched this prompt's blocks further than any
+    /// recurrent state survives, so the sequence prefills through tokens
+    /// another request already computed. Two requests reaching the same
+    /// boundary is what a fork point looks like — a system prompt, a shared
+    /// document — and the third should not pay for it again, so the state
+    /// this sequence retains there is held rather than yielded.
+    pub(crate) fn set_junction(&mut self, position: Option<usize>) {
+        self.junction = position;
+    }
+
+    pub(crate) fn junction(&self) -> Option<usize> {
+        self.junction
     }
 
     /// Append one token, closing a block if that filled it.
@@ -210,6 +231,7 @@ impl<T: Clone> SharedSnapshots<T> {
     /// Whether a snapshot is available under this hash. Does not count as
     /// use: routing asks this about every candidate worker, and only one of
     /// them will actually resume.
+    #[cfg(test)]
     pub(crate) fn contains(&self, hash: BlockHash) -> bool {
         self.entries.contains_key(&hash)
     }
@@ -235,8 +257,13 @@ impl<T: Clone> SharedSnapshots<T> {
         );
     }
 
-    pub(crate) fn remove(&mut self, hash: BlockHash) {
-        self.entries.remove(&hash);
+    /// Look at an entry without counting it as use.
+    pub(crate) fn peek(&self, hash: BlockHash) -> Option<&T> {
+        self.entries.get(&hash).map(|held| &held.value)
+    }
+
+    pub(crate) fn remove(&mut self, hash: BlockHash) -> Option<T> {
+        self.entries.remove(&hash).map(|held| held.value)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -251,12 +278,19 @@ impl<T: Clone> SharedSnapshots<T> {
     /// whose parent chain a live sequence still holds frees only its own
     /// tail, so how much a drop actually recovers is not knowable from here.
     ///
+    /// `dropped` sees each entry as it leaves, before `available` is read
+    /// again. Dropping the entry is not always what frees its storage — a
+    /// descendant can keep a snapshot alive for the attention rows it
+    /// restores through — so the caller releases what nothing will read
+    /// again.
+    ///
     /// Returns whether there is now room to spare.
     pub(crate) fn reclaim_for(
         &mut self,
         worker: WorkerId,
         reserve: usize,
         mut available: impl FnMut() -> usize,
+        mut dropped: impl FnMut(T),
     ) -> bool {
         while available() < reserve {
             let victim = self
@@ -268,7 +302,9 @@ impl<T: Clone> SharedSnapshots<T> {
             let Some(hash) = victim else {
                 return false;
             };
-            self.entries.remove(&hash);
+            if let Some(held) = self.entries.remove(&hash) {
+                dropped(held.value);
+            }
         }
         true
     }
@@ -426,7 +462,7 @@ mod tests {
         let mut shared = shared_with_three();
         shared.take_for_reuse(1).expect("entry 1 is held");
 
-        assert!(shared.reclaim_for(WorkerId(0), 1, one_slot_per_drop()));
+        assert!(shared.reclaim_for(WorkerId(0), 1, one_slot_per_drop(), |_| ()));
 
         assert_eq!(shared.len(), 2, "one drop was enough to reach the reserve");
         assert!(
@@ -448,14 +484,14 @@ mod tests {
         let mut shared = SharedSnapshots::<u32>::default();
         shared.publish(1, WorkerId(1), 10);
 
-        assert!(!shared.reclaim_for(WorkerId(0), 1, || 0));
+        assert!(!shared.reclaim_for(WorkerId(0), 1, || 0, |_| ()));
         assert!(shared.contains(1));
     }
 
     #[test]
     fn reclaim_does_nothing_when_there_is_already_room() {
         let mut shared = shared_with_three();
-        assert!(shared.reclaim_for(WorkerId(0), 2, || 5));
+        assert!(shared.reclaim_for(WorkerId(0), 2, || 5, |_| ()));
         assert_eq!(shared.len(), 3);
     }
 }

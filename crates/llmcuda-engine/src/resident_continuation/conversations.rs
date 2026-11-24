@@ -418,11 +418,17 @@ fn agent_conversations() {
     }
     let state = passes[0].new_state(&stream, CAPACITY).unwrap();
     let state_bytes = state.bytes();
-    let arena = SnapshotArena::new(&ctx, &config, CAPACITY, 2).unwrap();
+    let arena = SnapshotArena::new(
+        &ctx,
+        &config,
+        CAPACITY,
+        crate::state::SnapshotArenaSize::dense(2),
+    )
+    .unwrap();
     println!(
         "ALLOCATION gpu_state_bytes={state_bytes} history_bytes={} pinned_bytes={} shapes=1,2,4,8,16,32,64,128,256,512",
         CAPACITY * 4,
-        arena.bytes_per_slot() * arena.capacity()
+        (arena.bytes_per_interval() + arena.bytes_per_state()) * arena.capacity()
     );
     // SAFETY: sample writes the complete one-token buffer before reading it.
     let sampled = unsafe { ctx.alloc_pinned::<i32>(1).unwrap() };

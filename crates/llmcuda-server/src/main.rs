@@ -26,8 +26,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use llmcuda_cache::config::CacheConfig;
 use llmcuda_cuda::{check_gate, device};
 use llmcuda_engine::{
-    DEFAULT_SNAPSHOT_SLOTS_PER_WORKER, Engine, RouterConfig, ServingConfig, Speculation,
-    snapshot_bytes_per_slot,
+    DEFAULT_SNAPSHOT_SLOTS_PER_WORKER, Engine, RouterConfig, ServingConfig, SnapshotArenaSize,
+    Speculation, snapshot_bytes_per_interval, snapshot_bytes_per_state,
 };
 use llmcuda_model::budget;
 use llmcuda_model::{KvCacheType, KvCacheTypes, ModelConfig, verify};
@@ -1023,13 +1023,19 @@ fn main() -> std::process::ExitCode {
     // 7. Prefix-cache RAM. Sized here, before anything is allocated, so the
     //    preflight can say what the budget actually bought — a slot count is
     //    the quantity that matters and a byte figure is what was asked for.
-    let bytes_per_slot = snapshot_bytes_per_slot(&model, retention_interval) as u64;
+    let bytes_per_interval = snapshot_bytes_per_interval(&model, retention_interval);
+    let bytes_per_state = snapshot_bytes_per_state(&model);
     let workers = engine.worker_count().max(1) as u64;
+    let sequences = args.slots_per_worker as usize;
 
-    // What "the cache always hits" actually costs. A snapshot covers one
-    // retention interval, so a slot serving `per_slot_context` tokens needs
-    // that many intervals to keep a restore point everywhere in its context,
-    // and a worker needs that for every slot it serves.
+    // What "the cache always hits" actually costs. A snapshot's attention
+    // rows cover one retention interval, so a slot serving
+    // `per_slot_context` tokens needs that many intervals to be restorable
+    // everywhere in its context, and a worker needs that for every slot it
+    // serves. Recurrent states are needed only where a request resumes — a
+    // handful per sequence, whatever the depth — so they are counted apart
+    // (`SnapshotArenaSize`), and at 65.9 MiB against an interval's 40 that
+    // is most of what full coverage used to cost.
     //
     // Below this the arena does not degrade gracefully: `reclaim_for` yields
     // rather than publish when slots are scarce, so a worker that cannot hold
@@ -1038,43 +1044,57 @@ fn main() -> std::process::ExitCode {
     // card: 24 slots gave 0% prefix reuse on every request and 319 s of wall
     // clock; 119 slots gave 73-86% and 133 s.
     let per_slot_context = (args.total_context / args.slots_per_worker.max(1)) as usize;
-    let full_coverage_slots =
-        args.slots_per_worker as usize * per_slot_context.div_ceil(retention_interval.max(1));
+    let full_coverage = SnapshotArenaSize::covering(
+        sequences * per_slot_context.div_ceil(retention_interval.max(1)),
+        sequences,
+    );
+    let for_budget = |bytes: u64| {
+        SnapshotArenaSize::for_budget(
+            bytes / workers,
+            sequences,
+            bytes_per_interval,
+            bytes_per_state,
+        )
+        .at_most(full_coverage)
+    };
 
-    let slots_per_worker = match args.cache_ram {
+    let arena = match args.cache_ram {
         // A decision model scores a prompt and is done, and its requests never
         // resume from a prefix (a restored prefix has no final hidden states
         // for the head to read), so an arena would pin host RAM nothing reads.
-        _ if decisions => 0,
-        Some(size::FULL_COVERAGE) => full_coverage_slots,
-        Some(budget) => (budget / workers / bytes_per_slot.max(1)) as usize,
+        _ if decisions => SnapshotArenaSize::NONE,
+        Some(size::FULL_COVERAGE) => full_coverage,
+        Some(budget) => for_budget(budget),
         // Default to full coverage, bounded by a share of what the host can
         // spare. The old fixed 24 was chosen against the locked-memory limit
         // and covers 16K per slot, which is under a single agent turn at this
         // context; scaling with the configuration is what makes the shipped
         // `-c 405504 -s 3` work rather than silently miss.
         None => {
-            let budget = host_available_bytes()
-                .map(|available| available / DEFAULT_CACHE_RAM_SHARE)
-                .unwrap_or(DEFAULT_SNAPSHOT_SLOTS_PER_WORKER as u64 * bytes_per_slot * workers);
-            let affordable = (budget / workers / bytes_per_slot.max(1)) as usize;
-            full_coverage_slots
-                .min(affordable)
-                .max(DEFAULT_SNAPSHOT_SLOTS_PER_WORKER)
+            let floor = SnapshotArenaSize::dense(DEFAULT_SNAPSHOT_SLOTS_PER_WORKER);
+            let affordable = host_available_bytes()
+                .map(|available| for_budget(available / DEFAULT_CACHE_RAM_SHARE))
+                .unwrap_or(floor);
+            if affordable.intervals < floor.intervals {
+                floor
+            } else {
+                affordable
+            }
         }
     };
-    let cache_ram = slots_per_worker as u64 * bytes_per_slot * engine.worker_count() as u64;
+    let cache_ram = arena.bytes(bytes_per_interval, bytes_per_state) * workers;
     info!(
-        "\ncache ram        {:.2} GiB pinned — {} snapshots per worker at {:.2} MiB each",
+        "\ncache ram        {:.2} GiB pinned — per worker, {} intervals at {:.2} MiB and {} recurrent states at {:.2} MiB",
         size::gib(cache_ram),
-        slots_per_worker,
-        bytes_per_slot as f64 / (1024.0 * 1024.0)
+        arena.intervals,
+        bytes_per_interval as f64 / (1024.0 * 1024.0),
+        arena.states,
+        bytes_per_state as f64 / (1024.0 * 1024.0),
     );
     // Coverage is the number that predicts whether a conversation keeps
     // hitting: a slot can restore anywhere inside this many tokens, and
     // re-prefills from zero beyond it.
-    let coverage_per_slot =
-        slots_per_worker / args.slots_per_worker.max(1) as usize * retention_interval;
+    let coverage_per_slot = arena.intervals / sequences.max(1) * retention_interval;
     info!(
         "                 {} tokens of restore coverage per slot, of {} served ({:.0}% of the context)",
         coverage_per_slot,
@@ -1086,21 +1106,21 @@ fn main() -> std::process::ExitCode {
         if args.cache_ram.is_some() {
             warn!("                 --cache-ram is ignored for a decision model");
         }
-    } else if slots_per_worker == 0 {
+    } else if arena.intervals == 0 {
         warn!("                 no snapshots retained — prefix sharing is off");
-    } else if slots_per_worker < full_coverage_slots {
-        let full_bytes = full_coverage_slots as u64 * bytes_per_slot * workers;
+    } else if arena.intervals < full_coverage.intervals {
         warn!(
             "                 below full coverage — a conversation deeper than {} tokens re-prefills from zero on every turn",
             coverage_per_slot
         );
         warn!(
-            "                 `--cache-ram full` would take {} snapshots per worker ({:.2} GiB total)",
-            full_coverage_slots,
-            size::gib(full_bytes),
+            "                 `--cache-ram full` would take {} intervals and {} states per worker ({:.2} GiB total)",
+            full_coverage.intervals,
+            full_coverage.states,
+            size::gib(full_coverage.bytes(bytes_per_interval, bytes_per_state) * workers),
         );
     }
-    if !decisions && slots_per_worker < args.slots_per_worker as usize {
+    if !decisions && arena.intervals.min(arena.states) < sequences {
         // The engine keeps one slot per concurrent sequence free before it
         // will publish anything, so below that line it publishes nothing at
         // all — and whichever sequence loses the race for the remaining slots
@@ -1117,7 +1137,7 @@ fn main() -> std::process::ExitCode {
     info!("\nloading           {}", model_path.display());
     let serving = ServingConfig {
         prefill_chunk: args.prefill_chunk,
-        snapshot_slots: slots_per_worker,
+        snapshot_slots: arena,
         speculation,
         dflash_gguf: args.spec_dflash.clone(),
         draft_n_min: args.spec_draft_n_min as usize,

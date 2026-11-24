@@ -40,8 +40,9 @@ use crate::vision::VisionForward;
 use crate::{DeviceWeights, LoadError, SequenceState, StateError};
 use llmcuda_grammar::ToolConstraint;
 
-/// Pinned snapshot capacity per worker when no budget is given. One
-/// default-retention slot is 102.8125 MiB, so 24 slots consume 2.41 GiB per
+/// Pinned snapshot capacity per worker when no budget is given: this many
+/// attention intervals and a recurrent state for each. One such pair at the
+/// default retention interval is 102.8125 MiB, so 24 consume 2.41 GiB per
 /// worker and 7.23 GiB process-wide.
 /// This stays below the host's locked-memory limit while covering eight
 /// simultaneous retention points for each of the three serving sequences.
@@ -90,10 +91,10 @@ pub struct RuntimeConfig {
     pub draft_p_min: f32,
     /// Tokens between retained GDN snapshots.
     pub retention_interval: usize,
-    /// Pinned host snapshot slots. Zero disables retention, and with it
-    /// prefix sharing: a sequence that cannot check one out simply stops
-    /// snapshotting and serves normally.
-    pub snapshot_slots: usize,
+    /// The pinned host snapshot arena. No intervals disables retention, and
+    /// with it prefix sharing: a sequence that cannot check one out simply
+    /// stops snapshotting and serves normally.
+    pub snapshot_slots: crate::state::SnapshotArenaSize,
     /// Whether the end-of-turn token ends a sequence. A fixed-width
     /// throughput benchmark sets this false so its measurement cannot
     /// silently shrink.
@@ -322,6 +323,9 @@ struct RuntimeSequence {
     max_output: u32,
     last_snapshot_position: usize,
     last_snapshot: Option<Arc<SequenceSnapshot>>,
+    /// Whether `last_snapshot` was taken by this sequence, rather than being
+    /// the one it resumed from — which belongs to whoever published it.
+    last_snapshot_own: bool,
     retention_disabled: bool,
     /// `None` is greedy argmax, decided entirely on the device. `Some` pays a
     /// host round-trip per emitted token, only for this sequence.
@@ -341,6 +345,33 @@ struct RuntimeSequence {
     decision: Option<DecisionSequence>,
 }
 
+/// The fields [`RuntimeSequence::retain`] moves, borrowed apart from the
+/// rest of the sequence so the prefill loop can retain while it still reads
+/// the prompt.
+struct Retention<'a> {
+    prompt_len: usize,
+    position: &'a mut usize,
+    newest: &'a mut Option<Arc<SequenceSnapshot>>,
+    own: &'a mut bool,
+}
+
+impl Retention<'_> {
+    fn advance(self, snapshot: &Arc<SequenceSnapshot>, interval: usize) {
+        if *self.own
+            && let Some(previous) = self.newest.as_ref()
+        {
+            let interval = interval.max(1);
+            let prompt_tail = self.prompt_len / interval * interval;
+            if previous.position() != prompt_tail {
+                previous.yield_state();
+            }
+        }
+        *self.position = snapshot.position();
+        *self.newest = Some(Arc::clone(snapshot));
+        *self.own = true;
+    }
+}
+
 /// A decision request's device-side state: the spans its head reads and
 /// `[prompt][hidden]` f32 of final RMS-normed hidden states. Allocated at
 /// admission like image embeddings — never on the per-step path.
@@ -350,6 +381,28 @@ struct DecisionSequence {
 }
 
 impl RuntimeSequence {
+    /// Make `snapshot` this sequence's newest, and let the one before it
+    /// give up its recurrent state when the arena needs one.
+    ///
+    /// Restoring reads the recurrent state of the snapshot resumed from and
+    /// of no other, so the state behind this sequence's newest is only ever
+    /// read by a request that diverges from it before the next boundary.
+    /// That is likely at one place — the last boundary inside the prompt,
+    /// where the conversation's next turn forks, because the chat template
+    /// re-renders the reply (`docs/CACHE.md`) — and that state is kept. A
+    /// state passed during decode, or deeper inside the prompt, is yielded:
+    /// still resumable while it lasts, first to go when the pool is empty.
+    /// (The engine holds one more, where the prompt left a cached prefix.)
+    fn retain(&mut self, snapshot: &Arc<SequenceSnapshot>, interval: usize) {
+        Retention {
+            prompt_len: self.prompt.len(),
+            position: &mut self.last_snapshot_position,
+            newest: &mut self.last_snapshot,
+            own: &mut self.last_snapshot_own,
+        }
+        .advance(snapshot, interval);
+    }
+
     /// Whether this sequence's next token has to be picked on the host
     /// rather than taken from the device argmax: because it is sampled,
     /// because the grammar has to mask first, or because a constraint is
@@ -808,8 +861,10 @@ impl DeviceRuntime {
             SnapshotArena::new(&ctx, &config, retention_interval.max(1), snapshot_slots)?;
         debug!(
             device = device_ordinal,
-            slots = snapshot_arena.capacity(),
-            bytes_per_slot = snapshot_arena.bytes_per_slot(),
+            intervals = snapshot_arena.capacity(),
+            bytes_per_interval = snapshot_arena.bytes_per_interval(),
+            states = snapshot_arena.state_capacity(),
+            bytes_per_state = snapshot_arena.bytes_per_state(),
             "worker pinned snapshot arena ready"
         );
 
@@ -1299,6 +1354,7 @@ impl DeviceRuntime {
                 max_output: req.max_output_tokens,
                 last_snapshot_position: 0,
                 last_snapshot: None,
+                last_snapshot_own: false,
                 retention_disabled: false,
                 sampler: (!sampling.is_greedy()).then(|| Sampler::new(sampling)),
                 constraint,
@@ -1444,6 +1500,7 @@ impl DeviceRuntime {
             .set_rope_delta(delta);
         seq.last_snapshot_position = prefix;
         seq.last_snapshot = Some(Arc::clone(&snapshot));
+        seq.last_snapshot_own = false;
         seq.retention_disabled = false;
         // Snapshots restore the target's state only; the draft-side caches
         // over the restored prefix were computed by whoever produced the
@@ -1772,9 +1829,8 @@ impl DeviceRuntime {
                                 snapshot.set_next_token(output);
                             }
                             let snapshot = Arc::new(snapshot);
-                            seq.last_snapshot = Some(Arc::clone(&snapshot));
+                            seq.retain(&snapshot, self.retention_interval);
                             retained.push((*id, snapshot));
-                            seq.last_snapshot_position = position;
                         }
                         Err(StateError::SnapshotArenaExhausted) => {
                             seq.retention_disabled = true;
@@ -2211,9 +2267,8 @@ impl DeviceRuntime {
                             snapshot.set_next_token(last);
                         }
                         let snapshot = Arc::new(snapshot);
-                        seq.last_snapshot = Some(Arc::clone(&snapshot));
+                        seq.retain(&snapshot, self.retention_interval);
                         retained.push((*id, snapshot));
-                        seq.last_snapshot_position = position;
                     }
                     Err(StateError::SnapshotArenaExhausted) => {
                         seq.retention_disabled = true;
@@ -2654,9 +2709,14 @@ impl DeviceRuntime {
                             snapshot.set_next_token(next);
                         }
                         let snapshot = Arc::new(snapshot);
-                        seq.last_snapshot = Some(Arc::clone(&snapshot));
+                        Retention {
+                            prompt_len: seq.prompt.len(),
+                            position: &mut seq.last_snapshot_position,
+                            newest: &mut seq.last_snapshot,
+                            own: &mut seq.last_snapshot_own,
+                        }
+                        .advance(&snapshot, self.retention_interval);
                         retained.push((id, snapshot));
-                        seq.last_snapshot_position = position;
                     }
                     Err(StateError::SnapshotArenaExhausted) => {
                         seq.retention_disabled = true;

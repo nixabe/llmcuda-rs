@@ -40,7 +40,8 @@ pub use runtime::{
 };
 pub use sampling::{Sampler, SamplingParams};
 pub use state::{
-    SequenceSnapshot, SequenceState, SnapshotSlots, StateError, snapshot_bytes_per_slot,
+    ResumeHold, SNAPSHOT_STATES_PER_SEQUENCE, SequenceSnapshot, SequenceState, SnapshotArenaSize,
+    SnapshotSlots, StateError, snapshot_bytes_per_interval, snapshot_bytes_per_state,
 };
 pub use weights::{DeviceWeights, LoadError, LoadReport, TensorPlacement};
 pub use worker::{ServingConfig, Speculation, Worker, WorkerExecutionError, WorkerId};

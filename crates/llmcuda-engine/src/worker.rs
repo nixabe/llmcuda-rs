@@ -110,9 +110,9 @@ pub enum Speculation {
 pub struct ServingConfig {
     /// Tokens per chunked-prefill step.
     pub prefill_chunk: usize,
-    /// Pinned host snapshot slots for this worker. Zero disables retention,
+    /// This worker's pinned snapshot arena. No intervals disables retention,
     /// and with it prefix sharing.
-    pub snapshot_slots: usize,
+    pub snapshot_slots: crate::state::SnapshotArenaSize,
     /// Which speculative decoder to run.
     pub speculation: Speculation,
     /// DFlash drafter GGUF; required by [`Speculation::DFlash`], ignored
@@ -137,7 +137,9 @@ impl ServingConfig {
     pub fn new(prefill_chunk: usize) -> Self {
         Self {
             prefill_chunk,
-            snapshot_slots: crate::runtime::DEFAULT_SNAPSHOT_SLOTS_PER_WORKER,
+            snapshot_slots: crate::state::SnapshotArenaSize::dense(
+                crate::runtime::DEFAULT_SNAPSHOT_SLOTS_PER_WORKER,
+            ),
             speculation: Speculation::None,
             dflash_gguf: None,
             draft_n_min: 0,
@@ -218,7 +220,9 @@ struct PendingSequence {
     request: NewRequest,
     prompt: Vec<i32>,
     images: Vec<crate::image::SequenceImage>,
-    snapshot: Option<Arc<SequenceSnapshot>>,
+    /// The snapshot to resume from, its recurrent state held until this
+    /// sequence has restored it or is dropped without doing so.
+    snapshot: Option<crate::state::ResumeHold>,
     sampling: SamplingParams,
     constraint: Option<Box<ToolConstraint>>,
     decision: Option<crate::decision::DecisionSpans>,
@@ -533,12 +537,12 @@ impl Worker {
         req: NewRequest,
         prompt: Vec<i32>,
         images: Vec<crate::image::SequenceImage>,
-        snapshot: Arc<SequenceSnapshot>,
+        snapshot: crate::state::ResumeHold,
         sampling: SamplingParams,
         constraint: Option<Box<ToolConstraint>>,
     ) -> Result<RequestId, WorkerExecutionError> {
-        self.validate_pending(req, &prompt, Some(&snapshot))?;
-        let prefix = snapshot.position() as u32;
+        self.validate_pending(req, &prompt, Some(snapshot.snapshot()))?;
+        let prefix = snapshot.snapshot().position() as u32;
         let id = self
             .scheduler
             .admit_with_prefix(req, prefix)
@@ -593,11 +597,11 @@ impl Worker {
                         pending.images,
                         pending.decision.expect("guarded by the arm"),
                     )?,
-                    Some(snapshot) => runtime.admit_restored(
+                    Some(hold) => runtime.admit_restored(
                         pending.request,
                         pending.prompt,
                         pending.images,
-                        snapshot,
+                        Arc::clone(hold.snapshot()),
                         pending.sampling,
                         pending.constraint,
                     )?,

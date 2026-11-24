@@ -84,6 +84,10 @@ fn main() -> ExitCode {
         error!("cold worker did not retain the 2048-token boundary");
         return ExitCode::FAILURE;
     };
+    let Some(snapshot) = llmcuda_engine::ResumeHold::new(snapshot) else {
+        error!("the retained snapshot no longer holds its recurrent state");
+        return ExitCode::FAILURE;
+    };
     if let Err(failure) = restored.admit_tokens_restored(
         request,
         prompt,

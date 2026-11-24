@@ -513,6 +513,24 @@ Six-turn conversations, three at once on one card; reuse is the server's own
   21 × 2048). Against the reusable prefix, reuse is 97.1% → 98.4%; the
   remaining 552–692 tokens per turn (about `R/2`) need token-granular reuse
   (see WHY on llama.cpp's in-place slots).
+- **A recurrent state per interval was most of the bill.** Those rows pinned
+  one 62.8 MiB state beside every 40 MiB interval. The arena now keeps states
+  only where a request resumes (WHY, "The snapshot arena…"), so the default
+  row's coverage is 198 intervals and 24 states: 9.21 GiB by the arena's own
+  arithmetic against the 19.88 GiB that row pinned. Measured at one budget
+  instead of at full coverage, on a 31 GB single-card host (`--cache-ram
+  6GiB`, three conversations growing 30,049 → 59,021 tokens over six turns,
+  greedy, 48 tokens a turn, one process per arm):
+
+  | arena at 6 GiB | per worker | coverage per slot | prefix reuse | wall |
+  | :--- | :--- | ---: | :--- | ---: |
+  | a state per interval | 59 snapshots | 38,912 | turns 1–2, then **0 from turn 3** | 303.2 s |
+  | states where a request resumes | 115 intervals, 24 states | 77,824 | every turn, 28,672 → 51,200 | 123.8 s |
+
+  Six conversations over three slots sharing a 12K-token opening, which both
+  arenas cover, reuse the same 14,336 and 18,432 tokens on turns 1 and 2 in
+  either (81.7 and 74.9 s; the difference is which first-turn requests
+  happened to arrive after a neighbour had published).
 - **Oversizing buys nothing.** `--cache-ram 64GiB` on three cards pinned
   63.86 GiB (106% of the context) and took 60 s to healthy against 34 s at
   19.88 GiB, with identical reuse. `RLIMIT_MEMLOCK` (15.72 GiB) does not bind;
@@ -1097,7 +1115,9 @@ Rotary base and cache slot share one position buffer, M-RoPE is bit-exact with t
 
 ## The snapshot arena is all-or-nothing, so size it from the configuration
 
-Publishing yields rather than evicts when slots are scarce, so an undersized arena publishes nothing and the cache never hits. Three growing conversations on one card: 0% reuse against 73–86% once the arena covered the context; 319 s of wall clock against 132. The arena now holds one snapshot per retention interval, per slot, across the slot's share of `--total-context`, capped at a quarter of `MemAvailable` because it is page-locked; `--cache-ram full` lifts the cap.
+Publishing yields rather than evicts when slots are scarce, so an undersized arena publishes nothing and the cache never hits. Three growing conversations on one card: 0% reuse against 73–86% once the arena covered the context; 319 s of wall clock against 132. The arena holds one attention interval per retention interval, per slot, across the slot's share of `--total-context`, capped at a quarter of `MemAvailable` because it is page-locked; `--cache-ram full` lifts the cap.
+
+Recurrent states are held apart from the intervals and are far fewer. A restore reads the attention rows of every snapshot behind the resume point and the recurrent state of that one point, so a state earns its 62.8 MiB only where a request resumes: a sequence's newest boundary, the last one inside its prompt (where the next turn forks), and a boundary two requests have both reached. Every other state is yielded to the next snapshot once the pool, eight per serving sequence, has none free. At one 6 GiB budget that doubled restore coverage and took a six-turn run from 303 s to 124 s; the price is that the second request to fork somewhere new recomputes the shared prefix once ([CACHE.md](CACHE.md#a-state-is-kept-where-a-request-can-resume-and-nowhere-else)). vLLM and SGLang keep recurrent state the same way (`MambaManager.reachable_block_mask`; `unified_cache/components/mamba.py`).
 
 llama.cpp keeps a slot's KV in place between requests; ours restores from host snapshots. A test-only resident-slot prototype cut follow-up TTFT 8.34–18.31% but whole-conversation time only 0.27–0.83% (six paired file-tool conversations); it is not in production routing. [All pairs, transfer bytes and scope](OPTIMIZATION_CAMPAIGN.md#exact-prefix-resident-continuation).
 

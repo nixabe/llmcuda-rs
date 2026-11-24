@@ -32,11 +32,12 @@ at the top of [docs/BENCHMARKS.md](docs/BENCHMARKS.md)**, and that section is
 the only place they belong — do not restate a ratio anywhere else without a
 link to it.
 
-The standing is that every cell of the one-card N=3 target is clear of
-llama.cpp at its own best settings, on both prefill and decode. The thinnest
-margin (128K prefill) is inside this card's own thermal drift and stands only
-on alternating pairs. Treat thin margins as parity you have to keep, not as
-headroom.
+The standing is no longer that every cell is clear. Against llama.cpp's
+current head the 2K prefill cell is lost and the 2K decode margin is thin;
+the other cells have only been measured against a build that predates
+llama.cpp's fused MoE and GDN work, and are unknown until re-measured. Treat
+thin margins as parity you have to keep, not as headroom, and an unmeasured
+cell as unmeasured.
 
 **BENCHMARKS.md records the latest state only.** The "Current standing" table
 holds the current numbers and nothing else: when a measurement supersedes a

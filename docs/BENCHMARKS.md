@@ -9,7 +9,7 @@ behind it, and two durable lists: **WHY** and **WHY NOT**.
 | --- | --- |
 | Hardware | 3× Quadro RTX 8000, sm_75 (Turing), 47.3 GiB usable, 672 GB/s, 72 SMs, 6 MiB L2 |
 | Host | 125 GB RAM, 12 vCPU, CUDA 12.4, driver 595.84 |
-| llama.cpp | build 10456, commit `fd6863a69` |
+| llama.cpp | build 10456, commit `fd6863a69`; the † rows of the standing, build 12688, commit `ae6a7ad2c` |
 | Model | `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` — 30.36 GiB, 35.51 B params |
 | Second model | `Qwen3.8-27B-UD-Q8_K_XL.gguf` (`qwen35`, dense) — 29.30 GiB, 26.90 B params |
 
@@ -28,27 +28,67 @@ The bar is the faster of `-ub 2048` (llama.cpp's better decode setting) and
 ## Current standing
 
 One card, N=3, llama.cpp at `-np 3 -b 4096 -ub 4096`; prefill on GPU 2,
-decode on GPU 1. Not re-measured since the
+decode on GPU 1. Apart from the † rows, not re-measured since the
 [engine-only campaign](OPTIMIZATION_CAMPAIGN.md#final-comparison-with-the-original-implementation),
 which has its own pairs and the single-sequence numbers.
 
 | cell | llmcuda-rs tok/s | llama.cpp tok/s | margin |
 | :--- | ---: | ---: | ---: |
 | prefill 512 | 3,281.0 ± 8.6 | 3,007.5 | **+9.1%** |
-| prefill 2K | 3,819.4 ± 23.4 | 3,201.5 | **+19.3%** |
+| prefill 2K † | 3,649.3–3,652.7 | 4,111–4,159 | **−11% to −12%** |
 | prefill 8K | 3,665.5 ± 16.8 | 3,201.8 | **+14.5%** |
 | prefill 32K | 2,790.3 ± 5.8 | 2,655.1 | **+5.1%** |
 | prefill 65K | 2,226.0 ± 0.2 | 2,142.8 | **+3.9%** |
 | prefill 128K | 1,564.5 ± 0.3 | 1,551.6 | **+0.8%** |
-| decode 2K | 217.3 / 217.1 / 216.6 | 184.5 / 185.9 / 183.3 | **+16.8–18.2%** |
+| decode 2K † | 216.5 / 217.7 | 209.2–210.4 | **+2.9–4.1%** |
 | decode 32K | 165.7 / 166.5 / 165.2 | 151.0 / 150.4 / 150.8 | **+9.5–10.7%** |
+
+**† The two 2K rows are against llama.cpp build 12688 (`ae6a7ad2c`), and the
+prefill cell is lost.** Every other row is still against build 10456 and has
+not been re-measured; do not read a margin from them. Between the two builds
+llama.cpp's Turing path gained a fused MoE gate/up/SwiGLU GEMM, a device-built
+expert tile list, a four-column GDN recurrence and MoE fusion at multi-token
+decode widths (`mmq.cuh`, `mmid.cu`, `gated_delta_net.cu`, `mmvq.cu`).
+
+Where the prefill cell went, as kernel milliseconds per 6,138-token pass
+(`nsys -t cuda`, whole-process sums over six engine passes and four llama.cpp
+passes; llama.cpp's include its cold first pass, so its column is high):
+
+| work | llmcuda-rs | llama.cpp 12688 |
+| :--- | ---: | ---: |
+| routed experts, gate/up with SwiGLU | 345.9 | 223.5 |
+| routed experts, down | 223.2 | 107.5 |
+| expert dispatch, weighting and combine | 101.0 | 53.5 |
+| MoE router | 97.4 | ≤ 30.9 |
+| GDN recurrence | 235.2 | 194.6 |
+| Q8_0 projections with their activation quantize | 440.5 | 584.8 |
+| every kernel | 1,675 | 1,458 |
+
+The routed experts are the cell: 670 ms against 385, more than the whole
+difference, with the router and the recurrence adding to it and the engine's
+dense projections giving 144 ms back. llama.cpp's router is three cuBLAS
+`sgemm` shapes that the profile does not separate from its other fp32
+GEMMs, hence the bound; its `concat_non_cont` (41.3 ms) is in neither row.
+Its down projection runs 64-token tiles chosen from the mean tokens per
+expert (`mmq.cu`, `J_best`), the engine's two compiled bucket widths do not.
+
+The † rows were taken on a different host: one RTX 8000, 31 GB RAM, driver
+595.99. Processes alternated rather than paired within a process: three
+`bench_forward` processes (3,652.7 ± 13.7, 3,650.0 ± 8.1, 3,649.3 ± 14.9) and
+two `bench_decode_batch` processes for the engine, four `llama-batched-bench`
+processes at `-npl 3,1,3,1,3,1,3,1 -npp 2048 -ntg 128`, two per `-ub`. The
+llama.cpp ranges are each process's third and fourth N=3 rows: its first row
+is a cold start and its decode is still rising at the fourth (190 → 205 → 208
+→ 210 tok/s), so the decode margin is a ceiling. `-ub 2048` and `-ub 4096`
+agree within 1% at this depth. At N=1 on the same runs: decode 115.6 against
+104.4–104.8 tok/s (**+10%**); llama.cpp prefills 2K at 3,990–4,060 tok/s and
+the engine's N=1 prefill was not measured.
 
 The 512–32K prefill rows ran a binary predating the per-sequence prefill fork
 (an effect orders of magnitude inside the margins); the 65K row ran while
 gates used a neighbouring card, so its margin is a floor; 128K ran
 uncontended. Both decode rows are three same-hour alternating pairs (middle
-pair reversed) on a quiet box, listed pair by pair. The prefill 2K llama.cpp
-column is not a same-hour re-run, so allow for llama.cpp's ~1%/day drift.
+pair reversed) on a quiet box, listed pair by pair.
 
 ### Capability
 

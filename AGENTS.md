@@ -33,7 +33,7 @@ the only place they belong — do not restate a ratio anywhere else without a
 link to it.
 
 The standing is no longer that every cell is clear. Against llama.cpp's
-current head the 2K prefill cell is lost and the 2K decode margin is thin;
+current head the 2K prefill and 2K decode margins are both thin;
 the other cells have only been measured against a build that predates
 llama.cpp's fused MoE and GDN work, and are unknown until re-measured. Treat
 thin margins as parity you have to keep, not as headroom, and an unmeasured

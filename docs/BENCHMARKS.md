@@ -35,38 +35,45 @@ which has its own pairs and the single-sequence numbers.
 | cell | llmcuda-rs tok/s | llama.cpp tok/s | margin |
 | :--- | ---: | ---: | ---: |
 | prefill 512 | 3,281.0 ± 8.6 | 3,007.5 | **+9.1%** |
-| prefill 2K † | 3,838.7–3,848.6 | 4,111–4,159 | **−6.4% to −7.7%** |
+| prefill 2K † | 4,254.3–4,287.2 | 3,975–4,170 | **+2.0% to +7.8%** |
 | prefill 8K | 3,665.5 ± 16.8 | 3,201.8 | **+14.5%** |
 | prefill 32K | 2,790.3 ± 5.8 | 2,655.1 | **+5.1%** |
 | prefill 65K | 2,226.0 ± 0.2 | 2,142.8 | **+3.9%** |
 | prefill 128K | 1,564.5 ± 0.3 | 1,551.6 | **+0.8%** |
-| decode 2K † | 216.5 / 217.7 | 209.2–210.4 | **+2.9–4.1%** |
+| decode 2K † | 217.5 / 217.9 | 205.2–210.2 | **+3.5–6.2%** |
 | decode 32K | 165.7 / 166.5 / 165.2 | 151.0 / 150.4 / 150.8 | **+9.5–10.7%** |
 
-**† The two 2K rows are against llama.cpp build 12688 (`ae6a7ad2c`), and the
-prefill cell is lost.** Every other row is still against build 10456 and has
+**† The two 2K rows are against llama.cpp build 12688 (`ae6a7ad2c`), and both
+margins are thin.** Every other row is still against build 10456 and has
 not been re-measured; do not read a margin from them. Between the two builds
 llama.cpp's Turing path gained a fused MoE gate/up/SwiGLU GEMM, a device-built
 expert tile list, a four-column GDN recurrence and MoE fusion at multi-token
 decode widths (`mmq.cuh`, `mmid.cu`, `gated_delta_net.cu`, `mmvq.cu`).
 
-Where the prefill cell went, as kernel milliseconds per 6,138-token pass
-(`nsys -t cuda`, whole-process sums over six engine passes and four llama.cpp
-passes; llama.cpp's include its cold first pass, so its column is high):
+Where a 6,138-token pass goes, as kernel milliseconds (`nsys -t cuda`,
+whole-process sums over six engine passes and four llama.cpp passes;
+llama.cpp's include its cold first pass, so its column is high):
 
 | work | llmcuda-rs | llama.cpp 12688 |
 | :--- | ---: | ---: |
-| routed experts, gate/up with SwiGLU | 353.2 | 341.4 |
-| routed experts, down | 222.9 | 186.4 |
-| expert dispatch, weighting and combine | 73.1 | 53.5 |
-| MoE router | 38.5 | ≤ 31.0 |
-| GDN recurrence | 234.8 | 194.6 |
-| Q8_0 projections with every activation quantize | 438.4 | 401.8 |
-| every kernel | 1,588 | 1,458 |
+| routed experts, gate/up with SwiGLU | 352.4 | 341.4 |
+| routed experts, down | 221.9 | 186.4 |
+| expert dispatch, weighting and combine | 64.4 | 53.5 |
+| MoE router | 38.6 | ≤ 31.0 |
+| GDN recurrence | 171.2 | 194.6 |
+| Q8_0 projections with every activation quantize | 445.7 | 401.8 |
+| every kernel | 1,427 | 1,458 |
 
-No single kernel is the cell: the engine is behind in every row. What is left
-is in the four large ones, the two routed-expert GEMMs, the recurrence and
-the dense projections, 12 to 41 ms each. llama.cpp's router is three cuBLAS
+The engine is ahead in one row, the recurrence, and behind in every other,
+and the two totals are closer than the cell: llama.cpp's column carries a cold
+pass the engine's does not, so the table places the work and does not by
+itself account for the margin. The engine's
+recurrence row is its folded scan (138.5 ms) and the fused prelude ahead of it
+(32.8 ms), and the prelude also carries the causal convolution and the SiLU,
+so the row overstates the engine's side. Its projections row includes the GDN
+output norm that quantizes in place (18.8 ms), which is a norm and a SwiGLU as
+well as a quantize. What is left is in the routed-expert down projection and
+the dense projections, 35 to 44 ms each. llama.cpp's router is three cuBLAS
 `sgemm` shapes that the profile does not separate from its other fp32 GEMMs,
 hence the bound; its `concat_non_cont` (41.3 ms) is in no row. Its expert
 activation quantize (14.0 ms) is in the projections row, while the engine's
@@ -82,18 +89,20 @@ same `mul_mat_q<Q8_0, 128>` instantiation, and a table that splits them by
 name alone credits the 2,048-token pass's gate/up to the down projection.
 
 The † rows were taken on a different host: one RTX 8000, 31 GB RAM, driver
-595.99. Processes alternated rather than paired within a process: three
-`bench_forward` processes (3,848.6 ± 12.4, 3,838.7 ± 19.0, 3,844.3 ± 12.0) and
-two `bench_decode_batch` processes for the engine, four `llama-batched-bench`
-processes at `-npl 3,1,3,1,3,1,3,1 -npp 2048 -ntg 128`, two per `-ub`. The
-llama.cpp ranges are each process's third and fourth N=3 rows: its first row
-is a cold start and its decode is still rising at the fourth (190 → 205 → 208
-→ 210 tok/s), so the decode margin is a ceiling. `-ub 2048` and `-ub 4096`
-agree within 1% at this depth. Its prefill is still rising then too: a process
-given only four N=3 passes reads 3,261 → 3,764 → 3,873 on the second to
-fourth, so the range in the table is its warmed figure and a shorter run
-flatters the engine. At N=1 on the same runs: decode 115.6 against
-104.4–104.8 tok/s (**+10%**); llama.cpp prefills 2K at 3,990–4,060 tok/s and
+595.99. Processes alternated rather than paired within a process: six
+`bench_forward` processes (4,287.2 ± 13.8, 4,268.3 ± 14.0, 4,267.2 ± 15.1,
+4,254.3 ± 13.5, 4,272.1 ± 6.4, 4,265.0 ± 11.4) and two `bench_decode_batch`
+processes for the engine, two `llama-batched-bench` processes at
+`-npl 3,3,3,3,3,3,3,3,3,3,3,3 -npp 2048 -ntg 128`, one per `-ub`. The
+llama.cpp ranges are the sixth to twelfth passes of both processes: its first
+pass is a cold start and it is still rising for four more (3,424 → 3,739 →
+3,954 → 3,884 → 4,084 tok/s at `-ub 4096`), so a process given only four N=3
+passes reads 3,959–4,076 on its last and flatters the engine. Warmed, its
+passes scatter more than the engine's processes do, 4,043–4,113 at `-ub 4096`
+and 3,975–4,170 at `-ub 2048`, and the margin's width is that scatter. Its
+decode settles by the fourth pass. At N=1: decode 114.5–115.3 against
+104.4–104.7 tok/s (**+10%**), from the fourth N=1 row of four further llama.cpp processes at
+`-npl 3,1,3,1,3,1,3,1`; llama.cpp prefills 2K at 3,800–3,865 tok/s there and
 the engine's N=1 prefill was not measured.
 
 The 512–32K prefill rows ran a binary predating the per-sequence prefill fork
@@ -929,6 +938,8 @@ not depend on:
 - `gdn_chunk_inter` re-read the recurrent state per token.
 - The MoE router loaded 2.1 GB per layer to cover 6 MB.
 - The MoE combine split each token's row over eight blocks and every one recomputed the shared expert's gate: 400 MB a layer of repeat reads at 6,138 tokens. From 288 tokens one block walks the row. Bit-identical, and 1.012–1.025× in every one of eighteen `bench_forward` pairs at 512, 2,048 and 6,138 tokens (`LLMCUDA_BENCH_AB=LLMCUDA_COMBINE_ROW`).
+- A GDN layer walked its convolved q/k/v stream three times, as the convolution, the SiLU with the split and the q/k normalization: 201 MB read three times and written four at 6,138 tokens, two of the copies for a trace alone. `gdn_scan_prelude` is one launch that writes only what the scan reads. Bit-identical; 1.013–1.029× in twelve pairs at 2,048 and 6,138 tokens (`LLMCUDA_BENCH_AB=LLMCUDA_GDN_PRELUDE`).
+- The GDN output norm wrote `final_output` as floats for the quantizer to read back. Its 128-wide row is four of the quantizer's 32-element blocks, a warp each, so the norm rounds in place and the floats are never stored (`rms_norm_swiglu_q8_rows`). Same quants and scales; 1.003–1.013× in twelve pairs (`LLMCUDA_GDN_TAIL`).
 - Prefill attention gridded on 16 query heads re-streamed 2 KV heads' K/V;
   gridding on the KV head cut traffic 4–8×.
 - The GDN scan gives a warp four value columns sharing q/k, decay and beta.
@@ -1031,6 +1042,23 @@ solve, and the alpha/beta gates all looked bandwidth-bound; attention reached
 2 TB/s effective and was still 16× off. A register tile fixed all four and
 left them **bit-identical**, because it reassociates nothing.
 
+Two later cases of the same bug, both bit-identical fixes:
+
+- The first fused GDN prelude gave every (head, token) its own block, which
+  re-loads the convolution's four-tap window and its weights for every
+  output: 25 loads and stores an element, 1.5 ms a layer where the bytes are
+  worth 0.7. Eight tokens a block, each thread sliding its channel's window
+  through registers, is one new activation a token and the weights once a
+  tile: 1.05 ms. Sixteen tokens a block measured slower than eight
+  (5.87 against 5.67 ms with the scan).
+- The MoE dispatch scatter ranked an expert's tokens with a block-wide prefix
+  scan a 256-entry tile: nineteen barriers a tile, 192 tiles at 6,138 tokens,
+  in each of 256 blocks, 0.30 ms a layer for a 49K-entry table. A warp ballot
+  ranks 32 entries in lane order and a popcount carries the total, so the
+  block needs one barrier. The table is the same table (exact against the
+  reference at 37 and at 1,543 live tokens), and the pass is 0.997–1.011×,
+  mean 1.006×, over twelve pairs.
+
 ## Layout: banks and sectors
 
 - **A shared stride that is a multiple of 32 words is an 8-way bank
@@ -1105,6 +1133,8 @@ GDN kernels take `STEP_MAX_BATCH` state-pointer slots with `grid.z` picking the 
 ## Prefill: no GDN chunking, and wider passes
 
 The chunked GDN form does **26% more arithmetic** at this geometry and pays only on tensor cores, which Turing lacks for fp32. Prefill runs an unchunked register-resident scan, as llama.cpp's `gated_delta_net_cuda` does: worth 4.5%.
+
+The scan is a sequential walk with every warp resident, so a token costs what a warp issues for it, and the delta rule itself — four operations on each of a lane's sixteen state elements — was a third of that. The rest was reducing the warp's four columns across all 32 lanes one at a time, forty shuffles and forty adds a token, and an `expf` of the head's decay in every lane of the head's 32 warps. `gdn_scan_prefill_fold` exchanges two columns across each half of the warp and one across each quarter, so a column's total lands in eight lanes after six shuffles; those lanes compute the correction and four shuffles hand it round; the decay is taken once a (token, head). The same operations on the same operands, so outputs and states are **bit-identical**: 8.1 → 5.0 ms a layer with the normalization at three 2,046-token sequences (`bench_gdn_scan`), and in the model 3,325.8 → 3,517.4 tok/s at 2,048 tokens (1.055–1.060×) and 3,597.7 → 3,837.4 at 6,138 (1.058–1.078×), six pairs each (`LLMCUDA_BENCH_AB=LLMCUDA_GDN_SCAN_FOLD`). One sequence gains what three do: the scan is bound by instructions issued, not by resident warps.
 
 Flattening the N=3 prompts into one pass wins only when it makes the pass wider than any one sequence, not at equal total ubatch: 6,138 rows at 2K, the whole 24,576-row prompt at 8K, 12,288 at 32K and above. This is the shape behind llama.cpp preferring `-ub 4096` over `-ub 2048`.
 
@@ -1251,6 +1281,8 @@ Each row gives the decisive measurement and why it lost.
 
 | Attempt | Result |
 | --- | --- |
+| Scaling the routed down projection once per 32-element block | `moe_expert_down_mma` converts and scales its int32 pair after every `m8n8k16`, though a Q8_0 scale and an activation scale both span two; accumulating both steps first halves the `I2F`s, as `mma_q8_0_proj_split` and llama.cpp's `mmq` do. `bench_moe_mma` at 8,192 tokens: 22.7 and 21.3 ms against 22.3, inside the bench's own spread. Model, six pairs (GPU 0, one sequence): **1.001–1.004×** at 2,048 tokens, **1.004–1.008×** at 6,138, with last-token logits moving 1.52 and 0.24 max-abs on the synthetic prompt (argmax unchanged), and `int8_forward`'s cosine against the fp32 path 0.999733 against 0.999809 with per-step scaling. Scored against llama.cpp's last-token logits on real text it is `1 − cos` 8.90e-4 against 8.14e-4 at 2,048 tokens and 1.69e-3 against 1.82e-3 at 512: nearer once, farther once. Under 1% for a rounding change nothing shows to be the more accurate one; the kernel is not bound by this loop. Not shipped. |
+| A wider routed-expert tile to cut weight traffic at 6,138 tokens | Ablation on `bench_moe_mma`, 8,192 tokens: every dispatch block made to read expert 0's weights (all weight traffic a cache hit) is 19.5 ms against 21.3–22.7; every slot made to read the first 64 activation rows is 19.5; both, 18.5. Removing *all* weight DRAM traffic is worth at most 10–14% of the two GEMMs, and 128 slots a block would remove about 40% of it, at one block an SM (38 KB of shared against 27). Under 2% of a pass before the occupancy loss. Not built. |
 | Dense K2 cuBLAS with materialized half operands | Half-rounded dense weights and inputs fail three-sequence batch prefill at **0.31854** logit max-abs (limit **0.02**); high/low half operands with sixteen-bit inputs still fail the 42-token full-width/chunked comparison at **0.30180**. Rejected on correctness before any throughput claim. |
 | Exact twelve-bit K2 dots on half tensor cores | Exact in fp32 and bitwise-tested, but the 128-row/64-token prototype reports **276–324 bytes** of spill stores. Split over 512 threads, 512-token query/value still take **1.332/1.428 ms** (Q4) and **1.401/1.793 ms** (Q6), above compact integer calibration. Rejected on timing. |
 | Direct register staging for dense Q4 and Q6 | GPU 0, 512 tokens: Q4 query **0.748 ms** vs shared-staged **0.681 ms**; Q6 query/value **1.008/1.412–1.433 ms** vs roughly **0.945/1.05 ms**. Q4 routed values improve, so direct staging is kept for that path only. Rejected for dense and Q6. |

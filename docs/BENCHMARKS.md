@@ -690,37 +690,52 @@ cuda-oxide PTX behind the existing cudarc ABI, allocations and graph capture:
 residual add, standalone SwiGLU, sigmoid gating, softplus, standalone RoPE,
 production tiled RoPE, RMSNorm and fused RMSNorm/SwiGLU. Toolchain pin:
 [TOOLCHAIN.md](TOOLCHAIN.md), [`experiments/cuda-oxide`](../experiments/cuda-oxide).
-CUDA C++ stays the default: every model comparison below changes sign across
-pairs. Deep contexts, the dense model and three-card serving were not
+CUDA C++ stays the default. The dense model and three-card serving were not
 measured.
 
-Kernel tables: six alternating CUDA-event pairs on GPU 1, order reversed on
-odd pairs, 100 graph-captured launches per interval; small shapes are
-cache-hot. Model tables: three alternating prebuilt process pairs on GPU 1,
-only the switch different, middle pair reversed, box quiet; cells are
-pair 0 / 1 / 2. Register counts are offline CUDA 12.4 `ptxas -arch=sm_75`,
-not the driver's JIT.
+Kernel tables: twelve alternating CUDA-event pairs on GPU 0 (two processes of
+six), order reversed on odd pairs, 100 graph-captured launches per interval;
+small shapes are cache-hot. Model table: three rounds of prebuilt processes on
+GPU 0, only the switch different, order rotated each round, box quiet; cells
+are round 0 / 1 / 2. Register counts are offline CUDA 12.8
+`ptxas -arch=sm_75`, not the driver's JIT.
+
+All eight ports together, Qwen3.6:
+
+| N=3 | CUDA C++ tok/s | Eight Rust ports tok/s | Rust change across rounds |
+| --- | --- | --- | --- |
+| Decode at 2,048 per sequence, 64 steps after 4 warmup | 218.5 / 219.1 / 219.1 | 219.1 / 219.7 / 219.8 | +0.27% / +0.27% / +0.32% |
+| Decode at 32,768 per sequence, 64 steps after 4 warmup | 165.9 / 166.2 / 166.4 | 166.2 / 160.8 / 166.9 | +0.18% / −3.25% / +0.30% |
+| Prefill, one 2,048-token pass, 5 timed repetitions | 3650.61 / 3680.53 / 3666.40 | 3664.85 / 3673.64 / 3670.55 | +0.39% / −0.19% / +0.11% |
+
+The 160.8 cell is one stalled step (latency sd 4.82 ms against 0.09–0.13 in
+every other run; its median step, 18.03 ms, is level with the rest). Prefill
+within-process standard deviations: 11.02–50.81 tok/s C++, 13.19–25.44 Rust.
+Decode at 2K favours the ports by about a quarter of a percent in every
+round; deep decode and prefill are inside run-to-run spread. The kernel gains
+are a small fraction of the pass.
+
+**The compiler revision does not move these numbers.** PTX from cuda-oxide
+0.2.1 (`26754ae5`) and 0.4.0 (`f35d6ccc`) for the same Rust source differs by
+three instructions in the two normalization kernels and four registers in
+standalone RoPE (38 → 42); the other seven register counts are identical. In
+the same three rounds the 0.2.1 artifact measured 219.9 / 219.6 / 219.7
+(decode 2K), 166.3 / 166.4 / 166.5 (decode 32K) and 3664.95 / 3653.32 /
+3671.36 (prefill); residual add, new against old artifact, is within ±2.5% at
+cache-hot sizes and ±0.3% at a million elements and above. The newer
+compiler's loop unrolling leaves these grid-stride loops as they were.
 
 Residual add: NVRTC unrolls the grid-stride loop and cuda-oxide does not
 (36 against 16 registers, no spills). The port is bit-exact, including signed
-zero, subnormals, in-place aliases and graph replay.
+zero, subnormals, in-place aliases and graph replay. Only 40 standalone
+residuals run per step.
 
 | Elements | NVRTC us/launch, min–max | Rust us/launch, min–max |
 | ---: | ---: | ---: |
-| 2,048 | 1.716–1.767 | 1.484–1.515 |
-| 6,144 | 1.721–1.755 | 1.500–1.531 |
-| 1,048,576 | 23.859–23.940 | 23.817–23.879 |
-| 8,388,608 | 183.419–183.807 | 180.163–180.305 |
-
-Only 40 standalone residuals run per step, so the model pairs are parity:
-
-| N=3, 2K per sequence | NVRTC tok/s | Rust tok/s | Rust change across pairs |
-| --- | --- | --- | --- |
-| Decode, 64 steps after 4 warmup | 217.8 / 216.8 / 216.5 | 217.3 / 216.8 / 216.7 | −0.23% / 0.00% / +0.09% |
-| Prefill, 1,536 total chunk rows, 5 timed repetitions | 3073.34 / 3055.24 / 3057.28 | 3062.50 / 3059.73 / 3054.73 | −0.35% / +0.15% / −0.08% |
-
-Prefill within-process standard deviations: 6.88–12.42 tok/s NVRTC,
-7.21–9.79 Rust.
+| 2,048 | 1.258–1.309 | 1.092–1.159 |
+| 6,144 | 1.268–1.297 | 1.116–1.216 |
+| 1,048,576 | 23.749–23.844 | 23.655–23.716 |
+| 8,388,608 | 183.238–184.618 | 179.962–180.203 |
 
 ### Activation ports
 
@@ -731,26 +746,19 @@ cosine **1.000000000**. The 19-token, 40-block golden selects token **25358**.
 
 | Kernel / shape | Elements | NVRTC us/launch, min–max | Rust us/launch, min–max |
 | --- | ---: | ---: | ---: |
-| SwiGLU | 12,288 | 2.115–2.151 | 1.882–1.899 |
-| SwiGLU | 262,145 | 5.693–5.713 | 4.424–4.459 |
-| SwiGLU | 8,388,608 | 182.156–182.255 | 186.574–186.675 |
-| Sigmoid, elementwise | 12,288 | 1.556–1.592 | 1.434–1.452 |
-| Sigmoid, elementwise | 262,145 | 4.182–4.219 | 3.418–3.438 |
-| Sigmoid, elementwise | 8,388,608 | 253.953–254.505 | 252.453–252.785 |
-| Sigmoid, per row, width 2,048 | 12,288 | 1.638–1.672 | 1.619–1.720 |
-| Sigmoid, per row, width 2,048 | 262,145 | 4.585–4.618 | 4.356–4.380 |
-| Sigmoid, per row, width 2,048 | 8,388,608 | 132.924–133.251 | 142.222–142.510 |
+| SwiGLU | 12,288 | 1.572–1.597 | 1.380–1.454 |
+| SwiGLU | 262,145 | 4.183–4.260 | 3.260–3.295 |
+| SwiGLU | 8,388,608 | 181.903–182.047 | 186.121–186.628 |
+| Sigmoid, elementwise | 12,288 | 1.586–1.618 | 1.441–1.475 |
+| Sigmoid, elementwise | 262,145 | 4.254–4.280 | 3.468–3.502 |
+| Sigmoid, elementwise | 8,388,608 | 247.869–254.075 | 250.266–252.558 |
+| Sigmoid, per row, width 2,048 | 12,288 | 1.659–1.705 | 1.651–1.733 |
+| Sigmoid, per row, width 2,048 | 262,145 | 4.644–4.692 | 4.409–4.444 |
+| Sigmoid, per row, width 2,048 | 8,388,608 | 133.221–133.570 | 142.771–144.146 |
 
 SwiGLU is fused in the model, so only the standalone attention sigmoid gates
-change. Activation ports alone:
-
-| Qwen3.6, N=3, 2K per sequence | NVRTC tok/s | Rust activations tok/s | Rust change across pairs |
-| --- | --- | --- | --- |
-| Decode, 64 steps after 4 warmup | 217.6 / 216.8 / 217.0 | 217.4 / 217.5 / 217.0 | −0.09% / +0.32% / 0.00% |
-| Prefill, 1,536 total chunk rows, 5 timed repetitions | 3080.91 / 3059.20 / 3060.56 | 3071.82 / 3065.06 / 3059.15 | −0.30% / +0.19% / −0.05% |
-
-Prefill standard deviations: 8.49–10.13 tok/s NVRTC, 6.84–8.23 Rust. Large
-standalone SwiGLU and broadcast sigmoid regress.
+change. Large standalone SwiGLU (**2.2–2.5%**) and broadcast sigmoid
+(**6.6–7.4%**) regress.
 
 ### Rust normalization and rotary kernels need separate kernel and model gates
 
@@ -758,9 +766,9 @@ Standalone softplus, SwiGLU and layer-ops RoPE are API ports, not production
 hot paths; fused batched-decode rotary/append and multimodal IMRoPE remain
 CUDA C++.
 
-RMSNorm's second reduction is now a parallel shuffle over the warp partials,
+RMSNorm's second reduction is a parallel shuffle over the warp partials,
 removing a block barrier; the changed addition order makes it not
-bit-identical to the old kernel. Target-width max-abs errors against CPU were
+bit-identical to the C++ kernel. Target-width max-abs errors against CPU were
 **3.099e-6**, **1.192e-6** and **9.537e-7** (hidden, attention-head,
 GDN-head), cosines **1.000000000**, at unchanged tolerances. The 19-token
 golden passes but does not validate deep context. 1,536 rows are one prefill
@@ -768,24 +776,27 @@ chunk:
 
 | Kernel | Rows × width | NVRTC us/launch, min–max | Rust us/launch, min–max |
 | --- | ---: | ---: | ---: |
-| RMSNorm | 3 × 2,048 | 3.391–3.422 | 3.297–3.322 |
-| RMSNorm | 96 × 128 | 2.569–2.601 | 2.478–2.517 |
-| RMSNorm | 48 × 256 | 2.722–2.743 | 2.642–2.658 |
-| RMSNorm | 1,536 × 2,048 | 53.054–61.022 | 53.520–59.764 |
-| RMSNorm | 49,152 × 128 | 100.803–101.132 | 99.779–100.161 |
-| RMSNorm | 24,576 × 256 | 101.814–102.522 | 101.039–101.499 |
-| RMSNorm/SwiGLU | 3 × 2,048 | 3.856–3.912 | 4.219–4.234 |
-| RMSNorm/SwiGLU | 96 × 128 | 2.867–2.909 | 2.601–2.625 |
-| RMSNorm/SwiGLU | 48 × 256 | 2.898–2.928 | 2.744–2.753 |
-| RMSNorm/SwiGLU | 1,536 × 2,048 | 93.456–93.825 | 94.901–95.349 |
-| RMSNorm/SwiGLU | 49,152 × 128 | 182.724–182.995 | 182.378–182.496 |
-| RMSNorm/SwiGLU | 24,576 × 256 | 182.834–182.926 | 182.565–182.701 |
+| RMSNorm | 3 × 2,048 | 2.499–2.540 | 2.444–2.516 |
+| RMSNorm | 96 × 128 | 1.904–1.940 | 1.823–1.858 |
+| RMSNorm | 48 × 256 | 2.002–2.028 | 1.928–2.028 |
+| RMSNorm | 1,536 × 2,048 | 50.688–51.053 | 50.330–50.665 |
+| RMSNorm | 49,152 × 128 | 101.332–103.474 | 100.723–101.846 |
+| RMSNorm | 24,576 × 256 | 103.013–104.492 | 102.108–103.465 |
+| RMSNorm/SwiGLU | 3 × 2,048 | 2.848–3.952 | 3.072–4.251 |
+| RMSNorm/SwiGLU | 96 × 128 | 2.120–2.944 | 1.925–2.645 |
+| RMSNorm/SwiGLU | 48 × 256 | 2.929–3.011 | 2.765–2.798 |
+| RMSNorm/SwiGLU | 1,536 × 2,048 | 93.553–97.751 | 95.126–102.502 |
+| RMSNorm/SwiGLU | 49,152 × 128 | 182.538–182.764 | 182.006–182.310 |
+| RMSNorm/SwiGLU | 24,576 × 256 | 182.564–182.740 | 182.191–182.402 |
 
-Decode RMSNorm gained **2.4–3.8%**; hidden-width prefill spread **−0.9% to
-+9.1%**, not a stable win. Fused GDN normalization gained **9.8–11.0%** at
-96 × 128, about 0.26 us per GDN layer or roughly 8 us across 30 layers against
-a 13.8 ms batch decode step, and **0.16–0.27%** at its prefill shape. Generic
-fused width 2,048 still loses.
+The wide ranges in two fused rows are a level shift between the two
+processes, not within-pair noise; the per-pair figures below are paired.
+Decode RMSNorm gained **0.6–5.6%** at the hidden and GDN-head widths and
+**−0.9% to +4.9%** at the attention-head width; hidden-width prefill gained
+**0.5–0.9%**. Fused GDN normalization gained **4.8–11.9%** at 96 × 128, about
+0.25 us per GDN layer against a 13.7 ms batch decode step, and **0.2–0.3%** at
+its prefill shape. Generic fused width 2,048 still loses: **6.5–7.9%** at
+three rows and **0.3–4.7%** at 1,536.
 
 Production `attn_rope_partial_neox` already reuses frequencies across 16
 tokens. Its Rust port keeps that and, in grids of at most 72 blocks (the SM
@@ -796,42 +807,32 @@ positions from 2,048, width 256 with 64 rotated dimensions:
 
 | RoPE API | Tokens × heads | NVRTC us/launch, min–max | Rust us/launch, min–max |
 | --- | ---: | ---: | ---: |
-| Standalone | 3 × 16 | 7.086–7.137 | 6.615–6.630 |
-| Standalone | 3 × 2 | 7.066–7.096 | 6.572–6.590 |
-| Standalone | 512 × 16 | 322.540–325.626 | 181.100–181.752 |
-| Standalone | 512 × 2 | 43.909–44.200 | 23.987–24.085 |
-| Standalone | 1,536 × 16 | 955.752–955.843 | 517.571–517.996 |
-| Standalone | 1,536 × 2 | 130.367–130.934 | 73.280–73.626 |
-| Production tiled | 3 × 16 | 6.697–6.717 | 6.199–6.223 |
-| Production tiled | 3 × 2 | 6.697–6.758 | 6.185–6.410 |
-| Production tiled | 512 × 16 | 66.801–66.990 | 67.261–67.372 |
-| Production tiled | 512 × 2 | 19.313–19.367 | 12.861–12.902 |
-| Production tiled | 1,536 × 16 | 209.058–210.680 | 211.395–213.299 |
-| Production tiled | 1,536 × 2 | 26.941–27.400 | 26.255–26.352 |
+| Standalone | 3 × 16 | 7.122–7.161 | 6.615–6.715 |
+| Standalone | 3 × 2 | 7.075–7.118 | 6.578–6.615 |
+| Standalone | 512 × 16 | 329.605–330.035 | 182.602–183.627 |
+| Standalone | 512 × 2 | 44.073–44.524 | 24.699–24.838 |
+| Standalone | 1,536 × 16 | 975.708–976.082 | 530.409–531.049 |
+| Standalone | 1,536 × 2 | 133.273–134.205 | 69.448–70.594 |
+| Production tiled | 3 × 16 | 6.846–6.881 | 6.325–6.356 |
+| Production tiled | 3 × 2 | 6.861–6.900 | 6.308–6.350 |
+| Production tiled | 512 × 16 | 67.836–68.032 | 68.362–68.457 |
+| Production tiled | 512 × 2 | 19.757–19.943 | 13.128–13.165 |
+| Production tiled | 1,536 × 16 | 213.198–215.337 | 212.992–215.812 |
+| Production tiled | 1,536 × 2 | 27.464–27.937 | 26.765–26.891 |
 
-Production key RoPE at 512 tokens gained **49.8–50.5%** (about **6.5 us** per
-call) while query RoPE was **0.4–0.8% slower**; at 1,536 tokens key gained
-**2.2–4.0%** and query lost **0.4–2.0%**. The three-token cases gained
-**4.8–8.9%**, but batched decode uses the fused rotary/append path.
+Production key RoPE at 512 tokens gained **50.3–51.5%** (about **6.7 us** per
+call) while query RoPE was **0.6–0.9% slower**; at 1,536 tokens key gained
+**2.4–3.9%** and query moved **−0.7% to +0.7%**. The three-token cases gained
+**8.0–9.0%**, but batched decode uses the fused rotary/append path.
 
 Softplus keeps libdevice exp/log and the `x > 20` guard; it is not on the
 production GDN gate path:
 
 | Softplus elements | NVRTC us/launch, min–max | Rust us/launch, min–max |
 | ---: | ---: | ---: |
-| 96 | 1.298–1.335 | 1.131–1.176 |
-| 49,152 | 1.597–1.611 | 1.393–1.413 |
-| 8,388,608 | 129.293–130.004 | 126.403–126.484 |
-
-All eight ports together:
-
-| Qwen3.6, N=3, 2K per sequence | CUDA C++ tok/s | Eight Rust ports tok/s | Rust change across pairs |
-| --- | --- | --- | --- |
-| Decode, 64 steps after 4 warmup | 217.8 / 217.7 / 216.9 | 217.7 / 217.6 / 217.0 | -0.05% / -0.05% / +0.05% |
-| Prefill, 1,536 total chunk rows, 5 timed repetitions | 3085.54 / 3065.17 / 3064.11 | 3074.83 / 3067.78 / 3061.60 | -0.35% / +0.09% / -0.08% |
-
-Prefill standard deviations: **7.78–9.42 tok/s** C++, **6.86–11.02** Rust. The
-kernel gains are a small fraction of the pass.
+| 96 | 1.310–1.478 | 1.136–1.167 |
+| 49,152 | 1.603–1.653 | 1.396–1.428 |
+| 8,388,608 | 128.328–129.497 | 126.150–126.465 |
 
 ## Compile-time formats free registers that ptxas then spends
 
@@ -1383,6 +1384,7 @@ Each row gives the decisive measurement and why it lost.
 | Alternating shared K/V buffers in prefill attention | Removes one barrier per 8-key tile; shared memory 13,952 → 22,272 B; all gates passed. Three GPU 1 N=3 pairs: 2K **−0.13 / +0.23 / −0.14%**, 8K **+0.04 / +0.02 / +0.05%**, inside 8K's 9.80–23.47 tok/s within-process SD. Fewer barriers bought no full-prefill throughput. Reverted; above 8K not measured. |
 | Applying two token groups to every Rust tiled RoPE grid | Six alternating GPU 1 pairs: splitting alternate tokens over idle rotary threads gains **51.2–51.6%** at 512 tokens × 2 heads but loses **5.0–5.2%** at 512 × 16, duplicating double-precision frequency work. Use two groups only at most 72 blocks (72 SMs); keep 16-token frequency reuse above that. |
 | Keeping the literal production tiled RoPE port's unused rotary threads | Six alternating GPU 1 pairs, 512-token chunk, 2 key heads: NVRTC **19.437–19.511 us**, Rust **20.400–20.426 us** (**4.5–4.7% lower throughput**). 64 blocks on 72 SMs, and half the rotary threads exit. Using that half is a separately gated layout change, not a benefit of translation. |
+| Updating cuda-oxide (0.2.1 `26754ae5` → 0.4.0 `f35d6ccc`) to speed up the Rust ports | Same source, both artifacts built with `rust-kernels`, three rotated rounds on GPU 0: N=3 decode **219.9 / 219.6 / 219.7 old vs 219.1 / 219.7 / 219.8 new** at 2K and **166.3 / 166.4 / 166.5 vs 166.2 / 160.8 (one stalled step) / 166.9** at 32K; 2,048-token prefill **3664.95 / 3653.32 / 3671.36 vs 3664.85 / 3673.64 / 3670.55**. The PTX differs by three instructions and four registers in total: the new unroller does not touch grid-stride loops. The update is kept for the supported toolchain (stable Rust 1.99.1, the `NVIDIA/cuda-rust` home), not for speed. `cutile-rs` in the same repository still excludes sm_75 and was not run. |
 | Promoting the optimized eight-port Rust bundle to the default backend | Three alternating Qwen3.6 GPU 1 N=3/2K pairs: **−0.05% to +0.05% decode**, **−0.35% to +0.09% prefill**, despite narrow wins for the fused GDN norm and key RoPE. Query RoPE and generic fused hidden-width normalization still lose narrow gates. `rust-kernels` stays opt-in. |
 | Removing a Rust RMSNorm barrier by repeating the serial warp-partial sum in every warp | Six alternating GPU 1 pairs vs NVRTC: hidden-width RMSNorm loses **11.4–12.7%** at 3 × 2,048 and **9.7–11.2%** at 1,536 × 2,048. Up to 32 repeated dependent additions per warp cost more than the barrier. Use a parallel second shuffle reduction, gated for its changed addition order. |
 | Literal `usize` column loops and a rolled warp sum in the Rust normalization port | Six alternating GPU 1 pairs: 24,576 × 256 **100.606–102.575 us NVRTC** vs **104.244–105.007 us Rust** (2.3–3.5% lower throughput); 49,152 × 128 **100.073–100.855** vs **101.102–101.683 us** (0.8–1.1%). Causes: 64-bit column counters where NVRTC uses 32-bit, and an un-unrolled warp-partial loop. Keep 32-bit counters; lower register counts did not predict throughput. |

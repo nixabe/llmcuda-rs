@@ -15,32 +15,35 @@ The design plan offered two options.
 | Option | For | Against |
 | --- | --- | --- |
 | `cudarc` + CUDA C++ via NVRTC | Stable on sm_75; JIT specialization at load; inline PTX always available | Two languages; kernel code outside Rust's type system |
-| NVlabs `cuda-oxide` | Single-source Rust; compile-time kernel policies; monomorphization; PTX interop with existing launchers | Alpha; separate pinned nightly; sm_75 needs an explicit target and workload validation |
-| NVlabs `cutile-rs` | Rust tile DSL; compiler-managed layout; stable Rust; graph replay | Explicitly excludes sm_75; cannot target the deployment cards |
+| NVIDIA `cuda-oxide` | Single-source Rust; compile-time kernel policies; monomorphization; PTX interop with existing launchers | Alpha; separate pinned toolchain and a CUDA 13 toolkit to compile; sm_75 needs an explicit target and workload validation |
+| NVIDIA `cutile-rs` | Rust tile DSL; compiler-managed layout; stable Rust; graph replay | Explicitly excludes sm_75; cannot target the deployment cards |
 
 The decision rule was explicit: any "no" on the inline-PTX question collapses
 the choice to cudarc, because without an escape hatch you cannot reach
 `mma.sync.m16n8k8.f16` or `ldmatrix`, and you cannot route around a codegen
 bug.
 
-**cuda-oxide is obtainable from NVlabs.** The original availability rejection
+**cuda-oxide is obtainable from NVIDIA** (`NVIDIA/cuda-rust`, which absorbed
+`NVlabs/cuda-oxide` and `NVlabs/cutile-rs`). The original availability rejection
 is obsolete. Do not confuse it with Protryon's older `cuda-oxide` driver
 wrapper. Availability alone does not validate a replacement kernel.
 
 ## Rust compiler evaluation
 
-Source revisions checked on 2026-09-10:
+Source revision checked on 2026-11-25: both compilers now live in one
+repository, [NVIDIA/cuda-rust `f35d6ccc`](https://github.com/NVIDIA/cuda-rust/tree/f35d6ccc2e03a54e73e3796f415f11313e439d50).
 
-- [cuda-oxide `26754ae5`](https://github.com/NVlabs/cuda-oxide/tree/26754ae52c26c097dc1c465a1e42c4c5d05a3d40)
-  declares version 0.2.1 and pins `nightly-2026-08-28`. Its installation guide
-  lists sm_80+, but `cargo-oxide/src/commands/codegen_env.rs` explicitly handles
+- `cuda-oxide/` declares version 0.4.0 and pins Rust 1.99.1 with `rustc-dev`
+  (no longer a nightly). Building its host crates needs a CUDA 13.0+ toolkit;
+  the generated PTX has no such requirement. Its installation guide lists
+  sm_80+, but `cargo-oxide/src/commands/codegen_env.rs` explicitly handles
   Turing and accepts `--arch sm_75`. Its `ptx_asm!` macro supplies an inline-PTX
-  escape hatch. The residual-add probe ran on sm_75; this does not establish
-  support or performance for all of our tensor-core kernels.
-- [cutile-rs `2eed75e8`](https://github.com/NVlabs/cutile-rs/tree/2eed75e8f552be31216ddf2019288f03dfec4939)
-  declares version 0.3.1. Its README explicitly excludes architectures below
-  sm_80, including sm_75, with no plan to support them. CUDA 13.2 adds Ampere
-  support; 13.3 adds Hopper. Neither makes Turing a supported target.
+  escape hatch. Eight layer kernels run on sm_75; this does not establish
+  support or performance for our tensor-core kernels.
+- `cutile-rs/` declares version 0.6.0. Its README still states that GPUs below
+  sm_80, naming sm_70 and sm_75, are unsupported. Its backend is CUDA Tile IR:
+  13.2 for Ampere, Ada and Blackwell, 13.3 for Hopper. Nothing in it can be
+  built for or run on the deployment cards, so it has never been measured here.
 
 The candidate in [`experiments/cuda-oxide`](../experiments/cuda-oxide) ports
 `layer_ops.rs::{tensor_add, swiglu_mul, sigmoid_gate_mul, rms_norm_rows,

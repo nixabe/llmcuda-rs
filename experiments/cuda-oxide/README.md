@@ -1,7 +1,10 @@
 # Rust layer kernels
 
-This standalone experiment compiles `src/main.rs` with NVlabs cuda-oxide
-`26754ae52c26c097dc1c465a1e42c4c5d05a3d40` (0.2.1, nightly-2026-08-28).
+This standalone experiment compiles `src/main.rs` with cuda-oxide from
+[NVIDIA/cuda-rust](https://github.com/NVIDIA/cuda-rust) at
+`f35d6ccc2e03a54e73e3796f415f11313e439d50` (0.4.0, Rust 1.99.1 with `rustc-dev`). The
+compiler used to live at `NVlabs/cuda-oxide`, which now redirects to that
+monorepo; cuda-oxide is its `cuda-oxide/` directory.
 The engine's single opt-in `rust-kernels` feature loads residual add,
 standalone SwiGLU, sigmoid gating, softplus, both partial RoPE APIs, RMSNorm and
 fused RMSNorm/SwiGLU through cudarc. The feature forwards from the server and
@@ -11,8 +14,8 @@ embedded PTX is generated code, not an independently maintained kernel.
 Install the matching compiler, with the CUDA 13 toolkit and libclang available:
 
 ```sh
-cargo +nightly-2026-08-28 install --git https://github.com/NVlabs/cuda-oxide \
-  --rev 26754ae52c26c097dc1c465a1e42c4c5d05a3d40 cargo-oxide
+cargo +1.99.1 install --git https://github.com/NVIDIA/cuda-rust \
+  --rev f35d6ccc2e03a54e73e3796f415f11313e439d50 cargo-oxide
 ```
 
 For a local compiler checkout, put its `target/debug` directory on `PATH` and
@@ -24,21 +27,24 @@ python3 experiments/cuda-oxide/regenerate.py
 git diff -- crates/llmcuda-cuda/src/kernels/rust/tensor_add.ptx
 ```
 
-On the target host, the build used these environment overrides (the isolated
-libclang wheel was installed with `python3 -m pip install --target
-/tmp/llmcuda-oxide-python libclang==18.1.1`):
+The compiler's host crates need a CUDA 13.0+ toolkit (headers including
+`crt/`, `libnvvm`, `libnvJitLink`); the engine itself still builds and runs
+against CUDA 12.8. On the target host, which has no system CUDA 13, the
+toolkit was assembled from NVIDIA's `cu13` pip wheels into one prefix and the
+build used these overrides (libclang from `pip install --target ... libclang`):
 
 ```sh
-export CUDA_HOME=/usr/local/cuda-13.0
-export CUDA_TOOLKIT_PATH=/usr/local/cuda-13.0
-export LIBCLANG_PATH=/tmp/llmcuda-oxide-python/clang/native
-export BINDGEN_EXTRA_CLANG_ARGS='-isystem /usr/lib/gcc/x86_64-linux-gnu/11/include -idirafter /usr/local/cuda-12.4/include'
+export CUDA_HOME=/path/to/cu13          # include/, lib64/, nvvm/, bin/
+export CUDA_TOOLKIT_PATH=$CUDA_HOME
+export PATH=$CUDA_HOME/bin:$PATH
+export LIBCLANG_PATH=/path/to/python/clang/native
+export BINDGEN_EXTRA_CLANG_ARGS='-isystem /usr/lib/gcc/x86_64-linux-gnu/13/include'
 ```
 
-The fallback include path supplies cuRAND headers missing from the minimal
-CUDA 13.0 installation. This kernel uses no cuRAND API. It still reads the
-CUDA 13.0 driver header first. The engine benchmark uses its ordinary CUDA
-12.4 NVRTC dependency for the baseline.
+`cargo oxide doctor` still warns about the clang resource directory with this
+layout; the build succeeds. A cached build does not re-emit the PTX, so touch
+`src/main.rs` if `llmcuda_rust_device.ptx` is missing. The engine benchmark
+uses its ordinary CUDA 12.8 NVRTC dependency for the baseline.
 
 Run outside the sandbox, with an idle GPU and no other builds or GPU work
 during timing:

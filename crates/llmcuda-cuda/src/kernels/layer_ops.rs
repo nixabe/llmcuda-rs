@@ -258,6 +258,66 @@ __global__ void rms_norm_swiglu_rows(
     }
 }
 
+// `rms_norm_swiglu_rows` handing its output straight to the integer tensor
+// cores.
+//
+// At prefill width the Gated DeltaNet's `final_output` has exactly one
+// reader, the output projection, and that projection reads it as int8 with a
+// scale per 32 elements (`mma_quantize_rows_q8`). The norm's row is
+// `head_dim` wide, a whole number of those 32-element blocks, and the block
+// here is one thread an element -- so each warp already holds one
+// quantization block in its lanes, and can reduce the absolute maximum and
+// round in place. `normed` and `out` are then never written as floats: two
+// 100 MB stores and the quantizer's 100 MB read back, per layer, at 6,138
+// tokens.
+//
+// Both halves are their own kernels' arithmetic, operand for operand: the
+// norm and the SwiGLU as `rms_norm_swiglu_rows` (one element a thread, so its
+// strided loops run once), the quantization as `mma_quantize_rows_q8`
+// (absmax by xor butterfly, `a / 127` and `127 / a`, `rintf`, clamp). The
+// quants and scales are bit-identical to the two-launch form
+// (`gdn_tail_differential`).
+//
+// grid: (rows,). block: `width`, which must be a multiple of 32 and at most
+// `MAX_BLOCK`; the launcher checks both.
+__global__ void rms_norm_swiglu_q8_rows(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ gate,
+    signed char* __restrict__ q,
+    float* __restrict__ scales,
+    int width,
+    float eps
+) {
+    extern __shared__ float scratch[];
+    long long base = (long long)blockIdx.x * width;
+    int j = threadIdx.x;
+
+    float v = x[base + j];
+    float partial = 0.0f;
+    partial += v * v;
+    float sum_sq = block_reduce_sum(partial, scratch);
+
+    float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);
+
+    float nv = v * inv_rms * weight[j];
+    float g = gate[base + j];
+    float o = (g / (1.0f + expf(-g))) * nv;
+
+    float a = fabsf(o);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off));
+
+    float d = a > 0.0f ? a / 127.0f : 1.0f;
+    float inv = a > 0.0f ? 127.0f / a : 0.0f;
+
+    int qi = (int)rintf(o * inv);
+    qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
+
+    q[base + j] = (signed char)qi;
+    if ((j & 31) == 0) scales[(base + j) >> 5] = d;
+}
+
 __global__ void swiglu_mul(
     const float* __restrict__ gate,
     const float* __restrict__ up,
@@ -664,6 +724,7 @@ impl GateShape {
 pub struct LayerOpsKernels {
     rms_norm: CudaFunction,
     rms_norm_swiglu: CudaFunction,
+    rms_norm_swiglu_q8: CudaFunction,
     rope: CudaFunction,
     swiglu: CudaFunction,
     sigmoid_gate: CudaFunction,
@@ -693,6 +754,7 @@ impl LayerOpsKernels {
         Ok(Self {
             rms_norm: migrated.load_function("rms_norm_rows")?,
             rms_norm_swiglu: migrated.load_function("rms_norm_swiglu_rows")?,
+            rms_norm_swiglu_q8: module.load_function("rms_norm_swiglu_q8_rows")?,
             rope: migrated.load_function("rope_partial")?,
             swiglu: migrated.load_function("swiglu_mul")?,
             sigmoid_gate: migrated.load_function("sigmoid_gate_mul")?,
@@ -755,6 +817,80 @@ impl LayerOpsKernels {
         // same `rows * width` and indexed by the same expression.
         unsafe { builder.launch(cfg) }?;
         Ok(())
+    }
+
+    /// [`Self::rms_norm_swiglu`] followed by
+    /// [`super::mma::MmaKernels::quantize_rows`], in one launch that writes
+    /// neither float intermediate.
+    ///
+    /// `q` receives `rows * width` int8 and `scales` one fp32 per 32 of them,
+    /// both laid out as the quantizer lays out `[rows * width / k][k]` for
+    /// any `k` that is a multiple of `width`: bit-identical to the two-launch
+    /// form. Both may be longer than this call fills.
+    ///
+    /// Returns `Ok(false)` without launching when `width` is not a whole
+    /// number of 32-element blocks that fit one thread block, which is the
+    /// shape the fusion needs; the caller then runs the two launches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_swiglu_quantize(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        gate: &CudaSlice<f32>,
+        q: &mut CudaSlice<i8>,
+        scales: &mut CudaSlice<f32>,
+        rows: usize,
+        width: usize,
+        eps: f32,
+    ) -> Result<bool, LayerOpsError> {
+        if width == 0 || !width.is_multiple_of(32) || width > MAX_BLOCK {
+            return Ok(false);
+        }
+        let n = rows * width;
+        check_len("rms_norm x", n, x.len())?;
+        check_len("rms_norm weight", width, weight.len())?;
+        check_len("swiglu gate", n, gate.len())?;
+        if q.len() < n {
+            return Err(LayerOpsError::ShapeMismatch {
+                what: "swiglu quants",
+                expected: n,
+                got: q.len(),
+            });
+        }
+        if scales.len() < n / 32 {
+            return Err(LayerOpsError::ShapeMismatch {
+                what: "swiglu scales",
+                expected: n / 32,
+                got: scales.len(),
+            });
+        }
+        if rows == 0 {
+            return Ok(true);
+        }
+
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (width as u32, 1, 1),
+            shared_mem_bytes: ((width / 32) * size_of::<f32>()) as u32,
+        };
+        let width_i32 = width as i32;
+        let mut builder = stream.launch_builder(&self.rms_norm_swiglu_q8);
+        builder
+            .arg(x)
+            .arg(weight)
+            .arg(gate)
+            .arg(&mut *q)
+            .arg(&mut *scales)
+            .arg(&width_i32)
+            .arg(&eps);
+        // SAFETY: one block per row and one thread per element, so every
+        // thread reads `x` and `gate` and writes `q` at `row * width + j`
+        // inside `rows * width`, and lane 0 of each warp writes `scales` at
+        // that index over 32; all five lengths were checked above. Shared
+        // memory covers one float per warp, all the reduction stores.
+        unsafe { builder.launch(cfg) }?;
+        Ok(true)
     }
 
     /// RMSNorm over `rows` independent rows of `width` elements each.

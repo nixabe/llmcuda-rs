@@ -2440,6 +2440,9 @@ pub struct GdnBlock {
     /// Whether a batched prefill folds the convolution, SiLU, split and q/k
     /// normalization into `gdn_scan_prelude`. See [`Self::set_fused_prelude`].
     fused_prelude: bool,
+    /// Whether the output norm quantizes for the output projection itself at
+    /// tensor-core width. See [`Self::set_fused_tail`].
+    fused_tail: bool,
     recurrent_scratch: GdnScratch,
     chunked_scratch: GdnChunkedScratch,
     proj_q8_0: CudaFunction,
@@ -2587,6 +2590,7 @@ impl GdnBlock {
             recurrent,
             chunked,
             fused_prelude: env_enabled("LLMCUDA_GDN_PRELUDE"),
+            fused_tail: env_enabled("LLMCUDA_GDN_TAIL"),
             recurrent_scratch,
             chunked_scratch,
             proj_q8_0: module.load_function("gdn_proj_q8_0")?,
@@ -2656,6 +2660,15 @@ impl GdnBlock {
     /// three-launch form is what the fused one is tested against.
     pub fn set_fused_prelude(&mut self, fused: bool) {
         self.fused_prelude = fused;
+    }
+
+    /// Choose whether, at tensor-core width, the output norm writes the
+    /// output projection's int8 operand directly (the default) or
+    /// `final_output` is written as floats and quantized by a second launch.
+    /// Same quants either way. With it on, `final_output` is not written at
+    /// that width.
+    pub fn set_fused_tail(&mut self, fused: bool) {
+        self.fused_tail = fused;
     }
 
     /// Choose between the folded scan kernel (the default) and the unfolded
@@ -2866,6 +2879,8 @@ impl GdnBlock {
     /// token does not write `conv_raw`, `conv_silu`, `q` or `k`: those four
     /// then hold whatever an earlier call left. Turn it off with
     /// [`Self::set_fused_prelude`] before a forward whose trace is read.
+    /// Likewise `final_output` at tensor-core width under
+    /// [`Self::set_fused_tail`].
     pub fn trace(&self) -> Option<GdnTrace<'_>> {
         let s = self.scratch.as_ref()?;
         Some(GdnTrace {
@@ -3398,19 +3413,27 @@ impl GdnBlock {
             }
         }
 
-        self.layer_ops.rms_norm_swiglu(
-            stream,
-            &s.core,
-            &w.ssm_norm,
-            &s.z,
-            &mut s.core_norm,
-            &mut s.final_output,
-            tokens * g.value_heads,
-            g.head_dim,
-            g.rms_eps,
-        )?;
+        // At tensor-core width the norm writes the output projection's int8
+        // operand itself and `core_norm` and `final_output` are not written:
+        // see `rms_norm_swiglu_q8_rows`.
+        let staged = tc.is_some() && self.norm_swiglu_staged(stream, w, s, tokens)?;
+        if !staged {
+            self.layer_ops.rms_norm_swiglu(
+                stream,
+                &s.core,
+                &w.ssm_norm,
+                &s.z,
+                &mut s.core_norm,
+                &mut s.final_output,
+                tokens * g.value_heads,
+                g.head_dim,
+                g.rms_eps,
+            )?;
+        }
         if let Some(i8w) = tc {
-            self.stage_activations(stream, &s.final_output, tokens, g.value_dim())?;
+            if !staged {
+                self.stage_activations(stream, &s.final_output, tokens, g.value_dim())?;
+            }
             self.project_staged(
                 stream,
                 &i8w.out_q,
@@ -4012,17 +4035,23 @@ impl GdnBlock {
         // 8. final_output-N = ssm_norm(core) * silu(z). One launch: the norm's
         //    grid is one block per head-row and the multiply is elementwise
         //    over the same rows, so it rides along in the norm's second pass.
-        self.layer_ops.rms_norm_swiglu(
-            stream,
-            &s.core,
-            &w.ssm_norm,
-            &s.z,
-            &mut s.core_norm,
-            &mut s.final_output,
-            tokens * g.value_heads,
-            g.head_dim,
-            g.rms_eps,
-        )?;
+        // At tensor-core width the norm writes the output projection's int8
+        // operand itself and `core_norm` and `final_output` are not written:
+        // see `rms_norm_swiglu_q8_rows`.
+        let staged = tc.is_some() && self.norm_swiglu_staged(stream, w, s, tokens)?;
+        if !staged {
+            self.layer_ops.rms_norm_swiglu(
+                stream,
+                &s.core,
+                &w.ssm_norm,
+                &s.z,
+                &mut s.core_norm,
+                &mut s.final_output,
+                tokens * g.value_heads,
+                g.head_dim,
+                g.rms_eps,
+            )?;
+        }
 
         // 9/10. linear_attn_out-N, then attn_residual-N.
         //
@@ -4030,7 +4059,9 @@ impl GdnBlock {
         // core output rather than the normed input — so it re-quantizes rather
         // than reusing what step 2 produced.
         if let Some(i8w) = tc {
-            self.stage_activations(stream, &s.final_output, tokens, g.value_dim())?;
+            if !staged {
+                self.stage_activations(stream, &s.final_output, tokens, g.value_dim())?;
+            }
             self.project_staged(
                 stream,
                 &i8w.out_q,
@@ -4097,10 +4128,10 @@ impl GdnBlock {
     /// runs, and the narrower call reuses the front of it. Sizing it to
     /// whichever call happens to come first would make the second call
     /// reallocate mid-pass, which `AGENTS.md` rule 6 forbids.
-    fn quantize_activations(
+    /// Make the int8 activation buffers hold at least `tokens * k_dim`.
+    fn ensure_xq(
         &mut self,
         stream: &Arc<CudaStream>,
-        x: &CudaSlice<f32>,
         tokens: usize,
         k_dim: usize,
     ) -> Result<(), GdnBlockError> {
@@ -4117,6 +4148,52 @@ impl GdnBlock {
                 stream.alloc_zeros::<f32>(widest / QK8_0)?,
             ));
         }
+        Ok(())
+    }
+
+    /// The output norm, its SwiGLU and the output projection's activation
+    /// quantization in one launch, when this block is set up for it.
+    ///
+    /// `Ok(true)` means the int8 operand [`Self::project_staged`] reads is
+    /// staged and `core_norm` and `final_output` were **not** written;
+    /// `Ok(false)` means nothing was launched and the caller runs the norm
+    /// and the staging itself. It stands down for the fp16 projection path,
+    /// whose operand is not int8, and when turned off
+    /// ([`Self::set_fused_tail`]).
+    fn norm_swiglu_staged(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        w: &GdnLayerWeights,
+        s: &Scratch,
+        tokens: usize,
+    ) -> Result<bool, GdnBlockError> {
+        if !self.fused_tail || self.half.is_some() {
+            return Ok(false);
+        }
+        let g = self.geometry;
+        self.ensure_xq(stream, tokens, g.value_dim())?;
+        let (q, sc) = self.xq.as_mut().expect("just allocated");
+        Ok(self.layer_ops.rms_norm_swiglu_quantize(
+            stream,
+            &s.core,
+            &w.ssm_norm,
+            &s.z,
+            q,
+            sc,
+            tokens * g.value_heads,
+            g.head_dim,
+            g.rms_eps,
+        )?)
+    }
+
+    fn quantize_activations(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        tokens: usize,
+        k_dim: usize,
+    ) -> Result<(), GdnBlockError> {
+        self.ensure_xq(stream, tokens, k_dim)?;
         let (q, sc) = self.xq.as_mut().expect("just allocated");
         // The buffers are sized for the widest projection this block runs and
         // reused by the narrower ones, so they are routinely longer than this

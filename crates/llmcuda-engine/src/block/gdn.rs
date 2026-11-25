@@ -2565,13 +2565,14 @@ impl GdnBlock {
             geometry.value_heads,
             geometry.qk_heads,
         )?;
-        let chunked = GdnChunkedKernels::new(
+        let mut chunked = GdnChunkedKernels::new(
             ctx,
             geometry.head_dim,
             geometry.value_heads,
             geometry.qk_heads,
             geometry.chunk_len,
         )?;
+        chunked.set_scan_fold(env_enabled("LLMCUDA_GDN_SCAN_FOLD"));
         let recurrent_scratch = recurrent.scratch(&stream)?;
         let chunked_scratch = chunked.scratch(&stream, geometry.max_tokens)?;
 
@@ -2644,6 +2645,12 @@ impl GdnBlock {
             xq: None,
             half: None,
         })
+    }
+
+    /// Choose between the folded scan kernel (the default) and the unfolded
+    /// one. Same bits either way.
+    pub fn set_scan_fold(&mut self, fold: bool) {
+        self.chunked.set_scan_fold(fold);
     }
 
     /// Run the prefill-width projections on the fp16 tensor cores instead of
@@ -4822,6 +4829,13 @@ impl GdnBlock {
 
 /// A fixed grid over a grid-stride loop, so the launch shape does not depend on
 /// a host-side length and stays capturable in a CUDA graph (AGENTS.md rule 5).
+/// A default-on switch: off only when the variable is exactly `0`. Read once,
+/// at construction, so `bench_forward`'s `LLMCUDA_BENCH_AB` can build one
+/// pass each way.
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name).as_deref() != Ok("0")
+}
+
 fn elementwise_cfg(n: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (

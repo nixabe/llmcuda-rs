@@ -428,6 +428,199 @@ __global__ void gdn_scan_prefill(
 }
 
 
+// `exp(log_decay)` for the whole pass, once.
+//
+// `gdn_scan_prefill` takes the exponential in every lane of every warp of a
+// head, on every token: `head_dim / SCAN_COLS` warps computing one scalar the
+// head shares. `gdn_scan_prefill_fold` reads it from here instead. The call
+// is the same `expf` on the same operand, so the decay is the same bits.
+//
+// grid: any. block: any.
+__global__ void gdn_scan_decay(
+    const float* __restrict__ log_decay,
+    float* __restrict__ decay,
+    long long n
+) {
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        decay[i] = expf(log_decay[i]);
+    }
+}
+
+// Four per-lane partial sums to four warp totals in six shuffles.
+//
+// A lane of the scan carries a partial for each of its warp's `SCAN_COLS`
+// columns, and reducing each across the warp on its own is five shuffles and
+// five adds a column. Nothing needs all four totals in every lane at the
+// *end* of the reduction, only somewhere: so the first exchange keeps two
+// columns in each half of the warp and sends the other two across, the second
+// keeps one in each quarter, and the last three reduce one value inside eight
+// lanes. Lane `l` finishes holding the total of column `l >> 3`.
+//
+// Each total is still the `16, 8, 4, 2, 1` xor tree over the same 32
+// partials, so it is the bits the column-by-column reduction produced:
+// only which lane ends up holding it changed.
+__device__ __forceinline__ float scan_fold4(float p0, float p1, float p2, float p3, int lane) {
+    bool half = (lane & 16) != 0;
+    float keep_a = half ? p2 : p0;
+    float keep_b = half ? p3 : p1;
+    float send_a = half ? p0 : p2;
+    float send_b = half ? p1 : p3;
+    keep_a += __shfl_xor_sync(0xffffffff, send_a, 16);
+    keep_b += __shfl_xor_sync(0xffffffff, send_b, 16);
+    bool quarter = (lane & 8) != 0;
+    float keep = quarter ? keep_b : keep_a;
+    float send = quarter ? keep_a : keep_b;
+    keep += __shfl_xor_sync(0xffffffff, send, 8);
+    keep += __shfl_xor_sync(0xffffffff, keep, 4);
+    keep += __shfl_xor_sync(0xffffffff, keep, 2);
+    keep += __shfl_xor_sync(0xffffffff, keep, 1);
+    return keep;
+}
+
+// `gdn_scan_prefill` with fewer instructions a token, and the same floats.
+//
+// The scan is a sequential walk with every warp resident, so what a token
+// costs is what a warp issues for it, and the arithmetic proper -- sixteen
+// state elements a lane, four operations each -- was a third of that. The
+// rest was two column-by-column warp reductions (forty shuffles and forty
+// adds) and an `expf` every lane took of a scalar its whole head shares.
+// Here the reductions fold (`scan_fold4`), the correction is computed in the
+// eight lanes that hold a column's prediction and handed to the rest in four
+// shuffles, and the decay arrives precomputed (`gdn_scan_decay`).
+//
+// Every float is produced by the operation that produced it in
+// `gdn_scan_prefill`, on the same operands, in the same order; the
+// differential test holds the two kernels to equal bits. `SCAN_COLS` is
+// four here by construction, not by tuning: the fold is written for it.
+//
+// grid, block and the sequence axis: as `gdn_scan_prefill`.
+__global__ void gdn_scan_prefill_fold(
+    unsigned long long s0, unsigned long long s1,
+    unsigned long long s2, unsigned long long s3,
+    unsigned long long s4, unsigned long long s5,
+    unsigned long long s6, unsigned long long s7,
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ decay_in,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    int head_dim,
+    int value_heads,
+    int qk_heads,
+    int seq_len
+) {
+    int h  = blockIdx.x;
+    int vi0 = (blockIdx.y * SCAN_WARPS + threadIdx.y) * SCAN_COLS;
+    if (vi0 >= head_dim) return;
+    int z = blockIdx.z;
+    float* state;
+    switch (z) {
+        case 0: state = (float*)s0; break;
+        case 1: state = (float*)s1; break;
+        case 2: state = (float*)s2; break;
+        case 3: state = (float*)s3; break;
+        case 4: state = (float*)s4; break;
+        case 5: state = (float*)s5; break;
+        case 6: state = (float*)s6; break;
+        default: state = (float*)s7; break;
+    }
+    int lane = threadIdx.x;
+    int nr = head_dim >> 5;
+    // The column whose totals this lane holds after a fold.
+    int col = lane >> 3;
+
+    // Modulo, not division. See `super::gdn`'s module docs.
+    int hq = h % qk_heads;
+
+    // Everything a token reads, as pointers that advance by a stride.
+    const float* kp = k_norm + ((long long)z * seq_len * qk_heads + hq) * head_dim + lane;
+    const float* qp = q_norm + ((long long)z * seq_len * qk_heads + hq) * head_dim + lane;
+    const float* vp = v + ((long long)z * seq_len * value_heads + h) * head_dim + vi0 + col;
+    const float* dp = decay_in + (long long)z * seq_len * value_heads + h;
+    const float* bp = beta + (long long)z * seq_len * value_heads + h;
+    float*       op = out + ((long long)z * seq_len * value_heads + h) * head_dim + vi0 + col;
+    long long qk_stride = (long long)qk_heads * head_dim;
+    long long v_stride  = (long long)value_heads * head_dim;
+
+    float sreg[SCAN_COLS][SCAN_MAXR];
+    #pragma unroll
+    for (int c = 0; c < SCAN_COLS; ++c) {
+        long long sbase = ((long long)h * head_dim + vi0 + c) * head_dim;
+        #pragma unroll
+        for (int r = 0; r < SCAN_MAXR; ++r) {
+            sreg[c][r] = (r < nr) ? state[sbase + r * 32 + lane] : 0.0f;
+        }
+    }
+
+    for (int t = 0; t < seq_len; ++t) {
+        float kj[SCAN_MAXR], qj[SCAN_MAXR];
+        #pragma unroll
+        for (int r = 0; r < SCAN_MAXR; ++r) {
+            if (r < nr) {
+                kj[r] = kp[r * 32];
+                qj[r] = qp[r * 32];
+            } else {
+                kj[r] = 0.0f;
+                qj[r] = 0.0f;
+            }
+        }
+        float decay = *dp;
+
+        // 1. Decay, held in registers rather than written and re-read.
+        // 2. Delta correction against the *decayed* state.
+        float predicted[SCAN_COLS] = {};
+        #pragma unroll
+        for (int c = 0; c < SCAN_COLS; ++c) {
+            #pragma unroll
+            for (int r = 0; r < SCAN_MAXR; ++r) {
+                sreg[c][r] *= decay;
+                predicted[c] += sreg[c][r] * kj[r];
+            }
+        }
+        float pred = scan_fold4(predicted[0], predicted[1], predicted[2], predicted[3], lane);
+        float mine = (*bp) * (*vp - pred);
+        float vcorr[SCAN_COLS];
+        #pragma unroll
+        for (int c = 0; c < SCAN_COLS; ++c) {
+            vcorr[c] = __shfl_sync(0xffffffff, mine, c * 8);
+        }
+
+        // 3. Outer-product update, and 4. the output from the *updated* state,
+        //    in one pass: the freshly written state is consumed for the output
+        //    while it is still in the register.
+        float o[SCAN_COLS] = {};
+        #pragma unroll
+        for (int c = 0; c < SCAN_COLS; ++c) {
+            #pragma unroll
+            for (int r = 0; r < SCAN_MAXR; ++r) {
+                sreg[c][r] += vcorr[c] * kj[r];
+                o[c] += sreg[c][r] * qj[r];
+            }
+        }
+        float total = scan_fold4(o[0], o[1], o[2], o[3], lane);
+        if ((lane & 7) == 0) *op = total;
+
+        kp += qk_stride;
+        qp += qk_stride;
+        vp += v_stride;
+        op += v_stride;
+        dp += value_heads;
+        bp += value_heads;
+    }
+
+    #pragma unroll
+    for (int c = 0; c < SCAN_COLS; ++c) {
+        long long sbase = ((long long)h * head_dim + vi0 + c) * head_dim;
+        #pragma unroll
+        for (int r = 0; r < SCAN_MAXR; ++r) {
+            if (r < nr) state[sbase + r * 32 + lane] = sreg[c][r];
+        }
+    }
+}
+
+
 // The two intra-chunk Gram matrices, per query/key head:
 //
 //   kk[hq][t][i] = k_i . k_t      (the delta rule's key interference)
@@ -1044,6 +1237,8 @@ pub struct GdnChunkedScratch {
     uprime: CudaSlice<f32>,
     /// `[value_heads]`, `exp(gcum[c-1])` for the chunk just solved.
     lambda_last: CudaSlice<f32>,
+    /// `[max_seq_len][value_heads]`, `exp(log_decay)` for the folded scan.
+    decay: CudaSlice<f32>,
     max_seq_len: usize,
 }
 
@@ -1062,6 +1257,10 @@ pub struct GdnChunkedKernels {
     solve: CudaFunction,
     state_update: CudaFunction,
     scan: CudaFunction,
+    scan_fold: CudaFunction,
+    scan_decay: CudaFunction,
+    /// Whether [`Self::scan_batch_raw`] launches `gdn_scan_prefill_fold`.
+    fold: bool,
     head_dim: usize,
     value_heads: usize,
     qk_heads: usize,
@@ -1113,11 +1312,26 @@ impl GdnChunkedKernels {
             solve: module.load_function("gdn_chunk_solve_and_apply")?,
             state_update: module.load_function("gdn_chunk_state_update")?,
             scan: module.load_function("gdn_scan_prefill")?,
+            scan_fold: module.load_function("gdn_scan_prefill_fold")?,
+            scan_decay: module.load_function("gdn_scan_decay")?,
+            fold: true,
             head_dim,
             value_heads,
             qk_heads,
             chunk_len,
         })
+    }
+
+    /// Choose between `gdn_scan_prefill_fold` (the default) and
+    /// `gdn_scan_prefill`. They produce the same bits; the second is kept as
+    /// the kernel the first is measured and tested against.
+    pub fn set_scan_fold(&mut self, fold: bool) {
+        self.fold = fold;
+    }
+
+    /// Whether the scan launches the folded kernel.
+    pub fn scan_fold(&self) -> bool {
+        self.fold
     }
 
     /// How many value heads share each query/key head.
@@ -1162,6 +1376,7 @@ impl GdnChunkedKernels {
             oint: stream.alloc_zeros::<f32>(inter)?,
             uprime: stream.alloc_zeros::<f32>(inter)?,
             lambda_last: stream.alloc_zeros::<f32>(self.value_heads)?,
+            decay: stream.alloc_zeros::<f32>(max_seq_len * self.value_heads)?,
             max_seq_len,
         })
     }
@@ -1294,13 +1509,57 @@ impl GdnChunkedKernels {
             });
         }
 
-        let head_dim = self.head_dim as i32;
-        let value_heads = self.value_heads as i32;
-        let qk_heads = self.qk_heads as i32;
-
         // The flattened buffers are contiguous over `n * seq_len` tokens, so
         // one normalization pass covers every sequence.
         self.normalize_sequence(stream, scratch, q, k, total)?;
+        if self.fold {
+            let n = (total * self.value_heads) as i64;
+            let decay_cfg = LaunchConfig {
+                grid_dim: (
+                    (total * self.value_heads).div_ceil(256).min(4096) as u32,
+                    1,
+                    1,
+                ),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.scan_decay);
+            builder.arg(log_decay).arg(&mut scratch.decay).arg(&n);
+            // SAFETY: a grid-stride loop over `n = total * value_heads`
+            // elements; `log_decay` holds that many by this function's
+            // contract and `scratch.decay` holds `max_seq_len * value_heads`,
+            // which `total <= max_seq_len` above bounds.
+            unsafe { builder.launch(decay_cfg) }?;
+        }
+        // SAFETY: the caller's contract, passed through; the scratch was
+        // filled for these `n * seq_len` tokens just above.
+        unsafe { self.launch_scan(stream, scratch, states, v, log_decay, beta, out, seq_len) }
+    }
+
+    /// The scan launch itself, over a scratch already holding the normalized
+    /// q and k (and, for the folded kernel, the decay) of these tokens.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::scan_batch_raw`]; additionally the scratch must have been
+    /// filled for exactly these `states.len() * seq_len` tokens.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_scan(
+        &self,
+        stream: &Arc<CudaStream>,
+        scratch: &GdnChunkedScratch,
+        states: &[u64],
+        v: &CudaSlice<f32>,
+        log_decay: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        seq_len: usize,
+    ) -> Result<(), GdnChunkedError> {
+        const MAX_BATCH: usize = 8;
+        let n = states.len();
+        let head_dim = self.head_dim as i32;
+        let value_heads = self.value_heads as i32;
+        let qk_heads = self.qk_heads as i32;
 
         let mut slots = [states[0]; MAX_BATCH];
         slots[..n].copy_from_slice(states);
@@ -1314,15 +1573,21 @@ impl GdnChunkedKernels {
             shared_mem_bytes: 0,
         };
         let seq_i32 = seq_len as i32;
-        let mut builder = stream.launch_builder(&self.scan);
+        let mut builder = stream.launch_builder(if self.fold {
+            &self.scan_fold
+        } else {
+            &self.scan
+        });
         for slot in &slots {
             builder.arg(slot);
         }
+        builder.arg(&scratch.q_norm).arg(&scratch.k_norm).arg(v);
+        if self.fold {
+            builder.arg(&scratch.decay);
+        } else {
+            builder.arg(log_decay);
+        }
         builder
-            .arg(&scratch.q_norm)
-            .arg(&scratch.k_norm)
-            .arg(v)
-            .arg(log_decay)
             .arg(beta)
             .arg(&mut *out)
             .arg(&head_dim)
@@ -1682,21 +1947,72 @@ mod tests {
         // llama.cpp's fused op is `fastmodulo(h_idx, n_k_heads)` and its
         // fallback broadcasts with `ggml_repeat_4d`. See `super::gdn`.
         //
-        // Four, not three: `gdn_chunk_state_update` was split out of the solve
-        // and reads `k_norm` itself, and `gdn_scan_prefill` — the kernel a
-        // forward pass actually runs — makes the same choice independently of
-        // all three. Each can get it wrong the same way, and the failure mode
-        // is a model that still generates fluent text.
+        // Five, not three: `gdn_chunk_state_update` was split out of the solve
+        // and reads `k_norm` itself, and the two scans — `gdn_scan_prefill`
+        // and `gdn_scan_prefill_fold`, the kernel a forward pass actually
+        // runs — make the same choice independently of all three. Each can
+        // get it wrong the same way, and the failure mode is a model that
+        // still generates fluent text.
         assert_eq!(
             GDN_CHUNKED_SRC.matches("int hq = h % qk_heads;").count(),
-            4,
-            "gdn_scan_prefill, gdn_chunk_inter, gdn_chunk_solve_and_apply and \
-             gdn_chunk_state_update must all use modulo",
+            5,
+            "gdn_scan_prefill, gdn_scan_prefill_fold, gdn_chunk_inter, \
+             gdn_chunk_solve_and_apply and gdn_chunk_state_update must all use modulo",
         );
         assert!(
             !GDN_CHUNKED_SRC.contains("heads_per_kv"),
             "a kernel still takes the sharing ratio, which only division needs",
         );
+    }
+
+    /// The text of one kernel, from its signature to the next one's.
+    fn kernel_text(name: &str) -> &'static str {
+        let start = GDN_CHUNKED_SRC
+            .find(&format!("__global__ void {name}("))
+            .unwrap_or_else(|| panic!("{name} is not in the source"));
+        let rest = &GDN_CHUNKED_SRC[start + 1..];
+        let end = rest.find("__global__ void ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn the_folded_scan_keeps_the_unfolded_scans_arithmetic() {
+        // The fold may move which lane holds a total; it may not change an
+        // operation. These four lines are the scan's whole arithmetic and
+        // both kernels must spell them the same way, or the bit-identity the
+        // differential test measures is an accident of one input.
+        for line in [
+            "sreg[c][r] *= decay;",
+            "predicted[c] += sreg[c][r] * kj[r];",
+            "sreg[c][r] += vcorr[c] * kj[r];",
+            "o[c] += sreg[c][r] * qj[r];",
+        ] {
+            for kernel in ["gdn_scan_prefill", "gdn_scan_prefill_fold"] {
+                assert_eq!(
+                    kernel_text(kernel).matches(line).count(),
+                    1,
+                    "{kernel} must contain `{line}` exactly once",
+                );
+            }
+        }
+        // The decay is the same `expf`, hoisted out of the scan; the folded
+        // kernel must not take one of its own, fast or otherwise.
+        let fold = kernel_text("gdn_scan_prefill_fold");
+        assert!(!fold.contains("expf("), "the folded scan reads its decay");
+        assert!(kernel_text("gdn_scan_decay").contains("decay[i] = expf(log_decay[i]);"));
+        assert!(!GDN_CHUNKED_SRC.contains("__expf("));
+    }
+
+    #[test]
+    fn the_fold_is_written_for_four_columns() {
+        // `scan_fold4` takes four partials and leaves column `lane >> 3` in
+        // each lane; the folded scan broadcasts from lanes `c * 8` and stores
+        // from lanes `(lane & 7) == 0`. All of that is `SCAN_COLS == 4`.
+        assert_eq!(SCAN_COLS, 4);
+        let fold = kernel_text("gdn_scan_prefill_fold");
+        assert!(fold.contains("int col = lane >> 3;"));
+        assert!(fold.contains("vcorr[c] = __shfl_sync(0xffffffff, mine, c * 8);"));
+        assert!(fold.contains("if ((lane & 7) == 0) *op = total;"));
     }
 
     #[test]

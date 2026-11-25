@@ -739,9 +739,9 @@ pub struct LayerOpsKernels {
 
 impl LayerOpsKernels {
     /// Compile the CUDA C++ layer ops with NVRTC and load the Rust ones from
-    /// [`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX). Residual add and
-    /// elementwise sigmoid gating are Rust; with `rust-kernels`, so are SwiGLU,
-    /// per-row sigmoid gating, softplus, partial RoPE, RMSNorm and fused
+    /// [`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX). Residual add,
+    /// elementwise sigmoid gating and softplus are Rust; with `rust-kernels`,
+    /// so are SwiGLU, per-row sigmoid gating, partial RoPE, RMSNorm and fused
     /// RMSNorm/SwiGLU.
     /// All loading happens before hot-path launches or graph capture.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
@@ -761,7 +761,7 @@ impl LayerOpsKernels {
             sigmoid_gate: migrated.load_function("sigmoid_gate_mul")?,
             sigmoid_gate_elementwise: rust.load_function("sigmoid_gate_mul")?,
             add: rust.load_function("tensor_add")?,
-            softplus: migrated.load_function("softplus_elementwise")?,
+            softplus: rust.load_function("softplus_elementwise")?,
             conv1d: module.load_function("conv1d_causal_depthwise")?,
             conv1d_state: module.load_function("conv1d_update_state")?,
             conv1d_step: module.load_function("conv1d_step")?,

@@ -45,8 +45,8 @@ pub const TARGET_ARCH: &str = "compute_75";
 /// A kernel is launched from here by default only once it has passed its
 /// differential test and has not lost an interleaved pair against its CUDA
 /// C++ counterpart at any shape the model launches; the C++ source stays as
-/// the benchmark baseline. Default today: `tensor_add` and
-/// `sigmoid_gate_mul` in its elementwise shape.
+/// the benchmark baseline. Default today: `tensor_add`,
+/// `softplus_elementwise` and `sigmoid_gate_mul` in its elementwise shape.
 ///
 /// The file keeps its first kernel's name; it holds every Rust entry point.
 pub const RUST_KERNELS_PTX: &str = include_str!("rust/tensor_add.ptx");

@@ -110,6 +110,9 @@ const QUERY_TILE: usize = 8;
 /// dimension) triple to get one of 32 distinct values. A band hoists it out.
 const ROPE_TOKENS: u32 = 16;
 
+/// Largest RoPE grid, in blocks, launched on the Rust kernel.
+const RUST_ROPE_MAX_BLOCKS: u32 = 256;
+
 /// Head dimensions one lane reduces over, at most. Mirrors `ATTN_MAXD`.
 ///
 /// The query tile lives in registers as `qr[ATTN_QT][ATTN_MAXD]`, and an array
@@ -3349,6 +3352,7 @@ impl AttnDecodeScratch {
 pub struct AttentionKernels {
     split: CudaFunction,
     rope: CudaFunction,
+    rope_small: CudaFunction,
     rope_imrope: CudaFunction,
     flash: CudaFunction,
     flash_gqa: CudaFunction,
@@ -3491,15 +3495,15 @@ impl AttentionKernels {
         };
         let ptx = compile(&source, "attention").map_err(AttentionError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         #[cfg(feature = "rust-kernels")]
-        let migrated = ctx.load_module(cudarc::nvrtc::Ptx::from_src(include_str!(
-            "rust/tensor_add.ptx"
-        )))?;
+        let migrated = &rust;
         #[cfg(not(feature = "rust-kernels"))]
         let migrated = &module;
         Ok(Self {
             split: module.load_function("attn_split_query_gate")?,
             rope: migrated.load_function("attn_rope_partial_neox")?,
+            rope_small: rust.load_function("attn_rope_partial_neox")?,
             rope_imrope: module.load_function("attn_rope_partial_imrope")?,
             flash: module.load_function("attn_flash_causal")?,
             flash_gqa: module.load_function("attn_flash_causal_gqa")?,
@@ -4021,7 +4025,16 @@ impl AttentionKernels {
         let head_dim = self.head_dim as i32;
         let rope_dim_i = rope_dim as i32;
         let n_tokens_i = n_tokens as i32;
-        let mut builder = stream.launch_builder(&self.rope);
+        // Small grids go to the Rust kernel: it spreads a token band over the
+        // otherwise idle rotary threads when the grid fits the card's SMs, and
+        // measured faster up to a 192-block key grid. A 512-block query grid
+        // measured 0.6-0.9% slower, so wide grids stay CUDA C++.
+        let kernel = if cfg.grid_dim.0 * cfg.grid_dim.1 <= RUST_ROPE_MAX_BLOCKS {
+            &self.rope_small
+        } else {
+            &self.rope
+        };
+        let mut builder = stream.launch_builder(kernel);
         builder
             .arg(input)
             .arg(out)

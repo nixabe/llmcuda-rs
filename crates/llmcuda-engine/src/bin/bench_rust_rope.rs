@@ -181,6 +181,7 @@ fn main() -> Result<(), Error> {
                     positions.device_ptr(&stream).0,
                     out.device_ptr(&stream).0 + (guard * 4) as u64,
                 ];
+                let mut outputs: Vec<Vec<f32>> = Vec::new();
                 for (arm, kernel) in kernels.iter().enumerate() {
                     stream.memcpy_htod(&sentinel, &mut out)?;
                     launch(&stream, kernel, pointers, s)?;
@@ -192,7 +193,18 @@ fn main() -> Result<(), Error> {
                         ?s,
                         arm, guard, "CPU rotated-span and exact tail/guard gates passed"
                     );
+                    outputs.push(actual);
                 }
+                let differing = outputs[0]
+                    .iter()
+                    .zip(&outputs[1])
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                // Prefill rotates keys with one of these and decode appends
+                // them through the fused CUDA C++ path, so the two compilers
+                // must agree to the bit, not to a tolerance.
+                assert_eq!(differing, 0, "{s:?}: Rust and CUDA C++ outputs differ");
+                info!(?s, guard, n, "Rust is bit-identical to CUDA C++");
                 if guard != 4 || tokens == 5 || tokens == 17 {
                     continue;
                 }

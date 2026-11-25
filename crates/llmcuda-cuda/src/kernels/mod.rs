@@ -46,8 +46,8 @@ pub const TARGET_ARCH: &str = "compute_75";
 /// differential test and has not lost an interleaved pair against its CUDA
 /// C++ counterpart at any shape the model launches; the C++ source stays as
 /// the benchmark baseline. Default today: `tensor_add`,
-/// `softplus_elementwise`, `rope_partial` and `sigmoid_gate_mul` in its
-/// elementwise shape.
+/// `softplus_elementwise`, `rope_partial`, `sigmoid_gate_mul` in its
+/// elementwise shape and `attn_rope_partial_neox` on small grids.
 ///
 /// The file keeps its first kernel's name; it holds every Rust entry point.
 pub const RUST_KERNELS_PTX: &str = include_str!("rust/tensor_add.ptx");

@@ -728,6 +728,7 @@ pub struct LayerOpsKernels {
     rope: CudaFunction,
     swiglu: CudaFunction,
     sigmoid_gate: CudaFunction,
+    sigmoid_gate_elementwise: CudaFunction,
     add: CudaFunction,
     softplus: CudaFunction,
     conv1d: CudaFunction,
@@ -738,9 +739,10 @@ pub struct LayerOpsKernels {
 
 impl LayerOpsKernels {
     /// Compile the CUDA C++ layer ops with NVRTC and load the Rust ones from
-    /// [`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX). Residual add is Rust;
-    /// with `rust-kernels`, so are SwiGLU, sigmoid gating, softplus, partial
-    /// RoPE, RMSNorm and fused RMSNorm/SwiGLU.
+    /// [`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX). Residual add and
+    /// elementwise sigmoid gating are Rust; with `rust-kernels`, so are SwiGLU,
+    /// per-row sigmoid gating, softplus, partial RoPE, RMSNorm and fused
+    /// RMSNorm/SwiGLU.
     /// All loading happens before hot-path launches or graph capture.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
         let ptx = compile(LAYER_OPS_SRC, "layer_ops").map_err(LayerOpsError::Compile)?;
@@ -757,6 +759,7 @@ impl LayerOpsKernels {
             rope: migrated.load_function("rope_partial")?,
             swiglu: migrated.load_function("swiglu_mul")?,
             sigmoid_gate: migrated.load_function("sigmoid_gate_mul")?,
+            sigmoid_gate_elementwise: rust.load_function("sigmoid_gate_mul")?,
             add: rust.load_function("tensor_add")?,
             softplus: migrated.load_function("softplus_elementwise")?,
             conv1d: module.load_function("conv1d_causal_depthwise")?,
@@ -1089,7 +1092,13 @@ impl LayerOpsKernels {
         let n_i64 = n as i64;
         let width_i32 = width as i32;
         let broadcast_i32 = i32::from(shape == GateShape::PerRow);
-        let mut builder = stream.launch_builder(&self.sigmoid_gate);
+        // Elementwise gating is the Rust kernel; the per-row broadcast stays
+        // CUDA C++, where the Rust port loses at prefill sizes.
+        let kernel = match shape {
+            GateShape::Elementwise => &self.sigmoid_gate_elementwise,
+            GateShape::PerRow => &self.sigmoid_gate,
+        };
+        let mut builder = stream.launch_builder(kernel);
         builder
             .arg(x)
             .arg(gate)

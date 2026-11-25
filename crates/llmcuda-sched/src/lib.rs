@@ -20,6 +20,10 @@
 //! Start at [`config::SchedulerConfig`] for tunables and
 //! [`scheduler::Scheduler`] for the scheduler itself.
 
+// The scheduler holds no live cache, but its documentation links to the
+// pool it is paired with; this keeps those links resolving.
+use llmcuda_cache as _;
+
 pub mod config;
 pub mod error;
 pub mod ngram;

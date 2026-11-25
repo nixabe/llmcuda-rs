@@ -737,18 +737,17 @@ pub struct LayerOpsKernels {
 }
 
 impl LayerOpsKernels {
-    /// Compile layer ops with NVRTC. With `rust-kernels`, load residual add,
-    /// SwiGLU, sigmoid gating, softplus, partial RoPE, RMSNorm and fused
-    /// RMSNorm/SwiGLU from one
-    /// embedded Rust-generated module.
+    /// Compile the CUDA C++ layer ops with NVRTC and load the Rust ones from
+    /// [`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX). Residual add is Rust;
+    /// with `rust-kernels`, so are SwiGLU, sigmoid gating, softplus, partial
+    /// RoPE, RMSNorm and fused RMSNorm/SwiGLU.
     /// All loading happens before hot-path launches or graph capture.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
         let ptx = compile(LAYER_OPS_SRC, "layer_ops").map_err(LayerOpsError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         #[cfg(feature = "rust-kernels")]
-        let migrated = ctx.load_module(cudarc::nvrtc::Ptx::from_src(include_str!(
-            "rust/tensor_add.ptx"
-        )))?;
+        let migrated = &rust;
         #[cfg(not(feature = "rust-kernels"))]
         let migrated = &module;
         Ok(Self {
@@ -758,7 +757,7 @@ impl LayerOpsKernels {
             rope: migrated.load_function("rope_partial")?,
             swiglu: migrated.load_function("swiglu_mul")?,
             sigmoid_gate: migrated.load_function("sigmoid_gate_mul")?,
-            add: migrated.load_function("tensor_add")?,
+            add: rust.load_function("tensor_add")?,
             softplus: migrated.load_function("softplus_elementwise")?,
             conv1d: module.load_function("conv1d_causal_depthwise")?,
             conv1d_state: module.load_function("conv1d_update_state")?,

@@ -909,10 +909,10 @@ ATTN_FLASH(attn_flash_causal, ATTN_QT)
 #define MMA_VSTRIDE (4 + 8 * (((MMA_KT / 2) - 4 + 7) / 8))
 // Value-staging loads issued before the first store. See the staging loop.
 #define MMA_VB 2
-// Prefetch registers per thread, sized for the largest geometry the dispatch
-// admits (head_dim 256, so `kw4` is at most 32 and a block is 256 threads).
-// Both must be compile-time bounds or the arrays spill to local memory.
-#define MMA_KREG ((MMA_KT * 32 + 255) / 256)
+// Value prefetch batches per thread and column. The key prefetch count and
+// the columns a thread stages depend on the block's width, so the kernel body
+// derives them from its template arguments. All are compile-time bounds or
+// the arrays spill to local memory.
 #define MMA_VREG ((MMA_KT / 2) / MMA_VB)
 
 // Fragment ownership below requires one warp per head and one key octet.
@@ -1101,8 +1101,14 @@ __device__ void attn_flash_causal_mma_body(
     // unroll` over a fixed bound with the real trip count as a predicate rather
     // than as the bound.
     int kw4 = hd2 >> 2;                              // uint4s per key row
-    uint4 kreg[MMA_KREG];
-    unsigned short vlo[MMA_VREG][MMA_VB], vhi[MMA_VREG][MMA_VB];
+    // A block is `32 * HPB` threads and stages `MMA_KT` key rows of at most
+    // `MAXT` uint4s and at most `8 * MAXT` value columns. At eight heads a
+    // block that is one request and one column a thread; at four heads and
+    // head_dim 256 it is two of each, which is what these bounds say.
+    const int KREGN = (MMA_KT * MAXT + 32 * HPB - 1) / (32 * HPB);
+    const int VCOLS = (8 * MAXT + 32 * HPB - 1) / (32 * HPB);
+    uint4 kreg[KREGN];
+    unsigned short vlo[VCOLS][MMA_VREG][MMA_VB], vhi[VCOLS][MMA_VREG][MMA_VB];
 
     // K in the B layout of Q K^T, [key][dim/2]: dimensions 2c and 2c+1 of one
     // key are already adjacent binary16 in the cache, which is exactly the B
@@ -1117,7 +1123,7 @@ __device__ void attn_flash_causal_mma_body(
 #define MMA_PREFETCH(jj)                                                       \
     do {                                                                       \
         _Pragma("unroll")                                                      \
-        for (int i = 0; i < MMA_KREG; ++i) {                                   \
+        for (int i = 0; i < KREGN; ++i) {                                      \
             int t = tid + i * nthr;                                            \
             kreg[i] = make_uint4(0u, 0u, 0u, 0u);                              \
             if (t < MMA_KT * kw4) {                                            \
@@ -1132,16 +1138,20 @@ __device__ void attn_flash_causal_mma_body(
             }                                                                  \
         }                                                                      \
         _Pragma("unroll")                                                      \
-        for (int i = 0; i < MMA_VREG; ++i) {                                   \
-            int kk0 = vk0 + i * vkstep;                                        \
-            bool ok = vactive && kk0 < (MMA_KT >> 1);                          \
+        for (int c = 0; c < VCOLS; ++c) {                                      \
+            bool col = vd_col + c * nthr < head_dim;                           \
             _Pragma("unroll")                                                  \
-            for (int u = 0; u < MMA_VB; ++u) {                                 \
-                long long k0 = (jj) + 2 * (kk0 + u);                           \
-                vlo[i][u] = (ok && k0 < n_visible)                             \
-                                ? vd[k0 * vrow] : (unsigned short)0;           \
-                vhi[i][u] = (ok && k0 + 1 < n_visible)                         \
-                                ? vd[(k0 + 1) * vrow] : (unsigned short)0;     \
+            for (int i = 0; i < MMA_VREG; ++i) {                               \
+                int kk0 = vk0 + i * vkstep;                                    \
+                bool ok = col && vactive && kk0 < (MMA_KT >> 1);               \
+                _Pragma("unroll")                                              \
+                for (int u = 0; u < MMA_VB; ++u) {                             \
+                    long long k0 = (jj) + 2 * (kk0 + u);                       \
+                    vlo[c][i][u] = (ok && k0 < n_visible)                      \
+                        ? vd[k0 * vrow + c * nthr] : (unsigned short)0;        \
+                    vhi[c][i][u] = (ok && k0 + 1 < n_visible)                  \
+                        ? vd[(k0 + 1) * vrow + c * nthr] : (unsigned short)0;  \
+                }                                                              \
             }                                                                  \
         }                                                                      \
     } while (0)
@@ -1155,7 +1165,7 @@ __device__ void attn_flash_causal_mma_body(
         // 16-byte aligned; a 128-bit shared store is serviced in quarter-warp
         // phases, so the eight lanes of a phase cover all 32 banks.
         #pragma unroll
-        for (int i = 0; i < MMA_KREG; ++i) {
+        for (int i = 0; i < KREGN; ++i) {
             int t = tid + i * nthr;
             if (t < MMA_KT * kw4) {
                 int r = t / kw4;
@@ -1163,13 +1173,18 @@ __device__ void attn_flash_causal_mma_body(
             }
         }
         #pragma unroll
-        for (int i = 0; i < MMA_VREG; ++i) {
-            int kk0 = vk0 + i * vkstep;
-            if (vactive && kk0 < (MMA_KT >> 1)) {
-                #pragma unroll
-                for (int u = 0; u < MMA_VB; ++u) {
-                    v_sh[vd_col * vstride + kk0 + u] =
-                        (unsigned)vlo[i][u] | ((unsigned)vhi[i][u] << 16);
+        for (int c = 0; c < VCOLS; ++c) {
+            #pragma unroll
+            for (int i = 0; i < MMA_VREG; ++i) {
+                int kk0 = vk0 + i * vkstep;
+                if (vd_col + c * nthr < head_dim && vactive
+                    && kk0 < (MMA_KT >> 1)) {
+                    #pragma unroll
+                    for (int u = 0; u < MMA_VB; ++u) {
+                        v_sh[(vd_col + c * nthr) * vstride + kk0 + u] =
+                            (unsigned)vlo[c][i][u]
+                            | ((unsigned)vhi[c][i][u] << 16);
+                    }
                 }
             }
         }
@@ -1256,6 +1271,10 @@ __device__ void attn_flash_causal_mma_body(
 
 extern "C" {
 __global__ void attn_flash_causal_mma(const float* q,const unsigned short* k,const unsigned short* v,float* out,int q_heads,int kv_heads,int head_dim,const int* key_offset,float scale,int n_query){attn_flash_causal_mma_body<false,8,32>(q,k,v,out,q_heads,kv_heads,head_dim,key_offset,scale,n_query);}
+// Four query heads a KV head (Qwen3.5-9B and Clef, 16 over 4) at head_dim
+// 256: the same body in a four-warp block, each thread staging two key
+// requests and two value columns a tile.
+__global__ void attn_flash_causal_mma_h4(const float* q,const unsigned short* k,const unsigned short* v,float* out,int q_heads,int kv_heads,int head_dim,const int* key_offset,float scale,int n_query){attn_flash_causal_mma_body<false,4,32>(q,k,v,out,q_heads,kv_heads,head_dim,key_offset,scale,n_query);}
 __global__ void attn_flash_causal_mma_k2(const float* q,const unsigned short* k,const unsigned short* v,float* out,int q_heads,int kv_heads,int head_dim,const int* key_offset,float scale,int n_query){attn_flash_causal_mma_body<true,4,16>(q,k,v,out,q_heads,kv_heads,head_dim,key_offset,scale,n_query);}
 // K2 prefill: two 16-query tiles of one KV head's four query heads share each
 // staged run of 32 keys, so a barrier pair covers four key octets instead of
@@ -3336,6 +3355,12 @@ pub struct AttentionKernels {
     /// `attn_row_positions`, for the row-at-a-time decode path.
     row_positions: CudaFunction,
     flash_mma: CudaFunction,
+    /// `attn_flash_causal_mma_h4`: the same body in a four-head block, for
+    /// the geometries with four query heads a KV head.
+    flash_mma_h4: CudaFunction,
+    /// Whether the four-head block may be dispatched. On unless
+    /// `LLMCUDA_ATTN_MMA_H4=0`, which restores the fp32 GQA kernel for A/B.
+    mma_h4: bool,
     flash_mma_k2: CudaFunction,
     flash_mma_k2s: CudaFunction,
     decode_split: CudaFunction,
@@ -3490,6 +3515,15 @@ impl AttentionKernels {
                 )?;
                 f
             },
+            flash_mma_h4: {
+                let f = module.load_function("attn_flash_causal_mma_h4")?;
+                f.set_attribute(
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    MMA_SHARED_CEILING as i32,
+                )?;
+                f
+            },
+            mma_h4: std::env::var("LLMCUDA_ATTN_MMA_H4").as_deref() != Ok("0"),
             decode_mma_k2_batch_wpo2: module
                 .load_function("attn_flash_decode_mma_k2_batch_wpo2")?,
             decode_mma_k2_batch_wpo4: module
@@ -3721,12 +3755,33 @@ impl AttentionKernels {
     /// serves have to share a KV head — and the staged tiles must fit the
     /// carveout the function opts in to.
     fn mma_is_available(&self) -> bool {
+        self.mma_heads_per_block().is_some()
+    }
+
+    /// Query heads one block of the tensor-core prefill kernel serves at this
+    /// geometry, or `None` where it cannot run.
+    ///
+    /// Eight where a KV head has a multiple of eight query heads
+    /// ([`MMA_HEADS_PER_BLOCK`], Qwen3.6-35B-A3B). Four where it has a
+    /// multiple of four at head_dim 256 (Qwen3.5-9B and Clef, 16 over 4):
+    /// the same kernel body in a four-warp block. Head_dim 128 with four is
+    /// K2's, which has its own compensated kernels and is left on them.
+    fn mma_heads_per_block(&self) -> Option<usize> {
         let per_warp = 8 * MMA_WARPS_PER_HEAD;
-        self.head_dim.is_multiple_of(per_warp)
+        let fits = self.head_dim.is_multiple_of(per_warp)
             && self.head_dim / per_warp <= MMA_MAX_TILES
-            && self.gqa_ratio().is_multiple_of(MMA_HEADS_PER_BLOCK)
-            && self.q_heads.is_multiple_of(MMA_HEADS_PER_BLOCK)
-            && self.shared_bytes_mma() <= MMA_SHARED_CEILING
+            && self.shared_bytes_mma() <= MMA_SHARED_CEILING;
+        let serves =
+            |hpb: usize| self.gqa_ratio().is_multiple_of(hpb) && self.q_heads.is_multiple_of(hpb);
+        if !fits {
+            None
+        } else if serves(MMA_HEADS_PER_BLOCK) {
+            Some(MMA_HEADS_PER_BLOCK)
+        } else if self.mma_h4 && self.head_dim == 256 && serves(MMA_HEADS_PER_BLOCK / 2) {
+            Some(MMA_HEADS_PER_BLOCK / 2)
+        } else {
+            None
+        }
     }
 
     /// Whether [`Self::forward`] will take the tensor-core path at this query
@@ -3789,7 +3844,8 @@ impl AttentionKernels {
         } else if n_query < GQA_QUERY_TILE {
             n_query * self.q_heads
         } else if self.uses_tensor_cores(n_query) {
-            n_query.div_ceil(MMA_QUERY_TILE) * (self.q_heads / MMA_HEADS_PER_BLOCK)
+            let hpb = self.mma_heads_per_block().expect("uses_tensor_cores");
+            n_query.div_ceil(MMA_QUERY_TILE) * (self.q_heads / hpb)
         } else if self.gqa_shared_is_available() {
             n_query.div_ceil(GQA_QUERY_TILE) * self.kv_heads
         } else {
@@ -4244,15 +4300,23 @@ impl AttentionKernels {
                 self.head_dim as u32,
                 self.shared_bytes_t1(),
             )
-        } else if n_query >= MMA_QUERY_TILE && self.mma_is_available() {
+        } else if let Some(hpb) = self
+            .mma_heads_per_block()
+            .filter(|_| n_query >= MMA_QUERY_TILE)
+        {
+            // One warp a head, so the block is as wide as its heads.
             (
-                &self.flash_mma,
+                if hpb == MMA_HEADS_PER_BLOCK {
+                    &self.flash_mma
+                } else {
+                    &self.flash_mma_h4
+                },
                 (
                     (n_query as u32).div_ceil(MMA_QUERY_TILE as u32),
-                    (self.q_heads / MMA_HEADS_PER_BLOCK) as u32,
+                    (self.q_heads / hpb) as u32,
                     1,
                 ),
-                256,
+                (32 * hpb) as u32,
                 self.shared_bytes_mma(),
             )
         } else if self.gqa_shared_is_available() {

@@ -1656,3 +1656,79 @@ fn k2_batch_decode_keeps_each_sequences_window_and_split_order() {
         }
     }
 }
+
+// --------------------------------------------------------------------------
+// Four query heads a KV head at head_dim 256 (Qwen3.5-9B and Clef): the
+// tensor-core body in a four-warp block.
+// --------------------------------------------------------------------------
+
+/// The four-head block against the CPU reference, at prefill depths ragged
+/// against its 8-key tile and its 16-query tile, from an empty cache and on
+/// top of a cached prefix.
+///
+/// A block is four warps here, half the eight-head block, so each thread
+/// stages two key requests and two value columns a tile. A missed column or
+/// request leaves part of a staged tile stale, which shows as an error far
+/// outside the fp16 operand gate on the heads and dimensions that read it,
+/// so every head is compared at every depth.
+#[test]
+fn four_heads_a_kv_head_take_the_tensor_cores_and_match_the_reference() {
+    let Some(ctx) = setup() else { return };
+    let (q_heads, kv_heads, head_dim) = (16usize, 4usize, 256usize);
+    let stream = ctx.default_stream();
+    let kernels =
+        AttentionKernels::new(&ctx, q_heads, kv_heads, head_dim).expect("kernels compile");
+    if std::env::var("LLMCUDA_ATTN_MMA_H4").as_deref() == Ok("0") {
+        println!("SKIPPED: LLMCUDA_ATTN_MMA_H4=0 turns the four-head block off");
+        return;
+    }
+    assert!(
+        kernels.uses_tensor_cores(16),
+        "16 query heads over 4 KV heads at head_dim 256 must take the tensor cores"
+    );
+    assert_eq!(
+        kernels.blocks_per_launch(64),
+        4 * 4,
+        "four 16-query tiles by four head groups"
+    );
+
+    let mut rng = Xorshift64Star::new(0x0A77_4EAD);
+    // (cached keys, queries): 16 is one query tile, the rest are ragged.
+    const CASES: [(usize, usize); 6] = [(0, 16), (0, 33), (0, 129), (0, 511), (0, 1003), (300, 77)];
+    for (offset, n_query) in CASES {
+        let n_keys = offset + n_query;
+        // The reference needs the whole sequence; only the tail is launched.
+        let q_full: Vec<f32> = rng.vec_f32(n_keys * q_heads * head_dim, -1.0, 1.0);
+        let k = as_cached(&rng.vec_f32(n_keys * kv_heads * head_dim, -1.0, 1.0));
+        let v = as_cached(&rng.vec_f32(n_keys * kv_heads * head_dim, -1.0, 1.0));
+        let q_block = &q_full[offset * q_heads * head_dim..];
+        let device = run_device(
+            &stream, &kernels, q_block, &k, &v, n_query, n_keys, offset, q_heads, head_dim,
+        );
+
+        let mut worst_abs = 0.0f32;
+        let mut worst_cos = 1.0f32;
+        for h in 0..q_heads {
+            let kvh = kv_head_for_query_head(h as u32, q_heads as u32, kv_heads as u32) as usize;
+            let q_h = head_rows(&q_full, n_keys, q_heads, head_dim, h);
+            let k_h = head_rows(&k, n_keys, kv_heads, head_dim, kvh);
+            let v_h = head_rows(&v, n_keys, kv_heads, head_dim, kvh);
+            let full = causal_attention_streaming(&q_h, &k_h, &v_h);
+            let reference: Vec<f32> = full[offset..].iter().flatten().copied().collect();
+            let candidate: Vec<f32> = (0..n_query)
+                .flat_map(|t| {
+                    let base = (t * q_heads + h) * head_dim;
+                    device[base..base + head_dim].to_vec()
+                })
+                .collect();
+            let result = compare(&candidate, &reference);
+            worst_abs = worst_abs.max(result.max_abs_error);
+            worst_cos = worst_cos.min(result.cosine_similarity);
+            assert_matches(&candidate, &reference, &MMA_GATE);
+        }
+        println!(
+            "cached {offset:4} + {n_query:4} queries x {q_heads} heads: max_abs={worst_abs:.3e} \
+             cosine={worst_cos:.9}"
+        );
+    }
+}

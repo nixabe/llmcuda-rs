@@ -31,6 +31,7 @@ llmcuda-sched = { path = "crates/llmcuda-sched" }
 llmcuda-kernels = { path = "crates/llmcuda-kernels" }
 llmcuda-log = { path = "crates/llmcuda-log" }
 llmcuda-cuda = { path = "crates/llmcuda-cuda" }
+llmcuda-trt = { path = "crates/llmcuda-trt" }
 llmcuda-grammar = { path = "crates/llmcuda-grammar" }
 llmcuda-engine = { path = "crates/llmcuda-engine" }
 

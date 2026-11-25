@@ -1252,6 +1252,7 @@ dependencies = [
  "llmcuda-log",
  "llmcuda-model",
  "llmcuda-sched",
+ "llmcuda-trt",
  "parking_lot",
  "rustc-hash",
  "smallvec",

@@ -274,27 +274,102 @@ fn u2(env: &Env) -> Result<CheckOutcome, Error> {
     Ok(answer(&notes, "builds"))
 }
 
-/// U3: the same with Q4_0's 4-bit codes. TensorRT's INT4 packs two codes
-/// per byte; the nibble order is not in the headers, so both are tried and
-/// the one that matches the reference is reported.
+/// Two signed 4-bit codes per byte, in either nibble order. TensorRT's
+/// order is not in its headers, so a probe that builds tries both and keeps
+/// the one that matches its reference.
+fn pack_int4(codes: &[i8], low_first: bool) -> Vec<u8> {
+    codes
+        .chunks(2)
+        .map(|p| {
+            let (lo, hi) = (p[0] as u8 & 0x0F, p.get(1).map_or(0, |&v| v as u8 & 0x0F));
+            if low_first {
+                lo | hi << 4
+            } else {
+                hi | lo << 4
+            }
+        })
+        .collect()
+}
+
+/// INT4 with one fp16 scale per output channel and no blocks: the INT4
+/// weight-only form the block rejection leaves open. It cannot hold a GGUF
+/// block losslessly; it is here to say whether TensorRT has any INT4 GEMM
+/// on this card. Codes are drawn in [-8, 7] directly, so the reference is
+/// exact for them.
+fn int4_per_channel(env: &Env, low_first: bool) -> Result<String, Error> {
+    let (m, k, n) = (QM, QK, QN);
+    let (k_us, n_us) = (k as usize, n as usize);
+    let mut rng = Xorshift64Star::new(0x6413);
+    let codes: Vec<i8> = (0..n * k)
+        .map(|_| rng.next_u32_below(16) as i8 - 8)
+        .collect();
+    let scales: Vec<f16> = (0..n)
+        .map(|_| f16::from_f32(rng.next_f32_range(0.002, 0.02)))
+        .collect();
+    let x = rng.vec_f32((m * k) as usize, -1.0, 1.0);
+    let mut reference = vec![0f32; (m * n) as usize];
+    for i in 0..m as usize {
+        for j in 0..n_us {
+            let s = f64::from(scales[j].to_f32());
+            reference[i * n_us + j] = (0..k_us)
+                .map(|c| {
+                    f64::from(f16::from_f32(x[i * k_us + c]).to_f32())
+                        * f64::from(codes[j * k_us + c])
+                        * s
+                })
+                .sum::<f64>() as f32;
+        }
+    }
+    let builder = Builder::new()?;
+    let network = builder.network()?;
+    let input = network.input("x", DataType::Float, [m, k])?;
+    let x16 = network.cast(input, DataType::Half)?;
+    let w = network.constant([n, k], DataType::Int4, pack_int4(&codes, low_first), None)?;
+    let sc = network.constant([n], DataType::Half, half_bytes(&scales), None)?;
+    let wdq = network.dequantize(w, sc, DataType::Half, Some(0), None)?;
+    let y = network.cast(
+        network.matmul(x16, MatrixOp::None, wdq, MatrixOp::Transpose)?,
+        DataType::Float,
+    )?;
+    y.set_name("y")?;
+    network.mark_output(y)?;
+    let config = config(&builder)?;
+    config.set_profiling_verbosity(ProfilingVerbosity::Detailed);
+    let plan = build(&builder, &network, &config)?;
+    let runtime = Runtime::new()?;
+    let engine = runtime.deserialize(&plan)?;
+    let layers = layer_names(&engine.information()?);
+    let context = engine.context(AllocationStrategy::Static)?;
+    let dx = env.upload(&x)?;
+    let dy = env.zeros::<f32>((m * n) as usize)?;
+    // SAFETY: static shapes; buffers outlive the download.
+    unsafe {
+        context.set_tensor_address("x", env.ptr(&dx))?;
+        context.set_tensor_address("y", env.ptr(&dy))?;
+        context.enqueue(env.raw_stream())?;
+    }
+    let c = compare(&env.download(&dy)?, &reference);
+    Ok(format!(
+        "builds; plan {} B; {} engine layers {layers:?}; vs CPU: {}",
+        plan.len(),
+        layers.len(),
+        fmt_cmp(&c)
+    ))
+}
+
+/// U3: the same with Q4_0's 4-bit codes and block-32 scales (the lossless
+/// form), then per-channel INT4, both nibble orders each.
 fn u3(env: &Env) -> Result<CheckOutcome, Error> {
     let problem = quantized_problem(true);
     let mut notes = Vec::new();
     for (order, low_first) in [("low nibble first", true), ("high nibble first", false)] {
-        let pack = move |c: &[i8]| -> Vec<u8> {
-            c.chunks(2)
-                .map(|p| {
-                    let (lo, hi) = (p[0] as u8 & 0x0F, p.get(1).map_or(0, |&v| v as u8 & 0x0F));
-                    if low_first {
-                        lo | hi << 4
-                    } else {
-                        hi | lo << 4
-                    }
-                })
-                .collect()
-        };
+        let pack = move |c: &[i8]| pack_int4(c, low_first);
         let n = block_dq_matmul(env, DataType::Int4, &problem, pack)?;
-        notes.push(format!("[{order}] {n}"));
+        notes.push(format!("block-32 [{order}] {n}"));
+    }
+    for (order, low_first) in [("low nibble first", true), ("high nibble first", false)] {
+        let n = int4_per_channel(env, low_first).unwrap_or_else(|e| e.to_string());
+        notes.push(format!("per-channel [{order}] {n}"));
     }
     Ok(answer(&notes.join(" || "), "builds"))
 }

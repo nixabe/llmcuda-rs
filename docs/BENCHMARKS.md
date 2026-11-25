@@ -446,50 +446,48 @@ fp16 path's error against the CPU reference is 14× smaller (TESTING.md).
 
 A decision model: a 9.1B `qwen35` trunk plus a head that scores each
 question's options, served on `/v1/systemone`. One prefill, no decode:
-**nothing here is comparable to the tables above**. Baselines: `llama-server`
-(the 27B's build) and Cloudflare's PyTorch reference (`joint_schema_model.py`,
-with `fla` and `causal-conv1d`). GPU 1, same requests, prompt tokens/s
-(median latency); `Clef-Flash-Q8_0.gguf` for the servers, HF safetensors for
-PyTorch:
+**nothing here is comparable to the tables above**. Against `llama-server`
+build 12688 (`ae6a7ad2c`), GPU 0 of a one-card host, `Clef-Flash-Q8_0.gguf`,
+same requests (`tools/serving/bench_systemone.py`), prompt tokens/s over a
+set (median request latency at concurrency 1):
 
-| set | conc. | llmcuda-rs | llama-server | PyTorch fp16 | vs llama-server | vs PyTorch |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| short, 16 × 658–1,094 tokens | 1 | **2,552** (342 ms) | 1,884 (377 ms) | 1,809 (482 ms) | **+35%** | **+41%** |
-| short | 4 | **2,550** | 2,345 | 1,638 | **+8.7%** | **+56%** |
-| long, 8 × 3,012–3,512 tokens | 1 | **2,451** (1,376 ms) | 1,481 (1,409 ms) | 1,730 (1,977 ms) | **+65%** | **+42%** |
-| long | 4 | **2,446** | 2,406 | 1,791 | **+1.7%** | **+37%** |
+| set | conc. | llmcuda-rs | llama-server | margin |
+| :--- | ---: | ---: | ---: | ---: |
+| short, 16 × 830–1,190 tokens | 1 | **2,809–2,814** (349 ms) | 2,460–2,463 (402 ms) | **+14%** |
+| short | 4 | **2,823–2,830** | 2,489–2,491 | **+13%** |
+| long, 8 × 2,968–3,632 tokens | 1 | **3,082–3,088** (1,036 ms) | 2,430–2,432 (1,309 ms) | **+27%** |
+| long | 4 | **3,096–3,100** | 2,448–2,454 | **+26%** |
 
-Short rows and PyTorch: median of three rounds, engine order rotated. Long
-server rows: median of three alternating pairs, each won. PyTorch's conc. 4
-is its batch of four.
+Three alternating server pairs, each cell the range of their medians over
+three timed rounds; every set runs once untimed first, so llama-server's
+graph re-reservation for a new longest prompt is outside the figures.
 
-- **Read the long rows by latency and c4.** llama-server re-reserves its
-  graph for each new longest prompt (3.0–3.8 s against 1.2–1.5 s), inflating
-  the c1 margin. At steady state it is **2.3% on latency and 1.7% on
-  throughput**: parity to keep.
 - llama-server serializes decisions:
-  `-ngl 99 -fa on -c 20480 -b 16384 -ub 4096 -np 1`.
-- PyTorch's best on Turing is fp16; bf16 has no tensor-core path here
-  (446–460 tokens/s at batch 1, a quarter of fp16's).
+  `-ngl 99 -fa on -c 20480 -b 16384 -ub 4096 -np 1`. It takes a decision
+  prompt as one ubatch and refuses one longer than `-ub`, so the long set
+  stops under 4,096 tokens.
+- The engine's default three slots serve concurrency 4; its throughput is
+  flat in concurrency because a decision is one pass on one card either way.
 
-Both servers pick the reference's option on all 99 questions; ours sits
-closer to it on every summary (servers round to four decimals):
+Both servers pick the same option on all 192 labels of the two sets. Over
+the 264 probabilities and scores they return, the engine is a median
+**1.1e-3** and at most **1.7e-2** from llama-server on the short set, and
+**1.5e-3** and **2.3e-2** on the long (the engine rounds to four decimals).
+`confidence` is left out: llama-server rescales it against chance and the
+engine reports the winning probability.
 
-| set | vs | engine | median \|Δp\| | p99 | max |
-| :--- | :--- | :--- | ---: | ---: | ---: |
-| short | PyTorch fp16 | llmcuda-rs | 4.6e-4 | 1.2e-2 | 1.6e-2 |
-| short | PyTorch fp16 | llama-server | 8.1e-4 | 2.8e-2 | 3.7e-2 |
-| short | PyTorch bf16 | llmcuda-rs | 6.6e-4 | 1.5e-2 | 1.6e-2 |
-| short | PyTorch bf16 | llama-server | 7.7e-4 | 2.7e-2 | 2.8e-2 |
-| long | PyTorch fp16 | llmcuda-rs | 5.8e-4 | 6.2e-3 | 1.1e-2 |
-| long | PyTorch fp16 | llama-server | 1.4e-3 | 1.0e-2 | 2.2e-2 |
-| long | PyTorch bf16 | llmcuda-rs | 8.9e-4 | 6.1e-3 | 8.8e-3 |
-| long | PyTorch bf16 | llama-server | 1.4e-3 | 1.4e-2 | 2.5e-2 |
+**Against the publisher's PyTorch model, not re-measured on this host.** The
+last measurement predates the tensor-core attention this trunk now runs
+(WHY, "prefill belongs on the tensor cores") and used other request sets:
+there the engine was a median 4.6e-4 to 8.9e-4 and at most 1.6e-2 from
+PyTorch fp16 and bf16, nearer than llama-server on every summary, and
+PyTorch fp16 ran 1,638–1,809 prompt tokens/s. The attention change moved
+the engine's own answers by at most 5e-4 on the sets above.
 
-The trunk alone is 323 ms at 877 tokens and 1,321 ms at 3,350, against
-served medians of 342 and 1,376 ms; head, template, tokenization and HTTP
-are 4–6% of a request. The prefill is the request (WHY: "A decision prompt is
-one pass, at the width it is").
+The trunk alone is 290 ms at 877 tokens and 1,016 ms at 3,350
+(`bench_forward`); head, template, tokenization and HTTP are the rest of a
+request. The prefill is the request (WHY: "A decision prompt is one pass, at
+the width it is").
 
 ## Serving concurrent sessions
 
@@ -888,6 +886,16 @@ qualifies on `qwen35`: **+13.7%** prefill (316.0 → 359.3 tok/s, won 3/3), at
 (43.87 → 43.63 tok/s; decode launches are unchanged). On `qwen35moe` the
 predicates coincide (prefill 2452.4 → 2446.3, spreads overlap; peak VRAM
 byte-identical). `LLMCUDA_ATTN_INT8_ALL_OR_NOTHING=1` restores the old one.
+
+Prefill attention is on them too, and its block is as wide as a KV head's
+query heads: one warp a head, all of them reading one staged K/V tile. Eight
+heads a KV head (`qwen35moe`, 16 over 2) is a 256-thread block; four at
+head_dim 256 (Qwen3.5-9B and Clef, 16 over 4) is the same kernel body in a
+128-thread block, each thread staging two key requests and two value columns
+a tile. Before that block existed a four-head geometry fell through to the
+fp32 FMA kernel, at about 2.4 TFLOP/s on the causal half against the
+tensor-core kernel's ~22, and attention was 24% of a 3,350-token Clef pass.
+Qwen3.8-27B's six heads a KV head still take the fp32 kernel.
 
 ## Arithmetic: on dense projections, fp16 tensor cores beat integer ones
 

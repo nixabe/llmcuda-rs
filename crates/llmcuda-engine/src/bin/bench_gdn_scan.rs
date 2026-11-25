@@ -1,5 +1,7 @@
-//! The GDN prefill scan alone: `gdn_scan_prefill` against
-//! `gdn_scan_prefill_fold`, at the shape a batched prefill launches it at.
+//! The GDN prefill scan and what feeds it: `gdn_scan_prefill` against
+//! `gdn_scan_prefill_fold`, and the convolution, SiLU, split and
+//! normalization as separate launches against `gdn_scan_prelude`, at the
+//! shape a batched prefill launches them at.
 //!
 //! The scan is the largest GDN kernel in a prefill pass (7.8 ms of one at
 //! three 2,046-token sequences) and a whole-forward A/B needs a model load to
@@ -23,6 +25,7 @@ use std::time::Instant;
 use cudarc::driver::{CudaContext, CudaSlice};
 use llmcuda_cuda::device::{DeviceInfo, driver_available};
 use llmcuda_cuda::kernels::gdn_chunked::GdnChunkedKernels;
+use llmcuda_engine::block::gdn::{GdnBlock, GdnGeometry};
 use llmcuda_model::config::ModelConfig;
 use tracing::{error, info, warn};
 
@@ -212,5 +215,133 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         cell(&ms[1])
     );
 
+    // Everything from the q/k/v projection's output to the scan's: the
+    // convolution a sequence, the SiLU with its split, the normalization and
+    // the scan as separate launches, against the fused prelude and the scan.
+    let geometry = GdnGeometry::from_config(&ModelConfig::qwen3_6_35b_a3b(), total, 1e-6);
+    let block = GdnBlock::new(&ctx, geometry)?;
+    let conv_dim = geometry.conv_dim();
+    let conv_kernel = geometry.conv_kernel;
+    let seq_conv = tokens * conv_dim;
+    let d_x = stream.clone_htod(&gen_vec(total * conv_dim, -2.0, 2.0))?;
+    let d_w = stream.clone_htod(&gen_vec(conv_dim * conv_kernel, -0.5, 0.5))?;
+    let mut caches: Vec<CudaSlice<f32>> = (0..seqs)
+        .map(|_| stream.alloc_zeros::<f32>(geometry.conv_state_len()))
+        .collect::<Result<_, _>>()?;
+    let xs: Vec<CudaSlice<f32>> = (0..seqs)
+        .map(|seq| {
+            let mut own = stream.alloc_zeros::<f32>(seq_conv)?;
+            stream.memcpy_dtod(&d_x.slice(seq * seq_conv..(seq + 1) * seq_conv), &mut own)?;
+            Ok::<_, cudarc::driver::DriverError>(own)
+        })
+        .collect::<Result<_, _>>()?;
+    let mut conv_raw: Vec<CudaSlice<f32>> = (0..seqs)
+        .map(|_| stream.alloc_zeros::<f32>(seq_conv))
+        .collect::<Result<_, _>>()?;
+    // The pass convolves every sequence into one flattened buffer, which the
+    // SiLU then reads. Here each sequence convolves into its own buffer and
+    // the SiLU reads a flattened one of the same size holding other values:
+    // the same launches over the same bytes, which is all the timing needs.
+    let conv_all = stream.clone_htod(&gen_vec(total * conv_dim, -2.0, 2.0))?;
+    let mut silu = stream.alloc_zeros::<f32>(total * conv_dim)?;
+    let mut q = stream.alloc_zeros::<f32>(total * geometry.key_dim())?;
+    let mut k = stream.alloc_zeros::<f32>(total * geometry.key_dim())?;
+    let mut v = stream.alloc_zeros::<f32>(total * geometry.value_dim())?;
+    kernels.set_scan_fold(true);
+
+    let mut whole = |fused: bool| -> Result<(), Box<dyn std::error::Error>> {
+        use cudarc::driver::DevicePtrMut;
+        let state_ptrs: Vec<u64> = states
+            .iter_mut()
+            .map(|s| s.device_ptr_mut(&stream).0)
+            .collect();
+        if fused {
+            let cache_ptrs: Vec<u64> = caches
+                .iter_mut()
+                .map(|c| c.device_ptr_mut(&stream).0)
+                .collect();
+            // SAFETY: live, distinct states and caches of the geometry's
+            // lengths, held for the call; buffers allocated above at
+            // `[seqs][tokens][width]`.
+            unsafe {
+                kernels.prelude_scan_batch_raw(
+                    &stream,
+                    &mut scratch,
+                    &state_ptrs,
+                    &cache_ptrs,
+                    &d_x,
+                    &d_w,
+                    conv_kernel,
+                    &mut v,
+                    &d_g,
+                    &d_b,
+                    &mut d_out,
+                    tokens,
+                )?;
+            }
+            for (seq, cache) in caches.iter_mut().enumerate() {
+                block.layer_ops().conv1d_advance_state(
+                    &stream,
+                    &xs[seq],
+                    cache,
+                    tokens,
+                    conv_dim,
+                    conv_kernel,
+                )?;
+            }
+        } else {
+            for (seq, cache) in caches.iter_mut().enumerate() {
+                block.layer_ops().conv1d(
+                    &stream,
+                    &xs[seq],
+                    &d_w,
+                    cache,
+                    &mut conv_raw[seq],
+                    tokens,
+                    conv_dim,
+                    conv_kernel,
+                )?;
+            }
+            block.silu_split_qkv(&stream, &conv_all, &mut silu, &mut q, &mut k, &mut v, total)?;
+            // SAFETY: as above.
+            unsafe {
+                kernels.scan_batch_raw(
+                    &stream,
+                    &mut scratch,
+                    &state_ptrs,
+                    &q,
+                    &k,
+                    &v,
+                    &d_g,
+                    &d_b,
+                    &mut d_out,
+                    tokens,
+                )?;
+            }
+        }
+        Ok(())
+    };
+    let mut ms: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+    for round in 0..ROUNDS {
+        for i in 0..2 {
+            let arm = (i + round) % 2;
+            for _ in 0..WARMUP {
+                whole(arm == 1)?;
+            }
+            stream.synchronize()?;
+            let t0 = Instant::now();
+            for _ in 0..REPS {
+                whole(arm == 1)?;
+            }
+            stream.synchronize()?;
+            ms[arm].push(t0.elapsed().as_secs_f64() * 1e3 / REPS as f64);
+        }
+    }
+    info!(
+        "convolution to scan, ms a layer over {ROUNDS} rounds: separate launches {}, fused \
+         prelude {} (both with the folded scan)",
+        cell(&ms[0]),
+        cell(&ms[1])
+    );
     Ok(())
 }

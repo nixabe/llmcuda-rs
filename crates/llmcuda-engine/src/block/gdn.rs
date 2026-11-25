@@ -2437,6 +2437,9 @@ pub struct GdnBlock {
     layer_ops: LayerOpsKernels,
     recurrent: GdnKernels,
     chunked: GdnChunkedKernels,
+    /// Whether a batched prefill folds the convolution, SiLU, split and q/k
+    /// normalization into `gdn_scan_prelude`. See [`Self::set_fused_prelude`].
+    fused_prelude: bool,
     recurrent_scratch: GdnScratch,
     chunked_scratch: GdnChunkedScratch,
     proj_q8_0: CudaFunction,
@@ -2583,6 +2586,7 @@ impl GdnBlock {
             layer_ops,
             recurrent,
             chunked,
+            fused_prelude: env_enabled("LLMCUDA_GDN_PRELUDE"),
             recurrent_scratch,
             chunked_scratch,
             proj_q8_0: module.load_function("gdn_proj_q8_0")?,
@@ -2647,8 +2651,16 @@ impl GdnBlock {
         })
     }
 
+    /// Choose whether a batched prefill runs `gdn_scan_prelude` (the
+    /// default) or the three launches it replaces. Same bits either way; the
+    /// three-launch form is what the fused one is tested against.
+    pub fn set_fused_prelude(&mut self, fused: bool) {
+        self.fused_prelude = fused;
+    }
+
     /// Choose between the folded scan kernel (the default) and the unfolded
-    /// one. Same bits either way.
+    /// one. Same bits either way. The fused prelude needs the folded scan and
+    /// stands down without it.
     pub fn set_scan_fold(&mut self, fold: bool) {
         self.chunked.set_scan_fold(fold);
     }
@@ -2849,6 +2861,11 @@ impl GdnBlock {
     /// Every intermediate the last [`Self::forward`] produced.
     ///
     /// `None` before the first call, because the scratch is sized on demand.
+    ///
+    /// With the fused prelude on (the default) a forward of more than one
+    /// token does not write `conv_raw`, `conv_silu`, `q` or `k`: those four
+    /// then hold whatever an earlier call left. Turn it off with
+    /// [`Self::set_fused_prelude`] before a forward whose trace is read.
     pub fn trace(&self) -> Option<GdnTrace<'_>> {
         let s = self.scratch.as_ref()?;
         Some(GdnTrace {
@@ -3175,118 +3192,209 @@ impl GdnBlock {
             )?;
         }
 
-        let conv_dim = g.conv_dim();
-        let conv_chunk = chunk_tokens * conv_dim;
-        for (seq, state) in states.iter_mut().enumerate() {
-            let offset = seq * conv_chunk;
-            // SAFETY: sequence-major layout partitions both flattened buffers
-            // into `states.len()` disjoint chunks of `conv_chunk` elements.
-            let x = unsafe { crate::viewslice::subslice(stream, &s.qkv, offset, conv_chunk) };
-            let mut y =
-                unsafe { crate::viewslice::subslice(stream, &s.conv_raw, offset, conv_chunk) };
-            self.layer_ops.conv1d(
-                stream,
-                &x,
-                &w.conv1d,
-                &mut state.conv,
-                &mut y,
-                chunk_tokens,
-                conv_dim,
-                g.conv_kernel,
+        // At prefill width the convolution, the SiLU with its split, the q/k
+        // normalization and the scan's decay are one launch
+        // (`gdn_scan_prelude`): three walks over the 8,192-wide stream become
+        // one. It leaves `conv_raw`, `conv_silu`, `q` and `k` unwritten, which
+        // only a trace of [`Self::forward`] reads, and feeds the folded scan.
+        let fused_prelude = self.fused_prelude
+            && self.chunked.scan_fold()
+            && chunk_tokens > 1
+            && states.len() <= llmcuda_cuda::kernels::gdn::STEP_MAX_BATCH;
+        if fused_prelude {
+            if !gates_ready {
+                self.alpha_beta_gates(
+                    stream,
+                    &w.alpha,
+                    &w.beta,
+                    &s.normed,
+                    &w.dt_bias,
+                    &w.a,
+                    &mut s.alpha,
+                    &mut s.beta_raw,
+                    &mut s.a_softplus,
+                    &mut s.log_decay,
+                    &mut s.beta,
+                    tokens,
+                )?;
+            }
+            let conv_dim = g.conv_dim();
+            let conv_chunk = chunk_tokens * conv_dim;
+            check_len(
+                "prelude conv weight",
+                conv_dim * g.conv_kernel,
+                w.conv1d.len(),
             )?;
-        }
-        self.silu_split_qkv(
-            stream,
-            &s.conv_raw,
-            &mut s.conv_silu,
-            &mut s.q,
-            &mut s.k,
-            &mut s.v,
-            tokens,
-        )?;
-        if !gates_ready {
-            self.alpha_beta_gates(
-                stream,
-                &w.alpha,
-                &w.beta,
-                &s.normed,
-                &w.dt_bias,
-                &w.a,
-                &mut s.alpha,
-                &mut s.beta_raw,
-                &mut s.a_softplus,
-                &mut s.log_decay,
-                &mut s.beta,
-                tokens,
-            )?;
-        }
-
-        // The scans share no data across sequences, and each is a 44%-
-        // occupancy whole-chunk sequential walk — serializing them on one
-        // stream was pure wall time. One launch runs every sequence's scan
-        // concurrently; above the kernel's pointer-slot count, or at a
-        // one-token chunk (where `mix` routes to the recurrent kernel and
-        // must keep doing so), the per-sequence path below is the same
-        // arithmetic.
-        let key_chunk = chunk_tokens * g.key_dim();
-        let value_chunk = chunk_tokens * g.value_dim();
-        let heads_chunk = chunk_tokens * g.value_heads;
-        if chunk_tokens > 1 && states.len() <= llmcuda_cuda::kernels::gdn::STEP_MAX_BATCH {
             let state_ptrs: Vec<u64> = states
                 .iter()
                 .map(|state| state.recurrent.device_ptr(stream).0)
                 .collect();
-            // SAFETY: each pointer is a live
-            // `[value_heads][head_dim][head_dim]` recurrent state held
-            // mutably through `states` for this call, all distinct; the
-            // flattened buffers are `[states.len()][chunk_tokens][width]`
-            // per `Scratch::new` and the length checks above.
+            let cache_ptrs: Vec<u64> = states
+                .iter()
+                .map(|state| {
+                    check_len("prelude conv cache", g.conv_state_len(), state.conv.len())
+                        .map(|()| state.conv.device_ptr(stream).0)
+                })
+                .collect::<Result<_, _>>()?;
+            // SAFETY: each recurrent pointer is a live
+            // `[value_heads][head_dim][head_dim]` state and each cache
+            // pointer a live `[conv_dim][conv_kernel - 1]` window, length-
+            // checked just above, all held mutably through `states` for this
+            // call and distinct. The flattened buffers are
+            // `[states.len()][chunk_tokens][width]` per `Scratch::new`.
             unsafe {
-                self.chunked.scan_batch_raw(
+                self.chunked.prelude_scan_batch_raw(
                     stream,
                     &mut self.chunked_scratch,
                     &state_ptrs,
-                    &s.q,
-                    &s.k,
-                    &s.v,
+                    &cache_ptrs,
+                    &s.qkv,
+                    &w.conv1d,
+                    g.conv_kernel,
+                    &mut s.v,
                     &s.log_decay,
                     &s.beta,
                     &mut s.core,
                     chunk_tokens,
                 )?;
             }
-        } else {
+            // The caches advance after the launch that read them old.
             for (seq, state) in states.iter_mut().enumerate() {
-                // SAFETY: each offset and length describes the corresponding
-                // sequence's disjoint contiguous chunk in the flattened
-                // scratch.
-                let q =
-                    unsafe { crate::viewslice::subslice(stream, &s.q, seq * key_chunk, key_chunk) };
-                let k =
-                    unsafe { crate::viewslice::subslice(stream, &s.k, seq * key_chunk, key_chunk) };
-                let v = unsafe {
-                    crate::viewslice::subslice(stream, &s.v, seq * value_chunk, value_chunk)
+                // SAFETY: sequence-major layout partitions the flattened
+                // projection into `states.len()` disjoint chunks.
+                let x = unsafe {
+                    crate::viewslice::subslice(stream, &s.qkv, seq * conv_chunk, conv_chunk)
                 };
-                let decay = unsafe {
-                    crate::viewslice::subslice(stream, &s.log_decay, seq * heads_chunk, heads_chunk)
-                };
-                let beta = unsafe {
-                    crate::viewslice::subslice(stream, &s.beta, seq * heads_chunk, heads_chunk)
-                };
-                let mut core = unsafe {
-                    crate::viewslice::subslice(stream, &s.core, seq * value_chunk, value_chunk)
-                };
-                self.mix(
+                self.layer_ops.conv1d_advance_state(
                     stream,
-                    state,
-                    &q,
-                    &k,
-                    &v,
-                    &decay,
-                    &beta,
-                    &mut core,
+                    &x,
+                    &mut state.conv,
                     chunk_tokens,
+                    conv_dim,
+                    g.conv_kernel,
                 )?;
+            }
+        } else {
+            let conv_dim = g.conv_dim();
+            let conv_chunk = chunk_tokens * conv_dim;
+            for (seq, state) in states.iter_mut().enumerate() {
+                let offset = seq * conv_chunk;
+                // SAFETY: sequence-major layout partitions both flattened buffers
+                // into `states.len()` disjoint chunks of `conv_chunk` elements.
+                let x = unsafe { crate::viewslice::subslice(stream, &s.qkv, offset, conv_chunk) };
+                let mut y =
+                    unsafe { crate::viewslice::subslice(stream, &s.conv_raw, offset, conv_chunk) };
+                self.layer_ops.conv1d(
+                    stream,
+                    &x,
+                    &w.conv1d,
+                    &mut state.conv,
+                    &mut y,
+                    chunk_tokens,
+                    conv_dim,
+                    g.conv_kernel,
+                )?;
+            }
+            self.silu_split_qkv(
+                stream,
+                &s.conv_raw,
+                &mut s.conv_silu,
+                &mut s.q,
+                &mut s.k,
+                &mut s.v,
+                tokens,
+            )?;
+            if !gates_ready {
+                self.alpha_beta_gates(
+                    stream,
+                    &w.alpha,
+                    &w.beta,
+                    &s.normed,
+                    &w.dt_bias,
+                    &w.a,
+                    &mut s.alpha,
+                    &mut s.beta_raw,
+                    &mut s.a_softplus,
+                    &mut s.log_decay,
+                    &mut s.beta,
+                    tokens,
+                )?;
+            }
+
+            // The scans share no data across sequences, and each is a 44%-
+            // occupancy whole-chunk sequential walk — serializing them on one
+            // stream was pure wall time. One launch runs every sequence's scan
+            // concurrently; above the kernel's pointer-slot count, or at a
+            // one-token chunk (where `mix` routes to the recurrent kernel and
+            // must keep doing so), the per-sequence path below is the same
+            // arithmetic.
+            let key_chunk = chunk_tokens * g.key_dim();
+            let value_chunk = chunk_tokens * g.value_dim();
+            let heads_chunk = chunk_tokens * g.value_heads;
+            if chunk_tokens > 1 && states.len() <= llmcuda_cuda::kernels::gdn::STEP_MAX_BATCH {
+                let state_ptrs: Vec<u64> = states
+                    .iter()
+                    .map(|state| state.recurrent.device_ptr(stream).0)
+                    .collect();
+                // SAFETY: each pointer is a live
+                // `[value_heads][head_dim][head_dim]` recurrent state held
+                // mutably through `states` for this call, all distinct; the
+                // flattened buffers are `[states.len()][chunk_tokens][width]`
+                // per `Scratch::new` and the length checks above.
+                unsafe {
+                    self.chunked.scan_batch_raw(
+                        stream,
+                        &mut self.chunked_scratch,
+                        &state_ptrs,
+                        &s.q,
+                        &s.k,
+                        &s.v,
+                        &s.log_decay,
+                        &s.beta,
+                        &mut s.core,
+                        chunk_tokens,
+                    )?;
+                }
+            } else {
+                for (seq, state) in states.iter_mut().enumerate() {
+                    // SAFETY: each offset and length describes the corresponding
+                    // sequence's disjoint contiguous chunk in the flattened
+                    // scratch.
+                    let q = unsafe {
+                        crate::viewslice::subslice(stream, &s.q, seq * key_chunk, key_chunk)
+                    };
+                    let k = unsafe {
+                        crate::viewslice::subslice(stream, &s.k, seq * key_chunk, key_chunk)
+                    };
+                    let v = unsafe {
+                        crate::viewslice::subslice(stream, &s.v, seq * value_chunk, value_chunk)
+                    };
+                    let decay = unsafe {
+                        crate::viewslice::subslice(
+                            stream,
+                            &s.log_decay,
+                            seq * heads_chunk,
+                            heads_chunk,
+                        )
+                    };
+                    let beta = unsafe {
+                        crate::viewslice::subslice(stream, &s.beta, seq * heads_chunk, heads_chunk)
+                    };
+                    let mut core = unsafe {
+                        crate::viewslice::subslice(stream, &s.core, seq * value_chunk, value_chunk)
+                    };
+                    self.mix(
+                        stream,
+                        state,
+                        &q,
+                        &k,
+                        &v,
+                        &decay,
+                        &beta,
+                        &mut core,
+                        chunk_tokens,
+                    )?;
+                }
             }
         }
 
@@ -3775,64 +3883,131 @@ impl GdnBlock {
             )?;
         }
 
-        // 3/4. conv_output_raw-N, then conv_output_silu-N. The convolution
-        // advances the cache, which is why it must run once per batch and not
-        // once per comparison.
-        self.layer_ops.conv1d(
-            stream,
-            &s.qkv,
-            &w.conv1d,
-            &mut state.conv,
-            &mut s.conv_raw,
-            tokens,
-            g.conv_dim(),
-            g.conv_kernel,
-        )?;
-        // 5. conv_output_silu-N and q/k/v in one launch: the split reads every
-        //    element of the SiLU's output exactly once, so it can apply the
-        //    nonlinearity on the way through.
-        self.silu_split_qkv(
-            stream,
-            &s.conv_raw,
-            &mut s.conv_silu,
-            &mut s.q,
-            &mut s.k,
-            &mut s.v,
-            tokens,
-        )?;
-
-        // 6. alpha-N / a_softplus-N / gate-N and beta-N / beta_sigmoid-N.
-        //    One launch: both projections read the same `normed` and the
-        //    gates read nothing but their outputs.
-        if !gates_ready {
-            self.alpha_beta_gates(
+        // 3-7 in two launches at more than one token: `gdn_scan_prelude`
+        // convolves, activates, splits and normalizes, and the scan follows.
+        // See `run_batch_prefill`, which is this with more than one state.
+        // `conv_raw`, `conv_silu`, `q` and `k` are not written on this path;
+        // a caller that wants them traced turns it off
+        // ([`Self::set_fused_prelude`]).
+        if self.fused_prelude && self.chunked.scan_fold() && tokens > 1 {
+            if !gates_ready {
+                self.alpha_beta_gates(
+                    stream,
+                    &w.alpha,
+                    &w.beta,
+                    &s.normed,
+                    &w.dt_bias,
+                    &w.a,
+                    &mut s.alpha,
+                    &mut s.beta_raw,
+                    &mut s.a_softplus,
+                    &mut s.log_decay,
+                    &mut s.beta,
+                    tokens,
+                )?;
+            }
+            check_len(
+                "prelude conv weight",
+                g.conv_dim() * g.conv_kernel,
+                w.conv1d.len(),
+            )?;
+            check_len("prelude conv cache", g.conv_state_len(), state.conv.len())?;
+            check_len(
+                "prelude recurrent state",
+                g.recurrent_state_len(),
+                state.recurrent.len(),
+            )?;
+            let state_ptr = [state.recurrent.device_ptr(stream).0];
+            let cache_ptr = [state.conv.device_ptr(stream).0];
+            // SAFETY: both pointers are live allocations of the geometry's
+            // lengths, checked just above and held mutably through `state`
+            // for this call; the scratch buffers are `[tokens][width]` per
+            // `Scratch::new`.
+            unsafe {
+                self.chunked.prelude_scan_batch_raw(
+                    stream,
+                    &mut self.chunked_scratch,
+                    &state_ptr,
+                    &cache_ptr,
+                    &s.qkv,
+                    &w.conv1d,
+                    g.conv_kernel,
+                    &mut s.v,
+                    &s.log_decay,
+                    &s.beta,
+                    &mut s.core,
+                    tokens,
+                )?;
+            }
+            self.layer_ops.conv1d_advance_state(
                 stream,
-                &w.alpha,
-                &w.beta,
-                &s.normed,
-                &w.dt_bias,
-                &w.a,
-                &mut s.alpha,
-                &mut s.beta_raw,
-                &mut s.a_softplus,
-                &mut s.log_decay,
-                &mut s.beta,
+                &s.qkv,
+                &mut state.conv,
+                tokens,
+                g.conv_dim(),
+                g.conv_kernel,
+            )?;
+            self.mixer = Mixer::Chunked;
+        } else {
+            // 3/4. conv_output_raw-N, then conv_output_silu-N. The convolution
+            // advances the cache, which is why it must run once per batch and not
+            // once per comparison.
+            self.layer_ops.conv1d(
+                stream,
+                &s.qkv,
+                &w.conv1d,
+                &mut state.conv,
+                &mut s.conv_raw,
+                tokens,
+                g.conv_dim(),
+                g.conv_kernel,
+            )?;
+            // 5. conv_output_silu-N and q/k/v in one launch: the split reads every
+            //    element of the SiLU's output exactly once, so it can apply the
+            //    nonlinearity on the way through.
+            self.silu_split_qkv(
+                stream,
+                &s.conv_raw,
+                &mut s.conv_silu,
+                &mut s.q,
+                &mut s.k,
+                &mut s.v,
+                tokens,
+            )?;
+
+            // 6. alpha-N / a_softplus-N / gate-N and beta-N / beta_sigmoid-N.
+            //    One launch: both projections read the same `normed` and the
+            //    gates read nothing but their outputs.
+            if !gates_ready {
+                self.alpha_beta_gates(
+                    stream,
+                    &w.alpha,
+                    &w.beta,
+                    &s.normed,
+                    &w.dt_bias,
+                    &w.a,
+                    &mut s.alpha,
+                    &mut s.beta_raw,
+                    &mut s.a_softplus,
+                    &mut s.log_decay,
+                    &mut s.beta,
+                    tokens,
+                )?;
+            }
+
+            // 7. The delta rule.
+            self.mixer = self.mix(
+                stream,
+                state,
+                &s.q,
+                &s.k,
+                &s.v,
+                &s.log_decay,
+                &s.beta,
+                &mut s.core,
                 tokens,
             )?;
         }
-
-        // 7. The delta rule.
-        self.mixer = self.mix(
-            stream,
-            state,
-            &s.q,
-            &s.k,
-            &s.v,
-            &s.log_decay,
-            &s.beta,
-            &mut s.core,
-            tokens,
-        )?;
 
         // 8. final_output-N = ssm_norm(core) * silu(z). One launch: the norm's
         //    grid is one block per head-row and the multiply is elementwise

@@ -1142,7 +1142,6 @@ impl LayerOpsKernels {
         const BLOCK: usize = 256;
         let channels_i32 = channels as i32;
         let conv_kernel_i32 = conv_kernel as i32;
-        let seq_len_i32 = seq_len as i32;
 
         // One token needs no batch-wide view of the window, so the output and
         // the cache advance are one launch. See `conv1d_step`.
@@ -1188,7 +1187,51 @@ impl LayerOpsKernels {
         // indexes `state` at `ch * carry + (u + carry)` which is in
         // `[0, carry)`. Both buffers were length-checked above.
         unsafe { builder.launch(cfg) }?;
+        self.launch_conv1d_state(stream, x, state, seq_len, channels, conv_kernel)
+    }
 
+    /// Advance a conv cache past `seq_len` tokens of `x` without convolving.
+    ///
+    /// The second half of [`Self::conv1d`], for a caller whose convolution
+    /// ran elsewhere (the GDN prefill prelude reads the old cache and leaves
+    /// it old). Same kernel, same lengths, so the cache lands on the same
+    /// floats either way.
+    pub fn conv1d_advance_state(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        state: &mut CudaSlice<f32>,
+        seq_len: usize,
+        channels: usize,
+        conv_kernel: usize,
+    ) -> Result<(), LayerOpsError> {
+        if conv_kernel == 0 || conv_kernel > MAX_CONV_KERNEL {
+            return Err(LayerOpsError::UnsupportedConvKernel { conv_kernel });
+        }
+        if channels == 0 {
+            return Err(LayerOpsError::UnsupportedWidth { width: channels });
+        }
+        check_len("conv1d x", seq_len * channels, x.len())?;
+        check_len("conv1d state", channels * (conv_kernel - 1), state.len())?;
+        if seq_len == 0 {
+            return Ok(());
+        }
+        self.launch_conv1d_state(stream, x, state, seq_len, channels, conv_kernel)
+    }
+
+    fn launch_conv1d_state(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        state: &mut CudaSlice<f32>,
+        seq_len: usize,
+        channels: usize,
+        conv_kernel: usize,
+    ) -> Result<(), LayerOpsError> {
+        const BLOCK: usize = 256;
+        let channels_i32 = channels as i32;
+        let conv_kernel_i32 = conv_kernel as i32;
+        let seq_len_i32 = seq_len as i32;
         let state_cfg = LaunchConfig {
             grid_dim: (channels.div_ceil(BLOCK).min(1024) as u32, 1, 1),
             block_dim: (BLOCK as u32, 1, 1),
@@ -1203,8 +1246,8 @@ impl LayerOpsKernels {
             .arg(&conv_kernel_i32);
         // SAFETY: same index bounds as above, and `conv_kernel <=
         // MAX_CONV_KERNEL` is what makes the kernel's `staged` register array
-        // large enough — checked at the top of this function, which is the
-        // only path that launches it.
+        // large enough — checked at the top of both callers, which are the
+        // only paths that launch it.
         unsafe { builder.launch(state_cfg) }?;
         Ok(())
     }

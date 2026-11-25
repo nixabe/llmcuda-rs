@@ -155,6 +155,9 @@ const SCAN_WARPS: u32 = 4;
 /// Adjacent value indices one scan warp owns. Mirrors `SCAN_COLS`.
 const SCAN_COLS: u32 = 4;
 
+/// Tokens one prelude block convolves. Mirrors `PRELUDE_TT`.
+const PRELUDE_TT: usize = 8;
+
 /// Head dimensions one scan lane carries, at most. Mirrors `SCAN_MAXR`.
 ///
 /// The state is a register array indexed by constants after unrolling, so the
@@ -244,6 +247,231 @@ __global__ void gdn_chunk_normalize_qk(
     // reference stays attributable to the reduction order alone.
     q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;
     k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));
+}
+
+// Everything between the q/k/v projection and the scan, in one launch.
+//
+// A prefill pass ran this as three: the causal convolution
+// (`conv1d_causal_depthwise`, once a sequence), the SiLU with the q/k/v split
+// (`gdn_silu_split_qkv`) and `gdn_chunk_normalize_qk` above. Each walks the
+// same `[tokens][conv_dim]` stream -- 201 MB at 6,138 tokens -- and between
+// them they read it three times and wrote it four, counting the convolved and
+// the activated copies that only a trace reads. Here a block owns one value
+// head over `PRELUDE_TT` consecutive tokens: its threads convolve their
+// channels, apply the SiLU to their own accumulators, reduce the squares and
+// write the normalized q and k and the activated v. The stream is read once
+// and what the scan reads is written once.
+//
+// **Tokens are tiled because the launch is priced in memory instructions.**
+// One block a token re-loads the convolution's whole window and its weights
+// for every output: `conv_kernel` activations and as many weights a channel,
+// 25 loads and stores an element at this geometry, and that form measured
+// 1.5 ms a layer where the bytes it moves are worth 0.7. A thread that keeps
+// its channel's window in registers and slides it reads one new activation a
+// token and its weights once a tile.
+//
+// The arithmetic is each of the three kernels', operand for operand: the
+// convolution's `__fadd_rn(__fmul_rn)` chain in ascending tap order with the
+// carried cache standing in for negative positions, the SiLU as
+// `x / (1 + expf(-x))`, and `block_reduce_sum`'s reduction -- the
+// `__shfl_down_sync` tree inside a warp, then the warps' partials added in
+// ascending order from zero -- into the same `1/sqrt(sum + eps)`. So the
+// outputs are bit-identical to the three-launch form
+// (`gdn_prelude_differential`). The reductions of a tile share one barrier:
+// lane 0 of each warp stores its partial for every (token, q-or-k), and after
+// the barrier lane `i` adds up the warps' partials for reduction `i` and the
+// rest of its warp takes the total by shuffle.
+//
+// It also writes `exp(log_decay)` for its (token, head), which is
+// `gdn_scan_decay`'s whole job.
+//
+// The conv caches are read, not advanced: the caller still launches
+// `conv1d_update_state` a sequence afterwards, which needs the old cache and
+// the tail of `x` and nothing from here.
+//
+// grid: (value_heads, n_seq * ceil(seq_len / PRELUDE_TT)); a tile never
+// straddles two sequences. block: head_dim. shared: `2 * PRELUDE_TT` floats a
+// warp. `x` is `[n_seq][seq_len][conv_dim]`; the caches ride in as pointer
+// slots, a sequence each, like the scan's states.
+#define PRELUDE_MAX_CONV_KERNEL 8
+#define PRELUDE_TT 8
+
+// One channel's convolution window and weights, in registers.
+struct prelude_channel {
+    float win[PRELUDE_MAX_CONV_KERNEL];
+    float w[PRELUDE_MAX_CONV_KERNEL];
+};
+
+// Load a channel's weights and the `conv_kernel - 1` activations before
+// token `t0`, from the sequence or, at negative positions, its cache.
+__device__ __forceinline__ void prelude_open(
+    prelude_channel& c,
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ cache,
+    int ch,
+    int t0,
+    int channels,
+    int conv_kernel
+) {
+    int carry = conv_kernel - 1;
+    #pragma unroll
+    for (int i = 0; i < PRELUDE_MAX_CONV_KERNEL; ++i) {
+        c.w[i] = 0.0f;
+        c.win[i] = 0.0f;
+        if (i < conv_kernel) c.w[i] = weight[(long long)ch * conv_kernel + i];
+        if (i < carry) {
+            int u = t0 - carry + i;
+            c.win[i] = (u >= 0)
+                ? x[(long long)u * channels + ch]
+                : cache[(long long)ch * carry + (u + carry)];
+        }
+    }
+}
+
+// Convolve token `t` and apply the SiLU, then slide the window one token.
+__device__ __forceinline__ float prelude_step(
+    prelude_channel& c,
+    const float* __restrict__ x,
+    int ch,
+    int t,
+    int channels,
+    int conv_kernel
+) {
+    int carry = conv_kernel - 1;
+    float xv = x[(long long)t * channels + ch];
+    float acc = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < PRELUDE_MAX_CONV_KERNEL; ++i) {
+        // A select rather than `c.win[carry] = xv`: a runtime index would
+        // send the window to local memory.
+        if (i == carry) c.win[i] = xv;
+        if (i < conv_kernel) acc = __fadd_rn(acc, __fmul_rn(c.win[i], c.w[i]));
+    }
+    #pragma unroll
+    for (int i = 0; i + 1 < PRELUDE_MAX_CONV_KERNEL; ++i) c.win[i] = c.win[i + 1];
+    return acc / (1.0f + expf(-acc));
+}
+
+__global__ void gdn_scan_prelude(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    unsigned long long c0, unsigned long long c1,
+    unsigned long long c2, unsigned long long c3,
+    unsigned long long c4, unsigned long long c5,
+    unsigned long long c6, unsigned long long c7,
+    const float* __restrict__ log_decay,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    float* __restrict__ decay_out,
+    int head_dim,
+    int qk_heads,
+    int value_heads,
+    int seq_len,
+    int conv_kernel,
+    float eps,
+    float scale
+) {
+    extern __shared__ float scratch[];
+    int h = blockIdx.x;
+    int tiles = (seq_len + PRELUDE_TT - 1) / PRELUDE_TT;
+    int z = blockIdx.y / tiles;
+    int t0 = (blockIdx.y - z * tiles) * PRELUDE_TT;
+    int d = threadIdx.x;
+    int lane = d & 31;
+    int warp = d >> 5;
+    int n_warps = (blockDim.x + 31) >> 5;
+
+    const float* cache;
+    switch (z) {
+        case 0: cache = (const float*)c0; break;
+        case 1: cache = (const float*)c1; break;
+        case 2: cache = (const float*)c2; break;
+        case 3: cache = (const float*)c3; break;
+        case 4: cache = (const float*)c4; break;
+        case 5: cache = (const float*)c5; break;
+        case 6: cache = (const float*)c6; break;
+        default: cache = (const float*)c7; break;
+    }
+
+    int key_dim  = qk_heads * head_dim;
+    int conv_dim = 2 * key_dim + value_heads * head_dim;
+    const float* xs = x + (long long)z * seq_len * conv_dim;
+    // This tile's first token in the flattened `[n_seq][seq_len]` order.
+    long long tok0 = (long long)z * seq_len + t0;
+
+    if (d < PRELUDE_TT && t0 + d < seq_len) {
+        long long ht = (tok0 + d) * value_heads + h;
+        decay_out[ht] = expf(log_decay[ht]);
+    }
+
+    // Uniform across the block, so no thread waits at the barrier alone.
+    bool qk = h < qk_heads;
+    int chv = 2 * key_dim + h * head_dim + d;
+    int chq = h * head_dim + d;
+    int chk = key_dim + h * head_dim + d;
+
+    prelude_channel cv, cq, ck;
+    prelude_open(cv, xs, weight, cache, chv, t0, conv_dim, conv_kernel);
+    if (qk) {
+        prelude_open(cq, xs, weight, cache, chq, t0, conv_dim, conv_kernel);
+        prelude_open(ck, xs, weight, cache, chk, t0, conv_dim, conv_kernel);
+    }
+
+    float qv[PRELUDE_TT], kv[PRELUDE_TT];
+    #pragma unroll
+    for (int u = 0; u < PRELUDE_TT; ++u) {
+        qv[u] = 0.0f;
+        kv[u] = 0.0f;
+        int t = t0 + u;
+        if (t < seq_len) {
+            v_out[((tok0 + u) * value_heads + h) * head_dim + d] =
+                prelude_step(cv, xs, chv, t, conv_dim, conv_kernel);
+            if (qk) {
+                qv[u] = prelude_step(cq, xs, chq, t, conv_dim, conv_kernel);
+                kv[u] = prelude_step(ck, xs, chk, t, conv_dim, conv_kernel);
+            }
+        }
+    }
+    if (!qk) return;
+
+    // `block_reduce_sum`'s first half, for every reduction of the tile.
+    #pragma unroll
+    for (int u = 0; u < PRELUDE_TT; ++u) {
+        float qs = qv[u] * qv[u];
+        float ks = kv[u] * kv[u];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            qs += __shfl_down_sync(0xffffffff, qs, offset);
+            ks += __shfl_down_sync(0xffffffff, ks, offset);
+        }
+        if (lane == 0) {
+            scratch[(2 * u) * n_warps + warp] = qs;
+            scratch[(2 * u + 1) * n_warps + warp] = ks;
+        }
+    }
+    __syncthreads();
+
+    // Its second half: the warps' partials in ascending order from zero.
+    // Lane `i` sums reduction `i`; `2 * PRELUDE_TT` of them fit a warp.
+    float total = 0.0f;
+    if (lane < 2 * PRELUDE_TT) {
+        for (int w = 0; w < n_warps; ++w) total += scratch[lane * n_warps + w];
+    }
+
+    #pragma unroll
+    for (int u = 0; u < PRELUDE_TT; ++u) {
+        float q_sq = __shfl_sync(0xffffffff, total, 2 * u);
+        float k_sq = __shfl_sync(0xffffffff, total, 2 * u + 1);
+        if (t0 + u < seq_len) {
+            long long base = ((tok0 + u) * qk_heads + h) * head_dim;
+            float qn = qv[u];
+            float kn = kv[u];
+            q_out[base + d] = qn * (1.0f / sqrtf(q_sq + eps)) * scale;
+            k_out[base + d] = kn * (1.0f / sqrtf(k_sq + eps));
+        }
+    }
 }
 
 // The whole sequence as a sequential scan, with the state in registers.
@@ -1247,6 +1475,18 @@ impl GdnChunkedScratch {
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }
+
+    /// The normalized, pre-scaled `q` and the normalized `k` the last scan
+    /// read, `[max_seq_len][qk_heads][head_dim]` each.
+    pub fn normalized(&self) -> (&CudaSlice<f32>, &CudaSlice<f32>) {
+        (&self.q_norm, &self.k_norm)
+    }
+
+    /// `exp(log_decay)` as the last folded scan read it,
+    /// `[max_seq_len][value_heads]`.
+    pub fn decay(&self) -> &CudaSlice<f32> {
+        &self.decay
+    }
 }
 
 /// Compiled chunked-parallel Gated DeltaNet kernels.
@@ -1259,6 +1499,7 @@ pub struct GdnChunkedKernels {
     scan: CudaFunction,
     scan_fold: CudaFunction,
     scan_decay: CudaFunction,
+    prelude: CudaFunction,
     /// Whether [`Self::scan_batch_raw`] launches `gdn_scan_prefill_fold`.
     fold: bool,
     head_dim: usize,
@@ -1314,6 +1555,7 @@ impl GdnChunkedKernels {
             scan: module.load_function("gdn_scan_prefill")?,
             scan_fold: module.load_function("gdn_scan_prefill_fold")?,
             scan_decay: module.load_function("gdn_scan_decay")?,
+            prelude: module.load_function("gdn_scan_prelude")?,
             fold: true,
             head_dim,
             value_heads,
@@ -1604,6 +1846,134 @@ impl GdnChunkedKernels {
         // buffer access. No shared memory is requested and none is indexed.
         unsafe { builder.launch(cfg) }?;
         Ok(())
+    }
+
+    /// The convolution, SiLU, q/k/v split, q/k normalization and decay of a
+    /// batched prefill in one launch, followed by the scan.
+    ///
+    /// [`Self::scan_batch_raw`] with everything upstream of it folded in:
+    /// `x` is the q/k/v projection's output, `[states.len()][seq_len]
+    /// [conv_dim]`, and `conv_weight` the depthwise kernel, `[conv_dim]
+    /// [conv_kernel]`. `conv_caches` are the sequences' carried conv windows,
+    /// `[conv_dim][conv_kernel - 1]` each; they are read and **not**
+    /// advanced, which stays the caller's launch. `v` receives the activated
+    /// value stream, `[states.len()][seq_len][value_heads][head_dim]`.
+    ///
+    /// The bits are the three-launch form's followed by
+    /// [`Self::scan_batch_raw`]'s. Requires the folded scan, which is the
+    /// kernel that reads the decay this writes.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::scan_batch_raw`] for `states` and the flattened buffers.
+    /// Each `conv_caches` pointer must be a live `[conv_dim][conv_kernel -
+    /// 1]` float buffer, one per state, not written during the call.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn prelude_scan_batch_raw(
+        &self,
+        stream: &Arc<CudaStream>,
+        scratch: &mut GdnChunkedScratch,
+        states: &[u64],
+        conv_caches: &[u64],
+        x: &CudaSlice<f32>,
+        conv_weight: &CudaSlice<f32>,
+        conv_kernel: usize,
+        v: &mut CudaSlice<f32>,
+        log_decay: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        seq_len: usize,
+    ) -> Result<(), GdnChunkedError> {
+        const MAX_BATCH: usize = 8;
+        /// Mirrors `PRELUDE_MAX_CONV_KERNEL`.
+        const MAX_CONV_KERNEL: usize = 8;
+        let n = states.len();
+        assert!(
+            (1..=MAX_BATCH).contains(&n),
+            "scan batch of {n} outside 1..={MAX_BATCH}"
+        );
+        assert_eq!(conv_caches.len(), n, "one conv cache per state");
+        assert!(self.fold, "the fused prelude feeds the folded scan only");
+        assert!(
+            (1..=MAX_CONV_KERNEL).contains(&conv_kernel),
+            "conv kernel of {conv_kernel} outside 1..={MAX_CONV_KERNEL}"
+        );
+        let total = n * seq_len;
+        if total > scratch.max_seq_len {
+            return Err(GdnChunkedError::SequenceTooLong {
+                seq_len: total,
+                capacity: scratch.max_seq_len,
+            });
+        }
+        if seq_len == 0 {
+            return Ok(());
+        }
+        if self.head_dim > 32 * SCAN_MAXR {
+            return Err(GdnChunkedError::UnsupportedHeadDim {
+                head_dim: self.head_dim,
+            });
+        }
+        let conv_dim = (2 * self.qk_heads + self.value_heads) * self.head_dim;
+        assert_eq!(x.len(), total * conv_dim, "prelude x");
+        assert_eq!(conv_weight.len(), conv_dim * conv_kernel, "prelude weight");
+        assert_eq!(
+            v.len(),
+            total * self.value_heads * self.head_dim,
+            "prelude v"
+        );
+        assert_eq!(log_decay.len(), total * self.value_heads, "prelude decay");
+
+        let mut slots = [conv_caches[0]; MAX_BATCH];
+        slots[..n].copy_from_slice(conv_caches);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                self.value_heads as u32,
+                (n * seq_len.div_ceil(PRELUDE_TT)) as u32,
+                1,
+            ),
+            block_dim: (self.head_dim as u32, 1, 1),
+            shared_mem_bytes: (2 * PRELUDE_TT * self.head_dim.div_ceil(32) * size_of::<f32>())
+                as u32,
+        };
+        let head_dim = self.head_dim as i32;
+        let qk_heads = self.qk_heads as i32;
+        let value_heads = self.value_heads as i32;
+        let seq_i32 = seq_len as i32;
+        let conv_kernel_i32 = conv_kernel as i32;
+        let eps = L2_EPS;
+        let scale = self.output_scale();
+        let mut builder = stream.launch_builder(&self.prelude);
+        builder.arg(x).arg(conv_weight);
+        for slot in &slots {
+            builder.arg(slot);
+        }
+        builder
+            .arg(log_decay)
+            .arg(&mut scratch.q_norm)
+            .arg(&mut scratch.k_norm)
+            .arg(&mut *v)
+            .arg(&mut scratch.decay)
+            .arg(&head_dim)
+            .arg(&qk_heads)
+            .arg(&value_heads)
+            .arg(&seq_i32)
+            .arg(&conv_kernel_i32)
+            .arg(&eps)
+            .arg(&scale);
+        // SAFETY: one block per (value head, tile of `PRELUDE_TT` tokens of
+        // one sequence) and one thread per head element. A thread reads `x`
+        // at tokens `[t0 - conv_kernel + 1, t0 + PRELUDE_TT)` of its own
+        // sequence's slice, clamped above by `seq_len` and below by the cache
+        // it reads at `[ch * carry, ch * carry + carry)`, and the weight at
+        // `[ch * conv_kernel, ...)`; all three lengths were asserted above or
+        // are the caller's contract. It writes `v` and the scratch at its own
+        // (token, head, element) for tokens below `seq_len` only, inside
+        // `total` tokens, which the capacity check bounds. Shared memory
+        // covers `2 * PRELUDE_TT` floats per warp, which is what the tile's
+        // reductions store.
+        unsafe { builder.launch(cfg) }?;
+        // SAFETY: the caller's contract; the scratch was filled just above.
+        unsafe { self.launch_scan(stream, scratch, states, v, log_decay, beta, out, seq_len) }
     }
 
     /// Run the chunked form over `seq_len` tokens, advancing `state`.
@@ -2000,6 +2370,7 @@ mod tests {
         let fold = kernel_text("gdn_scan_prefill_fold");
         assert!(!fold.contains("expf("), "the folded scan reads its decay");
         assert!(kernel_text("gdn_scan_decay").contains("decay[i] = expf(log_decay[i]);"));
+        assert!(kernel_text("gdn_scan_prelude").contains("decay_out[ht] = expf(log_decay[ht]);"));
         assert!(!GDN_CHUNKED_SRC.contains("__expf("));
     }
 
@@ -2013,6 +2384,29 @@ mod tests {
         assert!(fold.contains("int col = lane >> 3;"));
         assert!(fold.contains("vcorr[c] = __shfl_sync(0xffffffff, mine, c * 8);"));
         assert!(fold.contains("if ((lane & 7) == 0) *op = total;"));
+    }
+
+    #[test]
+    fn the_prelude_denies_the_convolution_its_fma_and_normalizes_under_the_root() {
+        let prelude = &GDN_CHUNKED_SRC[GDN_CHUNKED_SRC
+            .find("struct prelude_channel {")
+            .expect("the prelude's convolution is in the source")..];
+        let prelude = &prelude[..prelude
+            .find("// The whole sequence as a sequential scan")
+            .expect("the scan follows the prelude")];
+        // `conv1d_causal_depthwise`'s chain and `gdn_silu_split_qkv`'s SiLU.
+        assert!(prelude.contains("acc = __fadd_rn(acc, __fmul_rn(c.win[i], c.w[i]));"));
+        assert!(prelude.contains("return acc / (1.0f + expf(-acc));"));
+        // `gdn_chunk_normalize_qk`'s two lines.
+        assert!(prelude.contains("qn * (1.0f / sqrtf(q_sq + eps)) * scale;"));
+        assert!(prelude.contains("kn * (1.0f / sqrtf(k_sq + eps));"));
+        // The reduction is `block_reduce_sum`'s: the down-shuffle tree, then
+        // the warps in order.
+        assert!(prelude.contains("qs += __shfl_down_sync(0xffffffff, qs, offset);"));
+        assert!(prelude.contains("total += scratch[lane * n_warps + w];"));
+        assert_eq!(PRELUDE_TT, 8);
+        assert!(GDN_CHUNKED_SRC.contains("#define PRELUDE_TT 8"));
+        assert!(!prelude.contains("rsqrtf"));
     }
 
     #[test]

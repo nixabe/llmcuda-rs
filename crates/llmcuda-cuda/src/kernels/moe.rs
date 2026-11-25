@@ -2325,27 +2325,48 @@ __global__ void moe_align_block_size(
     __syncthreads();
 
     // 3. scatter in ascending flat index.
+    //
+    // Each warp owns one contiguous run of the flat array, in warp order, and
+    // walks it 32 entries at a time. A ballot gives the warp its hits in
+    // lane order, which is flat-index order, so a hit's rank inside the
+    // 32-entry chunk is a popcount of the lanes below it and the warp's
+    // running total is a register. The only thing a warp needs from the
+    // others is how many hits the warps before it found, which is one count
+    // a warp and one barrier: the first walk counts, the second places.
+    //
+    // This was a block-wide prefix scan per 256-entry tile -- nineteen
+    // barriers a tile, 192 tiles at 6,138 tokens, in every one of the 256
+    // blocks -- for the same ranks. Integer counts, so the table is the same
+    // table.
     int base = cumsum[e];
-    int written = 0;
-    for (int o = 0; o < numel; o += blockDim.x) {
-        int i = o + tid;
-        int hit = (i < numel && topk_ids[i] == e) ? 1 : 0;
-        scan[tid] = hit;
-        __syncthreads();
-        for (int d = 1; d < blockDim.x; d <<= 1) {
-            int v = tid >= d ? scan[tid - d] : 0;
-            __syncthreads();
-            scan[tid] += v;
-            __syncthreads();
-        }
-        int rank  = scan[tid] - hit;
-        int total = scan[blockDim.x - 1];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int n_warps = blockDim.x >> 5;
+    int chunks = (numel + 31) >> 5;
+    int per_warp = (chunks + n_warps - 1) / n_warps;
+    int c0 = warp * per_warp;
+    int c1 = c0 + per_warp < chunks ? c0 + per_warp : chunks;
+
+    int found = 0;
+    for (int c = c0; c < c1; ++c) {
+        int i = c * 32 + lane;
+        unsigned int hits = __ballot_sync(0xffffffff, i < numel && topk_ids[i] == e);
+        found += __popc(hits);
+    }
+    if (lane == 0) scan[warp] = found;
+    __syncthreads();
+
+    int written = base;
+    for (int w = 0; w < warp; ++w) written += scan[w];
+    for (int c = c0; c < c1; ++c) {
+        int i = c * 32 + lane;
+        bool hit = i < numel && topk_ids[i] == e;
+        unsigned int hits = __ballot_sync(0xffffffff, hit);
         if (hit) {
-            int slot = base + written + rank;
+            int slot = written + __popc(hits & ((1u << lane) - 1u));
             if (slot < sorted_capacity) sorted_token_ids[slot] = i;
         }
-        written += total;
-        __syncthreads();
+        written += __popc(hits);
     }
 
     // 4. claim this expert's blocks, and record each one's live-row count

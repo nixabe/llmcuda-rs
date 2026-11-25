@@ -544,6 +544,105 @@ fn device_dispatch_tables_match_moe_align_block_size_including_padding() {
     println!("sorted_token_ids and expert_ids matched EXACTLY, padding included");
 }
 
+/// The same tables at a prefill width, with fewer live tokens than the
+/// buffer holds.
+///
+/// The scatter gives each warp a contiguous run of the flat `(token, k)`
+/// array and places hits by ballot. At 37 tokens that is two 32-entry chunks
+/// a warp and most of the kernel's index arithmetic never runs. Here 1,543
+/// live tokens in a 2,048-token buffer are 12,344 pairs: 386 chunks, 49 a
+/// warp, the last warp's run short and its final chunk three-quarters full,
+/// an expert's tokens spread over every warp, and the 64-slot blocks a wide
+/// pass really dispatches to.
+#[test]
+fn device_dispatch_tables_match_the_reference_at_a_prefill_width() {
+    const LIVE: usize = 1543;
+    const WIDE_BLOCK: usize = 64;
+    let Some(ctx) = device() else { return };
+    let g = MoeGeometry {
+        block_size: WIDE_BLOCK,
+        max_tokens: 2048,
+        ..geometry()
+    };
+    let stream = ctx.default_stream();
+    let kernels = MoeKernels::new(&ctx, g).expect("compiles");
+    let mut buffers = kernels.buffers(&stream).expect("buffers");
+
+    let mut rng = Xorshift64Star::new(DISPATCH_SEED ^ 0x_0057_1DE0);
+    let live: Vec<Vec<f32>> = (0..LIVE)
+        .map(|_| rng.vec_f32(g.num_experts, -8.0, 8.0))
+        .collect();
+    let mut flat: Vec<f32> = live.iter().flatten().copied().collect();
+    flat.resize(g.max_tokens * g.num_experts, -1.0e30);
+    let d_logits = stream.clone_htod(&flat).expect("upload logits");
+    kernels
+        .set_valid_tokens(&stream, &mut buffers, LIVE)
+        .expect("valid_tokens");
+    let (ids, _) = device_routing(&kernels, &stream, &mut buffers, &d_logits);
+
+    let reference = route_batch(&live, g.experts_per_token);
+    let topk_ids: Vec<Vec<u32>> = reference.iter().map(|d| d.expert_ids.clone()).collect();
+    for (t, row) in topk_ids.iter().enumerate() {
+        assert_eq!(
+            &device_ids_for(&ids, t, g.experts_per_token),
+            row,
+            "token {t}: routing diverged before dispatch",
+        );
+    }
+
+    kernels
+        .build_dispatch(&stream, &mut buffers)
+        .expect("dispatch");
+    let d_sorted = stream
+        .clone_dtoh(buffers.sorted_token_ids())
+        .expect("sorted back");
+    let d_experts = stream
+        .clone_dtoh(buffers.expert_ids())
+        .expect("expert ids back");
+    let d_post_pad = stream
+        .clone_dtoh(buffers.num_tokens_post_pad())
+        .expect("post-pad back");
+    stream.synchronize().expect("sync");
+
+    let expected = moe_align_block_size(&topk_ids, g.block_size, g.num_experts);
+    let sentinel = padding_sentinel(LIVE, g.experts_per_token);
+    let post_pad = d_post_pad[0] as usize;
+    assert_eq!(post_pad, expected.num_tokens_post_pad);
+
+    let device_sorted: Vec<u32> = d_sorted[..post_pad].iter().map(|&v| v as u32).collect();
+    let first_wrong = device_sorted
+        .iter()
+        .zip(&expected.sorted_token_ids)
+        .position(|(a, b)| a != b);
+    assert_eq!(
+        first_wrong, None,
+        "sorted_token_ids differ from the reference, first at this slot",
+    );
+    let num_blocks = post_pad / g.block_size;
+    assert_eq!(
+        &d_experts[..num_blocks],
+        &expected.expert_ids[..],
+        "expert_ids differ",
+    );
+    assert!(
+        d_sorted[post_pad..].iter().all(|&v| v as u32 == sentinel),
+        "capacity past num_tokens_post_pad is not filled with the sentinel",
+    );
+    assert!(
+        d_experts[num_blocks..]
+            .iter()
+            .all(|&v| v == INACTIVE_EXPERT),
+        "capacity past the last active block is not INACTIVE_EXPERT",
+    );
+    let real_slots = device_sorted.iter().filter(|&&v| v != sentinel).count();
+    assert_eq!(real_slots, LIVE * g.experts_per_token);
+    println!(
+        "dispatch at {LIVE} live of {} tokens: {real_slots} pairs in {num_blocks} blocks of \
+         {WIDE_BLOCK}, sorted_token_ids and expert_ids matched EXACTLY",
+        g.max_tokens,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (c) + (d) grouped GEMM on real quantized weights
 // ---------------------------------------------------------------------------

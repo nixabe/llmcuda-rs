@@ -182,10 +182,12 @@ fn main() {
         return;
     }
 
-    if let Ok(var) = std::env::var("LLMCUDA_BENCH_AB") {
-        ab_passes(
-            &ctx, &stream, &file, &directory, &weights, &config, &batches, reps, &var,
-        );
+    if let Ok(vars) = std::env::var("LLMCUDA_BENCH_AB") {
+        for var in vars.split(',').map(str::trim).filter(|v| !v.is_empty()) {
+            ab_passes(
+                &ctx, &stream, &file, &directory, &weights, &config, &batches, reps, var,
+            );
+        }
         return;
     }
 
@@ -303,6 +305,10 @@ fn main() {
 /// report gives each side's mean and the per-pair B/A ratios. A load of the
 /// 27B costs minutes on this machine's disk; this is what makes a three-pair
 /// A/B cost one load instead of six.
+///
+/// `VAR` may be a comma-separated list: each switch gets its own A/B in turn,
+/// over the same load, with every other listed switch left unset -- so at
+/// whatever its default is -- while it runs.
 ///
 /// It also prints how far apart the two passes' last-token logits are. That
 /// is a smoke check, not an accuracy gate: the gates are the differential
@@ -444,6 +450,9 @@ fn ab_passes(
             }
         }
     }
+    // Leave the switch at its default for whatever A/B follows.
+    // SAFETY: single-threaded, as above.
+    unsafe { std::env::remove_var(var) };
 }
 
 fn env_usize(key: &str) -> Option<usize> {

@@ -926,8 +926,22 @@ values on `UD-Q8_K_XL`, each under 1e-12 off. `bench_forward` in-process A/B
 | Q8_0 | 1,536 | 649.8 | **817.9** | 1.26× |
 
 The shipped file gains most because three projections had no tensor-core
-path. Dense model only: `qwen35moe` keeps int8 by default, and
-`LLMCUDA_HALF_GEMM=1` there is unmeasured.
+path. `qwen35moe` keeps int8 by default. There, `LLMCUDA_HALF_GEMM=1` is
+faster in every pair and no nearer or further from llama.cpp in any uniform
+way, so the default has not moved. Same A/B, six alternating pairs a row,
+GPU 0, one sequence of real English text, `UD-Q6_K_XL`; the last-token logits
+of each path are scored against llama.cpp `ae6a7ad2c` on the same ids:
+
+| tokens | int8 tok/s | fp16 tok/s | pairs | int8 1 − cos | fp16 1 − cos | int8 max-abs | fp16 max-abs |
+| ---: | ---: | ---: | :--- | ---: | ---: | ---: | ---: |
+| 512 | 2,556.0 | **2,646.6** | 1.006–1.057× | 1.69e-3 | 1.53e-3 | 1.279 | 0.805 |
+| 2,048 | 3,669.5 | **3,830.0** | 1.036–1.051× | 8.90e-4 | 1.70e-3 | 0.615 | 0.987 |
+
+Both paths share 9 of llama.cpp's top 10 tokens in both rows. At 2,048 both
+agree with its argmax; at 512 both pick the same other token, which llama.cpp
+puts 0.038 logits behind its own. Two prompts are a smoke check, not a gate:
+nothing here measures generated-text quality, and N=3 and deeper contexts are
+unmeasured on the fp16 path.
 
 ## Memory: find the index the operand does not depend on
 
@@ -1402,6 +1416,8 @@ Each row gives the decisive measurement and why it lost.
 | A second register stage in `hgemm` | **255 registers, 24 bytes of spill stores**, and 50.7 → 50.2 / 41.7 → 40.0 TFLOP/s on the FFN gate and down shapes at 512 tokens. The kernel cannot keep the extra stage resident. |
 | Tile-contiguous activation layout for `hgemm` | `[M/128][K/32][128][32]` fp16 was equal or slower on **13 of 14** shape/tile cells against the preceding control. Activations are 1/2 to 1/8 of a stage's bytes and L2-resident; loads wait on the weight stream. Rejected for no gain, not a measured loss. |
 | Split-K wherever wave arithmetic said it pays | Splitting any ragged-last-wave grid lost in the harness: 10,240×5,120 split 2/3/4 **1.02 / 1.11 / 1.15 ms** against **0.98** unsplit; 12,288×5,120 split 3 **1.26** against **1.11**. Splitting only under 1.25 waves at an 8% price won all six interleaved pairs on GPU 1: 512 tokens **834.0 → 845.0 tok/s**, 1,536 tokens **774.3 → 821.8**. |
+| TensorRT 11.4 as the prefill trunk on sm_75 | Probed with `trt_probe` on GPU 0. `IAttention` refuses to build below compute capability 8.0, decomposable or not, so TensorRT has no attention to offer these cards. Blockwise INT4 dequantize is rejected ("requires int8 or fp8e4m3 or fp4e2m1"). INT8 block-32 and INT4 per-channel dequantize build and are correct, but each runs as its own kernel ahead of an fp16 GEMM, so the fp16 weight is rebuilt every pass. That leaves TensorRT GEMMs between plugins over the engine's own kernels; the next row measures them. |
+| TensorRT-native fp16 projections (`bench_trt_gemm`) | Fast, but outside the fp16 GEMM contract. Summed over the 130 Q8_0 mixer projections of a pass (GPU 0, five rotated rounds, medians): **84.5 / 233.2 ms** at 2,048 / 6,144 tokens with exact-shape profiles and **79.3 / 234.2** with one dynamic profile, against the int8 split path's **143.0 / 414.2** and `hgemm`'s **107.8 / 297.3**. A strongly typed MatMul writes fp16, so `attn_k`/`attn_v` miss the contract on every TensorRT arm (**3.09e-2** against **2.52e-2**), and with fp16 weights so do `attn_gate` (**4.64e-2** against **2.54e-2**) and `attn_qkv` (**2.81e-2** exact, **6.61e-2** dynamic, against **2.52e-2**). Which fp16-weight arms miss moved between two runs of the bench, since the builder picks its tactics by timing; `attn_k`/`attn_v` missed in both. Exact profiles also change a row's result with batch width on all four shapes. Dequantized weights are slower than fp16 ones (INT8 block **88.1**, INT4 per-channel **89.0 ms** at 2,048), and INT4 costs cosine **0.9975**. The projections are **26%** of kernel time in an N=3 2K pass and **20%** across a 32K prefill, so even the fastest arm could have returned only about 12% of a 2K pass and 10% at 32K. The engine's own `hgemm` already returns 3.6–5.5% end to end, with no second runtime (WHY, "on dense projections, fp16 tensor cores beat integer ones"). |
 
 ## Rejected on arithmetic, before building
 
@@ -1415,8 +1431,6 @@ Each row gives the decisive measurement and why it lost.
 | `mma.m16n8k16` | — | NVRTC emits PTX at `compute_75`, `ptxas` rejects it (sm_80+); hand-decompose to `m16n8k8` / `m8n8k16` |
 
 ## Diagnoses that were right about the fact and wrong about the cost
-| TensorRT 11.4 as the prefill trunk on sm_75 | Probed with `trt_probe` on GPU 0. `IAttention` refuses to build below compute capability 8.0, decomposable or not, so TensorRT has no attention to offer these cards. Blockwise INT4 dequantize is rejected ("requires int8 or fp8e4m3 or fp4e2m1"). INT8 block-32 and INT4 per-channel dequantize build and are correct, but each runs as its own kernel ahead of an fp16 GEMM, so the fp16 weight is rebuilt every pass. That leaves TensorRT GEMMs between plugins over the engine's own kernels; the next row measures them. |
-| TensorRT-native fp16 projections (`bench_trt_gemm`) | Fast, but outside the fp16 GEMM contract. Summed over the 130 Q8_0 mixer projections of a pass (GPU 0, five rotated rounds, medians): **84.5 / 233.2 ms** at 2,048 / 6,144 tokens with exact-shape profiles and **79.3 / 234.2** with one dynamic profile, against the int8 split path's **143.0 / 414.2** and `hgemm`'s **107.8 / 297.3**. A strongly typed MatMul writes fp16, so `attn_k`/`attn_v` miss the contract on every TensorRT arm (**3.09e-2** against **2.52e-2**), and with fp16 weights so do `attn_gate` (**4.64e-2** against **2.54e-2**) and `attn_qkv` (**2.81e-2** exact, **6.61e-2** dynamic, against **2.52e-2**). Which fp16-weight arms miss moved between two runs of the bench, since the builder picks its tactics by timing; `attn_k`/`attn_v` missed in both. Exact profiles also change a row's result with batch width on all four shapes. Dequantized weights are slower than fp16 ones (INT8 block **88.1**, INT4 per-channel **89.0 ms** at 2,048), and INT4 costs cosine **0.9975**. The projections are **26%** of kernel time in an N=3 2K pass and **20%** across a 32K prefill, so even the fastest arm could have returned only about 12% of a 2K pass and 10% at 32K. The engine's own `hgemm` already returns 3.6–5.5% end to end, with no second runtime (WHY, "on dense projections, fp16 tensor cores beat integer ones"). |
 
 - **"The step barrier costs a neighbouring session almost nothing."** The
   median said **1.3x**, the mean **12.1x**: the barrier freezes tokens (21 of

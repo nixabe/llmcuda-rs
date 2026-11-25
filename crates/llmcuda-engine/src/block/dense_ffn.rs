@@ -1005,7 +1005,10 @@ impl DenseFfnBlock {
         let buffers = moe.shared_only_buffers(stream, mma && !narrow && !half)?;
         let half = if half {
             let n = geometry.max_tokens * geometry.intermediate;
-            let kernels = HgemmKernels::new(ctx)?;
+            let mut kernels = HgemmKernels::new(ctx)?;
+            if HgemmKernels::library_requested() {
+                kernels.enable_library(stream, crate::block::half::library_chunk())?;
+            }
             let (t, h, i) = (geometry.max_tokens, geometry.hidden, geometry.intermediate);
             let ws = kernels
                 .workspace_elems(t, i, h)

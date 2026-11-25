@@ -30,6 +30,15 @@ pub fn enabled_for(dense: bool) -> bool {
     }
 }
 
+/// `LLMCUDA_LT_GEMM_CHUNK`: most tokens one cuBLASLt call contracts, zero
+/// (the default) for no cap.
+pub fn library_chunk() -> usize {
+    std::env::var("LLMCUDA_LT_GEMM_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// The compiled GEMM, its staged fp16 activations and its split-K workspace.
 pub struct HalfStage {
     kernels: HgemmKernels,
@@ -44,8 +53,12 @@ impl HalfStage {
     /// Compile for the context's device. Nothing is allocated until
     /// [`Self::reserve`].
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, HgemmError> {
+        let mut kernels = HgemmKernels::new(ctx)?;
+        if HgemmKernels::library_requested() {
+            kernels.enable_library(&ctx.default_stream(), library_chunk())?;
+        }
         Ok(Self {
-            kernels: HgemmKernels::new(ctx)?,
+            kernels,
             x: None,
             workspace: None,
         })

@@ -315,3 +315,106 @@ fn the_bf16_exponent_keeps_the_max_under_fp16s_top_binade() {
     assert_eq!(bf16_half_exponent(&bytes), 16);
     assert_eq!(bf16_half_exponent(&[0, 0, 0, 0]), 0);
 }
+
+/// The opt-in cuBLASLt path ([`HgemmKernels::enable_library`]) under the
+/// same contract as the engine's own kernel: the same fp16 operands, an fp32
+/// accumulation, an fp32 result.
+///
+/// Whole launches and launches cut into token chunks, at shapes ragged
+/// against every tile, and two weights through one object so the copy made
+/// for the first is not served for the second. An overwrite at the natural
+/// stride is the only form the library path takes; the accumulate and
+/// wide-stride forms fall back to `hg_q8_*`, and that fallback is checked to
+/// leave the columns outside the output untouched.
+#[test]
+fn the_library_path_meets_the_same_rounding_contract() {
+    let Some(ctx) = device() else { return };
+    let stream = ctx.default_stream();
+    let mma = MmaKernels::new(&ctx).expect("int8 kernels compile");
+    for chunk in [0usize, 100] {
+        let mut hg = HgemmKernels::new(&ctx).expect("fp16 GEMM kernels compile");
+        hg.enable_library(&stream, chunk).expect("cuBLASLt loads");
+        let mut expected_bytes = 0;
+        let cases = [
+            (1usize, 8usize, 32usize),
+            (37, 130, 96),
+            (128, 128, 64),
+            (300, 514, 1024),
+            (513, 384, 320),
+        ];
+        for (case, &(tokens, rows, k)) in cases.iter().enumerate() {
+            let seed = 900 + case as u64;
+            let mut rng = Xorshift64Star::new(seed ^ 0x5eed);
+            let x = rng.vec_f32(tokens * k, -3.0, 3.0);
+            let xd = stream.clone_htod(&x).unwrap();
+            let mut xh = stream.alloc_zeros::<u16>(tokens * k).unwrap();
+            hg.to_half(&stream, &xd, &mut xh, tokens * k).unwrap();
+            let (bytes, deq) = q8_0_weights(rows, k, seed);
+            let src = stream.clone_htod(&bytes).unwrap();
+            let mut wq = stream.alloc_zeros::<i8>(rows * k).unwrap();
+            let mut ws = stream.alloc_zeros::<u16>(rows * k / 32).unwrap();
+            mma.repack_q8_0_half(&stream, &src, &mut wq, &mut ws, rows * k)
+                .unwrap();
+            let w = HalfWeight::Q8_0 {
+                q: &wq,
+                scales: &ws,
+            };
+            let mut out = stream.alloc_zeros::<f32>(tokens * rows).unwrap();
+            hg.gemm(
+                &stream, w, &xh, &mut out, None, tokens, rows, k, rows, false,
+            )
+            .unwrap();
+            let got = stream.clone_dtoh(&out).unwrap();
+            expected_bytes += rows * k * 2;
+            assert_eq!(
+                hg.library_resident_bytes(),
+                expected_bytes,
+                "one fp16 copy a weight"
+            );
+
+            let (mut worst, mut magnitude) = (0.0f64, 0.0f64);
+            for t in 0..tokens {
+                for r in 0..rows {
+                    let (mut s, mut m) = (0.0f64, 0.0f64);
+                    for i in 0..k {
+                        let p =
+                            f64::from(round_through_f16(x[t * k + i])) * f64::from(deq[r * k + i]);
+                        s += p;
+                        m += p.abs();
+                    }
+                    magnitude = magnitude.max(m);
+                    let g = got[t * rows + r];
+                    assert!(g.is_finite());
+                    worst = worst.max((f64::from(g) - s).abs());
+                }
+            }
+            let bound = 2.0 * (k as f64) * magnitude * 2f64.powi(-24) + 1e-6;
+            println!(
+                "library chunk {chunk:3} tokens {tokens:4} rows {rows:5} k {k:5}: max_abs \
+                 {worst:.3e} (bound {bound:.3e})"
+            );
+            assert!(worst <= bound, "max_abs {worst} exceeds {bound}");
+
+            // The accumulate form is not the library's; it must still run,
+            // through the engine's kernel, and add to what is there.
+            let mut acc = stream.clone_htod(&got).unwrap();
+            hg.gemm(&stream, w, &xh, &mut acc, None, tokens, rows, k, rows, true)
+                .unwrap();
+            let doubled = stream.clone_dtoh(&acc).unwrap();
+            for (d, g) in doubled.iter().zip(&got) {
+                assert!(
+                    (f64::from(*d) - 2.0 * f64::from(*g)).abs() <= 2.0 * bound,
+                    "the accumulate fallback did not add onto the library's result"
+                );
+            }
+            assert_eq!(
+                hg.library_resident_bytes(),
+                expected_bytes,
+                "the fallback makes no copy"
+            );
+            // Keep the weights alive until the next iteration allocates, so
+            // a reused address cannot alias an earlier copy within the test.
+            std::mem::forget((wq, ws));
+        }
+    }
+}

@@ -362,6 +362,21 @@ __device__ __forceinline__ void hg_gemm(
 
 // out[m][n] (+)= sum over z = 0, 1, ... of part[z][m][n], in that order, so the
 // result does not depend on which split finished first. Two columns a thread.
+// Split Q8_0 to resident fp16: `w16[i] = half(q[i] * d[i / 32])`, by the same
+// `hg_dequant4` the GEMM stages with, so the two paths read one weight.
+// A thread converts four weights; `n` is a multiple of 32.
+extern "C" __global__ void hg_q8_to_half_w(const signed char* __restrict__ wq,
+                                const unsigned short* __restrict__ ws,
+                                unsigned short* __restrict__ w16, long long n) {
+    long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= n) return;
+    unsigned q = *(const unsigned*)(wq + i);
+    unsigned sc = ws[i >> 5];
+    unsigned lo, hi;
+    hg_dequant4(q, sc | (sc << 16), lo, hi);
+    *(uint2*)(w16 + i) = make_uint2(lo, hi);
+}
+
 extern "C" __global__ void hg_splitk_reduce(
     const float* __restrict__ part, float* __restrict__ out,
     int M, int N, int ldo, int splits, int accumulate) {
@@ -407,6 +422,8 @@ pub enum HgemmError {
     },
     /// `ldo` is narrower than the output rows it must hold, or misaligned.
     Stride { ldo: usize, n: usize },
+    /// cuBLASLt refused a call of the library path ([`HgemmKernels::enable_library`]).
+    Library(cudarc::cublaslt::result::CublasError),
 }
 
 impl core::fmt::Display for HgemmError {
@@ -414,6 +431,7 @@ impl core::fmt::Display for HgemmError {
         match self {
             Self::Compile(e) => write!(f, "fp16 GEMM compile: {e}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
+            Self::Library(e) => write!(f, "cuBLASLt: {e:?}"),
             Self::RaggedContraction { k } => {
                 write!(f, "contraction {k} is not a multiple of {HGEMM_BK}")
             }
@@ -430,6 +448,12 @@ impl core::error::Error for HgemmError {}
 impl From<DriverError> for HgemmError {
     fn from(value: DriverError) -> Self {
         Self::Driver(value)
+    }
+}
+
+impl From<cudarc::cublaslt::result::CublasError> for HgemmError {
+    fn from(value: cudarc::cublaslt::result::CublasError) -> Self {
+        Self::Library(value)
     }
 }
 
@@ -492,7 +516,78 @@ pub struct HgemmKernels {
     bf16_128: CudaFunction,
     to_half: CudaFunction,
     reduce: CudaFunction,
+    q8_to_half_w: CudaFunction,
     sms: usize,
+    /// cuBLASLt over resident fp16 weights, when enabled. See
+    /// [`Self::enable_library`].
+    library: Option<std::sync::Mutex<Library>>,
+}
+
+/// Bytes of scratch cuBLASLt is offered, per kernels object; an engine holds
+/// one such object per block per prebuilt pass width, so this is multiplied
+/// by a few dozen. An algorithm that wants more is not chosen by the
+/// heuristic, rather than run short.
+const LIBRARY_WORKSPACE_BYTES: usize = 4 << 20;
+
+/// What [`HgemmKernels::enable_library`] holds: the cuBLASLt handle and
+/// descriptors, its workspace, and the fp16 copy of every Q8_0 weight it has
+/// been asked to contract.
+struct Library {
+    handle: cudarc::cublaslt::sys::cublasLtHandle_t,
+    desc: cudarc::cublaslt::sys::cublasLtMatmulDesc_t,
+    pref: cudarc::cublaslt::sys::cublasLtMatmulPreference_t,
+    workspace: CudaSlice<u8>,
+    /// fp16 `[N][K]` by the device address of the int8 weight it was made
+    /// from. The owner of the kernels owns those weights for as long, so an
+    /// address names one tensor; see [`HgemmKernels::enable_library`].
+    weights: std::collections::HashMap<u64, Arc<CudaSlice<u16>>>,
+    /// Layouts and the chosen algorithm by `(n_rows, k, tokens)`.
+    shapes: std::collections::HashMap<(usize, usize, usize), LibraryShape>,
+    /// Most tokens one call contracts; a wider launch is cut into equal
+    /// calls. Zero is no limit.
+    chunk: usize,
+    resident_bytes: usize,
+}
+
+/// Every live fp16 copy, by the device address of its int8 weight.
+///
+/// An engine builds one kernels object per block per prebuilt pass width and
+/// hands them all the same layer weights, so a copy per object would hold
+/// each tensor several times over (measured: 27.7 GiB for a 9.1B model whose
+/// fp16 weights are 17). Objects share a copy through this table and it is
+/// freed when the last of them drops.
+static LIBRARY_COPIES: std::sync::Mutex<
+    Option<std::collections::HashMap<u64, std::sync::Weak<CudaSlice<u16>>>>,
+> = std::sync::Mutex::new(None);
+
+struct LibraryShape {
+    a: cudarc::cublaslt::sys::cublasLtMatrixLayout_t,
+    b: cudarc::cublaslt::sys::cublasLtMatrixLayout_t,
+    c: cudarc::cublaslt::sys::cublasLtMatrixLayout_t,
+    algo: cudarc::cublaslt::sys::cublasLtMatmulAlgo_t,
+}
+
+// SAFETY: the handles are opaque pointers into cuBLASLt objects that are not
+// bound to a thread; every use is behind the `Mutex` that owns them and on
+// the stream the caller passes.
+unsafe impl Send for Library {}
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        use cudarc::cublaslt::result as lt;
+        // SAFETY: each handle was created by this struct and is destroyed
+        // once, here; failures at teardown have nowhere to go.
+        unsafe {
+            for shape in self.shapes.values() {
+                let _ = lt::destroy_matrix_layout(shape.a);
+                let _ = lt::destroy_matrix_layout(shape.b);
+                let _ = lt::destroy_matrix_layout(shape.c);
+            }
+            let _ = lt::destroy_matmul_pref(self.pref);
+            let _ = lt::destroy_matmul_desc(self.desc);
+            let _ = lt::destroy_handle(self.handle);
+        }
+    }
 }
 
 /// Most splits a plan uses. Each one costs a `[tokens][n]` fp32 partial
@@ -514,8 +609,224 @@ impl HgemmKernels {
             bf16_128: module.load_function("hg_bf16_128")?,
             to_half: module.load_function("hg_to_half")?,
             reduce: module.load_function("hg_splitk_reduce")?,
+            q8_to_half_w: module.load_function("hg_q8_to_half_w")?,
             sms,
+            library: None,
         })
+    }
+
+    /// Whether `LLMCUDA_LT_GEMM=1` asks for the library path.
+    pub fn library_requested() -> bool {
+        std::env::var("LLMCUDA_LT_GEMM").as_deref() == Ok("1")
+    }
+
+    /// Route Q8_0 contractions through cuBLASLt's fp16 GEMM over a resident
+    /// fp16 copy of each weight, instead of `hg_q8_*` over the split int8.
+    ///
+    /// The operands are the same values: the copy is made by the conversion
+    /// the GEMM stages with (`hg_dequant4`), the activations are the staged
+    /// fp16, and the output is fp32 from an fp32 accumulation. What differs is
+    /// the summation order, which is cuBLASLt's and may change with the token
+    /// count, so a row is not promised bit-identical across batch widths.
+    ///
+    /// **It doubles the weight's footprint**: two bytes an element beside
+    /// the 1.0625 of the split int8, which stays resident for the paths that
+    /// read it. The copy is made on a weight's first contraction, so the
+    /// first pass allocates; that is why this is opt-in and not a default.
+    /// Copies are keyed by the int8 weight's device address and shared by
+    /// every object given that weight, so the weights passed to
+    /// [`Self::gemm`] must outlive every such object and not be replaced in
+    /// place.
+    ///
+    /// `chunk` caps the tokens of one library call (zero for no cap).
+    pub fn enable_library(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        chunk: usize,
+    ) -> Result<(), HgemmError> {
+        use cudarc::cublaslt::{result as lt, sys};
+        let handle = lt::create_handle()?;
+        let desc = lt::create_matmul_desc(
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            sys::cudaDataType_t::CUDA_R_32F,
+        )?;
+        let pref = lt::create_matmul_pref()?;
+        let transpose: i32 = 1;
+        let ws_bytes = LIBRARY_WORKSPACE_BYTES;
+        // SAFETY: both objects were just created; each attribute buffer is
+        // the size passed with it.
+        unsafe {
+            lt::set_matmul_desc_attribute(
+                desc,
+                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                (&transpose) as *const i32 as *const core::ffi::c_void,
+                size_of::<i32>(),
+            )?;
+            lt::set_matmul_pref_attribute(
+                pref,
+                sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                (&ws_bytes) as *const usize as *const core::ffi::c_void,
+                size_of::<usize>(),
+            )?;
+        }
+        self.library = Some(std::sync::Mutex::new(Library {
+            handle,
+            desc,
+            pref,
+            workspace: stream.alloc_zeros::<u8>(ws_bytes)?,
+            weights: std::collections::HashMap::new(),
+            shapes: std::collections::HashMap::new(),
+            chunk,
+            resident_bytes: 0,
+        }));
+        Ok(())
+    }
+
+    /// Bytes of fp16 weight copies this object reads so far. Copies are
+    /// shared between objects given the same weight, so the sum over objects
+    /// overstates what is resident.
+    pub fn library_resident_bytes(&self) -> usize {
+        self.library
+            .as_ref()
+            .map_or(0, |l| l.lock().expect("library lock").resident_bytes)
+    }
+
+    /// One Q8_0 contraction through cuBLASLt. See [`Self::enable_library`].
+    #[allow(clippy::too_many_arguments)]
+    fn library_gemm(
+        &self,
+        library: &std::sync::Mutex<Library>,
+        stream: &Arc<CudaStream>,
+        q: &CudaSlice<i8>,
+        scales: &CudaSlice<u16>,
+        x: &CudaSlice<u16>,
+        out: &mut CudaSlice<f32>,
+        tokens: usize,
+        n_rows: usize,
+        k: usize,
+    ) -> Result<(), HgemmError> {
+        use cudarc::cublaslt::{result as lt, sys};
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let mut guard = library.lock().expect("library lock");
+        let lib = &mut *guard;
+        let key = q.device_ptr(stream).0;
+        if !lib.weights.contains_key(&key) {
+            let elements = n_rows * k;
+            let mut table = LIBRARY_COPIES.lock().expect("copy table lock");
+            let table = table.get_or_insert_with(Default::default);
+            table.retain(|_, copy| copy.strong_count() > 0);
+            if let Some(shared) = table.get(&key).and_then(std::sync::Weak::upgrade) {
+                need("shared fp16 weight", shared.len(), elements)?;
+                lib.resident_bytes += elements * 2;
+                lib.weights.insert(key, shared);
+            }
+        }
+        if !lib.weights.contains_key(&key) {
+            let elements = n_rows * k;
+            let mut w16 = stream.alloc_zeros::<u16>(elements)?;
+            let cfg = LaunchConfig {
+                grid_dim: ((elements / 4).div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let n_i = elements as i64;
+            let mut b = stream.launch_builder(&self.q8_to_half_w);
+            b.arg(q).arg(scales).arg(&mut w16).arg(&n_i);
+            // SAFETY: `q` holds `n_rows * k` codes and `scales` one per 32
+            // (checked by the caller); `w16` was allocated at that length and
+            // the grid masks every index past it.
+            unsafe { b.launch(cfg) }?;
+            lib.resident_bytes += elements * 2;
+            let w16 = Arc::new(w16);
+            LIBRARY_COPIES
+                .lock()
+                .expect("copy table lock")
+                .get_or_insert_with(Default::default)
+                .insert(key, Arc::downgrade(&w16));
+            lib.weights.insert(key, w16);
+        }
+        let calls = if lib.chunk == 0 {
+            1
+        } else {
+            tokens.div_ceil(lib.chunk)
+        };
+        let per_call = tokens.div_ceil(calls);
+        let (alpha, beta) = (1.0f32, 0.0f32);
+        let mut done = 0;
+        while done < tokens {
+            let t = per_call.min(tokens - done);
+            let shape_key = (n_rows, k, t);
+            if !lib.shapes.contains_key(&shape_key) {
+                // `w16` is `[N][K]` row-major, which is a column-major K x N
+                // matrix; transposed it is the N x K left operand. The staged
+                // activations are K x T the same way, and the N x T product
+                // in column-major order is `out[t][n]`.
+                let a = lt::create_matrix_layout(
+                    sys::cudaDataType_t::CUDA_R_16F,
+                    k as u64,
+                    n_rows as u64,
+                    k as i64,
+                )?;
+                let b = lt::create_matrix_layout(
+                    sys::cudaDataType_t::CUDA_R_16F,
+                    k as u64,
+                    t as u64,
+                    k as i64,
+                )?;
+                let c = lt::create_matrix_layout(
+                    sys::cudaDataType_t::CUDA_R_32F,
+                    n_rows as u64,
+                    t as u64,
+                    n_rows as i64,
+                )?;
+                // SAFETY: every handle is live.
+                let heuristic = unsafe {
+                    lt::get_matmul_algo_heuristic(lib.handle, lib.desc, a, b, c, c, lib.pref)
+                }?;
+                lib.shapes.insert(
+                    shape_key,
+                    LibraryShape {
+                        a,
+                        b,
+                        c,
+                        algo: heuristic.algo,
+                    },
+                );
+            }
+            let shape = &lib.shapes[&shape_key];
+            let w16 = &lib.weights[&key];
+            let (a_ptr, _ra) = w16.as_ref().device_ptr(stream);
+            let xs = x.slice(done * k..(done + t) * k);
+            let (b_ptr, _rb) = xs.device_ptr(stream);
+            let mut os = out.slice_mut(done * n_rows..(done + t) * n_rows);
+            let (c_ptr, _rc) = os.device_ptr_mut(stream);
+            let (ws_ptr, _rw) = lib.workspace.device_ptr_mut(stream);
+            // SAFETY: `w16` is `n_rows * k` fp16, the activation view `t * k`
+            // fp16 and the output view `t * n_rows` fp32, matching the three
+            // layouts; the workspace is the size the heuristic was offered.
+            unsafe {
+                lt::matmul(
+                    lib.handle,
+                    lib.desc,
+                    (&alpha) as *const f32 as *const core::ffi::c_void,
+                    (&beta) as *const f32 as *const core::ffi::c_void,
+                    a_ptr as *const core::ffi::c_void,
+                    shape.a,
+                    b_ptr as *const core::ffi::c_void,
+                    shape.b,
+                    c_ptr as *const core::ffi::c_void,
+                    shape.c,
+                    c_ptr as *mut core::ffi::c_void,
+                    shape.c,
+                    (&shape.algo) as *const sys::cublasLtMatmulAlgo_t,
+                    ws_ptr as *mut core::ffi::c_void,
+                    LIBRARY_WORKSPACE_BYTES,
+                    stream.cu_stream() as *mut _,
+                )?;
+            }
+            done += t;
+        }
+        Ok(())
     }
 
     /// Round `n` fp32 values to fp16 bits.
@@ -640,6 +951,18 @@ impl HgemmKernels {
         ldo: usize,
         accumulate: bool,
     ) -> Result<(), HgemmError> {
+        if let (Some(library), HalfWeight::Q8_0 { q, scales }) = (self.library.as_ref(), w)
+            && !accumulate
+            && ldo == n_rows
+            && tokens > 0
+            && n_rows > 0
+        {
+            need("gemm x", x.len(), tokens * k)?;
+            need("gemm out", out.len(), tokens * n_rows)?;
+            need("gemm q8_0 weights", q.len(), n_rows * k)?;
+            need("gemm q8_0 scales", scales.len(), n_rows * k / 32)?;
+            return self.library_gemm(library, stream, q, scales, x, out, tokens, n_rows, k);
+        }
         let mut plan = self.plan(tokens, n_rows, k);
         if workspace
             .as_ref()

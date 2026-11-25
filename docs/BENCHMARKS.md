@@ -951,6 +951,36 @@ puts 0.038 logits behind its own. Two prompts are a smoke check, not a gate:
 nothing here measures generated-text quality, and N=3 and deeper contexts are
 unmeasured on the fp16 path.
 
+**The remaining gap to the library is the weight's form, and closing it is
+opt-in.** `hgemm` reads split int8 and rebuilds each staged tile's fp16, which
+holds it to 55–62 TFLOP/s on Clef's shapes; cuBLASLt over fp16 weights that
+are already resident runs the same contraction at 62–100 (`bench_hgemm`,
+fp16 in, fp32 out, an fp32 accumulation). `LLMCUDA_LT_GEMM=1` keeps an fp16
+copy of every Q8_0 projection weight, made by the conversion `hgemm` stages
+with so both paths contract one set of values, and routes the prefill
+projections through cuBLASLt. On Clef-Flash, served, three alternating
+server pairs against llama-server, GPU 0:
+
+| set | conc. | default | `LLMCUDA_LT_GEMM=1` | llama-server |
+| :--- | ---: | ---: | ---: | ---: |
+| short, 16 × 830–1,190 tokens | 1 | 2,809–2,819 | **3,700–3,724** | 2,459–2,463 |
+| short | 4 | 2,824–2,833 | **3,739–3,752** | 2,491–2,493 |
+| long, 8 × 2,968–3,632 tokens | 1 | 3,083–3,089 | **3,849–3,891** | 2,430 |
+| long | 4 | 3,094–3,100 | **3,887–3,893** | 2,446–2,447 |
+
+It is not the default because of what it costs. The card holds **29.4 GiB
+against 16.1** after the sets have run, the fp16 copies beside the int8 the
+narrow paths still read. The copies are made on a weight's first contraction,
+so the first pass allocates, which design rule 6 forbids on a hot path. And
+the summation order is cuBLASLt's, chosen per shape: answers moved by at most
+**4e-4** against the default path and stayed as far from llama-server as
+before, but a row is not promised bit-identical across batch widths. Its
+throughput is also uneven in the token count: the 12,288 → 4,096 down
+projection runs at 49–54 TFLOP/s for 2,900–3,350 tokens and 89–100 around
+them, and capping the tokens of a call (`LLMCUDA_LT_GEMM_CHUNK`) moved that
+hole rather than closing it (3,350 tokens: 3,764 tok/s whole, 4,158 capped at
+1,200; 2,600 tokens: 4,107 whole, 3,840 capped). Only measured on Clef.
+
 ## Memory: find the index the operand does not depend on
 
 About half of every large win was a grid re-reading bytes its operand does

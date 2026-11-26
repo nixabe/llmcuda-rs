@@ -59,16 +59,36 @@ mod kernels {
         let stride = thread::blockDim_x() as i64 * thread::gridDim_x() as i64;
         let mut i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
             + thread::threadIdx_x() as i64;
-        while i < n {
-            unsafe {
+        // A capped grid makes each thread loop; four elements are read ahead
+        // of the exponentials so the loads do not queue behind them. Each
+        // element is still read before it is written, so exact aliasing holds.
+        let st = stride as usize;
+        unsafe {
+            while i + 3 * stride < n {
+                let (gp, up_p, op) = (gate.add(i as usize), up.add(i as usize), out.add(i as usize));
+                let g = (*gp, *gp.add(st), *gp.add(2 * st), *gp.add(3 * st));
+                let u = (*up_p, *up_p.add(st), *up_p.add(2 * st), *up_p.add(3 * st));
+                *op = (g.0 / (1.0 + (-g.0).exp())) * u.0;
+                *op.add(st) = (g.1 / (1.0 + (-g.1).exp())) * u.1;
+                *op.add(2 * st) = (g.2 / (1.0 + (-g.2).exp())) * u.2;
+                *op.add(3 * st) = (g.3 / (1.0 + (-g.3).exp())) * u.3;
+                i += 4 * stride;
+            }
+            while i < n {
                 let g = *gate.add(i as usize);
                 *out.add(i as usize) = (g / (1.0 + (-g).exp())) * *up.add(i as usize);
+                i += stride;
             }
-            i += stride;
         }
     }
 
     /// Elementwise or per-row sigmoid gating, preserving the sigmoid waypoint.
+    ///
+    /// With `broadcast`, row `i / width` gates every element of its row and
+    /// its sigmoid is stored once, by the thread holding the row's first
+    /// element. The row and the column are carried along the grid-stride
+    /// walk instead of being divided out per element: the 64-bit divide is
+    /// most of the loop otherwise.
     ///
     /// # Safety
     /// x/out cover n floats; gate/sig cover n floats or ceil(n/width) when
@@ -87,16 +107,35 @@ mod kernels {
         let stride = thread::blockDim_x() as i64 * thread::gridDim_x() as i64;
         let mut i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
             + thread::threadIdx_x() as i64;
-        while i < n {
-            let g = if broadcast != 0 { i / width as i64 } else { i };
-            unsafe {
-                let s = 1.0 / (1.0 + (-*gate.add(g as usize)).exp());
-                if broadcast == 0 || i % width as i64 == 0 {
-                    *sig.add(g as usize) = s;
+        unsafe {
+            if broadcast == 0 {
+                while i < n {
+                    let s = 1.0 / (1.0 + (-*gate.add(i as usize)).exp());
+                    *sig.add(i as usize) = s;
+                    *out.add(i as usize) = s * *x.add(i as usize);
+                    i += stride;
                 }
-                *out.add(i as usize) = s * *x.add(i as usize);
+            } else {
+                let width = width as i64;
+                let row_step = stride / width;
+                let col_step = stride - row_step * width;
+                let mut row = i / width;
+                let mut col = i - row * width;
+                while i < n {
+                    let s = 1.0 / (1.0 + (-*gate.add(row as usize)).exp());
+                    if col == 0 {
+                        *sig.add(row as usize) = s;
+                    }
+                    *out.add(i as usize) = s * *x.add(i as usize);
+                    i += stride;
+                    row += row_step;
+                    col += col_step;
+                    if col >= width {
+                        col -= width;
+                        row += 1;
+                    }
+                }
             }
-            i += stride;
         }
     }
 

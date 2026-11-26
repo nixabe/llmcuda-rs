@@ -1061,9 +1061,98 @@ pub fn dequantize_row_bf16(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Elements in one NVFP4 block.
+pub const QK_NVFP4: usize = 64;
+/// Elements under one NVFP4 sub-block scale.
+pub const QK_NVFP4_SUB: usize = 16;
+/// Bytes in one NVFP4 block: four scale bytes, then 32 bytes of nibbles.
+pub const BLOCK_NVFP4_BYTES: usize = QK_NVFP4 / QK_NVFP4_SUB + QK_NVFP4 / 2;
+
+/// E2M1 values, doubled, indexed by their four bits (sign in bit 3).
+///
+/// Ported from `kvalues_fp4` in llama.cpp's `ggml/src/ggml-common.h`.
+pub const NVFP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// Decode an unsigned E4M3 sub-block scale, already halved so that it
+/// multiplies the doubled values of [`NVFP4_VALUES`].
+///
+/// Ported from `ggml_ue4m3_to_fp32` in llama.cpp's `ggml/src/ggml-impl.h`,
+/// including its treatment of `0x7F` as zero.
+pub fn nvfp4_scale(byte: u8) -> f32 {
+    if byte == 0 || byte == 0x7F {
+        return 0.0;
+    }
+    let exp = i32::from((byte >> 3) & 0xF);
+    let man = f32::from(byte & 0x7);
+    let raw = if exp == 0 {
+        man * 2f32.powi(-9)
+    } else {
+        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+    };
+    raw * 0.5
+}
+
+/// Dequantize a whole NVFP4 row.
+///
+/// Each 16-element sub-block stores its low nibbles first: byte `j` of a
+/// sub-block holds element `j` in its low nibble and element `j + 8` in its
+/// high one. Ported from `dequantize_row_nvfp4` in llama.cpp's
+/// `ggml/src/ggml-quants.c`.
+pub fn dequantize_row_nvfp4(bytes: &[u8]) -> Result<Vec<f32>, BlockSizeError> {
+    if !bytes.len().is_multiple_of(BLOCK_NVFP4_BYTES) {
+        return Err(BlockSizeError {
+            format: "nvfp4 row",
+            expected: BLOCK_NVFP4_BYTES,
+            found: bytes.len() % BLOCK_NVFP4_BYTES,
+        });
+    }
+    let mut out = vec![0.0f32; bytes.len() / BLOCK_NVFP4_BYTES * QK_NVFP4];
+    for (block, y) in bytes
+        .as_chunks::<BLOCK_NVFP4_BYTES>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<QK_NVFP4>().0)
+    {
+        for sub in 0..QK_NVFP4 / QK_NVFP4_SUB {
+            let d = nvfp4_scale(block[sub]);
+            for j in 0..QK_NVFP4_SUB / 2 {
+                let q = block[4 + sub * (QK_NVFP4_SUB / 2) + j];
+                y[sub * QK_NVFP4_SUB + j] = f32::from(NVFP4_VALUES[usize::from(q & 0xF)]) * d;
+                y[sub * QK_NVFP4_SUB + j + QK_NVFP4_SUB / 2] =
+                    f32::from(NVFP4_VALUES[usize::from(q >> 4)]) * d;
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod row_tests {
     use super::*;
+
+    #[test]
+    fn nvfp4_decodes_scales_and_nibble_order() {
+        assert_eq!(BLOCK_NVFP4_BYTES, 36);
+        // exp 7, mantissa 0 is 1.0 before the halving; exp 0 is subnormal.
+        assert_eq!(nvfp4_scale(7 << 3), 0.5);
+        assert_eq!(nvfp4_scale((8 << 3) | 4), 1.5);
+        assert_eq!(nvfp4_scale(1), 2f32.powi(-10));
+        assert_eq!(nvfp4_scale(0), 0.0);
+        assert_eq!(nvfp4_scale(0x7F), 0.0);
+
+        let mut block = [0u8; BLOCK_NVFP4_BYTES];
+        block[0] = 7 << 3; // sub-block 0: 0.5
+        block[1] = 8 << 3; // sub-block 1: 1.0
+        block[4] = 0xF7; // element 0 = +12, element 8 = -12
+        block[4 + 8 + 3] = 0x92; // sub-block 1: element 3 = +2, element 11 = -1
+        let y = dequantize_row_nvfp4(&block).unwrap();
+        assert_eq!(y[0], 6.0);
+        assert_eq!(y[8], -6.0);
+        assert_eq!(y[16 + 3], 2.0);
+        assert_eq!(y[16 + 11], -1.0);
+        assert_eq!(y.iter().filter(|v| **v != 0.0).count(), 4);
+        assert!(dequantize_row_nvfp4(&block[..35]).is_err());
+    }
 
     #[test]
     fn block_sizes_match_the_ggml_layout() {

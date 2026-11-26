@@ -3526,7 +3526,7 @@ impl AttentionKernels {
                 )?;
                 f
             },
-            decode_combine: module.load_function("attn_flash_decode_combine")?,
+            decode_combine: rust.load_function("attn_flash_decode_combine")?,
             flash_t1: module.load_function("attn_flash_causal_t1")?,
             append: module.load_function("attn_kv_append")?,
             append_kv8: module.load_function("attn_kv_append_kv8")?,

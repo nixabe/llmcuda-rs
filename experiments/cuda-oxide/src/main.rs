@@ -5305,6 +5305,10 @@ mod kernels {
     /// element times `127 / amax`, rounded to nearest even and clamped to
     /// +-127. An all-zero block gets scale 1 and zero codes.
     ///
+    /// Symmetric, absmax, round-to-nearest: llama.cpp's `quantize_q8_1`
+    /// shape minus the sum term this formulation does not need (no zero
+    /// point, so no correction term).
+    ///
     /// grid: (rows, ceil(k_dim / 32 / blockDim.y)). block: (32, warps): a
     /// warp is one block.
     ///
@@ -5365,6 +5369,14 @@ mod kernels {
     }
 
     /// `mma_repack_q8_0` keeping the scales as binary16 bits.
+    ///
+    /// Which width the scales get is a bandwidth decision, not a numeric
+    /// one. Q8_0 stores an fp16 scale per 32 quants, so the fp32 form widens
+    /// a value with no more precision to give: 1.125 bytes an element
+    /// against Q8_0's 1.0625, 5.9% more traffic. That is noise for a shared
+    /// expert and 1.01 GiB of every decoded token for a 17,408-wide dense
+    /// FFN. This form keeps the file's own bits, so it is neither a
+    /// requantization nor a rounding.
     ///
     /// # Safety
     /// As `mma_repack_q8_0`, scales covering n_blocks halves.

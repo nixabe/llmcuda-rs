@@ -239,7 +239,7 @@ pub const DENSE_REPACK_INT8: bool = true;
 /// exactly the thing `tests/forward_pass.rs` checks for. So the token bound
 /// comes from the same `valid_tokens` device scalar the MoE kernels gate on,
 /// and the launch shape comes from the geometry — AGENTS.md rule 5.
-pub(crate) const GLUE_SRC: &str = r#"
+const GLUE_SRC: &str = r#"
 extern "C" {
 
 // The post-mixer RMSNorm, emitting both widths in one pass.
@@ -301,36 +301,6 @@ __global__ void dense_rms_norm_narrow(
         asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v));
         out_h[base + j] = h;
     }
-}
-
-// act_h[i] = (half)(silu(gate[i]) * up[i]).
-//
-// `LayerOpsKernels::swiglu` followed by a separate narrowing pass computes
-// the same thing in two launches and a full-width round trip through memory;
-// the down projection only ever reads the narrowed form, so the fp32
-// intermediate has no other reader and does not need to exist.
-//
-// `expf`, not `__expf`. `layer_ops.rs` has a test asserting its own SwiGLU
-// has not drifted to the fast intrinsic, and this has to agree with it byte
-// for byte or the two residencies stop being comparable.
-//
-// This is *not* folded into the up projection's epilogue, which is where it
-// was tried first: that epilogue runs on `lane == 0`, so 17,408 transcendental
-// calls would land on one lane in thirty-two. It measured 0.585 ms a layer at
-// four tokens against 0.560 here -- the launch it saved cost more than it was
-// worth. See docs/BENCHMARKS.md.
-__global__ void dense_swiglu_narrow(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    unsigned short* __restrict__ act_h,
-    int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g = gate[i];
-    float a = (g / (1.0f + expf(-g))) * up[i];
-    unsigned short h;
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(a));
-    act_h[i] = h;
 }
 
 }
@@ -1004,7 +974,7 @@ impl DenseFfnBlock {
                 },
                 kernels,
                 rms_norm_narrow: module.load_function("dense_rms_norm_narrow")?,
-                swiglu_narrow: module.load_function("dense_swiglu_narrow")?,
+                swiglu_narrow: rust.load_function("dense_swiglu_narrow")?,
                 gate_out: stream.alloc_zeros::<f32>(n)?,
                 up_out: stream.alloc_zeros::<f32>(n)?,
                 normed_h: stream.alloc_zeros::<u16>(geometry.max_tokens * geometry.hidden)?,
@@ -1023,7 +993,7 @@ impl DenseFfnBlock {
                     .load_function(&format!("dense_proj_split_t{tile_tokens}_r{rows_per_warp}"))?,
                 rows_per_warp,
                 rms_norm_narrow: module.load_function("dense_rms_norm_narrow")?,
-                swiglu_narrow: module.load_function("dense_swiglu_narrow")?,
+                swiglu_narrow: rust.load_function("dense_swiglu_narrow")?,
                 gate_out: stream.alloc_zeros::<f32>(n)?,
                 up_out: stream.alloc_zeros::<f32>(n)?,
                 normed_h: stream.alloc_zeros::<u16>(tokens * geometry.hidden)?,

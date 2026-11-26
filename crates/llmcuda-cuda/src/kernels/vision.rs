@@ -38,7 +38,7 @@ use super::compile;
 /// CUDA C++ source for the elementwise and reduction kernels.
 ///
 /// Kept as one translation unit so the whole set is one NVRTC invocation.
-pub(crate) const VISION_SRC: &str = r#"
+const VISION_SRC: &str = r#"
 extern "C" {
 
 // binary16 <-> fp32 by hand: NVRTC compiles from a string with no include
@@ -117,16 +117,6 @@ __global__ void vision_layer_norm(
         float centered = (h2f(row[j]) - mean) * inv;
         dst[j] = f2h(centered * g + b);
     }
-}
-
-__global__ void vision_gelu(unsigned short* __restrict__ x, long long n)
-{
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    // ggml's tanh approximation, computed in f32.
-    float v = h2f(x[i]);
-    float inner = 0.79788456f * v * (1.0f + 0.044715f * v * v);
-    x[i] = f2h(0.5f * v * (1.0f + tanhf(inner)));
 }
 
 // Rotates the query and key slices of the fused qkv buffer in place.
@@ -217,26 +207,6 @@ __global__ void vision_softmax_rows(
     for (int j = threadIdx.x; j < row_len; j += blockDim.x) {
         row[j] = f2h(h2f(row[j]) * inv);
     }
-}
-
-__global__ void vision_add_f16(
-    unsigned short* __restrict__ a,
-    const unsigned short* __restrict__ b,
-    long long n)
-{
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    a[i] = f2h(h2f(a[i]) + h2f(b[i]));
-}
-
-__global__ void vision_half_to_float(
-    const unsigned short* __restrict__ src,
-    float* __restrict__ dst,
-    long long n)
-{
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = h2f(src[i]);
 }
 
 } // extern "C"
@@ -346,13 +316,20 @@ impl VisionKernels {
                 .load_function(name)
                 .map_err(|e| VisionError::Build(format!("{name}: {e}")))
         };
+        let rust = ctx
+            .load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))
+            .map_err(VisionError::Driver)?;
+        let r = |name: &str| {
+            rust.load_function(name)
+                .map_err(|e| VisionError::Build(format!("{name}: {e}")))
+        };
         Ok(Self {
             layer_norm: f("vision_layer_norm")?,
-            gelu: f("vision_gelu")?,
+            gelu: r("vision_gelu")?,
             rope_qk: f("vision_rope_qk")?,
             softmax_rows: f("vision_softmax_rows")?,
-            add_f16: f("vision_add_f16")?,
-            half_to_float: f("vision_half_to_float")?,
+            add_f16: r("vision_add_f16")?,
+            half_to_float: r("vision_half_to_float")?,
             blas: CudaBlasLT::new(stream)?,
         })
     }

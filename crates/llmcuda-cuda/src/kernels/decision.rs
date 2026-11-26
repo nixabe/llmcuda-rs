@@ -532,46 +532,6 @@ __global__ void __launch_bounds__(128) dec_attention_128(
     attention_tile<128>(Q, ldq, K, ldk, V, ldv, O, ldo, part, nq, nk, heads, chunk, scale);
 }
 
-// Merge key-split partials: grid (nq, heads), one thread per head dim.
-__global__ void dec_attention_combine(
-    const float* __restrict__ part, int splits, int nq, int heads, int dh,
-    float* __restrict__ O, long long ldo)
-{
-    int q = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
-    if (d >= dh) return;
-    const float* ml = part + (long long)splits * nq * heads * dh;
-    float mx = -DEC_INF;
-    for (int z = 0; z < splits; ++z) mx = fmaxf(mx, ml[(((long long)z * nq + q) * heads + h) * 2]);
-    float num = 0.0f, den = 0.0f;
-    for (int z = 0; z < splits; ++z) {
-        long long slot = ((long long)z * nq + q) * heads + h;
-        float w = expf(ml[slot * 2] - mx);
-        den += ml[slot * 2 + 1] * w;
-        num += part[slot * dh + d] * w;
-    }
-    O[(long long)q * ldo + h * dh + d] = num / den;
-}
-
-// out[s][c] = mean over rows t of span s of LayerNorm(x[t])[c], with the
-// rows' (mean, rstd) from `dec_layer_norm`. Spans are (start, end) pairs at
-// `spans + s * stride`. Grid (ceil(cols / blockDim), nspans).
-__global__ void dec_span_mean(
-    const float* __restrict__ x, long long ldx, int cols,
-    const float2* __restrict__ stats, const float* __restrict__ g, const float* __restrict__ b,
-    const int* __restrict__ spans, int stride, int nspans,
-    float* __restrict__ out, long long ldo)
-{
-    int s = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nspans || c >= cols) return;
-    int start = spans[s * stride], end = spans[s * stride + 1];
-    float acc = 0.0f;
-    for (int t = start; t < end; ++t) {
-        float2 st = stats[t];
-        acc += (x[(long long)t * ldx + c] - st.x) * st.y;
-    }
-    out[(long long)s * ldo + c] = acc / (float)(end - start) * g[c] + b[c];
-}
-
 // out[s][c] = mean over the span's token ids of row `id` of an embedding
 // table stored as raw GGUF rows of `row_bytes` in format `fmt`.
 __global__ void dec_lexical(
@@ -585,17 +545,6 @@ __global__ void dec_lexical(
     float acc = 0.0f;
     for (int t = start; t < end; ++t) acc += dequant_element(table + (long long)tokens[t] * row_bytes, fmt, c);
     out[(long long)s * ldo + c] = acc / (float)(end - start);
-}
-
-// y[o][c] += src[owner(o)][c], owner at `spans[o * stride + 2]`.
-__global__ void dec_add_owner_rows(
-    float* __restrict__ y, long long ldy, const float* __restrict__ src, long long lds,
-    const int* __restrict__ spans, int stride, int n, int cols)
-{
-    int o = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= n || c >= cols) return;
-    int q = spans[o * stride + 2];
-    y[(long long)o * ldy + c] += src[(long long)q * lds + c];
 }
 
 // One block per question: softmax over its own options of
@@ -946,6 +895,8 @@ impl DecisionKernels {
         let ptx = compile(DECISION_SRC, "decision_head").map_err(DecisionKernelError::Compile)?;
         let module = ctx.load_module(ptx)?;
         let f = |name: &str| module.load_function(name);
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
+        let r = |name: &str| rust.load_function(name);
         let sm_count = ctx
             .attribute(
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
@@ -959,10 +910,10 @@ impl DecisionKernels {
             attention_32: f("dec_attention_32")?,
             attention_64: f("dec_attention_64")?,
             attention_128: f("dec_attention_128")?,
-            attention_combine: f("dec_attention_combine")?,
-            span_mean: f("dec_span_mean")?,
+            attention_combine: r("dec_attention_combine")?,
+            span_mean: r("dec_span_mean")?,
             lexical: f("dec_lexical")?,
-            add_owner_rows: f("dec_add_owner_rows")?,
+            add_owner_rows: r("dec_add_owner_rows")?,
             question_fields: f("dec_question_fields")?,
             features: f("dec_features")?,
             final_scores: f("dec_final_scores")?,

@@ -2592,43 +2592,6 @@ __global__ void attn_flash_causal_t1(
 }
 
 
-// Append this batch's roped keys and raw values to the cache, at the absolute
-// position the sequence has reached.
-//
-// This was two `cuMemcpyDtoDAsync` calls into `cache.k.slice_mut(at..)` and
-// `cache.v.slice_mut(at..)`, which is the same traffic and one fewer launch.
-// It is a kernel now for one reason: `at` was computed on the host, so the
-// destination was a **host-chosen address**. A CUDA graph records addresses,
-// so a captured decode step would write position `n` forever. Reading the
-// position from device memory is what makes the step replayable, and it is
-// `AGENTS.md` rule 5 besides.
-//
-// Both halves in one launch: they are the same shape and the same stride, and
-// the copies are independent, so splitting them would only cost a launch.
-//
-// grid: (ceil(2 * span / ATTN_APPEND_THREADS),). block: ATTN_APPEND_THREADS.
-__global__ void attn_kv_append(
-    const float* __restrict__ key,
-    const float* __restrict__ value,
-    unsigned short* __restrict__ k_cache,
-    unsigned short* __restrict__ v_cache,
-    const int* __restrict__ position,
-    int span,
-    int row
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= 2 * span) return;
-    // `span` is `n_tokens * row`; the cache is indexed by *position*, so the
-    // destination base is one row per position and not one span.
-    long long at = (long long)(*position) * (long long)row;
-    if (i < span) {
-        k_cache[at + i] = f2h(key[i]);
-    } else {
-        int j = i - span;
-        v_cache[at + j] = f2h(value[j]);
-    }
-}
-
 // attn_kv_append with either half in q8_0 (`kq8` / `vq8` nonzero). One thread
 // per element as above, so with `row` a multiple of 32 and 256-thread blocks
 // each warp holds exactly one 32-element block of one half of one position:
@@ -3499,7 +3462,7 @@ impl AttentionKernels {
             },
             decode_combine: rust.load_function("attn_flash_decode_combine")?,
             flash_t1: module.load_function("attn_flash_causal_t1")?,
-            append: module.load_function("attn_kv_append")?,
+            append: rust.load_function("attn_kv_append")?,
             append_kv8: module.load_function("attn_kv_append_kv8")?,
             rope_append_batch: module.load_function("attn_decode_rope_append_batch")?,
             kv,

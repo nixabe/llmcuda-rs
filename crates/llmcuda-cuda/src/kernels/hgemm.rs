@@ -53,7 +53,7 @@ pub const HGEMM_BM: usize = 128;
 /// Contraction elements per stage; also the Q8_0 block, so one scale a row.
 pub const HGEMM_BK: usize = 32;
 
-pub(crate) const HGEMM_SRC: &str = r#"
+const HGEMM_SRC: &str = r#"
 #define HG_BM 128
 #define HG_BK 32
 #define HG_GROUP 4
@@ -121,16 +121,6 @@ __device__ __forceinline__ unsigned hg_ldg2(const unsigned short* p) {
     unsigned short v;
     asm volatile("ld.global.nc.L2::128B.u16 %0, [%1];" : "=h"(v) : "l"(p));
     return v;
-}
-
-// fp32 -> fp16, round to nearest even, `n` elements.
-__global__ void hg_to_half(const float* __restrict__ x, unsigned short* __restrict__ y, long long n) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        unsigned short h;
-        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(x[i]));
-        y[i] = h;
-    }
 }
 
 // Halves offset of 16-byte chunk `c` (0..3) of row `r` in a [rows][32] fp16
@@ -586,7 +576,7 @@ impl HgemmKernels {
             q8_128: module.load_function("hg_q8_128")?,
             bf16_256: module.load_function("hg_bf16_256")?,
             bf16_128: module.load_function("hg_bf16_128")?,
-            to_half: module.load_function("hg_to_half")?,
+            to_half: rust.load_function("hg_to_half")?,
             reduce: rust.load_function("hg_splitk_reduce")?,
             q8_to_half_w: module.load_function("hg_q8_to_half_w")?,
             sms,

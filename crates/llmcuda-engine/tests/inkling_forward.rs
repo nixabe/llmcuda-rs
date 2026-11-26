@@ -81,7 +81,7 @@ fn device_forward_matches_llama_cpp_and_its_own_chunkings() {
     let ctx = CudaContext::new(0).expect("device 0");
     let stream = ctx.default_stream();
     let model = Arc::new(InklingModel::load(&ctx, &stream, &file).expect("the model loads"));
-    model.use_scalar_attention(std::env::var_os("LLMCUDA_INK_SCALAR_ATTN").is_some());
+    model.use_reference_kernels(std::env::var_os("LLMCUDA_INK_REFERENCE").is_some());
     println!(
         "weights resident: {:.2} GiB",
         model.weight_bytes() as f64 / (1u64 << 30) as f64

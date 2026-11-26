@@ -100,7 +100,7 @@ fn prefill_attention_matches_an_f64_oracle_on_both_kernels() {
         );
         let d_pos = stream.clone_htod(&[pos0 as i32]).unwrap();
         for (name, scalar) in [("scalar", true), ("tensor-core", false)] {
-            kernels.use_scalar_attention(scalar);
+            kernels.use_reference_kernels(scalar);
             let sentinel = 7.25f32;
             let mut out = stream
                 .clone_htod(&vec![sentinel; (tokens + 1) * heads * dim])
@@ -134,5 +134,51 @@ fn prefill_attention_matches_an_f64_oracle_on_both_kernels() {
             assert!(worst < 2e-4, "{name}: max-abs {worst}");
             assert!(1.0 - cos < 1e-9, "{name}: cosine {cos}");
         }
+    }
+}
+
+/// The tiled fp32 projection is the reference's sums, bit for bit: both are
+/// one ascending chain of fused products per output.
+#[test]
+fn tiled_projection_is_bit_identical_to_the_reference() {
+    let Some(ctx) = device() else { return };
+    let stream = ctx.default_stream();
+    let kernels = InklingKernels::new(&ctx).expect("kernels load");
+    let mut rng = Xorshift64Star::new(0x70c7);
+    for (rows, k, ldx, tokens) in [
+        (128usize, 2304usize, 2304usize, 37usize),
+        (130, 200, 260, 8),
+        (5, 64, 64, 1),
+        (64, 70, 70, 19),
+    ] {
+        let w = stream
+            .clone_htod(&rng.vec_f32(rows * k, -1.0, 1.0))
+            .unwrap();
+        let x = stream
+            .clone_htod(&rng.vec_f32(tokens * ldx, -3.0, 3.0))
+            .unwrap();
+        let run = |reference: bool| -> Vec<u32> {
+            kernels.use_reference_kernels(reference);
+            let mut out = stream
+                .clone_htod(&vec![7.25f32; (tokens + 1) * rows])
+                .unwrap();
+            kernels
+                .linear(&stream, &w, &x, &mut out, rows, k, ldx, tokens)
+                .unwrap();
+            stream
+                .clone_dtoh(&out)
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        let (want, got) = (run(true), run(false));
+        let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+        println!(
+            "projection {rows} x {k} (stride {ldx}), {tokens} rows: {differing} of {} differ",
+            want.len()
+        );
+        assert_eq!(differing, 0);
+        assert!(got[tokens * rows..].iter().all(|b| *b == 7.25f32.to_bits()));
     }
 }

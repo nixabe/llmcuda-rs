@@ -161,7 +161,8 @@ pub struct InklingKernels {
     rel_table: CudaFunction,
     attn: CudaFunction,
     attn_mma: CudaFunction,
-    scalar_attention: core::sync::atomic::AtomicBool,
+    linear_tiled: CudaFunction,
+    reference: core::sync::atomic::AtomicBool,
     gather_half: CudaFunction,
     situ_half: CudaFunction,
     moe_combine: CudaFunction,
@@ -181,7 +182,8 @@ impl InklingKernels {
         )?;
         Ok(Self {
             attn_mma: mma.load_function("ink_attn_mma")?,
-            scalar_attention: core::sync::atomic::AtomicBool::new(false),
+            linear_tiled: mma.load_function("ink_linear_tiled")?,
+            reference: core::sync::atomic::AtomicBool::new(false),
             embed: m.load_function("ink_embed")?,
             linear: m.load_function("ink_linear")?,
             mix: m.load_function("ink_mix")?,
@@ -224,7 +226,8 @@ impl InklingKernels {
         Ok(())
     }
 
-    /// `out[t][j] = w[j] . x[t]` in fp32 (`inkling::project`).
+    /// `out[t][j] = w[j] . x[t]` in fp32 (`inkling::project`): ascending
+    /// fused sums, the same bits from the tiled kernel as the reference.
     #[allow(clippy::too_many_arguments)]
     pub fn linear(
         &self,
@@ -241,6 +244,20 @@ impl InklingKernels {
         need("linear x", x.len(), tokens.saturating_sub(1) * ldx + k)?;
         need("linear out", out.len(), tokens * rows)?;
         let (r, k_i, l) = (rows as i32, k as i32, ldx as i32);
+        if !self.reference.load(core::sync::atomic::Ordering::Relaxed) {
+            let n = tokens as i32;
+            let mut b = stream.launch_builder(&self.linear_tiled);
+            b.arg(w)
+                .arg(x)
+                .arg(&mut *out)
+                .arg(&r)
+                .arg(&k_i)
+                .arg(&l)
+                .arg(&n);
+            // SAFETY: lengths checked against the grid.
+            unsafe { b.launch(cfg((rows.div_ceil(128), tokens.div_ceil(8), 1), 128, 0)) }?;
+            return Ok(());
+        }
         let mut b = stream.launch_builder(&self.linear);
         b.arg(w).arg(x).arg(&mut *out).arg(&r).arg(&k_i).arg(&l);
         // SAFETY: lengths checked against the grid.
@@ -489,10 +506,11 @@ impl InklingKernels {
         Ok(())
     }
 
-    /// Use the scalar attention kernel for prefill instead of the
-    /// tensor-core one: the reference the latter is compared with.
-    pub fn use_scalar_attention(&self, on: bool) {
-        self.scalar_attention
+    /// Run prefill on the plain reference kernels: the scalar attention
+    /// instead of the tensor-core one, the one-thread-a-sum fp32 projection
+    /// instead of the tiled one. For A/B measurement and differential tests.
+    pub fn use_reference_kernels(&self, on: bool) {
+        self.reference
             .store(on, core::sync::atomic::Ordering::Relaxed);
     }
 
@@ -528,11 +546,7 @@ impl InklingKernels {
         need("attn pos", pos.len(), 1)?;
         let (w, e, kv, d) = (window as i32, extent as i32, kv_heads as i32, dim as i32);
         let scale = 1.0 / (dim as f32).sqrt();
-        if dim == 128
-            && !self
-                .scalar_attention
-                .load(core::sync::atomic::Ordering::Relaxed)
-        {
+        if dim == 128 && !self.reference.load(core::sync::atomic::Ordering::Relaxed) {
             let (hd, n) = (heads as i32, tokens as i32);
             let mut b = stream.launch_builder(&self.attn_mma);
             b.arg(q)
@@ -930,6 +944,48 @@ extern "C" __global__ void __launch_bounds__(32) ink_attn_mma(
             o[m] = acc[m][2] * ib;
             o[16 + m] = acc[m][3] * ib;
         }
+    }
+}
+
+// out[t][j] = sum_i w[j][i] * x[t][i] in fp32, ascending i, each product
+// fused into the running sum: ink_linear's sums exactly, eight rows of x a
+// block. A thread owns one output j and reads its weight row once for the
+// eight; the rows of x come from a shared tile, 64 columns at a time.
+// ink_linear read both operands from global memory for every product, in
+// one thread a (row, output): 7.4 ms for the router at 1536 rows.
+//
+// grid: (ceil(rows / 128), ceil(tokens / 8)), 128 threads.
+extern "C" __global__ void __launch_bounds__(128) ink_linear_tiled(
+    const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ out,
+    int rows, int k, int ldx, int tokens
+) {
+    __shared__ float xs[64][8];
+    const int tid = threadIdx.x;
+    const int j = blockIdx.x * 128 + tid;
+    const int t0 = blockIdx.y * 8;
+    const float* wr = w + (long long)min(j, rows - 1) * k;
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int c0 = 0; c0 < k; c0 += 64) {
+        const int len = min(64, k - c0);
+#pragma unroll
+        for (int idx = tid; idx < 512; idx += 128) {
+            const int kk = idx >> 3, tok = idx & 7;
+            float v = 0.0f;
+            if (kk < len && t0 + tok < tokens) v = x[(long long)(t0 + tok) * ldx + c0 + kk];
+            xs[kk][tok] = v;
+        }
+        __syncthreads();
+        for (int kk = 0; kk < len; ++kk) {
+            const float wv = wr[c0 + kk];
+#pragma unroll
+            for (int tok = 0; tok < 8; ++tok) acc[tok] = fmaf(wv, xs[kk][tok], acc[tok]);
+        }
+        __syncthreads();
+    }
+    if (j < rows) {
+#pragma unroll
+        for (int tok = 0; tok < 8; ++tok)
+            if (t0 + tok < tokens) out[(long long)(t0 + tok) * rows + j] = acc[tok];
     }
 }
 

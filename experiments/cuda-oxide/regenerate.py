@@ -49,7 +49,7 @@ if ".target sm_75\n" not in ptx or any(
         "moe_route", "moe_dispatch_t1", "moe_route_dispatch_t1", "moe_align_block_size",
         "attn_rope_partial_imrope", "attn_kv_append_kv8", "attn_decode_rope_append_batch",
         "vision_layer_norm", "hg_q8_to_half_w", "dec_lexical", "dec_question_fields",
-        "dec_features",
+        "dec_features", "fwd_embed_quant",
     )
 ):
     raise SystemExit("compiler output has the wrong target or entry point")

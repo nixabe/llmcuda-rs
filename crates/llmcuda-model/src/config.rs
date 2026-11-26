@@ -721,13 +721,23 @@ impl ModelConfig {
     /// Number of layers holding growing KV cache.
     ///
     /// Only these count toward per-token cache capacity.
+    ///
+    /// For `inkling2_loop` these are its cache slots, one per layer
+    /// application; how many of them grow is
+    /// [`Self::kv_cache_bytes_per_token`]'s business.
     pub const fn num_attention_layers(&self) -> u32 {
-        self.num_layers / self.pattern_period
+        match &self.inkling {
+            Some(k) => k.slots(self.num_layers),
+            None => self.num_layers / self.pattern_period,
+        }
     }
 
     /// Number of layers holding fixed-size recurrent state.
     pub const fn num_gdn_layers(&self) -> u32 {
-        self.num_layers - self.num_attention_layers()
+        match &self.inkling {
+            Some(_) => 0,
+            None => self.num_layers - self.num_attention_layers(),
+        }
     }
 
     /// Bytes of KV cache consumed per token across all attention layers.
@@ -743,17 +753,38 @@ impl ModelConfig {
     ///
     /// Equal to `kv_bytes_per_token(2)` when both halves are binary16; with
     /// both at `Q8_0` it is 17/32 of that.
+    ///
+    /// For `inkling2_loop` only the full-attention slots grow with the
+    /// sequence; the sliding ones are rings, counted per sequence by
+    /// [`Self::gdn_state_bytes_per_sequence`].
     pub const fn kv_cache_bytes_per_token(&self) -> u64 {
         let row = self.attention.kv_heads as u64 * self.attention.head_dim as u64;
-        (self.kv_cache.k.row_bytes(row) + self.kv_cache.v.row_bytes(row))
-            * self.num_attention_layers() as u64
+        let growing = match &self.inkling {
+            Some(k) => k.full_slots(self.num_layers),
+            None => self.num_attention_layers(),
+        };
+        (self.kv_cache.k.row_bytes(row) + self.kv_cache.v.row_bytes(row)) * growing as u64
     }
 
     /// Bytes of recurrent state held per sequence across all GDN layers.
     ///
     /// Constant in sequence length: about 60 MiB per slot.
+    ///
+    /// This is the cache's second group: what a sequence holds whatever its
+    /// length. `inkling2_loop` has no recurrent layers, and its second
+    /// group is the sliding slots' ring caches — fixed, and at ~16 MiB a
+    /// slot a different page size from an attention block, which is what
+    /// the two groups are for.
     pub const fn gdn_state_bytes_per_sequence(&self) -> u64 {
-        self.gdn.state_bytes_per_layer() * self.num_gdn_layers() as u64
+        match &self.inkling {
+            Some(k) => {
+                let row = self.attention.kv_heads as u64 * self.attention.head_dim as u64;
+                (self.kv_cache.k.row_bytes(row) + self.kv_cache.v.row_bytes(row))
+                    * k.ring_rows() as u64
+                    * k.sliding_slots(self.num_layers) as u64
+            }
+            None => self.gdn.state_bytes_per_layer() * self.num_gdn_layers() as u64,
+        }
     }
 
     /// Parameters in one FFN unit's three matrices.

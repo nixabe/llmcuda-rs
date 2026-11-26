@@ -85,6 +85,36 @@ impl InklingConfig {
         layers + (self.loop_count - 1) * (self.loop_end - self.loop_start)
     }
 
+    /// The widest pass a served sequence's ring caches leave room for, in
+    /// rows. A sliding layer reads its window back from each row and a pass
+    /// appends before it attends, so the ring is the window plus this,
+    /// rounded up to a power of two.
+    pub const SERVING_PASS_ROWS: u32 = 2048;
+
+    /// Rows of a sliding slot's ring cache at [`Self::SERVING_PASS_ROWS`].
+    pub const fn ring_rows(&self) -> u32 {
+        (self.sliding_window + Self::SERVING_PASS_ROWS).next_power_of_two()
+    }
+
+    /// Cache slots whose layer attends over a sliding window: their keys
+    /// and values are bounded by [`Self::ring_rows`].
+    pub const fn sliding_slots(&self, layers: u32) -> u32 {
+        let mut count = 0;
+        let mut slot = 0;
+        while slot < self.slots(layers) {
+            if self.is_sliding(self.slot_layer(layers, slot)) {
+                count += 1;
+            }
+            slot += 1;
+        }
+        count
+    }
+
+    /// Cache slots that keep every position.
+    pub const fn full_slots(&self, layers: u32) -> u32 {
+        self.slots(layers) - self.sliding_slots(layers)
+    }
+
     /// The layer whose weights cache slot `slot` runs on.
     pub const fn slot_layer(&self, layers: u32, slot: u32) -> u32 {
         if slot < layers {
@@ -298,4 +328,87 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
     };
     crate::verify::check_config(&config).map_err(|e| ConfigLoadError(e.to_string()))?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Inkling 2 Mini's geometry: 24 layers, 6..18 run three times, every
+    /// layer sliding but 5, 11, 17 and 23.
+    fn mini() -> InklingConfig {
+        let full = [5u32, 11, 17, 23];
+        let sliding_layers = (0..24u32)
+            .filter(|l| !full.contains(l))
+            .fold(0u64, |mask, l| mask | 1 << l);
+        InklingConfig {
+            vocab_padded: 201_024,
+            sliding_layers,
+            sliding_window: 1024,
+            relative_length: 16,
+            relative_extent: 1024,
+            conv_taps: 4,
+            res_block: 6,
+            loop_start: 6,
+            loop_end: 18,
+            loop_count: 3,
+            gate_rank: 64,
+            expert_weights_scale_bits: 8.0f32.to_bits(),
+            situ_beta_bits: 4.0f32.to_bits(),
+            situ_linear_beta_bits: 25.0f32.to_bits(),
+            rms_eps_bits: 1e-6f32.to_bits(),
+            qk_clip_bits: 22.627f32.to_bits(),
+            relative_clip_bits: 8.0f32.to_bits(),
+            log_scale_floor: 8192,
+            log_scale_alpha_bits: 0.1f32.to_bits(),
+            softcap_bits: 30.0f32.to_bits(),
+        }
+    }
+
+    #[test]
+    fn slots_follow_the_loop_and_split_into_full_and_sliding() {
+        let k = mini();
+        assert_eq!(k.slots(24), 48);
+        // Slots past the layers replay the looped range, pass by pass.
+        assert_eq!(k.slot_layer(24, 23), 23);
+        assert_eq!(k.slot_layer(24, 24), 6);
+        assert_eq!(k.slot_layer(24, 35), 17);
+        assert_eq!(k.slot_layer(24, 36), 6);
+        assert_eq!(k.slot_layer(24, 47), 17);
+        // Layers 5 and 23 run once, 11 and 17 three times: eight full slots.
+        assert_eq!(k.full_slots(24), 8);
+        assert_eq!(k.sliding_slots(24), 40);
+    }
+
+    #[test]
+    fn a_ring_covers_the_window_and_the_widest_served_pass() {
+        let k = mini();
+        assert_eq!(k.ring_rows(), 4096);
+        assert!(k.ring_rows() >= k.sliding_window + InklingConfig::SERVING_PASS_ROWS);
+        assert!(k.ring_rows().is_power_of_two());
+    }
+
+    /// The cache's two groups for this model: 32 KiB a token for the eight
+    /// slots that grow, and 640 MiB a sequence of rings whatever its length.
+    #[test]
+    fn cache_geometry_counts_growing_slots_per_token_and_rings_per_sequence() {
+        let mut c = ModelConfig::qwen3_6_35b_a3b();
+        c.num_layers = 24;
+        c.pattern_period = 1;
+        c.attention_offset = 0;
+        c.attention = AttentionConfig {
+            q_heads: 24,
+            kv_heads: 8,
+            head_dim: 128,
+            rope_dim: 0,
+        };
+        c.kv_cache = KvCacheTypes::F16;
+        c.inkling = Some(mini());
+        assert_eq!(c.num_attention_layers(), 48);
+        assert_eq!(c.num_gdn_layers(), 0);
+        // 8 KV heads x 128 x 2 bytes, keys and values, eight slots.
+        assert_eq!(c.kv_cache_bytes_per_token(), 8 * 4096);
+        assert_eq!(c.gdn_state_bytes_per_sequence(), 40 * 4096 * 4096);
+        assert_eq!(c.gdn_state_bytes_per_sequence(), 640 << 20);
+    }
 }

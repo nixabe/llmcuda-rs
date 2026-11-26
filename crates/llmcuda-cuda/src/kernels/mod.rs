@@ -27,6 +27,8 @@ pub mod layer_ops;
 pub mod lm_head;
 pub mod mma;
 pub mod moe;
+#[cfg(test)]
+mod rust_parity;
 pub mod vision;
 
 use std::collections::HashMap;

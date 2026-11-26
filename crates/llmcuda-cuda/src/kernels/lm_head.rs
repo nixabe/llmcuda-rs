@@ -168,7 +168,7 @@ const ARGMAX_THREADS: u32 = 256;
 /// 970.
 pub const ARGMAX_BLOCKS: usize = 512;
 
-const LM_HEAD_SRC: &str = r#"
+pub(crate) const LM_HEAD_SRC: &str = r#"
 #define ARGMAX_THREADS 256
 #define LM_HEAD_STAGE_BLOCKS 16
 #define LM_HEAD_STAGE_U4 ((LM_HEAD_STAGE_BLOCKS * 34) / 16)

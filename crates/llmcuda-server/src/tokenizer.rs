@@ -15,6 +15,12 @@ const QWEN35_PATTERN: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL
 // IFM tokenizer.json: triple-digit number chunks and joiner-aware words.
 const K2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\x{200C}|\x{200D})+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+// `inkling2`: the o200k split from the publisher's tokenizer.json, which
+// llama.cpp's LLAMA_VOCAB_PRE_TYPE_GPT4O quotes before its own rewrite of it
+// (src/llama-vocab.cpp). Case-aware words with an optional contraction,
+// numbers in chunks of three, and a slash allowed after punctuation.
+const INKLING2_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 #[derive(Debug)]
 pub enum TokenizerError {
     Gguf(llmcuda_gguf::GgufError),
@@ -185,9 +191,13 @@ pub fn from_gguf(path: &Path) -> Result<Tokenizer, TokenizerError> {
         .get_string_array("tokenizer.ggml.tokens")
         .ok_or(TokenizerError::Missing("tokenizer.ggml.tokens"))?;
     let special = special_tokens(&gguf, tokens.len())?;
-    let (pattern, invert) = match gguf.get_str("tokenizer.ggml.pre") {
-        Some("qwen35") => (QWEN35_PATTERN, true),
-        Some("k2-horizon") => (K2_PATTERN, false),
+    // The third field: a piece that is itself a token is emitted whole,
+    // whatever the merge table would do with it (llama.cpp's
+    // `ignore_merges`).
+    let (pattern, invert, ignore_merges) = match gguf.get_str("tokenizer.ggml.pre") {
+        Some("qwen35") => (QWEN35_PATTERN, true, false),
+        Some("k2-horizon") => (K2_PATTERN, false, false),
+        Some("inkling2") => (INKLING2_PATTERN, false, true),
         _ => {
             return Err(TokenizerError::InvalidMetadata(
                 "unsupported GGUF pre-tokenizer".into(),
@@ -219,6 +229,7 @@ pub fn from_gguf(path: &Path) -> Result<Tokenizer, TokenizerError> {
         .collect::<Result<Vec<_>, _>>()?;
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
+        .ignore_merges(ignore_merges)
         .build()
         .map_err(TokenizerError::Build)?;
 
@@ -298,6 +309,41 @@ mod tests {
         let (_, eog) = pieces_from_gguf(Path::new(&model)).unwrap();
         assert!(eog.contains(&1));
         assert!(eog.contains(&250019));
+    }
+
+    /// Token ids llama.cpp ae6a7ad2c produced for the same text (the
+    /// `api.tokens` of the capture `inkling_reference.rs` uses).
+    #[test]
+    fn inkling_tokenizer_matches_llama_cpp_on_the_capture_prompt() {
+        let path = std::env::var_os("LLMCUDA_INKLING_MODEL").map_or_else(
+            || {
+                PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf"
+                ))
+            },
+            PathBuf::from,
+        );
+        if !path.exists() {
+            eprintln!("SKIPPED: no Inkling model at {}", path.display());
+            return;
+        }
+        let tokenizer = from_gguf(&path).unwrap();
+        let ids = tokenizer
+            .encode(
+                "The capital of Japan is Tokyo. The capital of France is",
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            ids.get_ids(),
+            [
+                371, 151451, 149879, 153630, 149884, 182416, 13, 149917, 151451, 149879, 151194,
+                149884
+            ]
+        );
+        let (_, eog) = pieces_from_gguf(&path).unwrap();
+        assert!(eog.contains(&200_006));
     }
 
     #[test]

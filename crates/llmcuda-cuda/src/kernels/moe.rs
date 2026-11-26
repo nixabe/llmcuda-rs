@@ -5104,7 +5104,7 @@ impl MoeKernels {
             route: module.load_function("moe_route")?,
             dispatch_t1: module.load_function("moe_dispatch_t1")?,
             route_dispatch_t1: module.load_function("moe_route_dispatch_t1")?,
-            align_count: module.load_function("moe_align_count")?,
+            align_count: rust.load_function("moe_align_count")?,
             align: module.load_function("moe_align_block_size")?,
             expert_ffn: [
                 module.load_function("moe_expert_ffn_q6k")?,

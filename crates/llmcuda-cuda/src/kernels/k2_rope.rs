@@ -10,7 +10,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use std::sync::Arc;
-const SRC: &str = r#"
+pub(crate) const SRC: &str = r#"
 __device__ __forceinline__ unsigned long long slot(int n,unsigned long long p0,unsigned long long p1,unsigned long long p2,unsigned long long p3,unsigned long long p4,unsigned long long p5,unsigned long long p6,unsigned long long p7){switch(n){case 0:return p0;case 1:return p1;case 2:return p2;case 3:return p3;case 4:return p4;case 5:return p5;case 6:return p6;default:return p7;}}
 __device__ __forceinline__ unsigned short half_bits(float v){unsigned short h;asm("cvt.rn.f16.f32 %0,%1;":"=h"(h):"f"(v));return h;}
 #if KV_KQ8 || KV_VQ8

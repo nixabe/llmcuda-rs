@@ -38,7 +38,7 @@ use super::compile;
 /// CUDA C++ source for the elementwise and reduction kernels.
 ///
 /// Kept as one translation unit so the whole set is one NVRTC invocation.
-const VISION_SRC: &str = r#"
+pub(crate) const VISION_SRC: &str = r#"
 extern "C" {
 
 // binary16 <-> fp32 by hand: NVRTC compiles from a string with no include

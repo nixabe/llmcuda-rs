@@ -767,9 +767,9 @@ impl LayerOpsKernels {
             &module
         };
         Ok(Self {
-            rms_norm: opt_in.load_function("rms_norm_rows")?,
-            rms_norm_swiglu: opt_in.load_function("rms_norm_swiglu_rows")?,
-            rms_norm_swiglu_q8: module.load_function("rms_norm_swiglu_q8_rows")?,
+            rms_norm: rust.load_function("rms_norm_rows")?,
+            rms_norm_swiglu: rust.load_function("rms_norm_swiglu_rows")?,
+            rms_norm_swiglu_q8: rust.load_function("rms_norm_swiglu_q8_rows")?,
             rope: rust.load_function("rope_partial")?,
             swiglu: opt_in.load_function("swiglu_mul")?,
             sigmoid_gate: opt_in.load_function("sigmoid_gate_mul")?,

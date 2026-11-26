@@ -468,6 +468,283 @@ fn grouped_gemm_contracts_each_tile_with_its_owner() {
     }
 }
 
+/// Activations laid out for an NVFP4 contraction: pair `p` of each
+/// 16-element group holds elements `p` and `p + 8`.
+fn byte_order(x: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0; x.len()];
+    for (g, group) in x.chunks(16).enumerate() {
+        for e in 0..16 {
+            out[g * 16 + ((e & 7) << 1) + (e >> 3)] = group[e];
+        }
+    }
+    out
+}
+
+fn situ(gate: f64, up: f64, beta: f64, lb: f64) -> f64 {
+    beta * (gate / beta).tanh() / (1.0 + (-gate).exp()) * lb * (up / lb).tanh()
+}
+
+/// The decode-shaped GEMM (`DecodeGemm`): dense with three activation
+/// planes, and the expert gate/up and down projections, in every format,
+/// against the same rounding contract as the prefill GEMM.
+#[test]
+fn decode_gemm_matches_its_rounding_contract() {
+    use llmcuda_cuda::kernels::inkling::DecodeGemm;
+    let Some(ctx) = device() else { return };
+    let stream = ctx.default_stream();
+    let mma = MmaKernels::new(&ctx).expect("int8 kernels compile");
+    let hg = HgemmKernels::new(&ctx).expect("fp16 GEMM kernels compile");
+    let dg = DecodeGemm::new(&ctx).expect("decode GEMM compiles");
+    let mut rng = Xorshift64Star::new(0xdec0de);
+    let half = |x: &[f32]| {
+        let d = stream.clone_htod(x).unwrap();
+        let mut h = stream.alloc_zeros::<u16>(x.len()).unwrap();
+        hg.to_half(&stream, &d, &mut h, x.len()).unwrap();
+        h
+    };
+    // The device operands for a `stack x rows x k` weight in a format, and
+    // the values the oracle multiplies with.
+    struct Staged {
+        q: Option<(
+            cudarc::driver::CudaSlice<i8>,
+            cudarc::driver::CudaSlice<u16>,
+        )>,
+        bytes: Option<cudarc::driver::CudaSlice<u8>>,
+        exponent: i32,
+        deq: Vec<f32>,
+    }
+    let stage = |format: &Format, n: usize, k: usize, seed: u64| -> Staged {
+        match format {
+            Format::Q8_0 => {
+                let (bytes, deq) = q8_0_weights(n, k, seed);
+                let src = stream.clone_htod(&bytes).unwrap();
+                let mut wq = stream.alloc_zeros::<i8>(n * k).unwrap();
+                let mut ws = stream.alloc_zeros::<u16>(n * k / 32).unwrap();
+                mma.repack_q8_0_half(&stream, &src, &mut wq, &mut ws, n * k)
+                    .unwrap();
+                Staged {
+                    q: Some((wq, ws)),
+                    bytes: None,
+                    exponent: 0,
+                    deq,
+                }
+            }
+            Format::Bf16 => {
+                let (bytes, vals) = bf16_weights(n, k, seed);
+                let exponent = bf16_half_exponent(&bytes);
+                let scale = 2f32.powi(exponent);
+                Staged {
+                    q: None,
+                    bytes: Some(stream.clone_htod(&bytes).unwrap()),
+                    exponent,
+                    deq: vals
+                        .iter()
+                        .map(|&v| round_through_f16(v * scale) / scale)
+                        .collect(),
+                }
+            }
+            Format::Nvfp4 => {
+                let (bytes, vals) = nvfp4_weights(n, k, seed);
+                Staged {
+                    q: None,
+                    bytes: Some(stream.clone_htod(&bytes).unwrap()),
+                    exponent: 0,
+                    deq: vals,
+                }
+            }
+        }
+    };
+    fn operand<'a>(format: &Format, s: &'a Staged) -> HalfWeight<'a> {
+        match format {
+            Format::Q8_0 => {
+                let (q, scales) = s.q.as_ref().unwrap();
+                HalfWeight::Q8_0 { q, scales }
+            }
+            Format::Bf16 => HalfWeight::Bf16 {
+                bytes: s.bytes.as_ref().unwrap(),
+                exponent: s.exponent,
+            },
+            Format::Nvfp4 => HalfWeight::Nvfp4 {
+                bytes: s.bytes.as_ref().unwrap(),
+                scale: 1.0,
+            },
+        }
+    }
+    let dot = |x: &[f32], w: &[f32]| -> (f64, f64) {
+        x.iter().zip(w).fold((0.0, 0.0), |(s, m), (a, b)| {
+            let p = f64::from(round_through_f16(*a)) * f64::from(*b);
+            (s + p, m + p.abs())
+        })
+    };
+
+    // Dense: weight rows [0, 32), [32, 64), [64, 96) read planes 0, 1, 2.
+    let (rows, k, plane_rows, ldo) = (96usize, 128usize, 8usize, 100usize);
+    for (name, format) in [("q8_0", Format::Q8_0), ("bf16", Format::Bf16)] {
+        let w = stage(&format, rows, k, 7);
+        for tokens in [1usize, 3, 8] {
+            let x = rng.vec_f32(3 * plane_rows * k, -3.0, 3.0);
+            let xh = half(&x);
+            let prior = rng.vec_f32(tokens * ldo, -1.0, 1.0);
+            let mut out = stream.clone_htod(&prior).unwrap();
+            dg.dense(
+                &stream,
+                operand(&format, &w),
+                &xh,
+                &mut out,
+                rows,
+                k,
+                tokens,
+                ldo,
+                plane_rows,
+                32,
+                64,
+            )
+            .unwrap();
+            let got = stream.clone_dtoh(&out).unwrap();
+            let (mut worst, mut bound) = (0.0f64, 0.0f64);
+            for t in 0..tokens {
+                for r in 0..ldo {
+                    if r >= rows {
+                        assert_eq!(got[t * ldo + r].to_bits(), prior[t * ldo + r].to_bits());
+                        continue;
+                    }
+                    let plane = r / 32;
+                    let xr = &x[(plane * plane_rows + t) * k..][..k];
+                    let (s, m) = dot(xr, &w.deq[r * k..][..k]);
+                    worst = worst.max((f64::from(got[t * ldo + r]) - s).abs());
+                    bound = bound.max(2.0 * k as f64 * m * 2f64.powi(-24) + 1e-6);
+                }
+            }
+            println!(
+                "decode dense {name} tokens {tokens}: max_abs {worst:.3e} (bound {bound:.3e})"
+            );
+            assert!(
+                worst <= bound,
+                "decode dense {name}: {worst} exceeds {bound}"
+            );
+        }
+    }
+
+    // Experts: three tokens routed to two experts each, out of five.
+    let (stack, n, ff, topk, tokens) = (5usize, 128usize, 64usize, 2usize, 3usize);
+    let pairs = tokens * topk;
+    let ids: Vec<i32> = vec![4, 0, 2, 2, 1, 4];
+    let factors: Vec<f32> = (0..stack).map(|e| 0.2 + e as f32 * 0.17).collect();
+    let pair_w: Vec<f32> = (0..pairs).map(|p| 0.5 + p as f32 * 0.4).collect();
+    let (d_ids, d_factors, d_pair_w) = (
+        stream.clone_htod(&ids).unwrap(),
+        stream.clone_htod(&factors).unwrap(),
+        stream.clone_htod(&pair_w).unwrap(),
+    );
+    let (beta, lb) = (4.0f32, 25.0f32);
+    for (name, format) in [
+        ("q8_0", Format::Q8_0),
+        ("bf16", Format::Bf16),
+        ("nvfp4", Format::Nvfp4),
+    ] {
+        let nv = matches!(format, Format::Nvfp4);
+        let gate_up = stage(&format, stack * 2 * ff, n, 11);
+        let down = stage(&format, stack * n, ff, 13);
+        let scale_of = |e: usize| if nv { f64::from(factors[e]) } else { 1.0 };
+        // Small activations keep the gates off SiTU's flat ends.
+        let x = rng.vec_f32(tokens * n, -0.3, 0.3);
+        let xh = half(&if nv { byte_order(&x) } else { x.clone() });
+        let mut hidden = stream.alloc_zeros::<u16>(pairs * ff).unwrap();
+        dg.gate_up(
+            &stream,
+            operand(&format, &gate_up),
+            stack,
+            &d_ids,
+            nv.then_some(&d_factors),
+            &xh,
+            &mut hidden,
+            2 * ff,
+            n,
+            pairs,
+            topk,
+            nv,
+            beta,
+            lb,
+        )
+        .unwrap();
+        let got: Vec<f32> = stream
+            .clone_dtoh(&hidden)
+            .unwrap()
+            .iter()
+            .map(|h| half::f16::from_bits(*h).to_f32())
+            .collect();
+        let mut want_hidden = vec![0.0f32; pairs * ff];
+        let mut worst = 0.0f64;
+        for (pair, &e) in ids.iter().enumerate() {
+            let e = e as usize;
+            let xr = &x[(pair / topk) * n..][..n];
+            for i in 0..ff {
+                let (g, _) = dot(xr, &gate_up.deq[(e * 2 * ff + i) * n..][..n]);
+                let (u, _) = dot(xr, &gate_up.deq[(e * 2 * ff + ff + i) * n..][..n]);
+                let v = situ(
+                    g * scale_of(e),
+                    u * scale_of(e),
+                    f64::from(beta),
+                    f64::from(lb),
+                );
+                want_hidden[pair * ff + i] = v as f32;
+                let at = if nv {
+                    (i & !15) + ((i & 7) << 1) + ((i & 15) >> 3)
+                } else {
+                    i
+                };
+                let err = (f64::from(got[pair * ff + at]) - v).abs() / v.abs().max(1e-2);
+                worst = worst.max(err);
+            }
+        }
+        println!("decode gate/up {name}: worst relative error {worst:.3e}");
+        // binary16 output: half an ulp is 2^-11 relative, plus the fp32
+        // sums' own error through SiTU's slope.
+        assert!(worst < 2e-3, "decode gate/up {name}: {worst}");
+
+        // Down, from the oracle's hidden values so the two are separable.
+        let hh = half(&if nv {
+            byte_order(&want_hidden)
+        } else {
+            want_hidden.clone()
+        });
+        let mut out = stream.alloc_zeros::<f32>(pairs * n).unwrap();
+        dg.down(
+            &stream,
+            operand(&format, &down),
+            stack,
+            &d_ids,
+            nv.then_some(&d_factors),
+            &hh,
+            &d_pair_w,
+            &mut out,
+            n,
+            ff,
+            pairs,
+        )
+        .unwrap();
+        let got = stream.clone_dtoh(&out).unwrap();
+        let (mut worst, mut bound) = (0.0f64, 0.0f64);
+        for (pair, &e) in ids.iter().enumerate() {
+            let e = e as usize;
+            let f = scale_of(e) * f64::from(pair_w[pair]);
+            for r in 0..n {
+                let (s, m) = dot(
+                    &want_hidden[pair * ff..][..ff],
+                    &down.deq[(e * n + r) * ff..][..ff],
+                );
+                worst = worst.max((f64::from(got[pair * n + r]) - s * f).abs());
+                bound = bound.max(2.0 * ff as f64 * m * f * 2f64.powi(-24) + 1e-6);
+            }
+        }
+        println!("decode down {name}: max_abs {worst:.3e} (bound {bound:.3e})");
+        assert!(
+            worst <= bound,
+            "decode down {name}: {worst} exceeds {bound}"
+        );
+    }
+}
+
 #[test]
 fn the_plan_splits_only_where_the_grid_underfills_the_card() {
     let Some(ctx) = device() else { return };

@@ -538,10 +538,18 @@ impl InklingState {
     }
 }
 
+/// Wall-clock per stage, each boundary synchronized: a diagnostic, and it
+/// costs the overlap a real pass has between host and device.
+struct Profile {
+    last: std::time::Instant,
+    stages: Vec<(&'static str, f64)>,
+}
+
 /// Scratch for passes of exactly `rows` rows.
 pub struct InklingPass {
     model: Arc<InklingModel>,
     rows: usize,
+    profile: Option<Profile>,
     d_tokens: CudaSlice<i32>,
     h: CudaSlice<f32>,
     input: CudaSlice<f32>,
@@ -643,6 +651,7 @@ impl InklingPass {
         Ok(Self {
             model: model.clone(),
             rows,
+            profile: None,
             d_tokens: stream.alloc_zeros::<i32>(rows)?,
             h: f(rows * n)?,
             input: f(rows * n)?,
@@ -699,6 +708,36 @@ impl InklingPass {
     /// Rows a pass runs.
     pub fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// Start timing stages: every stage boundary synchronizes the stream
+    /// from here on, so a profiled pass is slower than a plain one.
+    pub fn enable_profiling(&mut self) {
+        self.profile = Some(Profile {
+            last: std::time::Instant::now(),
+            stages: Vec::new(),
+        });
+    }
+
+    /// Seconds per stage since profiling was enabled, in first-seen order.
+    pub fn stage_seconds(&self) -> &[(&'static str, f64)] {
+        self.profile.as_ref().map_or(&[], |p| &p.stages)
+    }
+
+    /// Close the stage that just ran.
+    fn mark(&mut self, stream: &Arc<CudaStream>, stage: &'static str) -> Res {
+        let Some(p) = self.profile.as_mut() else {
+            return Ok(());
+        };
+        stream.synchronize()?;
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(p.last).as_secs_f64();
+        p.last = now;
+        match p.stages.iter_mut().find(|(name, _)| *name == stage) {
+            Some((_, total)) => *total += dt,
+            None => p.stages.push((stage, dt)),
+        }
+        Ok(())
     }
 
     /// The final normalized hidden states of the last pass, `[rows][n]`.
@@ -929,6 +968,7 @@ impl InklingPass {
                 .hg
                 .to_half(stream, &self.normed[j], &mut self.normed_h[j], plane)?;
         }
+        self.mark(stream, "attn inputs (mix, control, norm)")?;
         let (iq, ik, iv) = (0, 1.min(distinct - 1), 2.min(distinct - 1));
 
         Self::gemm(
@@ -998,6 +1038,7 @@ impl InklingPass {
             )?;
         }
 
+        self.mark(stream, "attn projections")?;
         // Key and value convolutions, each sequence over its own carry.
         let dynamic = layer.k_conv_proj.is_some();
         let mut row0 = 0;
@@ -1097,6 +1138,7 @@ impl InklingPass {
             rows,
         )?;
 
+        self.mark(stream, "conv, clips, bias table")?;
         // Append to each sequence's cache, then attend over it.
         let mut row0 = 0;
         for seg in segments.iter_mut() {
@@ -1132,6 +1174,7 @@ impl InklingPass {
             row0 += r;
         }
 
+        self.mark(stream, "attention")?;
         model.ops.sigmoid_gate(
             stream,
             &self.attended,
@@ -1187,6 +1230,7 @@ impl InklingPass {
             )?;
         }
 
+        self.mark(stream, "gate, output projection, conv")?;
         // Feed-forward: mix, control, norm, route, experts, convolve.
         {
             let mut top = unsafe { subslice(stream, &self.blocks, *blocks_live * plane, plane) };
@@ -1236,6 +1280,7 @@ impl InklingPass {
             moe.experts_per_token as usize,
             moe.expert_intermediate as usize,
         );
+        self.mark(stream, "ffn input (mix, control, norm)")?;
         model.kernels.linear(
             stream,
             &layer.router,
@@ -1255,12 +1300,14 @@ impl InklingPass {
             topk,
             f32::from_bits(kc.expert_weights_scale_bits),
         )?;
+        self.mark(stream, "router logits, route")?;
         model
             .kernels
             .dispatch(stream, &self.ids, &mut self.dispatch)?;
         model
             .kernels
             .gather_half(stream, &self.x, &mut self.dispatch, &mut self.xs, n)?;
+        self.mark(stream, "dispatch, gather")?;
         Self::gemm_experts(
             &model,
             stream,
@@ -1270,6 +1317,7 @@ impl InklingPass {
             &mut self.gate_up,
             experts,
         )?;
+        self.mark(stream, "expert gate/up")?;
         model.kernels.situ_half(
             stream,
             &self.gate_up,
@@ -1288,6 +1336,7 @@ impl InklingPass {
             &mut self.y,
             experts,
         )?;
+        self.mark(stream, "situ, expert down")?;
         model.kernels.moe_combine(
             stream,
             &self.y,
@@ -1317,6 +1366,7 @@ impl InklingPass {
         model
             .ops
             .add(stream, &self.ffn_inp, &self.ffn_out, &mut self.h, plane)?;
+        self.mark(stream, "combine, conv, residual")?;
         Ok(())
     }
 
@@ -1374,6 +1424,7 @@ impl InklingPass {
 
         let layers = c.num_layers as usize;
         let (start, end) = (kc.loop_start as usize, kc.loop_end as usize);
+        self.mark(stream, "embed")?;
         let mut live = 0usize;
         let mut emit = |pass: &Self, slot: usize| -> Res {
             if let Some(t) = tap.as_mut() {
@@ -1466,6 +1517,7 @@ impl InklingPass {
         for seg in segments.iter_mut() {
             seg.state.position += seg.rows;
         }
+        self.mark(stream, "loop messages, output mix and norm")?;
         Ok(())
     }
 
@@ -1496,6 +1548,7 @@ impl InklingPass {
                 .kernels
                 .softcap(stream, &mut self.head_logits, count * vocab, cap)?;
         }
+        self.mark(stream, "head")?;
         Ok(())
     }
 }

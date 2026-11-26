@@ -4241,6 +4241,10 @@ mod kernels {
     /// the element over the scale, rounded half away from zero. Returns the
     /// code's low byte and the scale as binary16 bits.
     ///
+    /// This is llama.cpp's `quantize_row_q8_0_ref` (ggml-quants.c):
+    /// `d = amax / 127`, `q = round(x * (1 / d))`. The maximum is exact and
+    /// commutative, so the butterfly order cannot change it.
+    ///
     /// # Safety
     /// All 32 lanes of the warp call this together, each with one element of
     /// the same block.

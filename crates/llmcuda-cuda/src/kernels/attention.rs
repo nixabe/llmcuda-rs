@@ -266,66 +266,6 @@ const DECODE_KEY_TILE: usize = 8;
 /// exponential phase gives one key slot to one lane.
 const GQA_KEY_TILE: usize = 8;
 
-/// The q8_0 KV-cache device helpers, verbatim as [`ATTENTION_SRC`] carries
-/// them, for other modules that write the same cache (`k2_rope`'s batched
-/// decode append). A test pins the two copies together.
-pub(crate) const KV_Q8_HELPERS: &str = r#"// q8_0 KV cache (KV_KQ8 / KV_VQ8, set per half by the K2 kernel set).
-// One position's row of n = kv_heads * head_dim elements is n int8 codes
-// followed by n / 32 binary16 scales; block b covers elements
-// [32b, 32b + 32). That is llama.cpp's block_q8_0 arithmetic in a layout
-// whose codes stay 16-byte aligned per head. Every reader sees the binary16
-// rounding of q * d, so the tensor-core and scalar kernels read the same
-// number, and the CPU reference can build it exactly.
-#ifndef KV_KQ8
-#define KV_KQ8 0
-#endif
-#ifndef KV_VQ8
-#define KV_VQ8 0
-#endif
-__device__ __forceinline__ long long kvq8_row_bytes(int n) { return (long long)n + (n >> 4); }
-// Four codes (one little-endian word) times one scale, as two packed binary16
-// pairs. Exact up to one rounding: 0x64XX is 1024 + XX in binary16, so
-// (q ^ 0x80) under that exponent is 1152 + q, subtracting 1152 is exact, and
-// mul.rn rounds the exact product q * d once -- f16(q * d), no I2F.
-__device__ __forceinline__ void kvq8_dequant4(unsigned codes, unsigned short d, unsigned* lo, unsigned* hi) {
-    unsigned x = codes ^ 0x80808080u;
-    unsigned a = __byte_perm(x, 0x64646464u, 0x4140);
-    unsigned b = __byte_perm(x, 0x64646464u, 0x4342);
-    unsigned dd = (unsigned)d | ((unsigned)d << 16);
-    asm("{ sub.rn.f16x2 %0, %2, %4; mul.rn.f16x2 %0, %0, %5;\n"
-        "  sub.rn.f16x2 %1, %3, %4; mul.rn.f16x2 %1, %1, %5; }"
-        : "=&r"(*lo), "=&r"(*hi) : "r"(a), "r"(b), "r"(0x64806480u), "r"(dd));
-}
-// Codes in bytes 0 and 1 of `codes`, each with its own scale: the packed
-// binary16 key pair a tensor-core V operand wants.
-__device__ __forceinline__ unsigned kvq8_dequant2(unsigned codes, unsigned short d0, unsigned short d1) {
-    unsigned a = __byte_perm(codes ^ 0x8080u, 0x64646464u, 0x4140);
-    unsigned dd = (unsigned)d0 | ((unsigned)d1 << 16);
-    unsigned r;
-    asm("{ sub.rn.f16x2 %0, %1, %2; mul.rn.f16x2 %0, %0, %3; }"
-        : "=&r"(r) : "r"(a), "r"(0x64806480u), "r"(dd));
-    return r;
-}
-// llama.cpp's quantize_row_q8_0_ref (ggml-quants.c) for the block whose 32
-// elements this warp's lanes hold, one each: d = amax / 127, q = round(x / d)
-// computed as x * (1 / d), d stored as binary16. fmaxf is exact and
-// commutative, so the butterfly order cannot change amax. Every lane must be
-// live. Returns this lane's code in the low byte; *d_bits gets the scale.
-__device__ __forceinline__ unsigned kvq8_quantize(float x, unsigned short* d_bits) {
-    float amax = fabsf(x);
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
-    }
-    float d = __fdiv_rn(amax, 127.0f);
-    float id = d != 0.0f ? __fdiv_rn(1.0f, d) : 0.0f;
-    unsigned short h;
-    asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(d));
-    *d_bits = h;
-    return (unsigned)(int)roundf(__fmul_rn(x, id)) & 0xffu;
-}
-"#;
-
 /// CUDA C++ baseline exposed for differential CUDA-event benchmarks.
 pub const ATTENTION_SRC: &str = r#"
 extern "C" {
@@ -396,24 +336,6 @@ __device__ __forceinline__ unsigned kvq8_dequant2(unsigned codes, unsigned short
     asm("{ sub.rn.f16x2 %0, %1, %2; mul.rn.f16x2 %0, %0, %3; }"
         : "=&r"(r) : "r"(a), "r"(0x64806480u), "r"(dd));
     return r;
-}
-// llama.cpp's quantize_row_q8_0_ref (ggml-quants.c) for the block whose 32
-// elements this warp's lanes hold, one each: d = amax / 127, q = round(x / d)
-// computed as x * (1 / d), d stored as binary16. fmaxf is exact and
-// commutative, so the butterfly order cannot change amax. Every lane must be
-// live. Returns this lane's code in the low byte; *d_bits gets the scale.
-__device__ __forceinline__ unsigned kvq8_quantize(float x, unsigned short* d_bits) {
-    float amax = fabsf(x);
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
-    }
-    float d = __fdiv_rn(amax, 127.0f);
-    float id = d != 0.0f ? __fdiv_rn(1.0f, d) : 0.0f;
-    unsigned short h;
-    asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(d));
-    *d_bits = h;
-    return (unsigned)(int)roundf(__fmul_rn(x, id)) & 0xffu;
 }
 
 // Causal GQA attention, online-softmax streaming form.
@@ -4818,8 +4740,6 @@ mod tests {
         // compile, run, and silently spill.
         assert_eq!(32 * ATTN_MAXD, 256);
         assert!(ATTENTION_SRC.contains("#define ATTN_MAXD 8"));
-        // k2_rope compiles its q8_0 append against this copy.
-        assert!(ATTENTION_SRC.contains(KV_Q8_HELPERS));
         assert!(
             ATTENTION_SRC.contains("float qr[QT][ATTN_MAXD];"),
             "the query tile is no longer a register array",

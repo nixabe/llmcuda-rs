@@ -5142,6 +5142,7 @@ impl MoeKernels {
 
         let ptx = compile(MOE_SRC, "moe").map_err(MoeError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         // Both compiled kernels stage a whole dispatch block, so the choice
         // has to match `block_size`, not just fit under it: launching the
         // wide kernel at a `block_size` the narrow one was sized for would
@@ -5201,7 +5202,7 @@ impl MoeKernels {
             } else {
                 "moe_expert_down_mma"
             })?,
-            reduce: module.load_function("moe_reduce")?,
+            reduce: rust.load_function("moe_reduce")?,
             shared_ffn: [
                 module.load_function("moe_shared_ffn_q6k")?,
                 module.load_function("moe_shared_ffn_q8")?,
@@ -5350,7 +5351,7 @@ impl MoeKernels {
                     ],
                 ],
             ],
-            swiglu: module.load_function("moe_swiglu")?,
+            swiglu: rust.load_function("moe_swiglu")?,
             geometry,
             mma_m,
             fused_iq,

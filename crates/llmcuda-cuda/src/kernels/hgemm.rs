@@ -187,14 +187,23 @@ __device__ __forceinline__ int hg_sw(int r, int c) { return r * HG_BK + ((c ^ ((
 // kps) only and writes alpha times its sum to `part[z][m][n]` (row stride N),
 // which `hg_splitk_reduce` adds up in z order. `kps` is a multiple of 8, so a
 // split starts on a scale8 boundary.
-template <int FMT, int WN>
+//
+// Grouped (G): the weight operand is a stack of matrices and each 128-token
+// tile contracts with the one `owners[tile]` names, `wstride` bytes (and
+// `wsstride` scales) into the stack, its result further scaled by
+// `escale[owner]` when that is given. A tile whose owner is negative is
+// skipped. This is how expert-sorted activations meet their experts: the
+// grid is fixed by the tile capacity and the routing stays on the device.
+template <int FMT, int WN, bool G>
 __device__ __forceinline__ void hg_gemm(
     const unsigned char* __restrict__ w,
     const unsigned short* __restrict__ ws,
     const unsigned short* __restrict__ x,
     float* __restrict__ out,
     float* __restrict__ part,
-    int M, int N, int K, int ldo, int accumulate, float alpha, float wscale, int kps
+    int M, int N, int K, int ldo, int accumulate, float alpha, float wscale, int kps,
+    const int* __restrict__ owners = nullptr, const float* __restrict__ escale = nullptr,
+    long long wstride = 0, long long wsstride = 0
 ) {
     constexpr int BN = 4 * WN;
     constexpr int NT = WN / 8;            // n8 tiles a warp owns
@@ -218,6 +227,13 @@ __device__ __forceinline__ void hg_gemm(
         const int r = lin % per;
         m0 = (first + r % gs) * HG_BM;
         n0 = (r / gs) * BN;
+    }
+    if (G) {
+        const int owner = owners[m0 / HG_BM];
+        if (owner < 0) return;
+        w += (long long)owner * wstride;
+        ws += (long long)owner * wsstride;
+        if (escale) alpha *= escale[owner];
     }
     const int wm = (warp >> 2) * 64, wn = (warp & 3) * WN;
     const int kblocks = K >> 5;
@@ -410,7 +426,18 @@ __device__ __forceinline__ void hg_gemm(
         const unsigned short* __restrict__ x, float* __restrict__ out,                  \
         float* __restrict__ part, int M, int N, int K, int ldo, int accumulate,         \
         float alpha, float wscale, int kps) {                                           \
-        hg_gemm<FMT, WN>(w, ws, x, out, part, M, N, K, ldo, accumulate, alpha, wscale, kps); \
+        hg_gemm<FMT, WN, false>(w, ws, x, out, part, M, N, K, ldo, accumulate, alpha, wscale, kps); \
+    }
+
+#define HG_ENTRY_G(NAME, FMT, WN, MINB)                                                 \
+    extern "C" __global__ void __launch_bounds__(256, MINB) NAME(                       \
+        const unsigned char* __restrict__ w, const unsigned short* __restrict__ ws,     \
+        const unsigned short* __restrict__ x, float* __restrict__ out,                  \
+        const int* __restrict__ owners, const float* __restrict__ escale,               \
+        long long wstride, long long wsstride, int M, int N, int K,                     \
+        float alpha, float wscale) {                                                    \
+        hg_gemm<FMT, WN, true>(w, ws, x, out, out, M, N, K, N, 0, alpha, wscale, K >> 5, \
+                               owners, escale, wstride, wsstride);                      \
     }
 
 HG_ENTRY(hg_q8_256, 0, 64, 1)
@@ -419,6 +446,12 @@ HG_ENTRY(hg_bf16_256, 1, 64, 1)
 HG_ENTRY(hg_bf16_128, 1, 32, 2)
 HG_ENTRY(hg_nv_256, 2, 64, 1)
 HG_ENTRY(hg_nv_128, 2, 32, 2)
+HG_ENTRY_G(hg_q8_g256, 0, 64, 1)
+HG_ENTRY_G(hg_q8_g128, 0, 32, 2)
+HG_ENTRY_G(hg_bf16_g256, 1, 64, 1)
+HG_ENTRY_G(hg_bf16_g128, 1, 32, 2)
+HG_ENTRY_G(hg_nv_g256, 2, 64, 1)
+HG_ENTRY_G(hg_nv_g128, 2, 32, 2)
 "#;
 
 /// Errors from the weight-only GEMM.
@@ -539,6 +572,8 @@ pub struct HgemmKernels {
     bf16_128: CudaFunction,
     nv_256: CudaFunction,
     nv_128: CudaFunction,
+    /// Grouped entries, `[format][wide]`: Q8_0, bf16, NVFP4.
+    grouped: [[CudaFunction; 2]; 3],
     to_half: CudaFunction,
     reduce: CudaFunction,
     q8_to_half_w: CudaFunction,
@@ -635,6 +670,20 @@ impl HgemmKernels {
             bf16_128: module.load_function("hg_bf16_128")?,
             nv_256: module.load_function("hg_nv_256")?,
             nv_128: module.load_function("hg_nv_128")?,
+            grouped: [
+                [
+                    module.load_function("hg_q8_g128")?,
+                    module.load_function("hg_q8_g256")?,
+                ],
+                [
+                    module.load_function("hg_bf16_g128")?,
+                    module.load_function("hg_bf16_g256")?,
+                ],
+                [
+                    module.load_function("hg_nv_g128")?,
+                    module.load_function("hg_nv_g256")?,
+                ],
+            ],
             to_half: rust.load_function("hg_to_half")?,
             reduce: rust.load_function("hg_splitk_reduce")?,
             q8_to_half_w: rust.load_function("hg_q8_to_half_w")?,
@@ -1154,6 +1203,106 @@ impl HgemmKernels {
             // rows of stride `ldo >= n_rows`; the grid stops at the last pair.
             unsafe { b.launch(cfg) }?;
         }
+        Ok(())
+    }
+
+    /// One contraction per 128-token tile, each against the matrix its
+    /// owner names in a stack of `stack` equally shaped ones:
+    /// `out[m][n] = scale(owner) * sum_k x[m][k] * half(w[owner])[n][k]` for
+    /// the rows `m` of every tile whose `owners` entry is not negative.
+    /// Rows of other tiles are left as they were.
+    ///
+    /// `w` is the whole stack in one of the formats [`Self::gemm`] takes;
+    /// an [`HalfWeight::Nvfp4`] `scale` applies to every matrix, on top of
+    /// `scales[owner]` when that is given. The launch covers `owners.len()`
+    /// tiles whatever they hold, so nothing about it depends on the routing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_grouped(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: HalfWeight<'_>,
+        stack: usize,
+        owners: &CudaSlice<i32>,
+        scales: Option<&CudaSlice<f32>>,
+        x: &CudaSlice<u16>,
+        out: &mut CudaSlice<f32>,
+        n_rows: usize,
+        k: usize,
+        wide: bool,
+    ) -> Result<(), HgemmError> {
+        if !k.is_multiple_of(HGEMM_BK) {
+            return Err(HgemmError::RaggedContraction { k });
+        }
+        let tiles = owners.len();
+        let tokens = tiles * HGEMM_BM;
+        need("grouped gemm x", x.len(), tokens * k)?;
+        need("grouped gemm out", out.len(), tokens * n_rows)?;
+        if let Some(s) = scales {
+            need("grouped gemm scales", s.len(), stack)?;
+        }
+        let (format, exponent, factor, wstride, wsstride) = match w {
+            HalfWeight::Q8_0 { q, scales } => {
+                need("grouped gemm q8_0 weights", q.len(), stack * n_rows * k)?;
+                need(
+                    "grouped gemm q8_0 scales",
+                    scales.len(),
+                    stack * n_rows * k / 32,
+                )?;
+                (0, 0, 1.0, n_rows * k, n_rows * k / 32)
+            }
+            HalfWeight::Bf16 { bytes, exponent } => {
+                need(
+                    "grouped gemm bf16 weights",
+                    bytes.len(),
+                    stack * n_rows * k * 2,
+                )?;
+                (1, exponent, 1.0, n_rows * k * 2, 0)
+            }
+            HalfWeight::Nvfp4 { bytes, scale } => {
+                if !k.is_multiple_of(64) {
+                    return Err(HgemmError::RaggedContraction { k });
+                }
+                let per = n_rows * k / 64 * 36;
+                need("grouped gemm nvfp4 weights", bytes.len(), stack * per)?;
+                (2, 0, scale, per, 0)
+            }
+        };
+        if tiles == 0 || n_rows == 0 {
+            return Ok(());
+        }
+        let bn = if wide { 256 } else { 128 };
+        let cfg = LaunchConfig {
+            grid_dim: (n_rows.div_ceil(bn) as u32, tiles as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (m_i, n_i, k_i) = (tokens as i32, n_rows as i32, k as i32);
+        let (wstride, wsstride) = (wstride as i64, wsstride as i64);
+        let wscale = 2f32.powi(exponent);
+        let alpha = 2f32.powi(-exponent) * factor;
+        let null = 0u64;
+        let mut b = stream.launch_builder(&self.grouped[format][usize::from(wide)]);
+        match w {
+            HalfWeight::Q8_0 { q, scales } => b.arg(q).arg(scales),
+            // Only the Q8_0 entry points read `ws`.
+            HalfWeight::Bf16 { bytes, .. } | HalfWeight::Nvfp4 { bytes, .. } => b.arg(bytes).arg(x),
+        };
+        b.arg(x).arg(&mut *out).arg(owners);
+        match scales {
+            Some(s) => b.arg(s),
+            None => b.arg(&null),
+        };
+        b.arg(&wstride)
+            .arg(&wsstride)
+            .arg(&m_i)
+            .arg(&n_i)
+            .arg(&k_i)
+            .arg(&alpha)
+            .arg(&wscale);
+        // SAFETY: the stack was length-checked for every owner below `stack`
+        // (the caller's routing names no other), `x` and `out` for every
+        // tile, and the kernel masks columns past `n_rows`.
+        unsafe { b.launch(cfg) }?;
         Ok(())
     }
 }

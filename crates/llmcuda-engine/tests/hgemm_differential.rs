@@ -344,6 +344,130 @@ fn half_gemm_matches_its_rounding_contract() {
     }
 }
 
+/// The grouped launch: each 128-token tile against the matrix its owner
+/// names, scaled by that owner's factor; unowned tiles untouched.
+#[test]
+fn grouped_gemm_contracts_each_tile_with_its_owner() {
+    let Some(ctx) = device() else { return };
+    let stream = ctx.default_stream();
+    let mma = MmaKernels::new(&ctx).expect("int8 kernels compile");
+    let hg = HgemmKernels::new(&ctx).expect("fp16 GEMM kernels compile");
+    let (stack, rows, k) = (5usize, 130usize, 192usize);
+    let owners: Vec<i32> = vec![3, -1, 0, 4, 3, -1, 1];
+    let tiles = owners.len();
+    let tokens = tiles * 128;
+    let factors: Vec<f32> = (0..stack).map(|e| 0.25 + e as f32 * 0.31).collect();
+    let d_owners = stream.clone_htod(&owners).unwrap();
+    let d_factors = stream.clone_htod(&factors).unwrap();
+    let mut rng = Xorshift64Star::new(0xface);
+    let x = rng.vec_f32(tokens * k, -3.0, 3.0);
+    let xd = stream.clone_htod(&x).unwrap();
+    let mut xh = stream.alloc_zeros::<u16>(tokens * k).unwrap();
+    hg.to_half(&stream, &xd, &mut xh, tokens * k).unwrap();
+    for (name, format) in [
+        ("q8_0", Format::Q8_0),
+        ("bf16", Format::Bf16),
+        ("nvfp4", Format::Nvfp4),
+    ] {
+        for wide in [false, true] {
+            let prior = rng.vec_f32(tokens * rows, -1.0, 1.0);
+            let mut out = stream.clone_htod(&prior).unwrap();
+            // What each output is compared with: the staged weight, and the
+            // factor the launch applies on top.
+            let (deq, scaled) = match format {
+                Format::Q8_0 => {
+                    let (bytes, deq) = q8_0_weights(stack * rows, k, 91);
+                    let src = stream.clone_htod(&bytes).unwrap();
+                    let mut wq = stream.alloc_zeros::<i8>(stack * rows * k).unwrap();
+                    let mut ws = stream.alloc_zeros::<u16>(stack * rows * k / 32).unwrap();
+                    mma.repack_q8_0_half(&stream, &src, &mut wq, &mut ws, stack * rows * k)
+                        .unwrap();
+                    let w = HalfWeight::Q8_0 {
+                        q: &wq,
+                        scales: &ws,
+                    };
+                    hg.gemm_grouped(
+                        &stream, w, stack, &d_owners, None, &xh, &mut out, rows, k, wide,
+                    )
+                    .unwrap();
+                    (deq, false)
+                }
+                Format::Bf16 => {
+                    let (bytes, vals) = bf16_weights(stack * rows, k, 92);
+                    let exponent = bf16_half_exponent(&bytes);
+                    let scale = 2f32.powi(exponent);
+                    let dev = stream.clone_htod(&bytes).unwrap();
+                    let w = HalfWeight::Bf16 {
+                        bytes: &dev,
+                        exponent,
+                    };
+                    hg.gemm_grouped(
+                        &stream, w, stack, &d_owners, None, &xh, &mut out, rows, k, wide,
+                    )
+                    .unwrap();
+                    let deq = vals
+                        .iter()
+                        .map(|&v| round_through_f16(v * scale) / scale)
+                        .collect();
+                    (deq, false)
+                }
+                Format::Nvfp4 => {
+                    let (bytes, vals) = nvfp4_weights(stack * rows, k, 93);
+                    let dev = stream.clone_htod(&bytes).unwrap();
+                    let w = HalfWeight::Nvfp4 {
+                        bytes: &dev,
+                        scale: 1.0,
+                    };
+                    hg.gemm_grouped(
+                        &stream,
+                        w,
+                        stack,
+                        &d_owners,
+                        Some(&d_factors),
+                        &xh,
+                        &mut out,
+                        rows,
+                        k,
+                        wide,
+                    )
+                    .unwrap();
+                    (vals, true)
+                }
+            };
+            let got = stream.clone_dtoh(&out).unwrap();
+            let mut worst = 0.0f64;
+            let mut bound = 0.0f64;
+            for (tile, &owner) in owners.iter().enumerate() {
+                for t in tile * 128..(tile + 1) * 128 {
+                    for r in 0..rows {
+                        let g = got[t * rows + r];
+                        if owner < 0 {
+                            assert_eq!(g.to_bits(), prior[t * rows + r].to_bits());
+                            continue;
+                        }
+                        let e = owner as usize;
+                        let factor = if scaled { f64::from(factors[e]) } else { 1.0 };
+                        let (mut s, mut m) = (0.0f64, 0.0f64);
+                        for i in 0..k {
+                            let p = f64::from(round_through_f16(x[t * k + i]))
+                                * f64::from(deq[(e * rows + r) * k + i]);
+                            s += p;
+                            m += p.abs();
+                        }
+                        worst = worst.max((f64::from(g) - s * factor).abs());
+                        bound = bound.max(2.0 * (k as f64) * m * factor * 2f64.powi(-24) + 1e-6);
+                    }
+                }
+            }
+            println!("grouped {name} wide {wide}: max_abs {worst:.3e} (bound {bound:.3e})");
+            assert!(
+                worst <= bound,
+                "grouped {name}: max_abs {worst} exceeds {bound}"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_plan_splits_only_where_the_grid_underfills_the_card() {
     let Some(ctx) = device() else { return };

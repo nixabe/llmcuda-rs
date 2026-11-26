@@ -416,34 +416,6 @@ __device__ __forceinline__ unsigned kvq8_quantize(float x, unsigned short* d_bit
     return (unsigned)(int)roundf(__fmul_rn(x, id)) & 0xffu;
 }
 
-// Deinterleave the packed query/gate tensor.
-//
-// grid: (n_tokens, q_heads). block: head_dim threads.
-//
-// `blk.N.attn_q.weight` emits, per token, [q_h0, gate_h0, q_h1, gate_h1, ...]
-// — a per-head stride of 2*head_dim with the query first. This is confirmed
-// against llama.cpp's src/models/qwen35moe.cpp, which views it with
-// stride = head_dim*2. It is NOT [all queries | all gates]: reading it that
-// way feeds query heads 8..15 the gates of heads 0..7, stays finite, and is a
-// different model.
-__global__ void attn_split_query_gate(
-    const float* __restrict__ packed,
-    float* __restrict__ q,
-    float* __restrict__ gate,
-    int q_heads,
-    int head_dim
-) {
-    long long t = blockIdx.x;
-    int h = blockIdx.y;
-    int d = threadIdx.x;
-
-    long long row = t * (long long)q_heads * 2 * head_dim;
-    long long dst = (t * (long long)q_heads + h) * (long long)head_dim + d;
-
-    q[dst]    = packed[row + (long long)(2 * h)     * head_dim + d];
-    gate[dst] = packed[row + (long long)(2 * h + 1) * head_dim + d];
-}
-
 // Partial rotary position embedding, NEOX (split-half) pairing.
 //
 // grid: (n_tokens, n_heads). block: head_dim threads.
@@ -2664,23 +2636,6 @@ __global__ void attn_flash_causal_t1(
 // the copies are independent, so splitting them would only cost a launch.
 //
 // grid: (ceil(2 * span / ATTN_APPEND_THREADS),). block: ATTN_APPEND_THREADS.
-// out[i] = position[0] + i, for i < n.
-//
-// A caller that wants to run one query row at a time needs each row's own
-// absolute position as a *device* pointer, because that is the only form the
-// attention kernels take one in (see the note on `key_offset` above: a host
-// position cannot be baked into a captured launch). One thread, `n` of them,
-// off the base the caller already holds.
-__global__ void attn_row_positions(
-    const int* __restrict__ position,
-    int* __restrict__ out,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = position[0] + i;
-}
-
 __global__ void attn_kv_append(
     const float* __restrict__ key,
     const float* __restrict__ value,
@@ -4993,13 +4948,15 @@ mod tests {
 
     #[test]
     fn the_split_kernel_strides_by_two_head_dims() {
-        // Guards the comment above from being "simplified" in the source.
+        // Guards the interleaved layout from being "simplified" in the Rust
+        // kernel: query head h at 2*h, its gate at 2*h + 1.
+        let src = crate::kernels::RUST_KERNELS_SRC;
         assert!(
-            ATTENTION_SRC.contains("packed[row + (long long)(2 * h)     * head_dim + d]"),
+            src.contains("*packed.add((row + 2 * h * head_dim as i64 + d) as usize)"),
             "query slice is no longer read at the interleaved 2*h stride",
         );
         assert!(
-            ATTENTION_SRC.contains("packed[row + (long long)(2 * h + 1) * head_dim + d]"),
+            src.contains("*packed.add((row + (2 * h + 1) * head_dim as i64 + d) as usize)"),
             "gate slice is no longer read at the interleaved 2*h+1 stride",
         );
     }

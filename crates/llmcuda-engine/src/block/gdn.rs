@@ -5246,58 +5246,37 @@ mod tests {
 
     use super::*;
 
-    /// The fused decode-step kernel convolves a channel with
-    /// `conv1d_step_batch`'s arithmetic, kept textually equal: the register
-    /// stage, the tap-order `__fadd_rn(__fmul_rn)` chain and the in-place
-    /// window advance. Only the input index differs (the fused body is
-    /// handed the token's row), and that line sits outside both windows.
+    /// The fused decode-step kernel convolves a channel with the standalone
+    /// `conv1d_step_batch`'s arithmetic: taps in ascending order, each
+    /// product rounded before it is added, then the window shifted by one
+    /// with this token appended.
+    ///
+    /// The standalone kernel is Rust and this one CUDA C++, so the two can
+    /// no longer be compared as text. This pins the fused side; the Rust
+    /// side is pinned in `llmcuda-cuda`, and `gdn_conv_silu_differential`
+    /// compares the two kernels' outputs bit for bit.
     #[test]
-    fn the_fused_conv_step_matches_layer_ops_conv1d_step_batch() {
-        fn window(src: &str, open: &str) -> String {
-            let at = src
-                .find(open)
-                .unwrap_or_else(|| panic!("{open} is missing"));
-            let from = at
-                + src[at..]
-                    .find("float acc = 0.0f;")
-                    .unwrap_or_else(|| panic!("{open} has no accumulator"));
-            const END: &str = "= xv0;\n    }";
-            let to = from
-                + src[from..]
-                    .find(END)
-                    .unwrap_or_else(|| panic!("{open} has no window advance"))
-                + END.len();
-            // `conv1d_step_batch` writes its output between the chain and the
-            // advance; the fused body returns it instead.
-            src[from..to]
-                .replace("out[(long long)z * channels + ch] = acc;", "")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
-        let layer_ops = window(
-            llmcuda_cuda::kernels::layer_ops::LAYER_OPS_SRC,
-            "__global__ void conv1d_step_batch(",
-        );
-        let fused = window(GDN_BLOCK_SRC, "float gdn_conv_step_channel(");
-        assert_eq!(
-            layer_ops, fused,
-            "gdn_conv_step_channel's convolution drifted from conv1d_step_batch's"
-        );
-        let src = llmcuda_cuda::kernels::layer_ops::LAYER_OPS_SRC;
-        let at = src
-            .find("__global__ void conv1d_step_batch(")
-            .expect("present");
-        assert!(
-            src[at..].contains("float staged[MAX_CONV_KERNEL];"),
-            "the register stage moved"
-        );
+    fn the_fused_conv_step_keeps_the_standalone_convolutions_arithmetic() {
         let at = GDN_BLOCK_SRC
             .find("float gdn_conv_step_channel(")
             .expect("present");
+        let body = &GDN_BLOCK_SRC[at..];
+        let body = &body[..body.find("return acc;").expect("it returns the sum")];
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        for line in [
+            "float staged[GDN_MAX_CONV_KERNEL];",
+            "staged[j] = state[(long long)ch * carry + j];",
+            "for (int i = 0; i < conv_kernel; ++i) {",
+            "float xv = (i < carry) ? staged[i] : xv0;",
+            "acc = __fadd_rn(acc, __fmul_rn(xv, weight[(long long)ch * conv_kernel + i]));",
+            "state[(long long)ch * carry + j] = staged[j + 1];",
+            "state[(long long)ch * carry + carry - 1] = xv0;",
+        ] {
+            assert!(flat.contains(line), "the fused convolution lost `{line}`");
+        }
         assert!(
-            GDN_BLOCK_SRC[at..].contains("float staged[GDN_MAX_CONV_KERNEL];"),
-            "the fused register stage moved"
+            !flat.contains("acc +="),
+            "the accumulation reverted to a contractible form"
         );
     }
 

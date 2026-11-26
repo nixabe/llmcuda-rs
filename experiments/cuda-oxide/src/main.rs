@@ -1,5 +1,16 @@
-//! Rust implementations of the layer-op and attention helper kernels.
-//! Raw pointers preserve the existing cudarc ABI, including in-place output.
+//! The engine's Rust CUDA kernels: layer ops and attention helpers.
+//!
+//! This is the only source for the kernels the engine launches from the
+//! embedded PTX; there is no CUDA C++ twin. Raw pointers keep the cudarc
+//! launch ABI, including in-place output. The CPU references are in
+//! `llmcuda-kernels`, and the launchers and their differential tests in
+//! `llmcuda-cuda` and `llmcuda-engine`.
+//!
+//! The PTX is built without implicit multiply-add fusion (`regenerate.py`),
+//! so each `mul_add` here is one rounding and every other product is rounded
+//! before it is added. Several kernels are compared bit for bit with fused
+//! CUDA C++ kernels that share their arithmetic; do not reorder a sum or
+//! change which products fuse without changing those too.
 
 use cuda_device::{DynamicSharedArray, device, kernel, thread, warp};
 use cuda_host::cuda_module;
@@ -8,7 +19,12 @@ use cuda_host::cuda_module;
 mod kernels {
     use super::*;
 
-    /// Add a residual with the same grid-stride loop as the NVRTC baseline.
+    /// `out = a + b`, elementwise. The residual add.
+    ///
+    /// One rounding, exactly as `llmcuda_kernels::norm::residual_add`, so it
+    /// is bit-identical to the reference and gated with `Tolerance::exact()`.
+    /// Grid-stride over a fixed grid, so the launch shape does not depend on
+    /// a host-side length and survives graph capture (AGENTS.md rule 5).
     ///
     /// # Safety
     /// All pointers cover `n` floats, n is nonnegative, and the launch is 1-D
@@ -81,7 +97,17 @@ mod kernels {
         }
     }
 
-    /// Softplus with the baseline overflow guard and libdevice exp/log.
+    /// `out = log(1 + exp(x))`, with a passthrough above 20. The GDN alpha
+    /// gate's nonlinearity: `a_softplus = softplus(alpha + ssm_dt.bias)`.
+    ///
+    /// `if x > 20 { x } else { ln(1 + exp(x)) }` is ggml's formulation
+    /// verbatim (`op_softplus` in `ggml/src/ggml-cuda/unary.cu` and
+    /// `ggml/src/ggml-cpu/unary-ops.cpp`, `ggml_compute_softplus_f32` in
+    /// `ggml/src/ggml-impl.h`). **The threshold is a correctness guard, not
+    /// an optimization:** exp overflows fp32 above x ~ 88.7, so a branch-free
+    /// softplus returns inf where the answer is x, and that inf becomes a
+    /// non-finite log-decay that poisons the whole recurrence. Where the
+    /// branch is taken it is invisible: log(1 + e^20) - 20 is ~2.06e-9.
     ///
     /// # Safety
     /// x/out cover n floats, n >= 0, and the launch is nonempty and 1-D.
@@ -100,7 +126,20 @@ mod kernels {
         }
     }
 
-    /// Split-half partial RoPE; paired outputs share double-precision angles.
+    /// Partial rotary embedding, NEOX (split-half) pairing: dimension i
+    /// pairs with i + rope_dim/2, and dimensions [rope_dim, head_dim) pass
+    /// through untouched. Paired outputs share one angle.
+    ///
+    /// **The tail is copied, not computed.** A load and a store with no
+    /// arithmetic between them preserve the bits, so the differential test
+    /// gates that span with `Tolerance::exact()`. Multiplying the tail by the
+    /// cosine of angle 0 would be right to an ulp and would fail that gate,
+    /// which is the point of having it.
+    ///
+    /// Angles are double precision because the reference's are
+    /// (`f64::from(theta_base).powf(...)`, `pos * freq`, then `as f32`).
+    /// The first product of each output is fused and the second rounded on
+    /// its own; that is the rounding the fused attention kernels share.
     ///
     /// # Safety
     /// x/out are disjoint buffers covering gridDim.y * heads * head_dim
@@ -261,7 +300,17 @@ mod kernels {
         }
     }
 
-    /// Weighted RMSNorm with the existing per-row launch ABI.
+    /// `y = x / sqrt(mean(x^2) + eps) * weight`, one row a block.
+    ///
+    /// Rows wider than the block are covered by a strided loop, which lets
+    /// one kernel serve hidden 2048 and head_dim 128. `weight` is one row of
+    /// `width` floats shared by every row of `x`.
+    ///
+    /// The arithmetic transcribes the reference operand for operand: sum of
+    /// squares, divide by width, add eps, one `1 / sqrt`, then
+    /// `x * inv_rms * weight` in that order. A reciprocal square root would
+    /// be faster and is not IEEE-exact; matching the reference's division
+    /// keeps the disagreement attributable to the reduction order alone.
     ///
     /// # Safety
     /// x/out cover gridDim.x * width floats and weight covers width floats.
@@ -287,7 +336,13 @@ mod kernels {
         }
     }
 
-    /// Fused RMSNorm/SwiGLU, retaining the normalized intermediate waypoint.
+    /// RMSNorm and the SwiGLU multiply that consumes it, in one launch.
+    ///
+    /// The Gated DeltaNet's output norm is immediately multiplied by
+    /// `silu(z)` over exactly the same elements, so the multiply rides along
+    /// in the norm's second pass. The reduction is `rms_norm_rows`', so
+    /// `normed` is bit-identical to what that kernel writes, and it is still
+    /// written: the block's differential test compares it.
     ///
     /// # Safety
     /// x/gate/normed/out cover gridDim.x * width floats, weight covers width,
@@ -317,8 +372,18 @@ mod kernels {
         }
     }
 
-    /// Fused RMSNorm/SwiGLU that hands int8 quants and one scale per 32
-    /// elements to the integer tensor cores, one element a thread.
+    /// `rms_norm_swiglu_rows` handing its output straight to the integer
+    /// tensor cores: int8 quants and one scale per 32 elements.
+    ///
+    /// At prefill width the Gated DeltaNet's output has one reader, the
+    /// output projection, which reads it as int8. The row is a whole number
+    /// of 32-element blocks and the block is one thread an element, so each
+    /// warp holds one quantization block in its lanes and reduces the
+    /// absolute maximum and rounds in place; `normed` and `out` are never
+    /// written as floats. Both halves keep their own kernels' arithmetic
+    /// (absmax by xor butterfly, `a / 127` and `127 / a`, round to even,
+    /// clamp), so quants and scales are bit-identical to the two-launch form
+    /// (`gdn_tail_differential`).
     ///
     /// # Safety
     /// x/gate cover gridDim.x * width floats, weight covers width, q covers
@@ -367,8 +432,15 @@ mod kernels {
         }
     }
 
-    /// Causal depthwise convolution over `[tokens][channels]`, reading the
-    /// carried cache for positions before this batch. Taps accumulate in
+    /// Causal depthwise convolution over the fused GDN q/k/v stream,
+    /// `[tokens][channels]`, reading the carried cache for positions before
+    /// this batch.
+    ///
+    /// `out[t][ch] = sum_{i<K} w[ch][i] * xw(t - (K-1) + i, ch)`. Tap K-1
+    /// multiplies the *current* token and tap 0 the oldest, which is
+    /// `ggml_compute_forward_ssm_conv_f32`'s window order
+    /// (`ggml/src/ggml-cpu/ops.cpp`) and is what a reversed loop gets
+    /// silently backwards. Taps accumulate in
     /// ascending order, each product rounded before it is added: the PTX is
     /// built without implicit fusion, which is what keeps this bit-identical
     /// to the scalar reference.
@@ -446,6 +518,11 @@ mod kernels {
     }
 
     /// The whole convolution for a one-token step, cache advanced in place.
+    ///
+    /// A batch needs a second kernel for the cache because its advance
+    /// depends on the last inputs of the whole batch. At one token the
+    /// window is the cache plus this token, and the new cache is the old one
+    /// shifted by one with this token appended.
     ///
     /// # Safety
     /// x/out cover channels floats, weight channels * conv_kernel, state
@@ -525,6 +602,12 @@ mod kernels {
 
     /// Advance the convolution cache to the last conv_kernel - 1 inputs.
     ///
+    /// A batch shorter than conv_kernel - 1 (every decode step) reads cache
+    /// entries it also overwrites. llama.cpp avoids that by taking the new
+    /// state as a view into a freshly concatenated buffer
+    /// (`llm_build_delta_net_base::build_conv_state`); there is no such
+    /// buffer here.
+    ///
     /// Safe in place without staging: slot j takes either a value of `x` or
     /// cache slot `j + seq_len`, always a later slot than any already
     /// written, and a thread owns its channel's whole cache row.
@@ -564,6 +647,12 @@ mod kernels {
 
     /// De-interleave the packed query/gate projection, one head per block.
     ///
+    /// `blk.N.attn_q.weight` emits, per token, `[q_h0, gate_h0, q_h1,
+    /// gate_h1, ...]`: a per-head stride of 2*head_dim with the query first,
+    /// as llama.cpp's `src/models/qwen35moe.cpp` views it. It is NOT
+    /// `[all queries | all gates]`: reading it that way feeds query heads
+    /// 8..15 the gates of heads 0..7, stays finite, and is a different model.
+    ///
     /// # Safety
     /// packed covers gridDim.x * q_heads * 2 * head_dim floats; q and gate
     /// each cover gridDim.x * q_heads * head_dim and are disjoint from packed
@@ -588,7 +677,8 @@ mod kernels {
         }
     }
 
-    /// Row positions `position[0] + i` for a prefill chunk.
+    /// Row positions `position[0] + i`, on device: a host position cannot
+    /// be baked into a captured launch.
     ///
     /// # Safety
     /// position covers one int, out covers n, and the 1-D launch is nonempty.

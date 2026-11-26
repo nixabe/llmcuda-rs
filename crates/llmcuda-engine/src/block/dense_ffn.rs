@@ -1652,11 +1652,29 @@ mod tests {
             )
             .replace("dense_", ""),
         );
-        let shared_reduce = tokens(between(
-            llmcuda_cuda::kernels::layer_ops::LAYER_OPS_SRC,
-            "__device__ __forceinline__ float block_reduce_sum(",
-            "\n}\n",
-        ));
+        // `rms_norm_rows` is Rust now, so its reduction is spelled out here:
+        // a shuffle-down tree per warp, then thread 0 adds the warp totals in
+        // ascending order behind two barriers. The Rust kernel pins the same
+        // order in `llmcuda-cuda`'s own tests.
+        let shared_reduce = tokens(
+            "__device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    v += __shfl_down_sync(0xffffffff, v, offset);
+                }
+                int lane = threadIdx.x & 31;
+                int warp = threadIdx.x >> 5;
+                if (lane == 0) scratch[warp] = v;
+                __syncthreads();
+
+                int n_warps = (blockDim.x + 31) >> 5;
+                float total = 0.0f;
+                if (threadIdx.x == 0) {
+                    for (int w = 0; w < n_warps; ++w) total += scratch[w];
+                    scratch[0] = total;
+                }
+                __syncthreads();
+                return scratch[0];",
+        );
         assert_eq!(
             dense_reduce, shared_reduce,
             "the dense block's copy of `block_reduce_sum` has drifted",
@@ -1665,11 +1683,6 @@ mod tests {
         // And the arithmetic around it. The stores are what the copy exists
         // to change, so they are the only lines not compared.
         let dense_body = between(GLUE_SRC, "__global__ void dense_rms_norm_narrow(", "\n}\n");
-        let shared_body = between(
-            llmcuda_cuda::kernels::layer_ops::LAYER_OPS_SRC,
-            "__global__ void rms_norm_rows(",
-            "\n}\n",
-        );
         for line in [
             "long long base = (long long)blockIdx.x * width;",
             "for (int j = threadIdx.x; j < width; j += blockDim.x) {",
@@ -1677,10 +1690,6 @@ mod tests {
             "float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);",
         ] {
             assert!(dense_body.contains(line), "the dense norm lost `{line}`");
-            assert!(
-                shared_body.contains(line),
-                "`rms_norm_rows` moved on: `{line}`"
-            );
         }
         // `layer_ops.rs` has its own test pinning this; the copy needs the
         // same one or the two diverge the moment that one is relaxed.

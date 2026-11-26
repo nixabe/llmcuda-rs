@@ -35,15 +35,23 @@
 //!   and gated with `Tolerance::exact()`. The rotary tail is copied, not
 //!   computed — partial rotary is easy to accidentally rotate, truncate or
 //!   reorder past its boundary, and a tolerance would pass all three. The
-//!   convolution spells its accumulation `__fadd_rn(acc, __fmul_rn(x, w))`
-//!   because contracting into an FMA would round once where the reference
-//!   rounds twice, and a tolerance can hide a reversed tap order on smooth
-//!   input where exact equality cannot.
+//!   convolution rounds each product before adding it (the Rust PTX is built
+//!   with multiply-add fusion off) because an FMA would round once where the
+//!   reference rounds twice, and a tolerance can hide a reversed tap order on
+//!   smooth input where exact equality cannot.
 //! - **RMSNorm, SwiGLU, the sigmoid gate and softplus cannot be.** RMSNorm
 //!   reduces 2048 squares in a shuffle tree where the reference sums
 //!   sequentially. The other three are elementwise, so their entire
 //!   disagreement is `expf` against `f32::exp` — about an ulp. All four are
 //!   gated on a measured tolerance sized for that, not on a matmul-era one.
+//!
+//! # Two languages, for now
+//!
+//! Most of these kernels are Rust, compiled ahead of time
+//! ([`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX)) and have no CUDA C++
+//! source. SwiGLU and per-row sigmoid gating are still CUDA C++ in
+//! [`LAYER_OPS_SRC`]: their Rust ports are bit-identical but slower at
+//! prefill sizes, and `rust-kernels` selects them.
 
 use std::sync::Arc;
 
@@ -53,18 +61,17 @@ use cudarc::driver::{
 
 use super::compile;
 
-/// Widest convolution the kernel will service.
+/// Widest convolution the launchers will service.
 ///
-/// The state-update kernel stages `conv_kernel - 1` window values in a
-/// per-thread register array before writing any of them, which is what makes
-/// updating the cache in place safe. That array needs a compile-time bound.
+/// The fused Gated DeltaNet decode kernels stage `conv_kernel - 1` window
+/// values in a register array of this size (`GDN_MAX_CONV_KERNEL`), and a
+/// cache these launchers advance has to be one those kernels can read. The
+/// Rust convolution kernels here need no bound of their own.
 ///
 /// Qwen3.6 needs 4 (`qwen35moe.ssm.conv_kernel`). 8 is headroom, not a
 /// surveyed requirement: llama.cpp reads `ssm_d_conv` from the file rather
-/// than hardcoding it per architecture, so nothing here can claim what other
-/// models in this family use. The cost of the headroom is four unused
-/// registers per thread in one launch, and anything wider is rejected at the
-/// launch path rather than overrunning the array.
+/// than hardcoding it per architecture. Anything wider is rejected at the
+/// launch path.
 pub const MAX_CONV_KERNEL: usize = 8;
 
 /// Largest block the RMSNorm and rotary kernels will launch.
@@ -73,137 +80,13 @@ pub const MAX_CONV_KERNEL: usize = 8;
 /// the strided reduction for RMSNorm.
 const MAX_BLOCK: usize = 1024;
 
-/// The NVRTC translation unit these kernels compile from.
+/// The NVRTC translation unit for the layer ops that are still CUDA C++:
+/// SwiGLU, and sigmoid gating in its per-row shape.
 ///
-/// Public so that a caller which keeps its own copy of one of these kernels
-/// can assert, in its own tests, that the copy has not drifted. That is not
-/// a hypothetical: `DenseFfnBlock` carries `rms_norm_rows` with one extra
-/// store, and a drift in the reduction order would put one layer's norm out
-/// of step with every other norm in the model.
+/// Every other kernel here is Rust, in
+/// [`RUST_KERNELS_SRC`](super::RUST_KERNELS_SRC).
 pub const LAYER_OPS_SRC: &str = r#"
-#define MAX_CONV_KERNEL 8
-
 extern "C" {
-
-// Sum across a block of up to 1024 threads. The same reduction as
-// `gdn.rs`/`gdn_chunked.rs`, verbatim and for the same reason: warp shuffles
-// then one pass through shared memory. The tree order differs from the
-// reference's sequential sum, which is the entire source of disagreement
-// between rms_norm_rows and llmcuda_kernels::norm::rms_norm.
-__device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffff, v, offset);
-    }
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    if (lane == 0) scratch[warp] = v;
-    __syncthreads();
-
-    int n_warps = (blockDim.x + 31) >> 5;
-    float total = 0.0f;
-    if (threadIdx.x == 0) {
-        for (int w = 0; w < n_warps; ++w) total += scratch[w];
-        scratch[0] = total;
-    }
-    __syncthreads();
-    return scratch[0];
-}
-
-// y = x / sqrt(mean(x^2) + eps) * weight, one row at a time.
-//
-// grid: one block per row. block: a whole number of warps, at most 1024;
-// rows wider than the block are covered by a strided loop, which is what lets
-// one kernel serve hidden 2048 and head_dim 128 without recompiling.
-//
-// `weight` is a single row of `width` floats shared by every row of `x`. That
-// is exactly the shape of both uses: the hidden-size norms have one weight
-// vector per layer applied to every token, and the per-head q/k and GDN
-// output norms have one weight vector per layer applied to every (token,
-// head) pair.
-//
-// The arithmetic transcribes the reference operand for operand: sum of
-// squares, divide by width, add eps, one 1/sqrtf, then `xi * inv_rms * wi` in
-// that order. rsqrtf would be faster and is not IEEE-exact; matching the
-// reference's division keeps the disagreement attributable to the reduction
-// order alone, as in the two GDN kernels.
-__global__ void rms_norm_rows(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    float* __restrict__ out,
-    int width,
-    float eps
-) {
-    extern __shared__ float scratch[];
-    long long base = (long long)blockIdx.x * width;
-
-    float partial = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float v = x[base + j];
-        partial += v * v;
-    }
-    float sum_sq = block_reduce_sum(partial, scratch);
-
-    float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);
-
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        out[base + j] = x[base + j] * inv_rms * weight[j];
-    }
-}
-
-// Partial rotary embedding, NEOX (split-half) pairing: dimension i pairs with
-// i + rope_dim/2, and dimensions [rope_dim, head_dim) pass through untouched.
-//
-// grid: (heads, tokens). block: head_dim threads, one per head element.
-//
-// **The tail is copied, not computed.** `out[base+j] = x[base+j]` for
-// j >= rope_dim is a load and a store with no arithmetic between them, so the
-// bits are preserved exactly and the differential test can gate that span
-// with Tolerance::exact(). Any formulation that instead multiplied the tail
-// by a cos of angle 0 would be "correct" to within an ulp and would fail that
-// gate, which is the point of having it.
-//
-// Angles are computed in double precision because the reference does
-// (`f64::from(theta_base).powf(...)`, `pos * freq`, then `as f32`). Turing
-// runs fp64 at 1/32 rate, which is irrelevant here: this kernel is two loads
-// and a store per thread and is bandwidth-bound, and computing the angle in
-// fp32 would introduce a second disagreement with the reference on top of the
-// one the tail gate exists to rule out.
-//
-// Each thread computes its own sin/cos rather than one thread per pair
-// computing both, so that no thread writes two elements and the pass-through
-// branch stays a plain copy.
-__global__ void rope_partial(
-    const float* __restrict__ x,
-    const unsigned int* __restrict__ positions,
-    float* __restrict__ out,
-    int heads,
-    int head_dim,
-    int rope_dim,
-    float theta_base
-) {
-    int h = blockIdx.x;
-    int t = blockIdx.y;
-    int j = threadIdx.x;
-    long long base = ((long long)t * heads + h) * head_dim;
-
-    if (j >= rope_dim) {
-        out[base + j] = x[base + j];
-        return;
-    }
-
-    int half = rope_dim >> 1;
-    int i = (j < half) ? j : (j - half);
-
-    double freq = pow((double)theta_base, -2.0 * (double)i / (double)rope_dim);
-    double angle = (double)positions[t] * freq;
-    float sin_a = (float)sin(angle);
-    float cos_a = (float)cos(angle);
-
-    float x0 = x[base + i];
-    float x1 = x[base + i + half];
-    out[base + j] = (j < half) ? (x0 * cos_a - x1 * sin_a)
-                               : (x0 * sin_a + x1 * cos_a);
-}
 
 // out = silu(gate) * up, elementwise.
 //
@@ -215,109 +98,6 @@ __global__ void rope_partial(
 // fast intrinsic is good to ~2 ulp of the *result*, not of the exponent,
 // which on the negative tail is a relative error the tolerance would have to
 // be widened for. This is not a bottleneck.
-// RMSNorm and the SwiGLU multiply that consumes it, in one launch.
-//
-// The Gated DeltaNet's output norm is immediately multiplied by `silu(z)`,
-// and the two kernels cover exactly the same elements: the norm's grid is one
-// block per row of `width`, and the multiply is elementwise over
-// `rows * width`. So the multiply rides along in the norm's second pass, and
-// a decode step loses a launch per Gated DeltaNet layer.
-//
-// The reduction is untouched -- same block, same width, same
-// `block_reduce_sum` -- so `normed` is bit-identical to what `rms_norm_rows`
-// writes, and it is still written: it is an intermediate the block's own
-// differential test compares.
-//
-// grid: (rows,). block: as `rms_norm_rows`.
-__global__ void rms_norm_swiglu_rows(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    const float* __restrict__ gate,
-    float* __restrict__ normed,
-    float* __restrict__ out,
-    int width,
-    float eps
-) {
-    extern __shared__ float scratch[];
-    long long base = (long long)blockIdx.x * width;
-
-    float partial = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float v = x[base + j];
-        partial += v * v;
-    }
-    float sum_sq = block_reduce_sum(partial, scratch);
-
-    float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);
-
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float nv = x[base + j] * inv_rms * weight[j];
-        normed[base + j] = nv;
-        float g = gate[base + j];
-        out[base + j] = (g / (1.0f + expf(-g))) * nv;
-    }
-}
-
-// `rms_norm_swiglu_rows` handing its output straight to the integer tensor
-// cores.
-//
-// At prefill width the Gated DeltaNet's `final_output` has exactly one
-// reader, the output projection, and that projection reads it as int8 with a
-// scale per 32 elements (`mma_quantize_rows_q8`). The norm's row is
-// `head_dim` wide, a whole number of those 32-element blocks, and the block
-// here is one thread an element -- so each warp already holds one
-// quantization block in its lanes, and can reduce the absolute maximum and
-// round in place. `normed` and `out` are then never written as floats: two
-// 100 MB stores and the quantizer's 100 MB read back, per layer, at 6,138
-// tokens.
-//
-// Both halves are their own kernels' arithmetic, operand for operand: the
-// norm and the SwiGLU as `rms_norm_swiglu_rows` (one element a thread, so its
-// strided loops run once), the quantization as `mma_quantize_rows_q8`
-// (absmax by xor butterfly, `a / 127` and `127 / a`, `rintf`, clamp). The
-// quants and scales are bit-identical to the two-launch form
-// (`gdn_tail_differential`).
-//
-// grid: (rows,). block: `width`, which must be a multiple of 32 and at most
-// `MAX_BLOCK`; the launcher checks both.
-__global__ void rms_norm_swiglu_q8_rows(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    const float* __restrict__ gate,
-    signed char* __restrict__ q,
-    float* __restrict__ scales,
-    int width,
-    float eps
-) {
-    extern __shared__ float scratch[];
-    long long base = (long long)blockIdx.x * width;
-    int j = threadIdx.x;
-
-    float v = x[base + j];
-    float partial = 0.0f;
-    partial += v * v;
-    float sum_sq = block_reduce_sum(partial, scratch);
-
-    float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);
-
-    float nv = v * inv_rms * weight[j];
-    float g = gate[base + j];
-    float o = (g / (1.0f + expf(-g))) * nv;
-
-    float a = fabsf(o);
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off));
-
-    float d = a > 0.0f ? a / 127.0f : 1.0f;
-    float inv = a > 0.0f ? 127.0f / a : 0.0f;
-
-    int qi = (int)rintf(o * inv);
-    qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
-
-    q[base + j] = (signed char)qi;
-    if ((j & 31) == 0) scales[(base + j) >> 5] = d;
-}
-
 __global__ void swiglu_mul(
     const float* __restrict__ gate,
     const float* __restrict__ up,
@@ -380,249 +160,6 @@ __global__ void sigmoid_gate_mul(
         float s = 1.0f / (1.0f + expf(-gate[g]));
         if (write_sig) sig[g] = s;
         out[i] = x[i] * s;
-    }
-}
-
-// out = a + b, elementwise. The residual add.
-//
-// One rounding, exactly as `llmcuda_kernels::norm::residual_add`, so this is
-// bit-identical to the reference rather than close to it and the differential
-// test gates it with Tolerance::exact(). Unlike the convolution it needs no
-// __fadd_rn to get there: a lone add has nothing to contract into an FMA.
-//
-// There is no fused alternative to check this against — every residual add in
-// the model currently has nowhere to go — so the whole content of this kernel
-// is that the operands are added in the order given and nothing else happens
-// to them.
-__global__ void tensor_add(
-    const float* __restrict__ a,
-    const float* __restrict__ b,
-    float* __restrict__ out,
-    long long n
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        out[i] = a[i] + b[i];
-    }
-}
-
-// out = log(1 + exp(x)), with a passthrough above 20. The GDN alpha gate's
-// nonlinearity: `a_softplus = softplus(alpha + ssm_dt.bias)`, which is then
-// multiplied by the already-negated `ssm_a` to give the log-decay
-// (`qwen35moe.cpp`, `alpha_softplus` / `gate`).
-//
-// `(x > 20.0f) ? x : logf(1.0f + expf(x))` is ggml's formulation verbatim.
-// The same expression appears three times in llama.cpp — `op_softplus` in
-// `ggml/src/ggml-cuda/unary.cu` (the CUDA path), `op_softplus` in
-// `ggml/src/ggml-cpu/unary-ops.cpp`, and `ggml_compute_softplus_f32` in
-// `ggml/src/ggml-impl.h`.
-//
-// **The threshold is a correctness guard, not an optimization.** expf
-// overflows fp32 above x ~ 88.7, so a branch-free softplus returns inf where
-// the answer is x, and that inf becomes a non-finite log-decay that poisons
-// the whole recurrence. Where the branch is taken it is also invisible:
-// log(1 + e^20) - 20 is ~2.06e-9, about a thousandth of an fp32 ulp at that
-// magnitude.
-//
-// (ggml's SYCL backend uses the numerically better
-// `max(x,0) + log1p(exp(-|x|))` — `op_softplus` in
-// `ggml/src/ggml-sycl/element_wise.cpp` — but that is not the form the CUDA
-// and CPU paths take, and Qwen3.6's `a_softplus` comes off the CUDA one.)
-__global__ void softplus_elementwise(
-    const float* __restrict__ x,
-    float* __restrict__ out,
-    long long n
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        float v = x[i];
-        out[i] = (v > 20.0f) ? v : logf(1.0f + expf(v));
-    }
-}
-
-// Causal depthwise convolution over the fused GDN q/k/v stream.
-//
-// out[t][ch] = sum_{i<K} w[ch][i] * xw(t - (K-1) + i, ch)
-//
-// where xw reads this batch's tokens for non-negative positions and the
-// carried cache for negative ones. Tap K-1 multiplies the *current* token and
-// tap 0 the oldest, which is `ggml_compute_forward_ssm_conv_f32`'s window
-// order (`ggml/src/ggml-cpu/ops.cpp`) and is the thing a reversed loop gets
-// silently backwards.
-//
-// grid: (ceil(channels / 256), tokens). block: 256 threads over channels, so
-// consecutive threads read consecutive channels of one token — the layout is
-// [seq_len][channels] with channels contiguous, so every load coalesces.
-//
-// __fmul_rn/__fadd_rn rather than `acc += x * w`: see the module docs. The
-// point is to deny nvcc the FMA contraction so this kernel is bit-identical
-// to the scalar reference rather than merely close to it.
-__global__ void conv1d_causal_depthwise(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    const float* __restrict__ state,
-    float* __restrict__ out,
-    int channels,
-    int conv_kernel
-) {
-    int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ch >= channels) return;
-    int t = blockIdx.y;
-    int carry = conv_kernel - 1;
-
-    float acc = 0.0f;
-    for (int i = 0; i < conv_kernel; ++i) {
-        int u = t - carry + i;
-        float xv = (u >= 0)
-            ? x[(long long)u * channels + ch]
-            : state[(long long)ch * carry + (u + carry)];
-        acc = __fadd_rn(acc, __fmul_rn(xv, weight[(long long)ch * conv_kernel + i]));
-    }
-    out[(long long)t * channels + ch] = acc;
-}
-
-// The whole convolution for a one-token step: output and cache advance in
-// one launch.
-//
-// `conv1d_causal_depthwise` and `conv1d_update_state` are two kernels because
-// a batch's cache advance depends on the *last* `conv_kernel - 1` inputs of
-// the whole batch, which the per-token blocks of the first kernel cannot see.
-// At one token there is no batch: the window is the cache plus this token,
-// and the new cache is the old one shifted by one with this token appended.
-// A thread owns its channel's whole cache row, so the shift is safe in place
-// once the row is staged in registers -- the same argument
-// `conv1d_update_state` already makes, with `seq_len` pinned to 1.
-//
-// The accumulation keeps `__fadd_rn(acc, __fmul_rn(...))` in ascending tap
-// order, so the output is bit-identical to the two-kernel path rather than
-// merely close: see the module docs on why the FMA contraction is denied here.
-//
-// grid: (ceil(channels / 256),). block: 256.
-__global__ void conv1d_step(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    float* __restrict__ state,
-    float* __restrict__ out,
-    int channels,
-    int conv_kernel
-) {
-    int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ch >= channels) return;
-    int carry = conv_kernel - 1;
-
-    float staged[MAX_CONV_KERNEL];
-    for (int j = 0; j < carry; ++j) {
-        staged[j] = state[(long long)ch * carry + j];
-    }
-    float xv0 = x[ch];
-
-    float acc = 0.0f;
-    for (int i = 0; i < conv_kernel; ++i) {
-        float xv = (i < carry) ? staged[i] : xv0;
-        acc = __fadd_rn(acc, __fmul_rn(xv, weight[(long long)ch * conv_kernel + i]));
-    }
-    out[ch] = acc;
-
-    for (int j = 0; j + 1 < carry; ++j) {
-        state[(long long)ch * carry + j] = staged[j + 1];
-    }
-    if (carry > 0) {
-        state[(long long)ch * carry + carry - 1] = xv0;
-    }
-}
-
-// `conv1d_step` over `n` sequences at once, one grid.y slice each.
-//
-// Batched decode ran this once per sequence -- 2n launches of launch floor
-// per GDN layer for a kernel that is over in ~3 us. The activations are the
-// batch scratch (`[n][channels]`, sequence-major); only the conv cache is
-// per-sequence, and it rides in as eight scalar pointer slots selected by a
-// warp-uniform switch, exactly as `gdn_recurrent_step` takes its states.
-// Each sequence's arithmetic reads and writes only its own z slice, so batch
-// and single-stream stay bit-identical through this kernel by construction.
-//
-// grid: (ceil(channels / 256), n). block: 256.
-__global__ void conv1d_step_batch(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    unsigned long long s0, unsigned long long s1,
-    unsigned long long s2, unsigned long long s3,
-    unsigned long long s4, unsigned long long s5,
-    unsigned long long s6, unsigned long long s7,
-    float* __restrict__ out,
-    int channels,
-    int conv_kernel
-) {
-    int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ch >= channels) return;
-    int z = blockIdx.y;
-    float* state;
-    switch (z) {
-        case 0: state = (float*)s0; break;
-        case 1: state = (float*)s1; break;
-        case 2: state = (float*)s2; break;
-        case 3: state = (float*)s3; break;
-        case 4: state = (float*)s4; break;
-        case 5: state = (float*)s5; break;
-        case 6: state = (float*)s6; break;
-        default: state = (float*)s7; break;
-    }
-    int carry = conv_kernel - 1;
-
-    float staged[MAX_CONV_KERNEL];
-    for (int j = 0; j < carry; ++j) {
-        staged[j] = state[(long long)ch * carry + j];
-    }
-    float xv0 = x[(long long)z * channels + ch];
-
-    float acc = 0.0f;
-    for (int i = 0; i < conv_kernel; ++i) {
-        float xv = (i < carry) ? staged[i] : xv0;
-        acc = __fadd_rn(acc, __fmul_rn(xv, weight[(long long)ch * conv_kernel + i]));
-    }
-    out[(long long)z * channels + ch] = acc;
-
-    for (int j = 0; j + 1 < carry; ++j) {
-        state[(long long)ch * carry + j] = staged[j + 1];
-    }
-    if (carry > 0) {
-        state[(long long)ch * carry + carry - 1] = xv0;
-    }
-}
-
-// Advance the convolution cache to the last conv_kernel-1 inputs.
-//
-// grid-stride over channels, one thread per channel. Every window value is
-// staged into registers before anything is written, so the update is safe
-// in place: a thread owns its channel's whole cache row and no other thread
-// touches it. That matters because a batch shorter than conv_kernel-1 — every
-// decode step — reads entries of the old cache that it also overwrites.
-// llama.cpp gets the same effect structurally, by taking the new state as a
-// view into a freshly concatenated buffer
-// (`llm_build_delta_net_base::build_conv_state`, `s_idx = conv_input->ne[0] -
-// conv_states->ne[0]`); we have no such buffer and must not need one.
-__global__ void conv1d_update_state(
-    const float* __restrict__ x,
-    float* __restrict__ state,
-    int seq_len,
-    int channels,
-    int conv_kernel
-) {
-    int carry = conv_kernel - 1;
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long ch = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-         ch < channels;
-         ch += stride) {
-        float staged[MAX_CONV_KERNEL];
-        for (int j = 0; j < carry; ++j) {
-            int u = seq_len - carry + j;
-            staged[j] = (u >= 0)
-                ? x[(long long)u * channels + ch]
-                : state[ch * carry + (u + carry)];
-        }
-        for (int j = 0; j < carry; ++j) {
-            state[ch * carry + j] = staged[j];
-        }
     }
 }
 
@@ -744,25 +281,12 @@ impl LayerOpsKernels {
     ///
     /// All loading happens before hot-path launches or graph capture.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
-        Self::load(ctx, false)
-    }
-
-    /// Every kernel from its CUDA C++ original.
-    ///
-    /// The oracle the Rust ports are compared against bit for bit
-    /// (`rust_kernels_differential`), and the other arm of an A/B. Not a
-    /// serving configuration.
-    pub fn cuda_cpp(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
-        Self::load(ctx, true)
-    }
-
-    fn load(ctx: &Arc<CudaContext>, all_cpp: bool) -> Result<Self, LayerOpsError> {
         let ptx = compile(LAYER_OPS_SRC, "layer_ops").map_err(LayerOpsError::Compile)?;
         let module = ctx.load_module(ptx)?;
-        let ported = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
-        let rust = if all_cpp { &module } else { &ported };
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
+        // Bit-identical to the CUDA C++ but slower at prefill sizes.
         let opt_in = if cfg!(feature = "rust-kernels") {
-            rust
+            &rust
         } else {
             &module
         };
@@ -1320,8 +844,7 @@ impl LayerOpsKernels {
             // SAFETY: threads past `channels` return before touching memory;
             // `state` is indexed in `[ch * carry, ch * carry + carry)` and
             // `weight` in `[ch * conv_kernel, ...)`, both length-checked
-            // above, and `conv_kernel <= MAX_CONV_KERNEL` is what makes the
-            // `staged` register array large enough.
+            // above.
             unsafe { builder.launch(cfg) }?;
             return Ok(());
         }
@@ -1402,10 +925,9 @@ impl LayerOpsKernels {
             .arg(&seq_len_i32)
             .arg(&channels_i32)
             .arg(&conv_kernel_i32);
-        // SAFETY: same index bounds as above, and `conv_kernel <=
-        // MAX_CONV_KERNEL` is what makes the kernel's `staged` register array
-        // large enough — checked at the top of both callers, which are the
-        // only paths that launch it.
+        // SAFETY: same index bounds as above; `seq_len >= 1` and the lengths
+        // were checked at the top of both callers, which are the only paths
+        // that launch it.
         unsafe { builder.launch(state_cfg) }?;
         Ok(())
     }
@@ -1452,25 +974,52 @@ fn check_len(what: &'static str, expected: usize, got: usize) -> Result<(), Laye
 
 #[cfg(test)]
 mod tests {
+    use super::super::{RUST_KERNELS_PTX, RUST_KERNELS_SRC};
     use super::*;
 
-    /// Where a snippet starts in the kernel source, or a failure naming it.
+    /// Where a snippet starts in the CUDA C++ source, or a failure naming it.
     fn at(needle: &str) -> usize {
         LAYER_OPS_SRC
             .find(needle)
             .unwrap_or_else(|| panic!("kernel source no longer contains `{needle}`"))
     }
 
+    /// One Rust kernel's source, from its signature to the next doc comment
+    /// at kernel indentation.
+    fn rust_kernel(name: &str) -> &'static str {
+        let open = format!("    pub unsafe fn {name}(");
+        let from = RUST_KERNELS_SRC
+            .find(&open)
+            .unwrap_or_else(|| panic!("the Rust source no longer has `{name}`"));
+        let len = RUST_KERNELS_SRC[from..]
+            .find("\n    }\n")
+            .unwrap_or_else(|| panic!("`{name}` has no end"));
+        &RUST_KERNELS_SRC[from..from + len]
+    }
+
+    /// One entry point or device function of the embedded PTX.
+    fn ptx_function(name: &str) -> &'static str {
+        let from = [
+            ".visible .entry ",
+            ".visible .func  (.param .b32 func_retval0) ",
+        ]
+        .iter()
+        .find_map(|kind| RUST_KERNELS_PTX.find(&format!("{kind}{name}(")))
+        .unwrap_or_else(|| panic!("the embedded PTX no longer has `{name}`"));
+        let len = RUST_KERNELS_PTX[from..]
+            .find("// -- End function")
+            .unwrap_or_else(|| panic!("`{name}` has no end"));
+        &RUST_KERNELS_PTX[from..from + len]
+    }
+
     #[test]
     fn the_rotary_tail_is_copied_not_computed() {
-        // The documented invariant, asserted structurally because it is a
-        // property of the *code path*, not of any particular input: the
-        // pass-through branch must be a bare load-store with no arithmetic,
-        // or the bits stop being preserved and Tolerance::exact() stops being
-        // reachable. Multiplying by cos(0) would be correct to an ulp and
-        // would fail the differential gate.
-        assert!(LAYER_OPS_SRC.contains(
-            "    if (j >= rope_dim) {\n        out[base + j] = x[base + j];\n        return;\n    }"
+        // The pass-through branch must be a bare load and store. If it were
+        // folded into the rotation with a zero angle the tail would be
+        // multiplied by cos(0) and added to x*sin(0) — correct to an ulp and
+        // a failure of the differential gate.
+        assert!(rust_kernel("rope_partial").contains(
+            "if j >= rope_dim {\n                *out.add(base + j as usize) = *x.add(base + j as usize);\n            }"
         ));
     }
 
@@ -1480,8 +1029,9 @@ mod tests {
         // 2i with 2i+1; both produce a rotation, both preserve norm, and only
         // one is Qwen's. `llmcuda_kernels::rope` cites
         // ggml_compute_forward_rope_flt's GGML_ROPE_TYPE_NEOX case for this.
-        assert!(LAYER_OPS_SRC.contains("int half = rope_dim >> 1;"));
-        assert!(LAYER_OPS_SRC.contains("float x1 = x[base + i + half];"));
+        let body = rust_kernel("rope_partial");
+        assert!(body.contains("let half = rope_dim / 2;"));
+        assert!(body.contains("let x1 = *x.add(base + (j + half) as usize);"));
     }
 
     #[test]
@@ -1489,33 +1039,41 @@ mod tests {
         // out[i] = x0 cos - x1 sin, out[i+half] = x0 sin + x1 cos. Swapping
         // the two signs rotates by -position instead of +position, which is
         // undetectable by norm preservation and by position 0.
-        assert!(LAYER_OPS_SRC.contains("(x0 * cos_a - x1 * sin_a)"));
-        assert!(LAYER_OPS_SRC.contains("(x0 * sin_a + x1 * cos_a)"));
+        let body = rust_kernel("rope_partial");
+        assert!(body.contains("= x0.mul_add(cos_a, -(x1 * sin_a));"));
+        assert!(body.contains("= x0.mul_add(sin_a, x1 * cos_a);"));
     }
 
     #[test]
-    fn the_convolution_denies_the_compiler_its_fma_contraction() {
+    fn the_convolution_is_compiled_without_a_fused_multiply_add() {
         // The one thing standing between this kernel and bit-exact agreement
-        // with the scalar reference. `acc += x * w` would let nvcc emit an
-        // fma, which rounds once where Rust rounds twice, and the
-        // differential test's Tolerance::exact() would fail.
-        assert!(LAYER_OPS_SRC.contains("acc = __fadd_rn(acc, __fmul_rn(xv,"));
-        let conv_start = at("__global__ void conv1d_causal_depthwise(");
-        let conv_end = at("__global__ void conv1d_update_state(");
-        let body = &LAYER_OPS_SRC[conv_start..conv_end];
-        assert!(
-            !body.contains("acc +="),
-            "the accumulation reverted to a contractible form",
-        );
+        // with the scalar reference: an fma rounds once where the reference
+        // rounds twice. The Rust source cannot say so on its own -- the
+        // compiler fuses `acc + x * w` unless the PTX is built with fusion
+        // off -- so this reads the artifact.
+        for name in [
+            "conv1d_causal_depthwise",
+            "conv1d_step",
+            "conv1d_step_batch",
+            "conv_step_channel",
+        ] {
+            let body = ptx_function(name);
+            assert!(!body.contains("fma."), "{name} was compiled with an fma");
+        }
+        assert!(ptx_function("conv1d_causal_depthwise").contains("mul.rn.f32"));
+        assert!(!rust_kernel("conv1d_causal_depthwise").contains("mul_add"));
     }
 
     #[test]
     fn the_convolution_taps_run_forward_so_the_last_tap_is_the_current_token() {
-        // u = t - (K-1) + i with i ascending: tap 0 reads the oldest input and
-        // tap K-1 reads token t. Reversing this is anti-causal and stays
-        // finite, fluent, and wrong.
-        assert!(LAYER_OPS_SRC.contains("int u = t - carry + i;"));
-        assert!(LAYER_OPS_SRC.contains("for (int i = 0; i < conv_kernel; ++i) {"));
+        // Tap i reads position `t - carry + i` with i ascending: tap 0 reads
+        // the oldest input and tap K-1 reads token t. Reversing this is
+        // anti-causal and stays finite, fluent, and wrong.
+        let body = rust_kernel("conv1d_causal_depthwise");
+        assert!(body.contains("let first = t - carry;"));
+        assert!(body.contains("x.offset((first as i64 * channels as i64 + ch as i64) as isize)"));
+        assert!(body.contains("xp = xp.wrapping_offset(channels as isize);"));
+        assert!(body.contains("let xv = if first + i >= 0 { *xp } else { *sp };"));
     }
 
     #[test]
@@ -1534,20 +1092,33 @@ mod tests {
     }
 
     #[test]
-    fn the_state_update_stages_before_it_writes() {
+    fn the_state_update_never_reads_a_slot_it_has_written() {
         // In-place safety. A batch shorter than conv_kernel-1 — which is every
-        // decode step — reads entries of the cache it also overwrites, so the
-        // read loop must complete before the write loop begins.
-        let read = at("staged[j] = (u >= 0)");
-        let write = at("state[ch * carry + j] = staged[j];");
-        assert!(read < write, "the cache is written before it is fully read");
+        // decode step — reads entries of the cache it also overwrites. Slot j
+        // takes cache slot `j + seq_len`, so with slots written in ascending
+        // order and at least one token, every read is of a later slot.
+        let body = rust_kernel("conv1d_update_state");
+        assert!(body.contains("let u = seq_len - carry + j;"));
+        assert!(body.contains("*row.add((u + carry) as usize)"));
+        for conv_kernel in 1..=MAX_CONV_KERNEL as i32 {
+            let carry = conv_kernel - 1;
+            for seq_len in 1..=carry {
+                for j in 0..carry {
+                    let u = seq_len - carry + j;
+                    if u < 0 {
+                        assert!(u + carry > j, "slot {j} would read a written slot");
+                    }
+                }
+            }
+        }
+        // The one-token step shifts the same way: slot j takes slot j + 1.
+        assert!(
+            RUST_KERNELS_SRC.contains("*state.add(j as usize) = *state.add((j + 1) as usize);")
+        );
     }
 
     #[test]
-    fn the_state_array_bound_covers_the_widest_supported_kernel() {
-        // The register array is `float staged[MAX_CONV_KERNEL]` and holds
-        // conv_kernel-1 entries, so the host-side bound must not exceed it.
-        assert!(LAYER_OPS_SRC.contains("#define MAX_CONV_KERNEL 8"));
+    fn the_conv_bound_covers_the_widest_supported_kernel() {
         assert_eq!(MAX_CONV_KERNEL, 8);
         // Qwen3.6's real width — `qwen35moe.ssm.conv_kernel` — must be
         // accepted. Spelled as a literal because this crate deliberately does
@@ -1559,18 +1130,47 @@ mod tests {
     }
 
     #[test]
-    fn rms_norm_divides_by_sqrt_rather_than_calling_rsqrtf() {
-        // Same choice as both GDN kernels: rsqrtf is faster and not
+    fn rms_norm_divides_by_sqrt_rather_than_taking_a_reciprocal_square_root() {
+        // Same choice as both GDN kernels: rsqrt is faster and not
         // IEEE-exact, and the reference divides. Matching it keeps the
         // measured disagreement attributable to the reduction order alone.
         assert!(
-            LAYER_OPS_SRC.contains("float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);")
+            RUST_KERNELS_SRC
+                .contains("1.0 / (block_reduce_sum(partial) / width as f32 + eps).sqrt()")
         );
-        assert!(LAYER_OPS_SRC.contains("out[base + j] = x[base + j] * inv_rms * weight[j];"));
-        // The negative half, scoped to the kernel body so that the comment
-        // explaining the choice does not satisfy its own assertion.
-        let body = &LAYER_OPS_SRC[at("__global__ void rms_norm_rows(")..at("// Partial rotary")];
-        assert!(!body.contains("rsqrtf"), "rms_norm reverted to rsqrtf");
+        assert!(
+            rust_kernel("rms_norm_rows")
+                .contains("*x.add(base + j as usize) * inv * *weight.add(j as usize);")
+        );
+        assert!(!RUST_KERNELS_SRC.contains("rsqrt"), "a norm took rsqrt");
+        for name in [
+            "rms_norm_rows",
+            "rms_norm_swiglu_rows",
+            "rms_norm_swiglu_q8_rows",
+        ] {
+            assert!(!ptx_function(name).contains("rsqrt"), "{name} took rsqrt");
+        }
+    }
+
+    #[test]
+    fn the_norm_reduction_adds_warp_totals_in_ascending_order() {
+        // The order is shared with the CUDA C++ `block_reduce_sum` copies in
+        // the Gated DeltaNet and dense-FFN kernels, which are compared to
+        // these norms bit for bit. A parallel second tree is faster at
+        // narrow rows and one ulp away.
+        let from = RUST_KERNELS_SRC
+            .find("unsafe fn block_reduce_sum(")
+            .expect("the reduction is present");
+        let body = &RUST_KERNELS_SRC[from..];
+        let body = &body[..body.find("\n    }\n").expect("it ends")];
+        assert!(body.contains("v += warp::shuffle_down_f32_sync(u32::MAX, v, offset);"));
+        assert!(body.contains("if tid == 0 {"));
+        assert!(body.contains("total += *scratch.add(w as usize);"));
+        assert_eq!(
+            body.matches("thread::sync_threads();").count(),
+            2,
+            "the reduction no longer has its two barriers",
+        );
     }
 
     #[test]
@@ -1586,8 +1186,7 @@ mod tests {
         // tanh form and silu(x)/x are equal on paper and round differently,
         // and this kernel is gated against the reciprocal one.
         assert!(LAYER_OPS_SRC.contains("float s = 1.0f / (1.0f + expf(-gate[g]));"));
-        let body = &LAYER_OPS_SRC
-            [at("__global__ void sigmoid_gate_mul(")..at("// out = a + b, elementwise")];
+        let body = &LAYER_OPS_SRC[at("__global__ void sigmoid_gate_mul(")..];
         assert!(
             !body.contains("tanh"),
             "the sigmoid was rewritten as a tanh"
@@ -1621,25 +1220,30 @@ mod tests {
     }
 
     #[test]
+    fn the_rust_sigmoid_is_the_same_reciprocal_form() {
+        // The elementwise gate launches the Rust kernel, which has to round
+        // as the CUDA C++ one above does.
+        let body = rust_kernel("sigmoid_gate_mul");
+        assert!(body.contains("let s = 1.0 / (1.0 + (-*gate.add(g as usize)).exp());"));
+        assert!(body.contains("if broadcast == 0 || i % width as i64 == 0 {"));
+        assert!(!body.contains("tanh"));
+    }
+
+    #[test]
     fn the_residual_add_is_a_single_rounding() {
-        // Nothing fused, nothing reassociated: `out[i] = a[i] + b[i]` is the
-        // reference's exact operand sequence, which is what lets the
-        // differential test gate it at exact equality rather than a
-        // tolerance. A scale folded in here would still look plausible.
-        assert!(LAYER_OPS_SRC.contains("        out[i] = a[i] + b[i];"));
-        let body =
-            &LAYER_OPS_SRC[at("__global__ void tensor_add(")..at("// out = log(1 + exp(x))")];
-        assert!(!body.contains("fma"), "the residual add grew an FMA");
-        // Scoped to the statement, not the whole body: the parameter list is
-        // full of `*` and a naive search would match those.
-        let store = body
-            .lines()
-            .find(|l| l.contains("out[i]"))
-            .expect("the residual add still stores through out[i]");
-        assert_eq!(
-            store.trim(),
-            "out[i] = a[i] + b[i];",
+        // Nothing fused, nothing reassociated: the reference's exact operand
+        // sequence, which is what lets the differential test gate it at
+        // exact equality rather than a tolerance. A scale folded in here
+        // would still look plausible.
+        let body = rust_kernel("tensor_add");
+        assert!(
+            body.contains("*out.add(i as usize) = *a.add(i as usize) + *b.add(i as usize);"),
             "the residual add is no longer a bare sum",
+        );
+        assert!(!body.contains("mul_add"));
+        assert!(
+            !ptx_function("tensor_add").contains("fma."),
+            "the residual add grew an FMA",
         );
     }
 
@@ -1650,7 +1254,10 @@ mod tests {
         // ggml_compute_softplus_f32 in ggml/src/ggml-impl.h, all three
         // identical. Dropping the branch returns inf above x ~ 88.7 rather
         // than saturating, and an inf log-decay poisons the recurrence.
-        assert!(LAYER_OPS_SRC.contains("out[i] = (v > 20.0f) ? v : logf(1.0f + expf(v));"));
+        assert!(
+            rust_kernel("softplus_elementwise")
+                .contains("if v > 20.0 { v } else { (1.0 + v.exp()).ln() };")
+        );
         // The threshold itself, checked arithmetically rather than trusted:
         // f32::exp overflows well above 20, so the branch is what stands
         // between the GDN alpha gate and a non-finite.

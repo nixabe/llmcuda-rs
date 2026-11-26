@@ -1,4 +1,5 @@
-//! Partial RoPE CPU differentials and six interleaved CUDA-event pairs.
+//! Tiled attention RoPE, CUDA C++ against Rust: CPU differentials, a bitwise
+//! comparison of the two, and six interleaved CUDA-event pairs.
 use cudarc::driver::sys::{CUevent_flags, CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
@@ -99,10 +100,6 @@ fn main() -> Result<(), Error> {
     // SAFETY: single stream, all buffers retained through synchronization.
     unsafe { ctx.disable_event_tracking() };
     let stream = ctx.new_stream()?;
-    let base = ctx.load_module(llmcuda_cuda::kernels::compile(
-        llmcuda_cuda::kernels::layer_ops::LAYER_OPS_SRC,
-        "rope_baseline",
-    )?)?;
     let rust = ctx.load_module(Ptx::from_src(include_str!(
         "../../../llmcuda-cuda/src/kernels/rust/tensor_add.ptx"
     )))?;
@@ -110,16 +107,13 @@ fn main() -> Result<(), Error> {
         llmcuda_cuda::kernels::attention::ATTENTION_SRC,
         "rope_attention_baseline",
     )?)?;
-    for tiled in [false, true] {
-        let entry = if tiled {
-            "attn_rope_partial_neox"
-        } else {
-            "rope_partial"
-        };
-        let kernels = [
-            if tiled { &attention } else { &base }.load_function(entry)?,
-            rust.load_function(entry)?,
-        ];
+    // Only the tiled attention kernel still has a CUDA C++ arm (it serves
+    // wide grids); the standalone `rope_partial` is Rust alone and is held to
+    // the CPU reference by `layer_ops_differential`.
+    {
+        let tiled = true;
+        let entry = "attn_rope_partial_neox";
+        let kernels = [attention.load_function(entry)?, rust.load_function(entry)?];
         for (tokens, heads, width, rotated) in [
             (5, 2, 32, 0),
             (5, 2, 96, 2),

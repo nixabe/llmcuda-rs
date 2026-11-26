@@ -105,6 +105,42 @@ __device__ __forceinline__ unsigned hg_bf16x2(unsigned v, float scale) {
     return (unsigned)l | ((unsigned)h << 16);
 }
 
+// One E2M1 nibble (sign in bit 3) to the fp16 bits of its doubled value:
+// 0, 1, 2, 3, 4, 6, 8, 12. Codes 2..7 are (1 + f / 2) * 2^e with e = m >> 1.
+__device__ __forceinline__ unsigned hg_fp4(unsigned nib) {
+    const unsigned m = nib & 7u;
+    const unsigned v = m < 2u ? m * 0x3C00u : (((15u + (m >> 1)) << 10) | ((m & 1u) << 9));
+    return v | ((nib & 8u) << 12);
+}
+
+// An unsigned E4M3 sub-block scale, halved, as fp16 bits; exact. 0 and 0x7F
+// decode to zero and the sign bit is ignored, as in ggml_ue4m3_to_fp32.
+__device__ __forceinline__ unsigned hg_ue4m3(unsigned b) {
+    const unsigned e = (b >> 3) & 15u, man = b & 7u;
+    unsigned short sub;
+    const float f = (float)man * 0.0009765625f;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(sub) : "f"(f));
+    const unsigned v = e ? (((e + 7u) << 10) | (man << 7)) : (unsigned)sub;
+    return (b == 0u || b == 0x7Fu) ? 0u : v;
+}
+
+// Four NVFP4 bytes: the low nibbles are four consecutive elements and the
+// high nibbles the four elements eight further on. Both come back as two
+// fp16 pairs times one fp16 scale (both halves of `s2`); the E2M1 value and
+// the E4M3 scale have four significand bits between them, so the product is
+// exact.
+__device__ __forceinline__ void hg_fp4x4(unsigned q, unsigned s2, unsigned& l0, unsigned& l1,
+                                         unsigned& h0, unsigned& h1) {
+    l0 = hg_fp4(q) | (hg_fp4(q >> 8) << 16);
+    l1 = hg_fp4(q >> 16) | (hg_fp4(q >> 24) << 16);
+    h0 = hg_fp4(q >> 4) | (hg_fp4(q >> 12) << 16);
+    h1 = hg_fp4(q >> 20) | (hg_fp4(q >> 28) << 16);
+    asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(l0) : "r"(s2));
+    asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(l1) : "r"(s2));
+    asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(h0) : "r"(s2));
+    asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(h1) : "r"(s2));
+}
+
 // A 16-byte (and a 2-byte) read-only load that asks L2 to fetch the whole
 // 128-byte line. A stage reads 32 bytes of a Q8_0 weight row and 64 of an
 // activation row, so without the hint each stage opens a fresh DRAM sector
@@ -115,6 +151,14 @@ __device__ __forceinline__ uint4 hg_ldg16(const void* p) {
     uint4 v;
     asm volatile("ld.global.nc.L2::128B.v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ uint2 hg_ldg8(const void* p) {
+    uint2 v;
+    // Two scalar loads: an NVFP4 sub-block sits four bytes past a multiple
+    // of eight, so the address is only 4-aligned.
+    asm volatile("ld.global.nc.L2::128B.u32 %0, [%1];" : "=r"(v.x) : "l"(p));
+    asm volatile("ld.global.nc.L2::128B.u32 %0, [%1+4];" : "=r"(v.y) : "l"(p));
     return v;
 }
 __device__ __forceinline__ unsigned hg_ldg2(const unsigned short* p) {
@@ -133,7 +177,9 @@ __device__ __forceinline__ int hg_sw(int r, int c) { return r * HG_BK + ((c ^ ((
 
 // out[m][n] (+)= alpha * sum_k x[m][k] * w[n][k]; see the module
 // documentation. FMT 0 is the split Q8_0 layout (`w` int8 [N][K], `ws` fp16
-// [N][K/32]); FMT 1 is bf16 [N][K], converted as `w * wscale`. WN is the warp
+// [N][K/32]); FMT 1 is bf16 [N][K], converted as `w * wscale`; FMT 2 is NVFP4
+// as ggml stores it, rows of K/64 36-byte blocks (K a multiple of 64), with
+// any per-matrix scale left to `alpha`. WN is the warp
 // tile's weight rows (64 or 32); a block is 2 x 4 warps, 128 tokens by 4 * WN
 // rows. K must be a multiple of 32; M and N are masked.
 //
@@ -187,10 +233,12 @@ __device__ __forceinline__ void hg_gemm(
     // W. Q8_0: rows tid >> 1 (+ 128 when BN is 256), sixteen int8 at
     // (tid & 1) * 16, plus the row's scale. bf16: rows tid >> 2 (+ 64, ...),
     // chunk tid & 3, eight values a chunk.
-    constexpr int WREP = FMT == 0 ? BN / 128 : BN / 64;
-    constexpr int WSTEP = FMT == 0 ? 128 : 64;
-    const int w_row = FMT == 0 ? tid >> 1 : tid >> 2;
-    const int w_sub = FMT == 0 ? tid & 1 : tid & 3;
+    // NVFP4: as Q8_0, sixteen elements a thread -- one sub-block, with its
+    // scale byte.
+    constexpr int WREP = FMT != 1 ? BN / 128 : BN / 64;
+    constexpr int WSTEP = FMT != 1 ? 128 : 64;
+    const int w_row = FMT != 1 ? tid >> 1 : tid >> 2;
+    const int w_sub = FMT != 1 ? tid & 1 : tid & 3;
 
     uint4 ra0 = make_uint4(0, 0, 0, 0), ra1 = ra0;
     uint4 rw[WREP];
@@ -220,6 +268,13 @@ __device__ __forceinline__ void hg_gemm(
                     } else if ((kb & 7) == 0) {
                         rsv[i] = hg_ldg16(ws + (long long)n * kblocks + kb);
                     }
+                } else if (FMT == 2) {
+                    const unsigned char* blk = w + ((long long)n * (K >> 6) + (k0 >> 6)) * 36;
+                    const int sb = ((k0 >> 4) & 3) + w_sub;
+                    const uint2 q = hg_ldg8(blk + 4 + sb * 8);
+                    rw[i].x = q.x;
+                    rw[i].y = q.y;
+                    rs[i] = blk[sb];
                 } else {
                     rw[i] = hg_ldg16(w + ((long long)n * K + k0 + w_sub * 8) * 2);
                 }
@@ -245,6 +300,14 @@ __device__ __forceinline__ void hg_gemm(
                 hg_dequant4(rw[i].y, s2, h0.z, h0.w);
                 hg_dequant4(rw[i].z, s2, h1.x, h1.y);
                 hg_dequant4(rw[i].w, s2, h1.z, h1.w);
+                *(uint4*)(&Ws[s][hg_sw(r, w_sub * 2)]) = h0;
+                *(uint4*)(&Ws[s][hg_sw(r, w_sub * 2 + 1)]) = h1;
+            } else if (FMT == 2) {
+                const unsigned sc = hg_ue4m3(rs[i]);
+                const unsigned s2 = sc | (sc << 16);
+                uint4 h0, h1;
+                hg_fp4x4(rw[i].x, s2, h0.x, h0.y, h1.x, h1.y);
+                hg_fp4x4(rw[i].y, s2, h0.z, h0.w, h1.z, h1.w);
                 *(uint4*)(&Ws[s][hg_sw(r, w_sub * 2)]) = h0;
                 *(uint4*)(&Ws[s][hg_sw(r, w_sub * 2 + 1)]) = h1;
             } else {
@@ -354,6 +417,8 @@ HG_ENTRY(hg_q8_256, 0, 64, 1)
 HG_ENTRY(hg_q8_128, 0, 32, 2)
 HG_ENTRY(hg_bf16_256, 1, 64, 1)
 HG_ENTRY(hg_bf16_128, 1, 32, 2)
+HG_ENTRY(hg_nv_256, 2, 64, 1)
+HG_ENTRY(hg_nv_128, 2, 32, 2)
 "#;
 
 /// Errors from the weight-only GEMM.
@@ -447,6 +512,13 @@ pub enum HalfWeight<'a> {
         bytes: &'a CudaSlice<u8>,
         exponent: i32,
     },
+    /// NVFP4 `[N][K]` as ggml stores it: `K / 64` blocks of 36 bytes a row.
+    /// The staged weights are the stored values exactly; `scale` (a
+    /// per-matrix factor, such as an expert's) multiplies the fp32 result.
+    Nvfp4 {
+        bytes: &'a CudaSlice<u8>,
+        scale: f32,
+    },
 }
 
 /// How one launch is shaped: the weight-row tile and the split-K factor.
@@ -465,6 +537,8 @@ pub struct HgemmKernels {
     q8_128: CudaFunction,
     bf16_256: CudaFunction,
     bf16_128: CudaFunction,
+    nv_256: CudaFunction,
+    nv_128: CudaFunction,
     to_half: CudaFunction,
     reduce: CudaFunction,
     q8_to_half_w: CudaFunction,
@@ -559,6 +633,8 @@ impl HgemmKernels {
             q8_128: module.load_function("hg_q8_128")?,
             bf16_256: module.load_function("hg_bf16_256")?,
             bf16_128: module.load_function("hg_bf16_128")?,
+            nv_256: module.load_function("hg_nv_256")?,
+            nv_128: module.load_function("hg_nv_128")?,
             to_half: rust.load_function("hg_to_half")?,
             reduce: rust.load_function("hg_splitk_reduce")?,
             q8_to_half_w: rust.load_function("hg_q8_to_half_w")?,
@@ -966,6 +1042,12 @@ impl HgemmKernels {
             HalfWeight::Bf16 { bytes, .. } => {
                 need("gemm bf16 weights", bytes.len(), n_rows * k * 2)?
             }
+            HalfWeight::Nvfp4 { bytes, .. } => {
+                if !k.is_multiple_of(64) {
+                    return Err(HgemmError::RaggedContraction { k });
+                }
+                need("gemm nvfp4 weights", bytes.len(), n_rows * k / 64 * 36)?
+            }
         }
         if tokens == 0 || n_rows == 0 {
             return Ok(());
@@ -1000,6 +1082,8 @@ impl HgemmKernels {
             (HalfWeight::Q8_0 { .. }, false) => (&self.q8_128, 0),
             (HalfWeight::Bf16 { exponent, .. }, true) => (&self.bf16_256, exponent),
             (HalfWeight::Bf16 { exponent, .. }, false) => (&self.bf16_128, exponent),
+            (HalfWeight::Nvfp4 { .. }, true) => (&self.nv_256, 0),
+            (HalfWeight::Nvfp4 { .. }, false) => (&self.nv_128, 0),
         };
         let cfg = LaunchConfig {
             grid_dim: (n_rows.div_ceil(bn) as u32, m_tiles as u32, splits as u32),
@@ -1015,14 +1099,19 @@ impl HgemmKernels {
             kps as i32,
         );
         let wscale = 2f32.powi(exponent);
-        let alpha = 2f32.powi(-exponent);
+        let alpha = match w {
+            HalfWeight::Nvfp4 { scale, .. } => scale,
+            _ => 2f32.powi(-exponent),
+        };
         {
             let mut b = stream.launch_builder(func);
             match w {
                 HalfWeight::Q8_0 { q, scales } => b.arg(q).arg(scales),
                 // The bf16 entry points never read `ws`; any device pointer
                 // will do.
-                HalfWeight::Bf16 { bytes, .. } => b.arg(bytes).arg(x),
+                HalfWeight::Bf16 { bytes, .. } | HalfWeight::Nvfp4 { bytes, .. } => {
+                    b.arg(bytes).arg(x)
+                }
             };
             b.arg(x).arg(&mut *out);
             // Unsplit launches never touch `part`; any device pointer will do.

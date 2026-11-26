@@ -89,9 +89,38 @@ fn bf16_weights(rows: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
     (bytes, vals)
 }
 
+/// NVFP4 bytes for `rows x k` weights and the values they store. Scale bytes
+/// cover the subnormal exponent, the two encodings of zero and a set sign
+/// bit; nibbles cover all sixteen codes.
+fn nvfp4_weights(rows: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+    let mut rng = Xorshift64Star::new(seed);
+    let mut bytes = Vec::with_capacity(rows * k / 64 * 36);
+    for block in 0..rows * k / 64 {
+        for sub in 0..4 {
+            let pick = (rng.next_f32_range(0.0, 1.0) * 97.0) as usize;
+            let byte = match (block + sub) % 29 {
+                0 => 0u8,
+                1 => 0x7F,
+                2 => 0x80 | ((pick % 80) as u8 + 8),
+                _ => (pick % 88) as u8,
+            };
+            bytes.push(byte);
+        }
+        for _ in 0..32 {
+            bytes.push((rng.next_f32_range(0.0, 1.0) * 255.99) as u8);
+        }
+    }
+    let vals = llmcuda_kernels::quant::dequantize_row_nvfp4(&bytes).unwrap();
+    (bytes, vals)
+}
+
+/// The per-matrix factor the NVFP4 cases pass, as an expert's scale would be.
+const NVFP4_SCALE: f32 = 0.371;
+
 enum Format {
     Q8_0,
     Bf16,
+    Nvfp4,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -108,6 +137,12 @@ fn run_case(
     accumulate: bool,
     seed: u64,
 ) {
+    // An NVFP4 row is whole 64-element blocks.
+    let k = if matches!(format, Format::Nvfp4) {
+        k.next_multiple_of(64)
+    } else {
+        k
+    };
     let mut rng = Xorshift64Star::new(seed ^ 0x5eed);
     let x = rng.vec_f32(tokens * k, -3.0, 3.0);
     let prior: Vec<f32> = rng.vec_f32(tokens * ldo, -1.0, 1.0);
@@ -179,6 +214,32 @@ fn run_case(
             .unwrap();
             deq
         }
+        Format::Nvfp4 => {
+            // The staged weights are the stored values exactly; the factor
+            // multiplies the fp32 sum.
+            let (bytes, vals) = nvfp4_weights(rows, k, seed);
+            assert!(vals.iter().all(|v| round_through_f16(*v) == *v));
+            let dev = stream.clone_htod(&bytes).unwrap();
+            let w = HalfWeight::Nvfp4 {
+                bytes: &dev,
+                scale: NVFP4_SCALE,
+            };
+            hg.gemm_with_plan(
+                stream,
+                w,
+                &xh,
+                &mut out,
+                Some(&mut workspace),
+                tokens,
+                rows,
+                k,
+                ldo,
+                accumulate,
+                plan,
+            )
+            .unwrap();
+            vals.iter().map(|v| v * NVFP4_SCALE).collect()
+        }
     };
     let got = stream.clone_dtoh(&out).unwrap();
 
@@ -227,6 +288,7 @@ fn run_case(
     let name = match format {
         Format::Q8_0 => "q8_0",
         Format::Bf16 => "bf16",
+        Format::Nvfp4 => "nvfp4",
     };
     println!(
         "{name} {plan:?} tokens {tokens:4} rows {rows:5} k {k:5} ldo {ldo:5} acc \
@@ -260,7 +322,7 @@ fn half_gemm_matches_its_rounding_contract() {
         (513, 384, 768, 384, true),
     ];
     let mut seed = 17;
-    for format in [Format::Q8_0, Format::Bf16] {
+    for format in [Format::Q8_0, Format::Bf16, Format::Nvfp4] {
         for wide in [false, true] {
             let whole = HgemmPlan { wide, splits: 1 };
             for &(tokens, rows, k, ldo, accumulate) in &shapes {

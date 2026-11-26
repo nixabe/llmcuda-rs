@@ -35,6 +35,10 @@ use llmcuda_model::{InklingConfig, ModelConfig};
 
 use crate::viewslice::subslice;
 
+mod decode;
+
+pub use decode::InklingDecode;
+
 /// Why loading or running the model failed.
 #[derive(Debug)]
 pub struct InklingRunError(pub String);
@@ -156,6 +160,8 @@ struct Layer {
     gate_up: Experts,
     down: Experts,
     looped: Option<LoopLayer>,
+    /// The same projections, packed for the decode GEMM.
+    decode: decode::DecodeLayer,
 }
 
 /// The resident model.
@@ -166,6 +172,8 @@ pub struct InklingModel {
     hg: HgemmKernels,
     ops: LayerOpsKernels,
     route: K2Kernels,
+    dg: llmcuda_cuda::kernels::inkling::DecodeGemm,
+    dec: llmcuda_cuda::kernels::inkling::InklingDecodeKernels,
     layers: Vec<Layer>,
     tok_embd: CudaSlice<u8>,
     embd_bf16: bool,
@@ -196,8 +204,8 @@ impl<'a> Loader<'a> {
         Ok((info.ggml_type, bytes, elements))
     }
 
-    /// A small tensor as fp32 on the device.
-    fn floats(&mut self, name: &str, elements: usize) -> Res<CudaSlice<f32>> {
+    /// A small tensor widened to fp32, on the host.
+    fn host_floats(&self, name: &str, elements: usize) -> Res<Vec<f32>> {
         let (ty, bytes, n) = self.info(name)?;
         if n != elements {
             return Err(bad(format!("{name}: {n} elements, expected {elements}")));
@@ -218,6 +226,12 @@ impl<'a> Loader<'a> {
                 )));
             }
         };
+        Ok(values)
+    }
+
+    /// A small tensor as fp32 on the device.
+    fn floats(&mut self, name: &str, elements: usize) -> Res<CudaSlice<f32>> {
+        let values = self.host_floats(name, elements)?;
         self.bytes += values.len() * 4;
         Ok(self.stream.clone_htod(&values)?)
     }
@@ -415,6 +429,7 @@ impl InklingModel {
                 gate_up: l.experts(&name("ffn_gate_up_exps.weight"), experts, 2 * ff, n)?,
                 down: l.experts(&name("ffn_down_exps.weight"), experts, n, ff)?,
                 looped,
+                decode: decode::DecodeLayer::load(&mut l, i, &config)?,
             });
         }
 
@@ -446,6 +461,8 @@ impl InklingModel {
             hg: HgemmKernels::new(ctx)?,
             ops: LayerOpsKernels::new(ctx)?,
             route: K2Kernels::new(ctx)?,
+            dg: llmcuda_cuda::kernels::inkling::DecodeGemm::new(ctx)?,
+            dec: llmcuda_cuda::kernels::inkling::InklingDecodeKernels::new(ctx)?,
             config,
             k,
         };
@@ -545,6 +562,36 @@ struct Profile {
     stages: Vec<(&'static str, f64)>,
 }
 
+impl Profile {
+    fn start() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+            stages: Vec::new(),
+        }
+    }
+
+    /// Forget the time since the last mark: what ran in between was not a
+    /// stage of this pass.
+    fn restart(&mut self, stream: &Arc<CudaStream>) -> Res {
+        stream.synchronize()?;
+        self.last = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Close the stage that just ran.
+    fn mark(&mut self, stream: &Arc<CudaStream>, stage: &'static str) -> Res {
+        stream.synchronize()?;
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        match self.stages.iter_mut().find(|(name, _)| *name == stage) {
+            Some((_, total)) => *total += dt,
+            None => self.stages.push((stage, dt)),
+        }
+        Ok(())
+    }
+}
+
 /// Scratch for passes of exactly `rows` rows.
 pub struct InklingPass {
     model: Arc<InklingModel>,
@@ -591,6 +638,8 @@ pub struct InklingPass {
     logits: CudaSlice<f32>,
     ids: CudaSlice<i32>,
     route_weights: CudaSlice<f32>,
+    /// Expert ids of every routing since [`Self::log_routes`], for tests.
+    route_log: Option<Vec<i32>>,
     dispatch: InkDispatch,
     xs: CudaSlice<u16>,
     gate_up: CudaSlice<f32>,
@@ -692,6 +741,7 @@ impl InklingPass {
             logits: f(rows * experts)?,
             ids: stream.alloc_zeros::<i32>(rows * topk)?,
             route_weights: f(rows * topk)?,
+            route_log: None,
             xs: hf(slots * n)?,
             gate_up: f(slots * 2 * ff)?,
             hidden_h: hf(slots * ff)?,
@@ -710,13 +760,22 @@ impl InklingPass {
         self.rows
     }
 
+    /// Record the experts of every routing from here on: `[rows][top_k]`
+    /// per layer application, in execution order. A diagnostic; it reads
+    /// the device back at every layer.
+    pub fn log_routes(&mut self) {
+        self.route_log = Some(Vec::new());
+    }
+
+    /// What [`Self::log_routes`] has recorded.
+    pub fn routes(&self) -> &[i32] {
+        self.route_log.as_deref().unwrap_or(&[])
+    }
+
     /// Start timing stages: every stage boundary synchronizes the stream
     /// from here on, so a profiled pass is slower than a plain one.
     pub fn enable_profiling(&mut self) {
-        self.profile = Some(Profile {
-            last: std::time::Instant::now(),
-            stages: Vec::new(),
-        });
+        self.profile = Some(Profile::start());
     }
 
     /// Seconds per stage since profiling was enabled, in first-seen order.
@@ -726,18 +785,10 @@ impl InklingPass {
 
     /// Close the stage that just ran.
     fn mark(&mut self, stream: &Arc<CudaStream>, stage: &'static str) -> Res {
-        let Some(p) = self.profile.as_mut() else {
-            return Ok(());
-        };
-        stream.synchronize()?;
-        let now = std::time::Instant::now();
-        let dt = now.duration_since(p.last).as_secs_f64();
-        p.last = now;
-        match p.stages.iter_mut().find(|(name, _)| *name == stage) {
-            Some((_, total)) => *total += dt,
-            None => p.stages.push((stage, dt)),
+        match self.profile.as_mut() {
+            Some(p) => p.mark(stream, stage),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// The final normalized hidden states of the last pass, `[rows][n]`.
@@ -1301,6 +1352,10 @@ impl InklingPass {
             f32::from_bits(kc.expert_weights_scale_bits),
         )?;
         self.mark(stream, "router logits, route")?;
+        if let Some(log) = self.route_log.as_mut() {
+            let ids = stream.clone_dtoh(&self.ids)?;
+            log.extend_from_slice(&ids[..rows * topk]);
+        }
         model
             .kernels
             .dispatch(stream, &self.ids, &mut self.dispatch)?;
@@ -1400,6 +1455,9 @@ impl InklingPass {
         }
         if tokens.iter().any(|t| *t < 0 || *t as u32 >= c.vocab_size) {
             return Err(bad("a token id is outside the vocabulary"));
+        }
+        if let Some(p) = self.profile.as_mut() {
+            p.restart(stream)?;
         }
         stream.memcpy_htod(tokens, &mut self.d_tokens)?;
         model.kernels.embed(
@@ -1529,6 +1587,9 @@ impl InklingPass {
         let vocab = model.config.vocab_size as usize;
         if row0 + count > self.rows {
             return Err(bad("logit rows outside the pass"));
+        }
+        if let Some(p) = self.profile.as_mut() {
+            p.restart(stream)?;
         }
         let src = unsafe { rows_of(stream, &self.final_norm, row0, count, n) };
         model

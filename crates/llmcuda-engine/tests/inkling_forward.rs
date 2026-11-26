@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream};
 use llmcuda_cuda::device::driver_available;
-use llmcuda_engine::inkling::{InklingModel, InklingPass, InklingState, Segment};
+use llmcuda_engine::inkling::{InklingDecode, InklingModel, InklingPass, InklingState, Segment};
 use llmcuda_kernels::compare::compare;
 
 /// Floor on a layer output's cosine against llama.cpp; see
@@ -56,6 +56,17 @@ fn last_hidden(
     assert_eq!(at, tokens.len());
     last
 }
+
+/// Floor on the decode path's hidden state against the prefill path's.
+///
+/// The two are the same arithmetic in a different summation order and agree
+/// to ~3e-6 in cosine wherever they route alike. They do not always: the
+/// router's sigmoid top-8 has near-ties, and on the capture prompt five of
+/// twelve positions send one to four of their 48 layer applications to a
+/// different eighth expert (the test prints which). The worst such position
+/// measured 0.99908; llama.cpp against the CPU reference flips the same way
+/// (`inkling_reference.rs`).
+const DECODE_COSINE: f32 = 0.998;
 
 #[test]
 fn device_forward_matches_llama_cpp_and_its_own_chunkings() {
@@ -109,8 +120,8 @@ fn device_forward_matches_llama_cpp_and_its_own_chunkings() {
     assert!(failures.is_empty(), "{failures:#?}");
     assert_eq!(state.position(), rows);
 
-    let hidden = stream.clone_dtoh(pass.hidden()).expect("read back");
-    let whole = hidden[(rows - 1) * n..].to_vec();
+    let every_row = stream.clone_dtoh(pass.hidden()).expect("read back");
+    let whole = every_row[(rows - 1) * n..].to_vec();
     let norm = compare(&whole, golden.f32("result_norm"));
     println!(
         "result_norm max_abs {:.3e} cos {:.8}",
@@ -182,5 +193,167 @@ fn device_forward_matches_llama_cpp_and_its_own_chunkings() {
             r.max_abs_error, r.cosine_similarity
         );
         assert_eq!(r.max_abs_error, 0.0, "batching changed row {which}");
+    }
+
+    // The decode path: fused kernels and the decode GEMM. Same arithmetic
+    // class as the passes above, different summation order, so it agrees
+    // with them to rounding rather than to the bit.
+    drop(pass);
+    let step_alone = |prefill: usize| -> (Vec<f32>, Vec<f32>) {
+        let mut state = InklingState::new(&stream, &model, 64).expect("state");
+        if prefill > 0 {
+            let mut pass = InklingPass::new(&model, &stream, prefill).expect("pass");
+            pass.run(
+                &stream,
+                &mut [Segment {
+                    state: &mut state,
+                    rows: prefill,
+                }],
+                &tokens[..prefill],
+                None,
+            )
+            .expect("the prefill runs");
+        }
+        let mut decode = InklingDecode::new(&model, &stream, 1).expect("decode");
+        for &t in &tokens[prefill..] {
+            decode
+                .step(&stream, &mut [&mut state], &[t])
+                .expect("the step runs");
+        }
+        decode.logits(&stream).expect("the head runs");
+        (
+            stream.clone_dtoh(decode.hidden()).expect("read back"),
+            stream.clone_dtoh(decode.head_logits()).expect("read back"),
+        )
+    };
+    // Position by position against a pass of one row, with the experts
+    // each routed to. The two paths agree to rounding until a router
+    // near-tie resolves differently, and then by one expert of eight.
+    {
+        let (slots, topk) = (48usize, 8usize);
+        let mut state = InklingState::new(&stream, &model, 64).expect("state");
+        let mut decode = InklingDecode::new(&model, &stream, 1).expect("decode");
+        decode.log_routes();
+        let mut ref_state = InklingState::new(&stream, &model, 64).expect("state");
+        let mut single = InklingPass::new(&model, &stream, 1).expect("pass");
+        single.log_routes();
+        let mut clean_worst = 1.0f32;
+        let mut flipped_positions = 0usize;
+        for (at, &t) in tokens.iter().enumerate() {
+            decode
+                .step(&stream, &mut [&mut state], &[t])
+                .expect("the step runs");
+            single
+                .run(
+                    &stream,
+                    &mut [Segment {
+                        state: &mut ref_state,
+                        rows: 1,
+                    }],
+                    &[t],
+                    None,
+                )
+                .expect("the pass runs");
+            let got = stream.clone_dtoh(decode.hidden()).expect("read back");
+            let r = compare(&got, &every_row[at * n..][..n]);
+            let sets = |ids: &[i32]| -> Vec<Vec<i32>> {
+                ids[at * slots * topk..][..slots * topk]
+                    .chunks(topk)
+                    .map(|c| {
+                        let mut c = c.to_vec();
+                        c.sort_unstable();
+                        c
+                    })
+                    .collect()
+            };
+            let (a, b) = (sets(decode.routes()), sets(single.routes()));
+            let differing: Vec<usize> = (0..slots).filter(|&i| a[i] != b[i]).collect();
+            println!(
+                "decode path position {at}: max_abs {:.3e} cos {:.8}, slots routed differently {differing:?}",
+                r.max_abs_error, r.cosine_similarity
+            );
+            assert!(
+                r.cosine_similarity > DECODE_COSINE,
+                "decode position {at}: {}",
+                r.cosine_similarity
+            );
+            if differing.is_empty() {
+                clean_worst = clean_worst.min(r.cosine_similarity);
+            } else {
+                flipped_positions += 1;
+            }
+        }
+        println!(
+            "{flipped_positions} of {} positions flip a routing; worst cosine without one {clean_worst:.8}",
+            tokens.len()
+        );
+        assert!(
+            clean_worst > 0.99999,
+            "a position with identical routing drifted: {clean_worst}"
+        );
+    }
+    let (decoded, decoded_logits) = step_alone(0);
+    let r = compare(&decoded, &whole);
+    println!(
+        "decode path, 12 steps vs one pass: max_abs {:.3e} cos {:.8}",
+        r.max_abs_error, r.cosine_similarity
+    );
+    assert!(
+        r.cosine_similarity > DECODE_COSINE,
+        "decode path: {}",
+        r.cosine_similarity
+    );
+    let r = compare(&decoded_logits, want);
+    println!(
+        "decode path logits vs llama.cpp: max_abs {:.3e} cos {:.8} argmax {}",
+        r.max_abs_error,
+        r.cosine_similarity,
+        argmax(&decoded_logits)
+    );
+    assert_eq!(argmax(&decoded_logits), argmax(want));
+    assert!(
+        r.cosine_similarity > 0.9995,
+        "decode logit cosine {}",
+        r.cosine_similarity
+    );
+    assert!(
+        r.max_abs_error < 0.5,
+        "decode logit max-abs {}",
+        r.max_abs_error
+    );
+
+    // A prefill pass handing over to decode steps mid-prompt.
+    let (handed, _) = step_alone(8);
+    let r = compare(&handed, &whole);
+    println!(
+        "prefill 8 then decode 4: max_abs {:.3e} cos {:.8}",
+        r.max_abs_error, r.cosine_similarity
+    );
+    assert!(
+        r.cosine_similarity > DECODE_COSINE,
+        "handover: {}",
+        r.cosine_similarity
+    );
+
+    // Three sequences decoded together are three sequences decoded alone:
+    // a row's column of the contraction does not depend on its neighbours.
+    let mut states: Vec<InklingState> = (0..3)
+        .map(|_| InklingState::new(&stream, &model, 64).expect("state"))
+        .collect();
+    let mut decode = InklingDecode::new(&model, &stream, 3).expect("decode");
+    for &t in &tokens {
+        let mut refs: Vec<&mut InklingState> = states.iter_mut().collect();
+        decode
+            .step(&stream, &mut refs, &[t, t, t])
+            .expect("the batched step runs");
+    }
+    let hidden = stream.clone_dtoh(decode.hidden()).expect("read back");
+    for (which, row) in hidden.chunks(n).enumerate() {
+        let r = compare(row, &decoded);
+        println!(
+            "decode path row {which} of 3: max_abs {:.3e} cos {:.8}",
+            r.max_abs_error, r.cosine_similarity
+        );
+        assert_eq!(r.max_abs_error, 0.0, "batching changed decode row {which}");
     }
 }

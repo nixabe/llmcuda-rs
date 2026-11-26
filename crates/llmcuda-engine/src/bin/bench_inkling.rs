@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cudarc::driver::CudaContext;
-use llmcuda_engine::inkling::{InklingModel, InklingPass, InklingState, Segment};
+use llmcuda_engine::inkling::{InklingDecode, InklingModel, InklingPass, InklingState, Segment};
 use tracing::{error, info};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -57,7 +57,7 @@ fn run(args: &[String]) -> Result<()> {
             prefill.push((rows, InklingPass::new(&model, &stream, n * rows)?));
             at += rows;
         }
-        let mut decode = InklingPass::new(&model, &stream, n)?;
+        let mut decode = InklingDecode::new(&model, &stream, n)?;
         let mut states = Vec::new();
         for _ in 0..n {
             states.push(InklingState::new(&stream, &model, pp + tg + 1)?);
@@ -92,12 +92,9 @@ fn run(args: &[String]) -> Result<()> {
             let t1 = Instant::now();
             for step in 0..tg {
                 let tokens: Vec<i32> = (0..n).map(|s| token(s * 104_729 + step)).collect();
-                let mut segments: Vec<Segment<'_>> = states
-                    .iter_mut()
-                    .map(|state| Segment { state, rows: 1 })
-                    .collect();
-                decode.run(&stream, &mut segments, &tokens, None)?;
-                decode.logits(&stream, 0, n)?;
+                let mut refs: Vec<&mut InklingState> = states.iter_mut().collect();
+                decode.step(&stream, &mut refs, &tokens)?;
+                decode.logits(&stream)?;
             }
             stream.synchronize()?;
             let t_tg = t1.elapsed().as_secs_f64();
@@ -112,9 +109,12 @@ fn run(args: &[String]) -> Result<()> {
             );
         }
         if profiling {
-            for (what, pass) in [("prefill", &prefill[0].1), ("decode", &decode)] {
-                let total: f64 = pass.stage_seconds().iter().map(|s| s.1).sum();
-                for (stage, seconds) in pass.stage_seconds() {
+            for (what, stages) in [
+                ("prefill", prefill[0].1.stage_seconds()),
+                ("decode", decode.stage_seconds()),
+            ] {
+                let total: f64 = stages.iter().map(|s| s.1).sum();
+                for (stage, seconds) in stages {
                     info!(
                         "  {what:7} {:5.1}% {seconds:8.3} s  {stage}",
                         100.0 * seconds / total

@@ -12,6 +12,7 @@ behind it, and two durable lists: **WHY** and **WHY NOT**.
 | llama.cpp | build 10456, commit `fd6863a69`; the † rows of the standing, build 12688, commit `ae6a7ad2c` |
 | Model | `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` — 30.36 GiB, 35.51 B params |
 | Second model | `Qwen3.8-27B-UD-Q8_K_XL.gguf` (`qwen35`, dense) — 29.30 GiB, 26.90 B params |
+| Third model | `Inkling-2-Mini-UD-Q4_K_XL.gguf` (`inkling2_loop`) — its own section below |
 
 llama.cpp at its own best settings, three parallel sequences, one card:
 
@@ -488,6 +489,68 @@ The trunk alone is 290 ms at 877 tokens and 1,016 ms at 3,350
 (`bench_forward`); head, template, tokenization and HTTP are the rest of a
 request. The prefill is the request (WHY: "A decision prompt is one pass, at
 the width it is").
+
+## Inkling 2 Mini (`inkling2_loop`)
+
+A looped MoE: 24 layers of weights run as 48 layer applications, 128 experts
+top-8 with NVFP4 expert weights, attention with a relative-position bias and
+a zero-logit sink. **Nothing here is comparable to the standing table** —
+another model, on GPU 0 of a one-card host, through the engine's forward
+alone (`bench_inkling`), not the server. `Inkling-2-Mini-UD-Q4_K_XL.gguf`
+(16.9 GiB resident), against llama.cpp build 12688 (`ae6a7ad2c`):
+
+```sh
+llama-batched-bench -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
+  -ngl 99 -sm none -fa on -b 2048 -ub 2048 -ctk f16 -ctv f16 -c 16384 \
+  -npp <ctx> -ntg 64 -npl 1,3
+bench_inkling <ctx> 64 1,3
+```
+
+Three interleaved pairs, tok/s as the range over them (decode is the
+aggregate over the N sequences):
+
+| cell | llmcuda-rs | llama.cpp | margin |
+| :--- | ---: | ---: | ---: |
+| prefill 512, N=1 | 1,246–1,274 | 799–812 | **+53% to +59%** |
+| prefill 512, N=3 | 1,732–1,754 | 942–963 | **+80% to +86%** |
+| prefill 2K, N=1 | 1,722–1,729 | 583–595 | **+189% to +197%** |
+| prefill 2K, N=3 | 1,862–1,872 | 592–599 | **+211% to +216%** |
+| decode after 512, N=1 | 56.2–56.4 | 39.6–40.7 | **+38% to +42%** |
+| decode after 512, N=3 | 101.7–102.4 | 88.2–90.6 | **+12% to +16%** |
+| decode after 2K, N=1 | 52.0–52.1 | 38.0–38.9 | **+34% to +37%** |
+| decode after 2K, N=3 | 94.9–95.1 | 81.5–82.4 | **+15% to +17%** |
+
+What the table does not say:
+
+- **Decode is not like for like at the edges.** The engine's step ends at the
+  soft-capped logits; `llama-batched-bench` also samples. llama.cpp does not
+  take its flash-attention path for this model (the bias goes in through the
+  mask), so `-fa on` is inert here.
+- **`-ub 2048` is the whole prompt** at both depths; nothing deeper than 2K
+  and no `-ub 4096` cell has been measured, on either side.
+- **Only the Q4_K_XL file has run.** Q8_K_XL (bf16 dense matrices, bf16
+  experts in the last four layers) loads through the same code and has not
+  been executed.
+- **Not served.** No runtime, scheduler, sampler or HTTP path drives this
+  forward yet, every sequence keeps a full-length cache for all 48
+  applications (sliding layers need 1,024 rows), and the vision projector is
+  not supported.
+
+Agreement with llama.cpp on a 12-token capture (`inkling_forward`): logits
+cosine 0.99994, max-abs 0.20, same argmax; the 48 layer outputs between
+0.99883 and 0.99998. The residue is routing, not arithmetic: the sigmoid top-8
+router has near-ties, and any change of summation order sends one to four of
+a position's 48 applications to a different eighth expert on two to five of
+the twelve positions. llama.cpp against the CPU reference does the same.
+Until the first such flip the engine's decode and prefill paths agree to
+1e-7 in cosine.
+
+Where a decode step goes at N=1 after 512 tokens (17.7 ms; CUDA events, ms):
+expert gate/up 3.5, attention projections 2.5, expert down 2.1, attention
+1.8, feed-forward input 1.6, attention inputs 1.3, loop controllers 1.9,
+routing 1.0, output projection 0.9, head 0.9, loop messages 0.8. The four
+contractions are 9 ms of it at 325–485 GB/s of stored weights against the
+card's 672.
 
 ## Serving concurrent sessions
 
@@ -1337,6 +1400,54 @@ The verify-step cost sets the sign. At 120K map-k4v emits all 27 available token
 
 ---
 
+## `inkling2_loop`: the operand order is free, so choose the one that loads wide
+
+Decode reads each weight once, and a tensor-core GEMV that builds its
+operands in registers is bound by how many load instructions it issues, not
+by the bytes. A contraction does not care in what order `k` runs as long as
+both operands agree, and a GEMM's output columns can be permuted freely.
+
+- **Decode GEMM (`DecodeGemm`).** Within a 64-element chunk lane quarter `t`
+  owns elements `[16t, 16t + 16)` of weights and activations alike: one
+  16-byte load is a lane's whole chunk of a Q8_0 row, where the natural
+  order needs eight two-byte loads from sixteen row streams. 87.2 → 43.5 us
+  for an 8,608 × 2,304 Q8_0 pack (242 → 485 GB/s); NVFP4 gate/up of eight
+  experts 210.5 → 87.8 us. NVFP4 goes further: a stored byte holds elements
+  `b` and `b + 8` of its sub-block, so contracting in *byte order* makes one
+  table load a ready fp16 pair, and the activations are written in that
+  order by the kernel that produces them.
+- **Prefill attention (`ink_attn_mma`).** One warp a (head, sixteen query
+  rows), nothing in shared memory: queries in registers for the whole scan,
+  the head dimension contracted with lane quarter `t` owning dims
+  `[32t, 32t + 32)`, and the output dims of `P V` permuted so column `n` of
+  product `m` is dim `16n + m`. A lane's share of a key row is one 64-byte
+  run and of a value row one 32-byte run. 2.89 s → 0.078 s over three
+  1,536-row passes against a scalar kernel.
+- **Split what you round.** Queries and probabilities enter as hi + lo
+  binary16 pairs (the binary16 of the value, then of what that dropped).
+  It measured no slower than one binary16 each (911–914 tok/s prefill at
+  N=1 against 909, single runs in one session) and lands as close to an f64
+  oracle as the fp32 scalar kernel: max-abs ≤ 4.8e-6 both.
+
+## `inkling2_loop`: a block a row is one SM
+
+Decode glue is fused so a layer is a dozen launches, each a block per
+sequence doing that row's small steps in turn. That is right for what is
+small. A loop controller streams 3.5 MB of fp32 weights and the router 1.2
+MB, and one SM reads at about a seventieth of the bus: inside the per-row
+blocks they measured 1.2–1.8 ms a launch. On grids of their own — a block a
+gate row, a thread a channel, a block per eight experts — the same work is
+40 us. Split by what streams weights, not by what belongs to the layer.
+
+The same reasoning sizes prefill. The fp32 router read both operands from
+global memory for every product, one thread a (row, expert); eight rows a
+block from a shared tile, each thread reading its weight row once for the
+eight, is the same ascending fused sums bit for bit and 6.5× faster. And
+the bias table — every distance for every row, 150 MB a layer at 1,536
+rows — cost more than the attention it fed; computing the bias of the
+(row, key) pairs actually scored, in the kernel, is bit-identical and took
+prefill from 1,455 to 1,775 tok/s.
+
 # WHY NOT
 
 Everything below was built or derived far enough to measure, and rejected. It is recorded so it is not re-attempted; several have been proposed twice.
@@ -1347,6 +1458,10 @@ Each row gives the decisive measurement and why it lost.
 
 | Attempt | Result |
 | --- | --- |
+| `inkling2_loop` decode GEMM: eight warps a 16-row tile, operands still loaded a pair at a time | `bench_inkling_dg`, GPU 0: 82.0 us for the 8,608 × 2,304 Q8_0 pack against 87.2 with one warp a tile, NVFP4 gate/up **184.6** against 210.5. The bound is load instructions, which more warps do not remove; the permuted wide-load order is 43.5 and 87.8 (WHY). |
+| `inkling2_loop` decode GEMM: wide loads staged through a per-warp shared tile to keep the natural `k` order | **85.8 us** Q8_0, **221.5 / 117.4 us** NVFP4 gate/up and down, against 82.0 / 184.6 / 84.6 unstaged: the store, the barrier and the reload cost more than the loads saved. Permuting `k` gets the wide loads with no staging. |
+| `inkling2_loop` depth mix in one pass, forty running sums in a local array | The mix-and-norm stage **28 → 40 us** a launch (CUDA events, N=1 decode). The array lives in local memory, and a pass a sum over 2,304 elements was never the cost: a row's block is one SM, and that is the bound. |
+| A contiguous span of the row per thread in the `inkling2_loop` per-row kernels | Controller stage **42 → 60 us**. Every `blockDim`-th element is already coalesced across a warp; a contiguous span per thread makes each warp load touch 32 lines. |
 | Scaling the routed down projection once per 32-element block | `moe_expert_down_mma` converts and scales its int32 pair after every `m8n8k16`, though a Q8_0 scale and an activation scale both span two; accumulating both steps first halves the `I2F`s, as `mma_q8_0_proj_split` and llama.cpp's `mmq` do. `bench_moe_mma` at 8,192 tokens: 22.7 and 21.3 ms against 22.3, inside the bench's own spread. Model, six pairs (GPU 0, one sequence): **1.001–1.004×** at 2,048 tokens, **1.004–1.008×** at 6,138, with last-token logits moving 1.52 and 0.24 max-abs on the synthetic prompt (argmax unchanged), and `int8_forward`'s cosine against the fp32 path 0.999733 against 0.999809 with per-step scaling. Scored against llama.cpp's last-token logits on real text it is `1 − cos` 8.90e-4 against 8.14e-4 at 2,048 tokens and 1.69e-3 against 1.82e-3 at 512: nearer once, farther once. Under 1% for a rounding change nothing shows to be the more accurate one; the kernel is not bound by this loop. Not shipped. |
 | A wider routed-expert tile to cut weight traffic at 6,138 tokens | Ablation on `bench_moe_mma`, 8,192 tokens: every dispatch block made to read expert 0's weights (all weight traffic a cache hit) is 19.5 ms against 21.3–22.7; every slot made to read the first 64 activation rows is 19.5; both, 18.5. Removing *all* weight DRAM traffic is worth at most 10–14% of the two GEMMs, and 128 slots a block would remove about 40% of it, at one block an SM (38 KB of shared against 27). Under 2% of a pass before the occupancy loss. Not built. |
 | Dense K2 cuBLAS with materialized half operands | Half-rounded dense weights and inputs fail three-sequence batch prefill at **0.31854** logit max-abs (limit **0.02**); high/low half operands with sixteen-bit inputs still fail the 42-token full-width/chunked comparison at **0.30180**. Rejected on correctness before any throughput claim. |

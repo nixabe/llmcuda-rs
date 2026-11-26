@@ -1578,6 +1578,7 @@ impl LmHeadKernels {
 
         let ptx = compile(LM_HEAD_SRC, "lm_head").map_err(LmHeadError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         // The row tile only serves whole groups of RT adjacent rows; a vocab
         // that is not a multiple of RT would leave the last group partially
         // live, which the kernel does not guard. The real 248,320-entry head
@@ -1671,8 +1672,8 @@ impl LmHeadKernels {
             ],
             bf16_b3_row_tile,
             b3_row_tile,
-            argmax_partial: module.load_function("argmax_partial")?,
-            argmax_final: module.load_function("argmax_final")?,
+            argmax_partial: rust.load_function("argmax_partial")?,
+            argmax_final: rust.load_function("argmax_final")?,
             argmax_prob: module.load_function("argmax_prob")?,
             geometry,
         })

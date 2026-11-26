@@ -952,10 +952,8 @@ fn k2_dense_hidden_width_specialization_keeps_the_integer_tree() {
 /// The down projections quantize `silu(gate) * up` straight from the gate and
 /// up outputs. Against `LayerOpsKernels::swiglu` followed by the ordinary
 /// projection, outputs must match bit for bit on both the GEMV and the
-/// tensor-core widths. Under `rust-kernels` that SwiGLU is the cuda-oxide
-/// kernel rather than this NVRTC expression, so the default build is the
-/// oracle.
-#[cfg(not(feature = "rust-kernels"))]
+/// tensor-core widths. That SwiGLU is the Rust kernel and the fused one an
+/// NVRTC expression, so this also holds the two compilers to the same bits.
 #[test]
 fn fused_swiglu_quantization_matches_a_separate_swiglu() {
     use llmcuda_cuda::kernels::{k2_gemm::K2Gemm, layer_ops::LayerOpsKernels};

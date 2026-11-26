@@ -45,21 +45,17 @@
 //!   disagreement is `expf` against `f32::exp` — about an ulp. All four are
 //!   gated on a measured tolerance sized for that, not on a matmul-era one.
 //!
-//! # Two languages, for now
+//! # One language
 //!
-//! Most of these kernels are Rust, compiled ahead of time
-//! ([`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX)) and have no CUDA C++
-//! source. SwiGLU and per-row sigmoid gating are still CUDA C++ in
-//! [`LAYER_OPS_SRC`]: their Rust ports are bit-identical but slower at
-//! prefill sizes, and `rust-kernels` selects them.
+//! Every kernel here is Rust, compiled ahead of time
+//! ([`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX)); this module no longer
+//! invokes NVRTC. The source is [`RUST_KERNELS_SRC`](super::RUST_KERNELS_SRC).
 
 use std::sync::Arc;
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
-
-use super::compile;
 
 /// Widest convolution the launchers will service.
 ///
@@ -81,91 +77,6 @@ pub const MAX_CONV_KERNEL: usize = 8;
 const MAX_BLOCK: usize = 1024;
 
 /// The NVRTC translation unit for the layer ops that are still CUDA C++:
-/// SwiGLU, and sigmoid gating in its per-row shape.
-///
-/// Every other kernel here is Rust, in
-/// [`RUST_KERNELS_SRC`](super::RUST_KERNELS_SRC).
-pub const LAYER_OPS_SRC: &str = r#"
-extern "C" {
-
-// out = silu(gate) * up, elementwise.
-//
-// grid-stride over a fixed grid so the launch shape does not depend on a
-// host-side length, which is what keeps it capturable in a CUDA graph
-// (AGENTS.md rule 5).
-//
-// `expf`, not `__expf`: the reference is `x / (1.0 + (-x).exp())` and the
-// fast intrinsic is good to ~2 ulp of the *result*, not of the exponent,
-// which on the negative tail is a relative error the tolerance would have to
-// be widened for. This is not a bottleneck.
-__global__ void swiglu_mul(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    float* __restrict__ out,
-    long long n
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        float g = gate[i];
-        out[i] = (g / (1.0f + expf(-g))) * up[i];
-    }
-}
-
-// out = sigmoid(gate) * x, with the gate either x's own shape or one scalar
-// per row broadcast across it.
-//
-// **Two shapes, because the model has two of these and they are not the same
-// op.** Assuming one and reindexing at the call site would work for whichever
-// caller guessed right and would silently read `rows` floats as `rows * width`
-// for the other, so `broadcast` is an argument and the gate length is checked
-// against it on every launch:
-//
-//  - the Gated Attention output gate is **elementwise** over
-//    [tokens][q_heads * head_dim] — 4096 gate values per token
-//    (`attn_gate` in `src/models/qwen35moe.cpp`, whose sigmoid is
-//    `attn_gate_sigmoid`);
-//  - the MoE shared expert's gate is **one scalar per token** —
-//    `ffn_gate_inp_shexp` is a single `[hidden]` row, so its projection
-//    collapses to a scalar — broadcast over the whole hidden dimension
-//    (`build_layer_ffn`).
-//
-// `1.0f / (1.0f + expf(-g))` is ggml_sigmoid verbatim (`op_sigmoid` in
-// `ggml/src/ggml-cuda/unary.cu`). The algebraically equal forms —
-// 0.5f * (1 + tanhf(x/2)), or silu(x)/x — round differently, and
-// `llmcuda_kernels::norm::sigmoid` spells it this same way.
-//
-// `sig` receives the nonlinearity on its own, so a divergence localizes to
-// the sigmoid or to the product rather than to "the gate", and so the caller
-// keeps llama.cpp's `attn_gate_sigmoid` waypoint. It is **gate's** shape, not
-// x's: when broadcasting, only the thread holding column 0 of a row writes
-// it, so no two threads write the same element.
-__global__ void sigmoid_gate_mul(
-    const float* __restrict__ x,
-    const float* __restrict__ gate,
-    float* __restrict__ sig,
-    float* __restrict__ out,
-    long long n,
-    int width,
-    int broadcast
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        long long g = i;
-        bool write_sig = true;
-        if (broadcast) {
-            long long row = i / (long long)width;
-            write_sig = (i - row * (long long)width) == 0;
-            g = row;
-        }
-        float s = 1.0f / (1.0f + expf(-gate[g]));
-        if (write_sig) sig[g] = s;
-        out[i] = x[i] * s;
-    }
-}
-
-}
-"#;
-
 /// Something went wrong compiling or launching a layer-op kernel.
 #[derive(Debug)]
 pub enum LayerOpsError {
@@ -265,7 +176,6 @@ pub struct LayerOpsKernels {
     rope: CudaFunction,
     swiglu: CudaFunction,
     sigmoid_gate: CudaFunction,
-    sigmoid_gate_elementwise: CudaFunction,
     add: CudaFunction,
     softplus: CudaFunction,
     conv1d: CudaFunction,
@@ -281,23 +191,14 @@ impl LayerOpsKernels {
     ///
     /// All loading happens before hot-path launches or graph capture.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
-        let ptx = compile(LAYER_OPS_SRC, "layer_ops").map_err(LayerOpsError::Compile)?;
-        let module = ctx.load_module(ptx)?;
         let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
-        // Bit-identical to the CUDA C++ but slower at prefill sizes.
-        let opt_in = if cfg!(feature = "rust-kernels") {
-            &rust
-        } else {
-            &module
-        };
         Ok(Self {
             rms_norm: rust.load_function("rms_norm_rows")?,
             rms_norm_swiglu: rust.load_function("rms_norm_swiglu_rows")?,
             rms_norm_swiglu_q8: rust.load_function("rms_norm_swiglu_q8_rows")?,
             rope: rust.load_function("rope_partial")?,
-            swiglu: opt_in.load_function("swiglu_mul")?,
-            sigmoid_gate: opt_in.load_function("sigmoid_gate_mul")?,
-            sigmoid_gate_elementwise: rust.load_function("sigmoid_gate_mul")?,
+            swiglu: rust.load_function("swiglu_mul")?,
+            sigmoid_gate: rust.load_function("sigmoid_gate_mul")?,
             add: rust.load_function("tensor_add")?,
             softplus: rust.load_function("softplus_elementwise")?,
             conv1d: rust.load_function("conv1d_causal_depthwise")?,
@@ -633,8 +534,7 @@ impl LayerOpsKernels {
         // Elementwise gating is the Rust kernel; the per-row broadcast stays
         // CUDA C++, where the Rust port loses at prefill sizes.
         let kernel = match shape {
-            GateShape::Elementwise => &self.sigmoid_gate_elementwise,
-            GateShape::PerRow => &self.sigmoid_gate,
+            GateShape::Elementwise | GateShape::PerRow => &self.sigmoid_gate,
         };
         let mut builder = stream.launch_builder(kernel);
         builder
@@ -977,13 +877,6 @@ mod tests {
     use super::super::{RUST_KERNELS_PTX, RUST_KERNELS_SRC};
     use super::*;
 
-    /// Where a snippet starts in the CUDA C++ source, or a failure naming it.
-    fn at(needle: &str) -> usize {
-        LAYER_OPS_SRC
-            .find(needle)
-            .unwrap_or_else(|| panic!("kernel source no longer contains `{needle}`"))
-    }
-
     /// One Rust kernel's source, from its signature to the next doc comment
     /// at kernel indentation.
     fn rust_kernel(name: &str) -> &'static str {
@@ -1175,9 +1068,13 @@ mod tests {
 
     #[test]
     fn swiglu_uses_the_accurate_exponential() {
-        assert!(LAYER_OPS_SRC.contains("out[i] = (g / (1.0f + expf(-g))) * up[i];"));
-        let body = &LAYER_OPS_SRC[at("__global__ void swiglu_mul(")..at("// out = sigmoid(gate)")];
-        assert!(!body.contains("__expf"), "swiglu reverted to __expf");
+        // libdevice exp through `f32::exp`, in the reference's operand order,
+        // on both the grouped and the single-element path.
+        let body = rust_kernel("swiglu_mul");
+        assert!(body.contains("*op = (g.0 / (1.0 + (-g.0).exp())) * u.0;"));
+        assert!(
+            body.contains("*out.add(i as usize) = (g / (1.0 + (-g).exp())) * *up.add(i as usize);")
+        );
     }
 
     #[test]
@@ -1185,13 +1082,13 @@ mod tests {
         // `op_sigmoid` in ggml/src/ggml-cuda/unary.cu is 1/(1+expf(-x)). The
         // tanh form and silu(x)/x are equal on paper and round differently,
         // and this kernel is gated against the reciprocal one.
-        assert!(LAYER_OPS_SRC.contains("float s = 1.0f / (1.0f + expf(-gate[g]));"));
-        let body = &LAYER_OPS_SRC[at("__global__ void sigmoid_gate_mul(")..];
+        let body = rust_kernel("sigmoid_gate_mul");
+        assert!(body.contains("let s = 1.0 / (1.0 + (-*gate.add(i as usize)).exp());"));
+        assert!(body.contains("let s = 1.0 / (1.0 + (-*gate.add(row as usize)).exp());"));
         assert!(
             !body.contains("tanh"),
             "the sigmoid was rewritten as a tanh"
         );
-        assert!(!body.contains("__expf"), "the gate reverted to __expf");
     }
 
     #[test]
@@ -1200,9 +1097,11 @@ mod tests {
         // elementwise and the shared expert's is one scalar per token. A
         // kernel that hardcoded either would read the other's buffer at the
         // wrong stride and stay finite while being wrong.
-        assert!(LAYER_OPS_SRC.contains("long long row = i / (long long)width;"));
-        assert!(LAYER_OPS_SRC.contains("            g = row;"));
-        assert!(LAYER_OPS_SRC.contains("        long long g = i;"));
+        let body = rust_kernel("sigmoid_gate_mul");
+        assert!(body.contains("if broadcast == 0 {"));
+        assert!(body.contains("let mut row = i / width;"));
+        // The row is carried along the walk, and must wrap with the column.
+        assert!(body.contains("if col >= width {\n                        col -= width;\n                        row += 1;"));
     }
 
     #[test]
@@ -1213,20 +1112,10 @@ mod tests {
         // documented one — and it is what makes the differential test's
         // "every sig entry was written" sentinel check meaningful.
         assert!(
-            LAYER_OPS_SRC.contains("write_sig = (i - row * (long long)width) == 0;"),
+            rust_kernel("sigmoid_gate_mul")
+                .contains("if col == 0 {\n                        *sig.add(row as usize) = s;"),
             "the broadcast sigmoid lost its single-writer guard",
         );
-        assert!(LAYER_OPS_SRC.contains("if (write_sig) sig[g] = s;"));
-    }
-
-    #[test]
-    fn the_rust_sigmoid_is_the_same_reciprocal_form() {
-        // The elementwise gate launches the Rust kernel, which has to round
-        // as the CUDA C++ one above does.
-        let body = rust_kernel("sigmoid_gate_mul");
-        assert!(body.contains("let s = 1.0 / (1.0 + (-*gate.add(g as usize)).exp());"));
-        assert!(body.contains("if broadcast == 0 || i % width as i64 == 0 {"));
-        assert!(!body.contains("tanh"));
     }
 
     #[test]

@@ -76,20 +76,16 @@ Two things make step 1 fail in a port that looks like a transcription:
   first RMSNorm port used a faster cross-warp tree and was one ulp away from
   the fused Gated DeltaNet kernels, which are compared to it exactly.
 
-`rust-kernels` is a **compile-time Cargo feature, disabled by default**, that
-additionally selects the three ports that are bit-identical but slower at
-prefill sizes, and so still have their CUDA C++: standalone SwiGLU, per-row
-sigmoid gating and the attention RoPE on wide grids.
-
-```sh
-cargo build --release -p llmcuda-server --features rust-kernels
-cargo build --release -p llmcuda-engine --bin bench_decode_batch --features rust-kernels
-```
+A port that is bit-identical but slower is usually slower for one of the
+reasons the cuda-oxide README lists under "Porting another kernel" (loads
+issued one at a time, scalar where NVRTC uses a 16-byte vector, a 64-bit
+divide per element); fix that before concluding the kernel has to stay CUDA
+C++. No kernel exists in both languages and there is no feature that selects
+between them.
 
 The embedded PTX is checked in, so no build needs cuda-oxide or CUDA toolkit
 headers. Regenerating it uses the separate toolchain in
-[`experiments/cuda-oxide`](../experiments/cuda-oxide). Kernel selection is
-fixed in the compiled binary; there is no runtime switch. See
+[`experiments/cuda-oxide`](../experiments/cuda-oxide). See
 [TOOLCHAIN.md](TOOLCHAIN.md#rust-compiler-evaluation).
 
 ## Reference checkouts

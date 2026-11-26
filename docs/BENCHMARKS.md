@@ -689,13 +689,11 @@ The layer ops are moving to Rust a kernel at a time: cuda-oxide PTX behind
 the existing cudarc ABI, allocations and graph capture. A port launches once
 it is bit-identical to its CUDA C++ original and costs the model nothing
 measurable; it does not have to be faster
-([DEVELOPMENT.md](DEVELOPMENT.md#rust-cuda-kernels)). Launching from Rust:
-residual add, softplus, standalone RoPE, RMSNorm and both fused
-RMSNorm/SwiGLU forms, the four convolution kernels, the attention query/gate
-split and row positions, elementwise sigmoid gating, and production tiled
-RoPE on grids of at most 256 blocks. Standalone SwiGLU, per-row sigmoid gating
-and wide-grid tiled RoPE are bit-identical but slower at prefill sizes and
-stay behind `rust-kernels`. Toolchain pin:
+([DEVELOPMENT.md](DEVELOPMENT.md#rust-cuda-kernels)). Every layer op launches
+from Rust, with the small MoE, Gated DeltaNet, K2, sampling, embedding,
+vision and decision kernels listed at `RUST_KERNELS_PTX`; the GEMVs, GEMMs,
+flash attention and the chunked Gated DeltaNet scan are CUDA C++. No kernel
+exists in both languages. Toolchain pin:
 [TOOLCHAIN.md](TOOLCHAIN.md), [`experiments/cuda-oxide`](../experiments/cuda-oxide).
 The dense model and three-card serving were not measured.
 
@@ -1410,7 +1408,7 @@ Each row gives the decisive measurement and why it lost.
 | Removing a Rust RMSNorm barrier by repeating the serial warp-partial sum in every warp | Six alternating GPU 1 pairs vs NVRTC: hidden-width RMSNorm loses **11.4–12.7%** at 3 × 2,048 and **9.7–11.2%** at 1,536 × 2,048. Up to 32 repeated dependent additions per warp cost more than the barrier. The barrier stays, with thread 0 adding the warp totals as `block_reduce_sum` does. |
 | Literal `usize` column loops and a rolled warp sum in the Rust normalization port | Six alternating GPU 1 pairs: 24,576 × 256 **100.606–102.575 us NVRTC** vs **104.244–105.007 us Rust** (2.3–3.5% lower throughput); 49,152 × 128 **100.073–100.855** vs **101.102–101.683 us** (0.8–1.1%). Causes: 64-bit column counters where NVRTC uses 32-bit, and an un-unrolled warp-partial loop. Keep 32-bit counters; lower register counts did not predict throughput. |
 | Promoting the literal five-kernel Rust bundle to the default backend | Three alternating Qwen3.6 GPU 1 N=3/2K pairs lose **0.05–0.28% decode** and **0.05–0.38% prefill**; fused width-128 decode normalization loses **3.8–4.4%** kernel throughput. Matching arithmetic and geometry does not make a migration compiler-neutral. The bundle stays behind the disabled-by-default `rust-kernels` switch. |
-| Enabling the plain Rust activation ports by default | Six alternating GPU 1 pairs at 8,388,608 elements: SwiGLU **182.156–182.255 us NVRTC** vs **186.574–186.675 us Rust** (2.3–2.4% lower throughput); per-row sigmoid at width 2,048 **132.924–133.251** vs **142.222–142.510 us** (6.4–6.7%). Three N=3/2K model pairs change sign. Kept behind `rust-kernels`, rejected as default. |
+| The plain grid-stride loop for the Rust activation ports | Six alternating pairs at 8,388,608 elements: SwiGLU **182.2 us NVRTC vs 186.6 us Rust** (2.4% lower throughput); per-row sigmoid at width 2,048 **133.1 vs 142.4 us** (6.5%). SwiGLU reading four elements ahead of the exponentials is 184.2 (1.2%) and faster than NVRTC up to a million elements (4.98 vs 5.82 us at 262,145); groups of eight were worse (34 vs 25 us at a million). The sigmoid's loss was two 64-bit divides per element: carrying the row and column along the walk gives **130.3 vs 132.8 us**. Both launch from Rust in that form. |
 | Four-float Rust residual loads/stores with the existing launch grid | Bit-exact. Six GPU 1 pairs vs scalar Rust: 16,384 elements scalar **1.577–1.640 us**, vector **1.798–1.835 us** (8.9–13.9% lower throughput); 8,388,608 elements **180.408–180.593** vs **179.876–180.062 us** (0.20–0.35% higher). The unchanged grid leaves three quarters of its blocks empty at 16K. Rejected. |
 | GDN split projection at row tiles 1 and 2 (`uint4` form, N=3) | 78.4 and 46.4 us per qkv/gate call vs RT=4's 33.9. RT=1 has the most warps and in-flight bytes and is worst: memory-level parallelism does not bind; instruction count per byte does, and it falls with RT. |
 | The output projection at row tile 2 (2,048 rows, 512 warps at RT = 4 — under half a wave) | Bit-identical; **flat at N=1** (23.0 us), **+25% at N=3** (28.2 → 35.2 us). The grid was 0.44 waves deep, yet doubling warps bought nothing: at three tokens the cost is activation instructions per weight byte, which halving RT doubles. Wave fill does not bind a decode-width GEMV here. |

@@ -2,9 +2,9 @@
 //! the ones listed at [`RUST_KERNELS_PTX`] are Rust, compiled ahead of time by
 //! cuda-oxide and embedded as PTX, and have no CUDA C++ source. Their Rust
 //! source and regeneration tool live in `experiments/cuda-oxide`. Kernels are
-//! moving from the first group to the second one at a time; the opt-in
-//! `rust-kernels` feature additionally selects the ports that are not yet
-//! launched by default.
+//! moving from the first group to the second one at a time. Which language a
+//! kernel is in is fixed in the source; there is no feature or runtime
+//! switch.
 //!
 //! Every kernel here has a scalar fp32 counterpart in `llmcuda-kernels` and a
 //! differential test that checks one against the other. Per `AGENTS.md`, a
@@ -27,8 +27,6 @@ pub mod layer_ops;
 pub mod lm_head;
 pub mod mma;
 pub mod moe;
-#[cfg(test)]
-mod rust_parity;
 pub mod vision;
 
 use std::collections::HashMap;
@@ -68,12 +66,8 @@ pub const TARGET_ARCH: &str = "compute_75";
 /// `dequantize_q6_k`, `vision_softmax_rows`, `vision_rope_qk`,
 /// `k2_rotary_prepare`, `moe_block_gate_and_combine`, `gdn_recurrent_step`,
 /// `gdn_norm_alpha_beta_gates`, `gdn_proj_f32`, `dec_final_scores` and
-/// `argmax_prob`.
-///
-/// Both languages: `sigmoid_gate_mul` launches from here in its elementwise
-/// shape and `attn_rope_partial_neox` on small grids. Their other shapes, and
-/// `swiglu_mul`, are slower from Rust at prefill sizes and stay CUDA C++
-/// unless `rust-kernels` is set.
+/// `argmax_prob`, `swiglu_mul`, `sigmoid_gate_mul` and
+/// `attn_rope_partial_neox`. No kernel exists in both languages.
 ///
 /// The PTX is built with implicit multiply-add fusion off
 /// (`CUDA_OXIDE_NO_FMA`): a kernel fuses where its source says `mul_add` and

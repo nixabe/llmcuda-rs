@@ -443,54 +443,6 @@ __device__ __forceinline__ unsigned kvq8_quantize(float x, unsigned short* d_bit
 // -- see below.
 #define ROPE_TT 16
 
-__global__ void attn_rope_partial_neox(
-    const float* __restrict__ in,
-    float* __restrict__ out,
-    int n_heads,
-    int head_dim,
-    int rope_dim,
-    const int* __restrict__ pos_offset,
-    float theta_base,
-    int n_tokens
-) {
-    long long t0 = (long long)blockIdx.x * ROPE_TT;
-    int h = blockIdx.y;
-    int d = threadIdx.x;
-
-    int half = rope_dim >> 1;
-
-    if (d >= rope_dim) {
-        for (int u = 0; u < ROPE_TT; ++u) {
-            long long t = t0 + u;
-            if (t >= n_tokens) break;
-            long long base = (t * (long long)n_heads + h) * (long long)head_dim;
-            out[base + d] = in[base + d];
-        }
-        return;
-    }
-    // Dimensions [half, rope_dim) are written by their partner thread d-half.
-    if (d >= half) return;
-
-    // Hoisted: the one quantity in here that does not depend on the token.
-    double freq = pow((double)theta_base, -2.0 * (double)d / (double)rope_dim);
-
-    for (int u = 0; u < ROPE_TT; ++u) {
-        long long t = t0 + u;
-        if (t >= n_tokens) break;
-        long long base = (t * (long long)n_heads + h) * (long long)head_dim;
-
-        double pos = (double)(*pos_offset) + (double)t;
-        double angle = pos * freq;
-        float sin_a = (float)sin(angle);
-        float cos_a = (float)cos(angle);
-
-        float x0 = in[base + d];
-        float x1 = in[base + d + half];
-        out[base + d]        = x0 * cos_a - x1 * sin_a;
-        out[base + d + half] = x0 * sin_a + x1 * cos_a;
-    }
-}
-
 // Interleaved multimodal rotary (IMROPE), the three-component sibling of
 // attn_rope_partial_neox for prefill chunks that overlap an image span.
 //
@@ -3354,13 +3306,9 @@ impl AttentionKernels {
         let ptx = compile(&source, "attention").map_err(AttentionError::Compile)?;
         let module = ctx.load_module(ptx)?;
         let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
-        #[cfg(feature = "rust-kernels")]
-        let migrated = &rust;
-        #[cfg(not(feature = "rust-kernels"))]
-        let migrated = &module;
         Ok(Self {
             split: rust.load_function("attn_split_query_gate")?,
-            rope: migrated.load_function("attn_rope_partial_neox")?,
+            rope: rust.load_function("attn_rope_partial_neox")?,
             rope_small: rust.load_function("attn_rope_partial_neox")?,
             rope_imrope: module.load_function("attn_rope_partial_imrope")?,
             flash: module.load_function("attn_flash_causal")?,

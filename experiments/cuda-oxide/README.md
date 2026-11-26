@@ -57,7 +57,7 @@ Run outside the sandbox, on an idle GPU:
 ```sh
 CUDA_VISIBLE_DEVICES=0 cargo test --release -p llmcuda-cuda
 CUDA_VISIBLE_DEVICES=0 cargo test --release -p llmcuda-engine \
-  --test layer_ops_differential --test rust_kernels_differential \
+  --test layer_ops_differential \
   --test gdn_tail_differential --test gdn_conv_silu_differential \
   --test gdn_verify_differential --test attention_differential
 ```
@@ -85,16 +85,27 @@ catches a port that is close but not identical.
 4. Switch the launch site, delete the CUDA C++, and move the tests that read
    its source to this one.
 
-Shapes that lose from Rust keep their CUDA C++ and launch from here only
-under `rust-kernels`: standalone SwiGLU, per-row sigmoid gating, and the
-tiled attention RoPE above 256 blocks. `bench_rust_activations` and
-`bench_rust_rope` time those against their Rust ports and check both arms
-against the CPU references.
+Things cuda-oxide does differently from NVRTC that have cost throughput
+here, each of which made a bit-identical port look like it had to stay C++:
 
-Two things cuda-oxide does differently from NVRTC that have cost throughput
-here: a fixed-size local array stays in local memory rather than registers,
-and a `usize`/`i64` index product inside a loop is a 64-bit multiply per
-iteration. Walk a pointer instead. Measured results are in
+- **Loads are issued where the source reads.** A GPU thread executes in
+  order, so a load interleaved with a dependent chain waits on it. Read a
+  group of elements into locals, then compute: sixteen for a warp's strided
+  contraction, eight for a block-strided loop, four ahead of exponentials.
+  Same order of operations, so still bit-identical. Bigger groups are not
+  always better; measure.
+- **No 16-byte loads.** A bandwidth-bound kernel that NVRTC reads through
+  `float4` needs `ld.global.v4.f32` / `st.global.v4.f32` in `ptx_asm!`
+  (`load4`/`store4` here).
+- **No strength reduction of a 64-bit divide.** Carry a row and a column
+  along a strided walk instead of dividing the index per element.
+- A fixed-size local array indexed by a loop variable stays in local memory;
+  index it with literals (a small macro) and it stays in registers.
+- A `usize`/`i64` index product inside a loop is a 64-bit multiply per
+  iteration. Walk a pointer instead.
+
+Non-coherent loads (`ld.global.nc`) and unrolling without grouping did not
+help. Measured results are in
 [BENCHMARKS.md](../../docs/BENCHMARKS.md#rust-kernel-authoring-can-keep-the-existing-launcher).
 
 The tiled attention kernel `attn_rope_partial_neox` reuses frequencies over

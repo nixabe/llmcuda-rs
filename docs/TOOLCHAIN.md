@@ -58,15 +58,9 @@ regeneration.
 
 Which kernels launch from Rust and what a port must show first is in the
 [build instructions](DEVELOPMENT.md#rust-cuda-kernels); there is no runtime
-switch. Three kernels still exist in both languages, and have gates that run
-both:
-
-- `rust_kernels_differential` requires the Rust elementwise sigmoid gate and
-  the CUDA C++ per-row one to agree bit for bit on the same problem;
-- `bench_rust_rope` checks the tiled attention RoPE against the CPU
-  reference, asserts Rust and CUDA C++ are bit-identical, and times them;
-- `bench_rust_activations` checks SwiGLU and both sigmoid shapes against the
-  CPU references, with guards, aliases and graph replay, and times them.
+switch, and no kernel exists in both languages. A Rust kernel is held by its
+CPU-reference differential test and, where a fused CUDA C++ kernel shares its
+arithmetic, by the test that compares the two exactly.
 
 [The paired measurements](BENCHMARKS.md#rust-kernel-authoring-can-keep-the-existing-launcher)
 show model-level parity. The first normalization ports were faster at narrow

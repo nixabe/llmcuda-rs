@@ -229,3 +229,74 @@ fn tiled_projection_is_bit_identical_to_the_reference() {
         assert!(got[tokens * rows..].iter().all(|b| *b == 7.25f32.to_bits()));
     }
 }
+
+/// `ink_clip` with the logarithmic position scale on, at positions either
+/// side of the floor: `x * scale`, L2-clipped per group, times
+/// `1 + alpha * ln(max(1, (pos + 1) / floor))`. The model's capture is
+/// twelve positions against a floor of 8,192, so nothing else takes the
+/// branch where the scale is not one.
+#[test]
+fn prefill_clip_applies_the_position_scale_past_its_floor() {
+    let Some(ctx) = device() else { return };
+    let stream = ctx.default_stream();
+    let kernels = InklingKernels::new(&ctx).expect("kernels load");
+    let (groups, width, threshold) = (6usize, 128usize, 22.627f32);
+    let mut rng = Xorshift64Star::new(0xc11b);
+    // (first position, rows, alpha and floor)
+    for (pos0, tokens, log) in [
+        (0usize, 5usize, None),
+        (8_185, 20, Some((0.1f32, 8_192.0f32))),
+        (100_000, 3, Some((0.1, 8_192.0))),
+        (2, 12, Some((0.25, 4.0))),
+    ] {
+        // Half the groups short enough to pass unclipped, half not.
+        let mut x = rng.vec_f32(tokens * groups * width, -3.0, 3.0);
+        for (g, group) in x.chunks_mut(width).enumerate() {
+            if g % 2 == 0 {
+                for v in group.iter_mut() {
+                    *v *= 0.2;
+                }
+            }
+        }
+        let scale = rng.vec_f32(groups * width, 0.5, 1.5);
+        let mut want = x.clone();
+        llmcuda_kernels::inkling::clip(&mut want, width, Some(&scale), groups, threshold);
+        let mut scaled = 0usize;
+        for (t, row) in want.chunks_mut(groups * width).enumerate() {
+            if let Some((alpha, floor)) = log {
+                let tau = 1.0 + alpha * ((pos0 + t + 1) as f32 / floor).max(1.0).ln();
+                scaled += usize::from(tau > 1.0);
+                for v in row.iter_mut() {
+                    *v *= tau;
+                }
+            }
+        }
+        let mut d_x = stream.clone_htod(&x).unwrap();
+        let d_scale = stream.clone_htod(&scale).unwrap();
+        let d_pos = stream.clone_htod(&[pos0 as i32]).unwrap();
+        kernels
+            .clip(
+                &stream,
+                &mut d_x,
+                Some(&d_scale),
+                &d_pos,
+                width,
+                groups,
+                threshold,
+                log,
+                tokens,
+            )
+            .unwrap();
+        let got = stream.clone_dtoh(&d_x).unwrap();
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!(
+            "clip from position {pos0}, {tokens} rows, log {log:?}: {scaled} rows scaled, max_abs {worst:.3e}"
+        );
+        // fp32 on both sides; the norm is summed in a different order.
+        assert!(worst < 2e-5, "max-abs {worst}");
+    }
+}

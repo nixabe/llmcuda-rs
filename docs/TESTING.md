@@ -347,7 +347,7 @@ applies to it except the kernels it shares (`hgemm`).
 | `llmcuda-kernels` `quant` unit tests (`nvfp4_*`) | NVFP4 dequantization: the E2M1 table, the unsigned-E4M3 scale, the byte-to-element layout | nothing |
 | `llmcuda-engine/tests/inkling_reference.rs` | The CPU reference (`llmcuda_kernels::inkling`) against a llama.cpp capture at all 48 layer applications, the final norm and the logits; prints how many tokens llama.cpp routes to a different expert set at each | the model and its capture; SKIPS without them |
 | `llmcuda-engine/tests/hgemm_differential.rs` (`nvfp4`, `grouped`, `decode_gemm_*`) | The prefill GEMM's NVFP4 format and grouped launch, and the decode GEMM in all three formats and three shapes, against the rounding contract | a device |
-| `llmcuda-engine/tests/inkling_attention.rs` | Prefill attention — scalar, tensor-core with a bias table, tensor-core computing the bias — against an f64 oracle over full and sliding windows, ragged tiles and a mid-cache start, the last two bit-identical to each other; the tiled fp32 projection bit-identical to the plain one | a device |
+| `llmcuda-engine/tests/inkling_attention.rs` | Prefill attention — scalar, tensor-core with a bias table, tensor-core computing the bias — against an f64 oracle over full and sliding windows, ragged tiles and a mid-cache start, the last two bit-identical to each other; the tiled fp32 projection bit-identical to the plain one; the prefill clip with the logarithmic position scale at positions either side of its floor | a device |
 | `llmcuda-engine/tests/inkling_forward.rs` | The device forward against the capture at every layer application; every cut of the prompt into passes, token by token included, and a two-sequence batch, bit-identical to one pass; the decode path against the prefill path position by position with the experts both route to; a prefill handing over to decode; three sequences decoded together bit-identical to one | a device, the model and its capture |
 | `llmcuda-engine/tests/inkling_decode_kernels.rs` | Each fused decode kernel against a host oracle at shapes the capture never reaches: attention past the sliding window, over caches longer than one 256-key scan chunk, with the position scale on and a bias table shorter than the reach, rows at different depths in one launch; keys and values fed a row at a time through the carried convolution with static and input-dependent taps; attention inputs in all five layer shapes (no, one or three mixing queries, with and without loop controllers); the feed-forward glue over three steps — residual with and without a new block, mix, controller, norm in both layouts, routing (ids exact), and the layer tail | a device |
 | `llmcuda-server` `tokenizer` tests (`inkling_*`) | The `inkling2` pre-tokenizer yields llama.cpp's ids on the capture prompt | the model; SKIPS without it |
@@ -369,12 +369,10 @@ operator reads 0.3–0.8. The decode-path check therefore asserts tight
 agreement up to the first position whose routing differs and a floor after
 it, and prints the applications that differ.
 
-**Not gated:** the prefill glue kernels (`ink_mix`, `ink_conv`, `ink_clip`,
-`ink_ctrl_*`, `ink_rel_table`, the dispatch and SiTU kernels) have no
-kernel-level differential test of their own; they are exercised through
-`inkling_forward` against the capture, twelve positions deep, so the
-prefill clip's position scale past its 8,192 floor has never been taken
-there. Nothing serves this model, so nothing under "Serving acceptance
+**Not gated:** the prefill glue kernels (`ink_mix`, `ink_conv`, `ink_ctrl_*`, `ink_rel_table`, the dispatch and SiTU kernels) have no
+kernel-level differential test of their own, `ink_clip` excepted; they are
+exercised through `inkling_forward` against the capture, twelve positions
+deep. Nothing serves this model, so nothing under "Serving acceptance
 status" covers it.
 
 ## Serving acceptance status

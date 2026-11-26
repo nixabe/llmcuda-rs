@@ -1,0 +1,138 @@
+//! `inkling2_loop` prefill attention, both device kernels, against an f64
+//! oracle on the operands the kernels are given: fp32 queries and bias
+//! table, the binary16 key and value caches.
+//!
+//! `p_j = exp(s_j) / (1 + sum exp(s))`, `s_j = q . k_j / sqrt(d) +
+//! table[min(p - j, extent)]` over `j <= p` (and `j > p - window`). The
+//! shapes put the first row mid-cache, leave a ragged last tile of query
+//! rows and a ragged last group of keys, and run full attention with a
+//! table shorter than the reach as well as a sliding window.
+//!
+//! SKIPS — reporting that it skipped — without a driver or a device.
+
+use std::sync::Arc;
+
+use cudarc::driver::CudaContext;
+use llmcuda_cuda::device::driver_available;
+use llmcuda_cuda::kernels::inkling::InklingKernels;
+use llmcuda_kernels::rng::Xorshift64Star;
+
+fn device() -> Option<Arc<CudaContext>> {
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver present");
+        return None;
+    }
+    match CudaContext::new(0) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            println!("SKIPPED: could not create a context on device 0: {e}");
+            None
+        }
+    }
+}
+
+#[test]
+fn prefill_attention_matches_an_f64_oracle_on_both_kernels() {
+    let Some(ctx) = device() else { return };
+    let stream = ctx.default_stream();
+    let kernels = InklingKernels::new(&ctx).expect("kernels load");
+    let (heads, kv_heads, dim) = (6usize, 2usize, 128usize);
+    let mut rng = Xorshift64Star::new(0x1a77);
+
+    for (tokens, pos0, window, extent) in [
+        (37usize, 50usize, 0usize, 30usize),
+        (37, 50, 24, 24),
+        (16, 0, 0, 64),
+        (5, 3, 0, 4),
+        (64, 200, 100, 100),
+    ] {
+        let cache_rows = pos0 + tokens;
+        // Queries large enough that the logits are tens wide, as the model's
+        // are: that is where a rounded operand shows.
+        let q = rng.vec_f32(tokens * heads * dim, -3.0, 3.0);
+        let half = |x: Vec<f32>| -> Vec<u16> {
+            x.iter()
+                .map(|v| half::f16::from_f32(*v).to_bits())
+                .collect()
+        };
+        let k = half(rng.vec_f32(cache_rows * kv_heads * dim, -2.0, 2.0));
+        let v = half(rng.vec_f32(cache_rows * kv_heads * dim, -4.0, 4.0));
+        let table = rng.vec_f32(tokens * heads * (extent + 1), -6.0, 6.0);
+
+        let f = |h: u16| f64::from(half::f16::from_bits(h).to_f32());
+        let scale = 1.0 / (dim as f64).sqrt();
+        let mut want = vec![0.0f64; tokens * heads * dim];
+        for t in 0..tokens {
+            let p = pos0 + t;
+            let lo = if window > 0 && p + 1 > window {
+                p + 1 - window
+            } else {
+                0
+            };
+            for h in 0..heads {
+                let kvh = h / (heads / kv_heads);
+                let qr = &q[(t * heads + h) * dim..][..dim];
+                let scores: Vec<f64> = (lo..=p)
+                    .map(|j| {
+                        let kr = &k[(j * kv_heads + kvh) * dim..][..dim];
+                        let dot: f64 = qr.iter().zip(kr).map(|(a, b)| f64::from(*a) * f(*b)).sum();
+                        dot * scale
+                            + f64::from(table[(t * heads + h) * (extent + 1) + (p - j).min(extent)])
+                    })
+                    .collect();
+                let top = scores.iter().copied().fold(0.0f64, f64::max);
+                let denom: f64 = (-top).exp() + scores.iter().map(|s| (s - top).exp()).sum::<f64>();
+                for (j, s) in (lo..=p).zip(&scores) {
+                    let w = (s - top).exp() / denom;
+                    let vr = &v[(j * kv_heads + kvh) * dim..][..dim];
+                    for (o, x) in want[(t * heads + h) * dim..][..dim].iter_mut().zip(vr) {
+                        *o += w * f(*x);
+                    }
+                }
+            }
+        }
+
+        let (d_q, d_k, d_v, d_table) = (
+            stream.clone_htod(&q).unwrap(),
+            stream.clone_htod(&k).unwrap(),
+            stream.clone_htod(&v).unwrap(),
+            stream.clone_htod(&table).unwrap(),
+        );
+        let d_pos = stream.clone_htod(&[pos0 as i32]).unwrap();
+        for (name, scalar) in [("scalar", true), ("tensor-core", false)] {
+            kernels.use_scalar_attention(scalar);
+            let sentinel = 7.25f32;
+            let mut out = stream
+                .clone_htod(&vec![sentinel; (tokens + 1) * heads * dim])
+                .unwrap();
+            kernels
+                .attn(
+                    &stream, &d_q, &d_k, &d_v, &d_table, &mut out, &d_pos, window, extent, heads,
+                    kv_heads, dim, tokens,
+                )
+                .unwrap();
+            let got = stream.clone_dtoh(&out).unwrap();
+            assert!(
+                got[tokens * heads * dim..].iter().all(|x| *x == sentinel),
+                "{name}: wrote past the last row"
+            );
+            let (mut worst, mut dot, mut gg, mut ww) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (g, w) in got.iter().zip(&want) {
+                let g = f64::from(*g);
+                worst = worst.max((g - w).abs());
+                dot += g * w;
+                gg += g * g;
+                ww += w * w;
+            }
+            let cos = dot / (gg.sqrt() * ww.sqrt());
+            println!(
+                "{name:>11} tokens {tokens:3} pos {pos0:3} window {window:3} extent {extent:3}: max_abs {worst:.3e} 1-cos {:.3e}",
+                1.0 - cos
+            );
+            // Values are within +-4 and the weights sum to at most one; fp32
+            // sums of a few hundred terms leave ~1e-5.
+            assert!(worst < 2e-4, "{name}: max-abs {worst}");
+            assert!(1.0 - cos < 1e-9, "{name}: cosine {cos}");
+        }
+    }
+}

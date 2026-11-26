@@ -63,6 +63,7 @@ fn run(args: &[String]) -> Result<()> {
             states.push(InklingState::new(&stream, &model, pp + tg + 1)?);
         }
         let profiling = std::env::var_os("LLMCUDA_PROFILE").is_some();
+        model.use_scalar_attention(std::env::var_os("LLMCUDA_INK_SCALAR_ATTN").is_some());
         if profiling {
             decode.enable_profiling();
             for (_, pass) in &mut prefill {

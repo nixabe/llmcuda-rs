@@ -160,6 +160,8 @@ pub struct InklingKernels {
     rms_groups: CudaFunction,
     rel_table: CudaFunction,
     attn: CudaFunction,
+    attn_mma: CudaFunction,
+    scalar_attention: core::sync::atomic::AtomicBool,
     gather_half: CudaFunction,
     situ_half: CudaFunction,
     moe_combine: CudaFunction,
@@ -173,7 +175,13 @@ impl InklingKernels {
     /// Load the entry points.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, InklingError> {
         let m = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
+        let mma = ctx.load_module(
+            super::compile(ATTN_MMA_SRC, "inkling attention")
+                .map_err(|_| InklingError::Shape("the attention kernel failed to compile"))?,
+        )?;
         Ok(Self {
+            attn_mma: mma.load_function("ink_attn_mma")?,
+            scalar_attention: core::sync::atomic::AtomicBool::new(false),
             embed: m.load_function("ink_embed")?,
             linear: m.load_function("ink_linear")?,
             mix: m.load_function("ink_mix")?,
@@ -481,10 +489,19 @@ impl InklingKernels {
         Ok(())
     }
 
+    /// Use the scalar attention kernel for prefill instead of the
+    /// tensor-core one: the reference the latter is compared with.
+    pub fn use_scalar_attention(&self, on: bool) {
+        self.scalar_attention
+            .store(on, core::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Attention of `tokens` consecutive rows over their sequence's cache
     /// (the attention loop of `inkling::hidden_states`): the rows sit at
     /// positions `pos[0]..`, and the caches already hold them. `window == 0`
-    /// is full attention.
+    /// is full attention. At head_dim 128 this is the tensor-core kernel:
+    /// queries and probabilities as hi + lo binary16 pairs, fp32
+    /// accumulation.
     #[allow(clippy::too_many_arguments)]
     pub fn attn(
         &self,
@@ -511,6 +528,31 @@ impl InklingKernels {
         need("attn pos", pos.len(), 1)?;
         let (w, e, kv, d) = (window as i32, extent as i32, kv_heads as i32, dim as i32);
         let scale = 1.0 / (dim as f32).sqrt();
+        if dim == 128
+            && !self
+                .scalar_attention
+                .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            let (hd, n) = (heads as i32, tokens as i32);
+            let mut b = stream.launch_builder(&self.attn_mma);
+            b.arg(q)
+                .arg(k_cache)
+                .arg(v_cache)
+                .arg(table)
+                .arg(&mut *out)
+                .arg(pos)
+                .arg(&w)
+                .arg(&e)
+                .arg(&hd)
+                .arg(&kv)
+                .arg(&n)
+                .arg(&scale);
+            // SAFETY: lengths checked; the caller's caches cover every
+            // position up to the last row's, and the kernel reads no key
+            // past it.
+            unsafe { b.launch(cfg((heads, tokens.div_ceil(ATTN_MMA_ROWS), 1), 32, 0)) }?;
+            return Ok(());
+        }
         let mut b = stream.launch_builder(&self.attn);
         b.arg(q)
             .arg(k_cache)
@@ -674,6 +716,225 @@ impl InklingKernels {
         Ok(())
     }
 }
+
+/// Query rows one tensor-core attention block covers.
+pub const ATTN_MMA_ROWS: usize = 16;
+
+const ATTN_MMA_SRC: &str = r#"
+extern "C" {
+
+__device__ __forceinline__ void am_mma(float* d, unsigned a0, unsigned a1, unsigned b0) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(b0));
+}
+
+// A pair of fp32 as two binary16 pairs, `hi` the nearest binary16 and `lo`
+// the binary16 of what that rounding dropped: hi + lo carries about 22
+// bits. One binary16 a query element moved a score by ~1e-3 (the logits
+// reach +-45 before the scale), which the fp32 scalar kernel and llama.cpp
+// do not do.
+__device__ __forceinline__ void am_split2(float lo, float hi, unsigned& H, unsigned& L) {
+    unsigned short l, h, rl, rh;
+    float bl, bh;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(l) : "f"(lo));
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(hi));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(bl) : "h"(l));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(bh) : "h"(h));
+    const float dl = lo - bl, dh = hi - bh;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(rl) : "f"(dl));
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(rh) : "f"(dh));
+    H = (unsigned)l | ((unsigned)h << 16);
+    L = (unsigned)rl | ((unsigned)rh << 16);
+}
+
+// inkling2_loop attention for sixteen consecutive query rows of one head, on
+// the tensor cores: p_j = exp(s_j) / (1 + sum exp(s)),
+// s_j = q . k_j * scale + table[min(p - j, extent)], over cache rows j <= p
+// (and j > p - window when window > 0), p = pos[0] + row. head_dim is 128.
+//
+// One warp a block, and nothing staged in shared memory. Eight keys a step:
+//
+//   scores  C[query 16][key 8] = Q K^T. The sixteen query rows live in
+//           registers for the whole scan, as hi + lo binary16 pairs. The head dimension is
+//           contracted in a permuted order - lane quarter t owns dims
+//           [32t, 32t + 32) of both operands - so a lane's share of a key
+//           row is one 64-byte run.
+//   softmax in fp32, online: a running maximum per query row (it starts at
+//           the sink's logit, zero), sums and accumulators rescaled when it
+//           moves.
+//   values  O[query 16][dim 8] += P V, sixteen times for the 128 dims. The
+//           probabilities go in as hi + lo binary16 straight from the score
+//           fragment, whose layout is the A operand's. The output dims are
+//           permuted the same way (column n of product m is dim 16n + m),
+//           so a lane's share of a value row is one 32-byte run.
+//
+// The scalar kernel this replaces computed each score as a 128-step dot in
+// one thread: 6.7 ms a layer at 512 rows.
+extern "C" __global__ void __launch_bounds__(32) ink_attn_mma(
+    const float* __restrict__ q, const unsigned short* __restrict__ k_cache,
+    const unsigned short* __restrict__ v_cache, const float* __restrict__ table,
+    float* __restrict__ out, const int* __restrict__ pos,
+    int window, int extent, int heads, int kv_heads, int tokens, float scale
+) {
+    const int lane = threadIdx.x, g = lane >> 2, t = lane & 3;
+    const int h = blockIdx.x, r0 = blockIdx.y * 16;
+    const int kv = h / (heads / kv_heads);
+    const long long stride = (long long)kv_heads * 128;
+    const int p0 = pos[0];
+    const int ra = r0 + g, rb = r0 + 8 + g;
+    const bool oka = ra < tokens, okb = rb < tokens;
+    const int pa = p0 + ra, pb = p0 + rb;
+    const int p_first = p0 + r0;
+    const int p_last = p0 + min(r0 + 15, tokens - 1);
+
+    unsigned qa[16], qb[16], qal[16], qbl[16];
+#pragma unroll
+    for (int s = 0; s < 16; ++s) {
+        qa[s] = 0u;
+        qb[s] = 0u;
+        qal[s] = 0u;
+        qbl[s] = 0u;
+    }
+    if (oka) {
+        const float* qr = q + ((long long)ra * heads + h) * 128 + 32 * t;
+#pragma unroll
+        for (int s = 0; s < 16; ++s) am_split2(qr[2 * s], qr[2 * s + 1], qa[s], qal[s]);
+    }
+    if (okb) {
+        const float* qr = q + ((long long)rb * heads + h) * 128 + 32 * t;
+#pragma unroll
+        for (int s = 0; s < 16; ++s) am_split2(qr[2 * s], qr[2 * s + 1], qb[s], qbl[s]);
+    }
+    const float* tba = table + ((long long)ra * heads + h) * (extent + 1);
+    const float* tbb = table + ((long long)rb * heads + h) * (extent + 1);
+
+    float acc[16][4];
+#pragma unroll
+    for (int m = 0; m < 16; ++m)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[m][i] = 0.0f;
+    // The sink: logit zero, attending to nothing.
+    float ma = 0.0f, mb = 0.0f;
+    float la = t == 0 ? 1.0f : 0.0f, lb = la;
+    const float lowest = -1.0e30f;
+
+    int lo = (window > 0 && p_first + 1 > window) ? p_first + 1 - window : 0;
+    lo &= ~7;
+    for (int j0 = lo; j0 <= p_last; j0 += 8) {
+        float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const int jk = j0 + g;
+        // A lane past the last key contracts zeros: the MMA is warp-wide, so
+        // only the load may be conditional.
+        uint4 k0 = make_uint4(0, 0, 0, 0), k1 = k0, k2 = k0, k3 = k0;
+        if (jk <= p_last) {
+            const uint4* kp = (const uint4*)(k_cache + (long long)jk * stride + kv * 128 + 32 * t);
+            k0 = kp[0];
+            k1 = kp[1];
+            k2 = kp[2];
+            k3 = kp[3];
+        }
+        const unsigned kw[16] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w,
+                                 k2.x, k2.y, k2.z, k2.w, k3.x, k3.y, k3.z, k3.w};
+        // The low parts first: the small terms into the accumulator before
+        // the large ones.
+#pragma unroll
+        for (int s = 0; s < 16; ++s) am_mma(c, qal[s], qbl[s], kw[s]);
+#pragma unroll
+        for (int s = 0; s < 16; ++s) am_mma(c, qa[s], qb[s], kw[s]);
+
+        // c[0], c[1]: row a against keys j0 + 2t, j0 + 2t + 1; c[2], c[3]: row b.
+        const int jv = j0 + 2 * t;
+        float sa[2], sb[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int j = jv + i;
+            const bool va = oka && j <= pa && (window == 0 || j > pa - window);
+            const bool vb = okb && j <= pb && (window == 0 || j > pb - window);
+            sa[i] = va ? c[i] * scale + tba[min(pa - j, extent)] : lowest;
+            sb[i] = vb ? c[2 + i] * scale + tbb[min(pb - j, extent)] : lowest;
+        }
+        float xa = fmaxf(sa[0], sa[1]), xb = fmaxf(sb[0], sb[1]);
+        xa = fmaxf(xa, __shfl_xor_sync(0xffffffff, xa, 1));
+        xa = fmaxf(xa, __shfl_xor_sync(0xffffffff, xa, 2));
+        xb = fmaxf(xb, __shfl_xor_sync(0xffffffff, xb, 1));
+        xb = fmaxf(xb, __shfl_xor_sync(0xffffffff, xb, 2));
+        const float na = fmaxf(ma, xa), nb = fmaxf(mb, xb);
+        const float fa = __expf(ma - na), fb = __expf(mb - nb);
+        ma = na;
+        mb = nb;
+        const float pa0 = __expf(sa[0] - na), pa1 = __expf(sa[1] - na);
+        const float pb0 = __expf(sb[0] - nb), pb1 = __expf(sb[1] - nb);
+        la = la * fa + (pa0 + pa1);
+        lb = lb * fb + (pb0 + pb1);
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            acc[m][0] *= fa;
+            acc[m][1] *= fa;
+            acc[m][2] *= fb;
+            acc[m][3] *= fb;
+        }
+        unsigned a0, a1, a0l, a1l;
+        am_split2(pa0, pa1, a0, a0l);
+        am_split2(pb0, pb1, a1, a1l);
+
+        // Values of keys jv and jv + 1, dims [16g, 16g + 16).
+        unsigned wa[8], wb[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            wa[i] = 0u;
+            wb[i] = 0u;
+        }
+        if (jv <= p_last) {
+            const uint4* vp = (const uint4*)(v_cache + (long long)jv * stride + kv * 128 + 16 * g);
+            const uint4 v0 = vp[0], v1 = vp[1];
+            wa[0] = v0.x; wa[1] = v0.y; wa[2] = v0.z; wa[3] = v0.w;
+            wa[4] = v1.x; wa[5] = v1.y; wa[6] = v1.z; wa[7] = v1.w;
+        }
+        if (jv + 1 <= p_last) {
+            const uint4* vp = (const uint4*)(v_cache + (long long)(jv + 1) * stride + kv * 128 + 16 * g);
+            const uint4 v0 = vp[0], v1 = vp[1];
+            wb[0] = v0.x; wb[1] = v0.y; wb[2] = v0.z; wb[3] = v0.w;
+            wb[4] = v1.x; wb[5] = v1.y; wb[6] = v1.z; wb[7] = v1.w;
+        }
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            const int sh = 16 * (m & 1);
+            const unsigned b = ((wa[m >> 1] >> sh) & 0xffffu) | (((wb[m >> 1] >> sh) & 0xffffu) << 16);
+            am_mma(acc[m], a0l, a1l, b);
+            am_mma(acc[m], a0, a1, b);
+        }
+    }
+
+    la += __shfl_xor_sync(0xffffffff, la, 1);
+    la += __shfl_xor_sync(0xffffffff, la, 2);
+    lb += __shfl_xor_sync(0xffffffff, lb, 1);
+    lb += __shfl_xor_sync(0xffffffff, lb, 2);
+    const float ia = 1.0f / la, ib = 1.0f / lb;
+    // acc[m]: columns 2t and 2t + 1 of product m, which are dims 32t + m and
+    // 32t + 16 + m.
+    if (oka) {
+        float* o = out + ((long long)ra * heads + h) * 128 + 32 * t;
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            o[m] = acc[m][0] * ia;
+            o[16 + m] = acc[m][1] * ia;
+        }
+    }
+    if (okb) {
+        float* o = out + ((long long)rb * heads + h) * 128 + 32 * t;
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            o[m] = acc[m][2] * ib;
+            o[16 + m] = acc[m][3] * ib;
+        }
+    }
+}
+
+}  // extern "C"
+"#;
 
 /// Token columns one decode-GEMM launch contracts.
 pub const DG_MAX_ROWS: usize = 8;

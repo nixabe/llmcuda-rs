@@ -60,14 +60,14 @@ fn last_hidden(
 /// Floor on the decode path's hidden state against the prefill path's.
 ///
 /// The two are the same arithmetic in a different summation order and agree
-/// to ~3e-6 in cosine wherever they route alike. They do not always: the
-/// router's sigmoid top-8 has near-ties, and on the capture prompt a few of
-/// the twelve positions send one to four of their 48 layer applications to
-/// a different eighth expert (the test prints which; two to five positions
-/// across the summation orders tried). The worst such position measured
-/// 0.99908; llama.cpp against the CPU reference flips the same way
-/// (`inkling_reference.rs`).
-const DECODE_COSINE: f32 = 0.998;
+/// to ~1e-7 in cosine until they first route differently. They do: the
+/// router's sigmoid top-8 has near-ties, and on the capture prompt two to
+/// five of the twelve positions (it moves with the summation order) send
+/// one to four of their 48 layer applications to a different eighth expert.
+/// The test prints which. The worst such position measured 0.99822, with
+/// three applications flipped; llama.cpp against the CPU reference flips
+/// the same way (`inkling_reference.rs`). A wrong operator reads 0.3-0.8.
+const DECODE_COSINE: f32 = 0.995;
 
 #[test]
 fn device_forward_matches_llama_cpp_and_its_own_chunkings() {
@@ -81,6 +81,7 @@ fn device_forward_matches_llama_cpp_and_its_own_chunkings() {
     let ctx = CudaContext::new(0).expect("device 0");
     let stream = ctx.default_stream();
     let model = Arc::new(InklingModel::load(&ctx, &stream, &file).expect("the model loads"));
+    model.use_scalar_attention(std::env::var_os("LLMCUDA_INK_SCALAR_ATTN").is_some());
     println!(
         "weights resident: {:.2} GiB",
         model.weight_bytes() as f64 / (1u64 << 30) as f64
@@ -238,6 +239,8 @@ fn device_forward_matches_llama_cpp_and_its_own_chunkings() {
         let mut ref_state = InklingState::new(&stream, &model, 64).expect("state");
         let mut single = InklingPass::new(&model, &stream, 1).expect("pass");
         single.log_routes();
+        // Until a routing flips, nothing separates the paths but rounding.
+        // After one, later positions attend over a cache that differs.
         let mut clean_worst = 1.0f32;
         let mut flipped_positions = 0usize;
         for (at, &t) in tokens.iter().enumerate() {
@@ -278,19 +281,19 @@ fn device_forward_matches_llama_cpp_and_its_own_chunkings() {
                 "decode position {at}: {}",
                 r.cosine_similarity
             );
-            if differing.is_empty() {
+            if differing.is_empty() && flipped_positions == 0 {
                 clean_worst = clean_worst.min(r.cosine_similarity);
-            } else {
+            } else if !differing.is_empty() {
                 flipped_positions += 1;
             }
         }
         println!(
-            "{flipped_positions} of {} positions flip a routing; worst cosine without one {clean_worst:.8}",
+            "{flipped_positions} of {} positions flip a routing; worst cosine before the first {clean_worst:.8}",
             tokens.len()
         );
         assert!(
             clean_worst > 0.99999,
-            "a position with identical routing drifted: {clean_worst}"
+            "the paths drifted before any routing flipped: {clean_worst}"
         );
     }
     let (decoded, decoded_logits) = step_alone(0);

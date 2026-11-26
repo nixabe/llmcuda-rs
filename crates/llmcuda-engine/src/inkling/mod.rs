@@ -475,6 +475,12 @@ impl InklingModel {
         &self.config
     }
 
+    /// Run prefill attention on the scalar reference kernel instead of
+    /// the tensor-core one. For A/B measurement and tests.
+    pub fn use_scalar_attention(&self, on: bool) {
+        self.kernels.use_scalar_attention(on);
+    }
+
     /// Bytes of weights resident on the device.
     pub fn weight_bytes(&self) -> usize {
         self.weight_bytes

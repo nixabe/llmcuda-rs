@@ -355,7 +355,7 @@ impl K2Kernels {
             ctx.load_module(compile(&source(), "k2_horizon").map_err(MoeError::Compile)?)?;
         let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
-            norm: module.load_function("k2_norm")?,
+            norm: rust.load_function("k2_norm")?,
             route: module.load_function("k2_route")?,
             project: module.load_function("k2_project")?,
             project_tiles: [
@@ -363,9 +363,9 @@ impl K2Kernels {
                 module.load_function("k2_project_b8")?,
             ],
             dispatch: module.load_function("k2_dispatch")?,
-            dispatch_count: module.load_function("k2_dispatch_count")?,
-            dispatch_prefix: module.load_function("k2_dispatch_prefix")?,
-            dispatch_gather: module.load_function("k2_dispatch_gather")?,
+            dispatch_count: rust.load_function("k2_dispatch_count")?,
+            dispatch_prefix: rust.load_function("k2_dispatch_prefix")?,
+            dispatch_gather: rust.load_function("k2_dispatch_gather")?,
             project_grouped: module.load_function("k2_project_grouped")?,
             values: rust.load_function("k2_values")?,
             combine: rust.load_function("k2_combine")?,

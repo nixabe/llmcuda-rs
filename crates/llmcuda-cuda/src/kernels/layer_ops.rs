@@ -776,10 +776,10 @@ impl LayerOpsKernels {
             sigmoid_gate_elementwise: rust.load_function("sigmoid_gate_mul")?,
             add: rust.load_function("tensor_add")?,
             softplus: rust.load_function("softplus_elementwise")?,
-            conv1d: module.load_function("conv1d_causal_depthwise")?,
-            conv1d_state: module.load_function("conv1d_update_state")?,
-            conv1d_step: module.load_function("conv1d_step")?,
-            conv1d_step_batch: module.load_function("conv1d_step_batch")?,
+            conv1d: rust.load_function("conv1d_causal_depthwise")?,
+            conv1d_state: rust.load_function("conv1d_update_state")?,
+            conv1d_step: rust.load_function("conv1d_step")?,
+            conv1d_step_batch: rust.load_function("conv1d_step_batch")?,
         })
     }
 

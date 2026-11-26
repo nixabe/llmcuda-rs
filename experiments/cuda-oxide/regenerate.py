@@ -42,6 +42,8 @@ if ".target sm_75\n" not in ptx or any(
         "attn_flash_decode_combine_k2_batch", "embed_q8_0", "dequantize_q8_0",
         "gdn_silu_split_qkv", "gdn_conv_silu_split_step_batch", "gdn_normalize_qk",
         "gdn_chunk_normalize_qk", "dense_rms_norm_narrow", "dec_layer_norm",
+        "dequantize_q6_k", "vision_softmax_rows", "vision_rope_qk",
+        "k2_rotary_prepare", "moe_block_gate_and_combine",
     )
 ):
     raise SystemExit("compiler output has the wrong target or entry point")

@@ -2412,6 +2412,316 @@ mod kernels {
             }
         }
     }
+
+    /// Dequantize a flat Q6_K tensor, one thread per `(superblock, half,
+    /// l)`: four elements, 32 apart, from the low nibbles and high bit pairs
+    /// that share bytes. `y = (d * scale) * (code - 32)`, in that order.
+    ///
+    /// A superblock is 210 bytes: 128 of low nibbles, 64 of high pairs, 16
+    /// signed scales and a binary16 super-scale.
+    ///
+    /// # Safety
+    /// src covers n_superblocks * 210 bytes and dst n_superblocks * 256
+    /// floats.
+    #[kernel]
+    pub unsafe fn dequantize_q6_k(src: *const u8, dst: *mut f32, n_superblocks: i64) {
+        let t = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        if t >= n_superblocks * 64 {
+            return;
+        }
+        let sb = t / 64;
+        let rem = (t % 64) as usize;
+        let (half, l) = (rem / 32, rem % 32);
+        unsafe {
+            let base = src.add((sb * 210) as usize);
+            let ql = base.add(half * 64);
+            let qh = base.add(128 + half * 32);
+            let sc = base.add(192 + half * 8) as *const i8;
+            let d = load_half_le(base.add(208));
+            let is = l / 16;
+            let (lo0, lo1, hi) = (*ql.add(l) as i32, *ql.add(l + 32) as i32, *qh.add(l) as i32);
+            let raw1 = (lo0 & 0xF) | ((hi & 3) << 4);
+            let raw2 = (lo1 & 0xF) | (((hi >> 2) & 3) << 4);
+            let raw3 = (lo0 >> 4) | (((hi >> 4) & 3) << 4);
+            let raw4 = (lo1 >> 4) | (((hi >> 6) & 3) << 4);
+            let y = dst.add((sb * 256) as usize + half * 128);
+            *y.add(l) = d * *sc.add(is) as f32 * (raw1 - 32) as f32;
+            *y.add(l + 32) = d * *sc.add(is + 2) as f32 * (raw2 - 32) as f32;
+            *y.add(l + 64) = d * *sc.add(is + 4) as f32 * (raw3 - 32) as f32;
+            *y.add(l + 96) = d * *sc.add(is + 6) as f32 * (raw4 - 32) as f32;
+        }
+    }
+
+    /// Softmax in place over each row of fp16 attention scores: subtract the
+    /// row maximum, exponentiate, and scale by the reciprocal of the sum,
+    /// every step taken in fp32 and rounded back to fp16.
+    ///
+    /// Both reductions are a shuffle-down tree per warp and a second tree
+    /// over the warp results.
+    ///
+    /// grid: (rows,). block: a multiple of 32, at most 1024.
+    ///
+    /// # Safety
+    /// scores covers gridDim.x * row_len halves.
+    #[kernel]
+    pub unsafe fn vision_softmax_rows(scores: *mut u16, row_len: i32) {
+        static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
+        const LOWEST: f32 = -3.4e38;
+        let tid = thread::threadIdx_x();
+        let step = thread::blockDim_x() as i32;
+        let warps = (thread::blockDim_x() + 31) >> 5;
+        unsafe {
+            let row = scores.add(thread::blockIdx_x() as usize * row_len as usize);
+            let mut local_max = LOWEST;
+            let mut j = tid as i32;
+            while j < row_len {
+                local_max = local_max.max(h2f(*row.add(j as usize)));
+                j += step;
+            }
+            let mut off = 16;
+            while off > 0 {
+                local_max = local_max.max(warp::shuffle_down_f32_sync(u32::MAX, local_max, off));
+                off >>= 1;
+            }
+            if tid & 31 == 0 {
+                RED[(tid >> 5) as usize] = local_max;
+            }
+            thread::sync_threads();
+            if tid < 32 {
+                let mut v = if tid < warps { RED[tid as usize] } else { LOWEST };
+                let mut off = 16;
+                while off > 0 {
+                    v = v.max(warp::shuffle_down_f32_sync(u32::MAX, v, off));
+                    off >>= 1;
+                }
+                if tid == 0 {
+                    RED[0] = v;
+                }
+            }
+            thread::sync_threads();
+            let row_max = RED[0];
+            thread::sync_threads();
+
+            let mut total = 0.0f32;
+            let mut j = tid as i32;
+            while j < row_len {
+                let e = (h2f(*row.add(j as usize)) - row_max).exp();
+                *row.add(j as usize) = f2h(e);
+                total += e;
+                j += step;
+            }
+            let mut off = 16;
+            while off > 0 {
+                total += warp::shuffle_down_f32_sync(u32::MAX, total, off);
+                off >>= 1;
+            }
+            if tid & 31 == 0 {
+                RED[(tid >> 5) as usize] = total;
+            }
+            thread::sync_threads();
+            if tid < 32 {
+                let mut v = if tid < warps { RED[tid as usize] } else { 0.0 };
+                let mut off = 16;
+                while off > 0 {
+                    v += warp::shuffle_down_f32_sync(u32::MAX, v, off);
+                    off >>= 1;
+                }
+                if tid == 0 {
+                    RED[0] = v;
+                }
+            }
+            thread::sync_threads();
+            let inv = 1.0 / RED[0];
+            let mut j = tid as i32;
+            while j < row_len {
+                *row.add(j as usize) = f2h(h2f(*row.add(j as usize)) * inv);
+                j += step;
+            }
+        }
+    }
+
+    /// Rotate the query and key slices of the vision tower's packed fp16
+    /// `[q | k | v]` rows in place by 2-D rotary positions: the first quarter
+    /// of each head's pairs takes the patch's first coordinate, the second
+    /// quarter its second.
+    ///
+    /// grid: (tokens, 2, heads). block: at least head_dim / 2 threads.
+    ///
+    /// # Safety
+    /// qkv covers tokens * 3 * hidden halves and positions two ints a token.
+    #[kernel]
+    pub unsafe fn vision_rope_qk(
+        qkv: *mut u16,
+        positions: *const i32,
+        hidden: i32,
+        head_dim: i32,
+        theta_base: f32,
+    ) {
+        let token = thread::blockIdx_x() as i64;
+        let slice = thread::blockIdx_y() as i32;
+        let head = thread::blockIdx_z() as i32;
+        let j = thread::threadIdx_x() as i32;
+        let half_dim = head_dim >> 1;
+        let quarter = head_dim >> 2;
+        if j >= half_dim {
+            return;
+        }
+        unsafe {
+            let base = qkv.add(
+                (token * 3 * hidden as i64) as usize + (slice * hidden + head * head_dim) as usize,
+            );
+            let pos = if j < quarter {
+                *positions.add(2 * token as usize)
+            } else {
+                *positions.add(2 * token as usize + 1)
+            };
+            let k = if j < quarter { j } else { j - quarter };
+            let freq = theta_base.powf(-(k as f32) / quarter as f32);
+            let angle = pos as f32 * freq;
+            let (sin_a, cos_a) = (angle.sin(), angle.cos());
+            let x0 = h2f(*base.add(j as usize));
+            let x1 = h2f(*base.add((j + half_dim) as usize));
+            *base.add(j as usize) = f2h(x0.mul_add(cos_a, -(x1 * sin_a)));
+            *base.add((j + half_dim) as usize) = f2h(x0.mul_add(sin_a, x1 * cos_a));
+        }
+    }
+
+    /// Precompute K2's rotary `(sin, cos)` pairs for a chunk of tokens of up
+    /// to eight sequences, each starting at its own device-side position.
+    /// The angle is formed in double precision and narrowed once, as the
+    /// reference does.
+    ///
+    /// grid: (ceil(chunk / 8), sequences). block: (rope_dim / 2 or more, 8).
+    ///
+    /// # Safety
+    /// Each used position pointer covers one int; coefficients covers
+    /// (offset + sequences * chunk) * rope_dim floats.
+    #[kernel]
+    pub unsafe fn k2_rotary_prepare(
+        coefficients: *mut f32,
+        chunk: i32,
+        rope_dim: i32,
+        theta: f32,
+        offset: i32,
+        p0: u64,
+        p1: u64,
+        p2: u64,
+        p3: u64,
+        p4: u64,
+        p5: u64,
+        p6: u64,
+        p7: u64,
+    ) {
+        let t = (thread::blockIdx_x() * 8 + thread::threadIdx_y()) as i32;
+        let d = thread::threadIdx_x() as i32;
+        let seq = thread::blockIdx_y() as i32;
+        if t >= chunk || d >= rope_dim / 2 {
+            return;
+        }
+        let position = match seq {
+            0 => p0,
+            1 => p1,
+            2 => p2,
+            3 => p3,
+            4 => p4,
+            5 => p5,
+            6 => p6,
+            _ => p7,
+        } as *const i32;
+        unsafe {
+            let freq = (theta as f64).powf(-2.0 * d as f64 / rope_dim as f64);
+            let angle = (*position as f64 + t as f64) * freq;
+            let at = ((offset as i64 + (seq * chunk) as i64 + t as i64) * rope_dim as i64
+                + 2 * d as i64) as usize;
+            *coefficients.add(at) = angle.sin() as f32;
+            *coefficients.add(at + 1) = angle.cos() as f32;
+        }
+    }
+
+    /// The MoE block's tail in one launch: the shared expert's sigmoid gate,
+    /// the routed sum over the top-k contributions, and both adds.
+    ///
+    /// ```text
+    /// g       = sigmoid(w . normed[t])
+    /// routed  = sum_k partial[t][k]          ascending k
+    /// ffn_out = routed + shexp[t] * g
+    /// l_out   = ffn_out + residual[t]
+    /// ```
+    ///
+    /// The gate's dot product is taken by the first 256 threads, each over a
+    /// strided share, and reduced like RMSNorm's sum of squares; the routed
+    /// sum stays ascending inside one thread, so it matches the reference's
+    /// order. `routed` and `ffn_out` are still written out, because the
+    /// golden capture has them as waypoints.
+    ///
+    /// grid: (max_tokens, ceil(hidden / block)). block: at least 256, with a
+    /// float of dynamic shared memory per warp.
+    ///
+    /// # Safety
+    /// w covers hidden floats; normed, shexp, residual and the three row
+    /// outputs max_tokens * hidden; partial max_tokens * top_k * hidden;
+    /// gate max_tokens; valid_tokens one int. Outputs are disjoint from
+    /// inputs and each other.
+    #[kernel]
+    pub unsafe fn moe_block_gate_and_combine(
+        w: *const f32,
+        normed: *const f32,
+        partial: *const f32,
+        shexp: *const f32,
+        residual: *const f32,
+        valid_tokens: *const i32,
+        top_k: i32,
+        hidden: i32,
+        gate: *mut f32,
+        routed: *mut f32,
+        ffn_out: *mut f32,
+        l_out: *mut f32,
+    ) {
+        let t = thread::blockIdx_x() as i64;
+        let tid = thread::threadIdx_x() as i32;
+        unsafe {
+            if t >= *valid_tokens as i64 {
+                return;
+            }
+            let base = (t * hidden as i64) as usize;
+            let xs = normed.add(base);
+            let mut s = 0.0f32;
+            if tid < 256 {
+                let mut j = tid;
+                while j < hidden {
+                    // NVRTC contracts the original's s += w[j] * xs[j].
+                    s = (*w.add(j as usize)).mul_add(*xs.add(j as usize), s);
+                    j += 256;
+                }
+            }
+            s = block_reduce_sum(s);
+            let g = 1.0 / (1.0 + (-s).exp());
+            if tid == 0 && thread::blockIdx_y() == 0 {
+                *gate.add(t as usize) = g;
+            }
+
+            let pbase = partial.add((t * top_k as i64 * hidden as i64) as usize);
+            let step = (thread::gridDim_y() * thread::blockDim_x()) as i32;
+            let mut j = (thread::blockIdx_y() * thread::blockDim_x()) as i32 + tid;
+            while j < hidden {
+                let mut p = pbase.add(j as usize);
+                let mut r = 0.0f32;
+                let mut k = 0;
+                while k < top_k {
+                    r += *p;
+                    p = p.wrapping_add(hidden as usize);
+                    k += 1;
+                }
+                let at = base + j as usize;
+                let v = (*shexp.add(at)).mul_add(g, r);
+                *routed.add(at) = r;
+                *ffn_out.add(at) = v;
+                *l_out.add(at) = v + *residual.add(at);
+                j += step;
+            }
+        }
+    }
 }
 
 fn main() {}

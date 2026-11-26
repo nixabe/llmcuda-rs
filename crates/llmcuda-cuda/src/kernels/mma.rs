@@ -65,7 +65,7 @@ pub const MMA_N: usize = 8;
 /// Contraction elements consumed per instruction, fixed by the instruction.
 pub const MMA_K: usize = 16;
 
-const MMA_SRC: &str = r#"
+pub(super) const MMA_SRC: &str = r#"
 extern "C" {
 
 // Two little-endian bytes as an IEEE half, widened. NVRTC has no include path,

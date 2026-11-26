@@ -5059,6 +5059,242 @@ mod kernels {
             }
         }
     }
+
+    /// K2's decode-step rotary and cache append for up to eight sequences,
+    /// from the prepared sine/cosine table: rotate the query and key rows,
+    /// and write the rotated key and the raw value to each sequence's fp16
+    /// cache at its own position.
+    ///
+    /// grid: (qh + kh, sequences <= 8). block: dim.
+    ///
+    /// # Safety
+    /// q/qr cover sequences * qh * dim floats, k/kr/v sequences * kh * dim;
+    /// coefficients covers sequences * rope_dim; each used slot holds a live
+    /// pointer (append position, K cache, V cache), the caches covering
+    /// position + 1 rows of kh * dim halves.
+    #[kernel]
+    pub unsafe fn k2_rotary_append(
+        q: *const f32,
+        qr: *mut f32,
+        k: *const f32,
+        kr: *mut f32,
+        v: *const f32,
+        coefficients: *const f32,
+        ap0: u64, ap1: u64, ap2: u64, ap3: u64, ap4: u64, ap5: u64, ap6: u64, ap7: u64,
+        kc0: u64, kc1: u64, kc2: u64, kc3: u64, kc4: u64, kc5: u64, kc6: u64, kc7: u64,
+        vc0: u64, vc1: u64, vc2: u64, vc3: u64, vc4: u64, vc5: u64, vc6: u64, vc7: u64,
+        qh: i32,
+        kh: i32,
+        dim: i32,
+        rope_dim: i32,
+    ) {
+        let seq = thread::blockIdx_y() as i32;
+        let h = thread::blockIdx_x() as i32;
+        let d = thread::threadIdx_x() as i32;
+        let is_q = h < qh;
+        let hh = if is_q { h } else { h - qh };
+        let heads = if is_q { qh } else { kh };
+        let (input, out) = if is_q { (q, qr) } else { (k, kr) };
+        let base = ((seq as i64 * heads as i64 + hh as i64) * dim as i64) as usize;
+        let (du, hu) = (d as usize, (rope_dim / 2) as usize);
+        let half = rope_dim / 2;
+        unsafe {
+            let (mut k_cache, mut v_cache) = (core::ptr::null_mut::<u16>(), core::ptr::null_mut::<u16>());
+            let mut at = 0i64;
+            if !is_q {
+                let pos = match seq {
+                0 => ap0,
+                1 => ap1,
+                2 => ap2,
+                3 => ap3,
+                4 => ap4,
+                5 => ap5,
+                6 => ap6,
+                _ => ap7,
+            } as *const i32;
+                k_cache = match seq {
+                0 => kc0,
+                1 => kc1,
+                2 => kc2,
+                3 => kc3,
+                4 => kc4,
+                5 => kc5,
+                6 => kc6,
+                _ => kc7,
+            } as *mut u16;
+                v_cache = match seq {
+                0 => vc0,
+                1 => vc1,
+                2 => vc2,
+                3 => vc3,
+                4 => vc4,
+                5 => vc5,
+                6 => vc6,
+                _ => vc7,
+            } as *mut u16;
+                at = *pos as i64 * kh as i64 * dim as i64 + hh as i64 * dim as i64;
+            }
+            let co = coefficients.add((seq as i64 * rope_dim as i64) as usize + 2 * du);
+            if d >= rope_dim {
+                let x = *input.add(base + du);
+                *out.add(base + du) = x;
+                if !is_q {
+                    *k_cache.add(at as usize + du) = f2h(x);
+                    *v_cache.add(at as usize + du) = f2h(*v.add(base + du));
+                }
+                return;
+            }
+            if d >= half {
+                return;
+            }
+            let (sin_a, cos_a) = (*co, *co.add(1));
+            let (x0, x1) = (*input.add(base + du), *input.add(base + du + hu));
+            let y0 = x0.mul_add(cos_a, -(x1 * sin_a));
+            let y1 = x0.mul_add(sin_a, x1 * cos_a);
+            *out.add(base + du) = y0;
+            *out.add(base + du + hu) = y1;
+            if !is_q {
+                *k_cache.add(at as usize + du) = f2h(y0);
+                *k_cache.add(at as usize + du + hu) = f2h(y1);
+                *v_cache.add(at as usize + du) = f2h(*v.add(base + du));
+                *v_cache.add(at as usize + du + hu) = f2h(*v.add(base + du + hu));
+            }
+        }
+    }
+
+    /// Store element `e` of position `pos`'s row: binary16, or a q8_0 code
+    /// plus, from each block's first lane, its scale.
+    ///
+    /// # Safety
+    /// All 32 lanes of the warp call this together with one q8_0 block's
+    /// elements; cache covers the row in its format.
+    #[device]
+    unsafe fn kv8_store(cache: *mut u16, q8: i32, pos: i64, row: i32, e: i32, x: f32) {
+        unsafe {
+            if q8 == 0 {
+                *cache.add((pos * row as i64 + e as i64) as usize) = f2h(x);
+                return;
+            }
+            let (code, d) = kvq8_quantize(x);
+            let dst = (cache as *mut u8).add((pos * (row as i64 + (row >> 4) as i64)) as usize);
+            *dst.add(e as usize) = code as u8;
+            if e & 31 == 0 {
+                *(dst.add((row + 2 * (e >> 5)) as usize) as *mut u16) = d;
+            }
+        }
+    }
+
+    /// `k2_rotary_append` with either half of the cache in q8_0. A rotary
+    /// pair is computed by one thread, so the key and value rows are parked
+    /// in shared memory and every thread then stores its own element, which
+    /// puts one 32-element block in each warp for the q8_0 scale.
+    ///
+    /// grid: (qh + kh, sequences <= 8). block: dim, a multiple of 32, at
+    /// most 1024.
+    ///
+    /// # Safety
+    /// As `k2_rotary_append`, each cache covering its rows in its own format.
+    #[kernel]
+    pub unsafe fn k2_rotary_append_kv8(
+        q: *const f32,
+        qr: *mut f32,
+        k: *const f32,
+        kr: *mut f32,
+        v: *const f32,
+        coefficients: *const f32,
+        ap0: u64, ap1: u64, ap2: u64, ap3: u64, ap4: u64, ap5: u64, ap6: u64, ap7: u64,
+        kc0: u64, kc1: u64, kc2: u64, kc3: u64, kc4: u64, kc5: u64, kc6: u64, kc7: u64,
+        vc0: u64, vc1: u64, vc2: u64, vc3: u64, vc4: u64, vc5: u64, vc6: u64, vc7: u64,
+        qh: i32,
+        kh: i32,
+        dim: i32,
+        rope_dim: i32,
+        kq8: i32,
+        vq8: i32,
+    ) {
+        static mut KROW: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        static mut VROW: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        let seq = thread::blockIdx_y() as i32;
+        let h = thread::blockIdx_x() as i32;
+        let d = thread::threadIdx_x() as i32;
+        let is_q = h < qh;
+        let hh = if is_q { h } else { h - qh };
+        let heads = if is_q { qh } else { kh };
+        let (input, out) = if is_q { (q, qr) } else { (k, kr) };
+        let base = ((seq as i64 * heads as i64 + hh as i64) * dim as i64) as usize;
+        let (du, hu) = (d as usize, (rope_dim / 2) as usize);
+        let half = rope_dim / 2;
+        unsafe {
+            let (mut k_cache, mut v_cache) = (core::ptr::null_mut::<u16>(), core::ptr::null_mut::<u16>());
+            let mut at = 0i64;
+            if !is_q {
+                let pos = match seq {
+                0 => ap0,
+                1 => ap1,
+                2 => ap2,
+                3 => ap3,
+                4 => ap4,
+                5 => ap5,
+                6 => ap6,
+                _ => ap7,
+            } as *const i32;
+                k_cache = match seq {
+                0 => kc0,
+                1 => kc1,
+                2 => kc2,
+                3 => kc3,
+                4 => kc4,
+                5 => kc5,
+                6 => kc6,
+                _ => kc7,
+            } as *mut u16;
+                v_cache = match seq {
+                0 => vc0,
+                1 => vc1,
+                2 => vc2,
+                3 => vc3,
+                4 => vc4,
+                5 => vc5,
+                6 => vc6,
+                _ => vc7,
+            } as *mut u16;
+                at = *pos as i64 * kh as i64 * dim as i64 + hh as i64 * dim as i64;
+            }
+            let co = coefficients.add((seq as i64 * rope_dim as i64) as usize + 2 * du);
+            let krow = SharedArray::as_raw_mut_ptr(&raw mut KROW);
+            let vrow = SharedArray::as_raw_mut_ptr(&raw mut VROW);
+            if d >= rope_dim {
+                let x = *input.add(base + du);
+                *out.add(base + du) = x;
+                if !is_q {
+                    *krow.add(du) = x;
+                    *vrow.add(du) = *v.add(base + du);
+                }
+            } else if d < half {
+                let (sin_a, cos_a) = (*co, *co.add(1));
+                let (x0, x1) = (*input.add(base + du), *input.add(base + du + hu));
+                let y0 = x0.mul_add(cos_a, -(x1 * sin_a));
+                let y1 = x0.mul_add(sin_a, x1 * cos_a);
+                *out.add(base + du) = y0;
+                *out.add(base + du + hu) = y1;
+                if !is_q {
+                    *krow.add(du) = y0;
+                    *krow.add(du + hu) = y1;
+                    *vrow.add(du) = *v.add(base + du);
+                    *vrow.add(du + hu) = *v.add(base + du + hu);
+                }
+            }
+            if is_q {
+                return;
+            }
+            thread::sync_threads();
+            let row = kh * dim;
+            let e = hh * dim + d;
+            let pos = at / row as i64;
+            kv8_store(k_cache, kq8, pos, row, e, *krow.add(du));
+            kv8_store(v_cache, vq8, pos, row, e, *vrow.add(du));
+        }
+    }
 }
 
 fn main() {}

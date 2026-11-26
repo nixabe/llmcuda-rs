@@ -50,6 +50,7 @@ if ".target sm_75\n" not in ptx or any(
         "attn_rope_partial_imrope", "attn_kv_append_kv8", "attn_decode_rope_append_batch",
         "vision_layer_norm", "hg_q8_to_half_w", "dec_lexical", "dec_question_fields",
         "dec_features", "fwd_embed_quant",
+        "k2_rotary_append", "k2_rotary_append_kv8",
     )
 ):
     raise SystemExit("compiler output has the wrong target or entry point")

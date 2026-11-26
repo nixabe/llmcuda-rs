@@ -711,3 +711,65 @@ part of its memory; its lexical prior reads only option spans, which are
 text. The images themselves are sized by
 `llmcuda_kernels::vision::preprocess_hf`, the reference processor's resize,
 rather than the llama.cpp fit-and-pad the chat path uses.
+
+# Inkling 2 Mini
+
+[`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF),
+`general.architecture = inkling2_loop`, in `UD-Q4_K_XL` and `UD-Q8_K_XL` (the
+repository's root files, which are byte-identical to its
+`Mainline_Support/` copies). **The engine runs its forward; nothing serves
+it.** `llmcuda-server` refuses the file by name, because the scheduler, the
+pager and the snapshot arena are built from an attention-and-GDN layer list
+that does not describe this model.
+
+## Structure
+
+| Property | Value |
+| --- | --- |
+| Layers | 24 of weights; layers 6–17 run three times, so **48 layer applications**, each with its own cache |
+| Hidden | 2304 |
+| Attention heads | 24 Q, 8 KV (head `h` reads KV head `h / 3`), head dim 128, no rotary embedding |
+| Window | sliding, 1024, on every layer but 5, 11, 17 and 23, which attend over everything |
+| Position | a learned relative bias (16 features a head, 1024 distances) added to the logits unscaled; on the full layers a `1 + 0.1 ln(max(1, (pos + 1) / 8192))` scale on queries and bias features |
+| Sink | a zero logit attending to nothing, `p_j = exp(s_j) / (1 + Σ exp(s))`, less a per-row sink projection |
+| Clips | queries and keys L2-clipped at 22.627, bias features at 8, values RMS-normed |
+| Convolutions | four causal taps on keys, values, attention output and feed-forward output, each carrying three rows; the taps are input-dependent on the full layers |
+| Depth mixing | every layer input is a softmax mix over the residual blocks so far (six layers a block) |
+| Loop controllers | rank 64, on passes two and three: a gain and a forget gate on each of Q, K, V and the feed-forward input, read from messages mixed out of the pass before |
+| Experts | 128, top-8 by sigmoid score plus a selection bias, weights normalized and scaled by 8; merged gate/up 2304 → 2304, down 1152 → 2304, SiTU activation |
+| Head | logits soft-capped at 30 |
+| Vocabulary | 200,058 (tables padded to 201,024), GPT-2 BPE with the `inkling2` pre-tokenizer |
+
+`ModelConfig::from_gguf` returns the usual configuration with
+[`InklingConfig`](../crates/llmcuda-model/src/inkling.rs) in `inkling`; the
+keys and their validation follow llama.cpp's `inkling2.cpp` and
+`inkling2-loop.cpp` at `ae6a7ad2c`.
+
+## Formats
+
+| File | Dense matrices | Experts | Resident |
+| --- | --- | --- | ---: |
+| `UD-Q4_K_XL` | Q8_0 | NVFP4 in layers 0–19, Q8_0 in 20–23 | 16.9 GiB |
+| `UD-Q8_K_XL` | bf16 | NVFP4 in layers 0–19, bf16 in 20–23 | 22.3 GiB |
+
+NVFP4 (GGML type 40) is 64 elements in 36 bytes: four unsigned-E4M3 scale
+bytes, one a 16-element sub-block, then 32 bytes of E2M1 nibbles, where byte
+`j` of a sub-block holds element `j` low and element `j + 8` high. A tensor
+may carry a per-expert `.scale` beside it. Nothing is requantized: every
+format is contracted from its stored bytes, converted to binary16 exactly.
+
+## What exists, and what does not
+
+- **Forward**: `llmcuda_engine::inkling` — `InklingPass` (prefill, any
+  cut of a prompt into passes and any batch of sequences bit-identical to
+  one pass) and `InklingDecode` (up to eight sequences a step). Numbers are
+  in [BENCHMARKS.md](BENCHMARKS.md#inkling-2-mini-inkling2_loop); gates in
+  [TESTING.md](TESTING.md#the-looped-architecture-inkling2_loop).
+- **Tokenizer**: the server's tokenizer reads the `inkling2` pre-tokenizer
+  and matches llama.cpp on the capture prompt.
+- **Not yet**: a serving runtime, sampling, the chat template's tool and
+  thinking conventions, the vision projector (`mmproj-F16.gguf`), and a
+  bounded cache for the sliding layers — a sequence keeps full-length keys
+  and values for all 48 applications, 196 KiB a token, where 40 of them
+  need 1,024 rows.
+

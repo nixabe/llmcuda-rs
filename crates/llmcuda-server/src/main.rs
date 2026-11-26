@@ -621,6 +621,15 @@ fn model_config_for(
     let file =
         llmcuda_gguf::GgufFile::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let config = ModelConfig::from_gguf(&file).map_err(|e| format!("{}: {e}", path.display()))?;
+    // One fact, said once, rather than every tensor the serving schema does
+    // not find.
+    if config.inkling.is_some() {
+        return Err(format!(
+            "{}: {}",
+            path.display(),
+            llmcuda_engine::inkling::NOT_SERVED
+        ));
+    }
     // The file's own name, for `/v1/models`. `ModelConfig::name` is the name
     // of the *architecture's* transcribed configuration, which is the right
     // thing for a shape check and the wrong thing to serve: a second

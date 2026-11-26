@@ -37,6 +37,18 @@ use crate::viewslice::subslice;
 
 mod decode;
 
+/// Why a serving runtime refuses this architecture.
+///
+/// The forward is here and measured; nothing above it is. The scheduler,
+/// pager and snapshot arena are built from an attention-and-GDN layer list,
+/// and this model has 48 cache slots over 24 layers, no recurrent state, and
+/// sliding windows the pager knows nothing of.
+pub const NOT_SERVED: &str = concat!(
+    "`inkling2_loop` is not served yet: the engine runs its forward ",
+    "(`llmcuda_engine::inkling`, `bench_inkling`), but no scheduler, ",
+    "cache accounting or sampler drives it"
+);
+
 pub use decode::InklingDecode;
 
 /// Why loading or running the model failed.

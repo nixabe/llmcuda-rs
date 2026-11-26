@@ -655,6 +655,9 @@ impl DeviceRuntimeHandle {
         config: ModelConfig,
         runtime: RuntimeConfig,
     ) -> Result<Self, RuntimeError> {
+        if config.inkling.is_some() {
+            return Err(RuntimeError::Schema(crate::inkling::NOT_SERVED.into()));
+        }
         let (commands, receiver) = sync_channel::<RuntimeCommand>(1);
         let (ready_tx, ready_rx) = sync_channel::<Result<SnapshotSlots, RuntimeError>>(0);
         let thread = std::thread::Builder::new()

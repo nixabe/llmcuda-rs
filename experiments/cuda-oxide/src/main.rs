@@ -4177,6 +4177,264 @@ mod kernels {
             }
         }
     }
+
+    /// Interleaved multimodal rotary (IMROPE) on the leading `rope_dim`
+    /// dimensions of each head: pair `d` takes the temporal, height or width
+    /// position by `d % 3`, the spatial ones only below their bound. The
+    /// tail is copied.
+    ///
+    /// grid: (tokens, heads). block: head_dim.
+    ///
+    /// # Safety
+    /// input and out are disjoint and cover n_tokens * n_heads * head_dim
+    /// floats; mrope_pos covers three ints a token.
+    #[kernel]
+    pub unsafe fn attn_rope_partial_imrope(
+        input: *const f32,
+        out: *mut f32,
+        n_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        mrope_pos: *const i32,
+        h_bound: i32,
+        w_bound: i32,
+        theta_base: f32,
+        n_tokens: i32,
+    ) {
+        let t = thread::blockIdx_x() as i64;
+        let h = thread::blockIdx_y() as i64;
+        let d = thread::threadIdx_x() as i32;
+        if t >= n_tokens as i64 {
+            return;
+        }
+        let half = rope_dim >> 1;
+        let base = ((t * n_heads as i64 + h) * head_dim as i64) as usize;
+        unsafe {
+            if d >= rope_dim {
+                *out.add(base + d as usize) = *input.add(base + d as usize);
+                return;
+            }
+            if d >= half {
+                return;
+            }
+            let c = d % 3;
+            let component = if c == 1 && d < h_bound {
+                *mrope_pos.add(3 * t as usize + 1)
+            } else if c == 2 && d < w_bound {
+                *mrope_pos.add(3 * t as usize + 2)
+            } else {
+                *mrope_pos.add(3 * t as usize)
+            };
+            // Loads before the transcendental chain, not behind it.
+            let x0 = *input.add(base + d as usize);
+            let x1 = *input.add(base + (d + half) as usize);
+            let freq = (theta_base as f64).powf(-2.0 * d as f64 / rope_dim as f64);
+            let angle = component as f64 * freq;
+            let (sin_a, cos_a) = (angle.sin() as f32, angle.cos() as f32);
+            *out.add(base + d as usize) = x0.mul_add(cos_a, -(x1 * sin_a));
+            *out.add(base + (d + half) as usize) = x0.mul_add(sin_a, x1 * cos_a);
+        }
+    }
+
+    /// Quantize one element of a 32-element q8_0 block: the block's scale is
+    /// its largest magnitude over 127, found across the warp, and the code is
+    /// the element over the scale, rounded half away from zero. Returns the
+    /// code's low byte and the scale as binary16 bits.
+    ///
+    /// # Safety
+    /// All 32 lanes of the warp call this together, each with one element of
+    /// the same block.
+    #[device]
+    unsafe fn kvq8_quantize(x: f32) -> (u32, u16) {
+        let mut amax = x.abs();
+        let mut off = 16;
+        while off > 0 {
+            amax = amax.max(warp::shuffle_xor_f32_sync(u32::MAX, amax, off));
+            off >>= 1;
+        }
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        (((x * id).round() as i32 as u32) & 0xff, f2h(d))
+    }
+
+    /// `attn_kv_append` with either half of the cache in q8_0. One thread per
+    /// element, so with `row` a multiple of 32 and 256-thread blocks each
+    /// warp holds exactly one 32-element block of one half of one position:
+    /// the early return, the K/V choice and the format choice are all
+    /// warp-uniform and `kvq8_quantize` sees all 32 lanes. A binary16 half is
+    /// written exactly as `attn_kv_append` writes it.
+    ///
+    /// A q8_0 row of n elements is n int8 codes followed by n / 32 binary16
+    /// scales.
+    ///
+    /// # Safety
+    /// key and value cover span floats; each cache covers every position's
+    /// row in its own format; position covers one int. row and span are
+    /// multiples of 32.
+    #[kernel]
+    pub unsafe fn attn_kv_append_kv8(
+        key: *const f32,
+        value: *const f32,
+        k_cache: *mut u16,
+        v_cache: *mut u16,
+        position: *const i32,
+        span: i32,
+        row: i32,
+        kq8: i32,
+        vq8: i32,
+    ) {
+        let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        if i >= 2 * span {
+            return;
+        }
+        let is_k = i < span;
+        let j = if is_k { i } else { i - span };
+        unsafe {
+            let x = if is_k { *key.add(j as usize) } else { *value.add(j as usize) };
+            let cache = if is_k { k_cache } else { v_cache };
+            let pos = *position as i64 + (j / row) as i64;
+            let e = j % row;
+            if (if is_k { kq8 } else { vq8 }) == 0 {
+                *cache.add((pos * row as i64 + e as i64) as usize) = f2h(x);
+                return;
+            }
+            let (code, d) = kvq8_quantize(x);
+            let row_bytes = row as i64 + (row >> 4) as i64;
+            let dst = (cache as *mut u8).add((pos * row_bytes) as usize);
+            *dst.add(e as usize) = code as u8;
+            if e & 31 == 0 {
+                *(dst.add((row + 2 * (e >> 5)) as usize) as *mut u16) = d;
+            }
+        }
+    }
+
+    /// One decode token for up to eight sequences: rotate the query and key
+    /// rows and append the rotated key and the raw value to each sequence's
+    /// fp16 cache at its own position, in one launch.
+    ///
+    /// The first `q_heads` blocks of a sequence rotate a query head; the rest
+    /// rotate a key head and write the cache. Positions and cache addresses
+    /// ride in as pointer slots, so a captured graph replays at any position.
+    ///
+    /// grid: (q_heads + kv_heads, sequences <= 8). block: head_dim.
+    ///
+    /// # Safety
+    /// q_in/q_out cover sequences * q_heads * head_dim floats, k_in/k_out and
+    /// v_in sequences * kv_heads * head_dim; each used slot holds a live
+    /// pointer (rope position, append position, K cache, V cache) for its
+    /// sequence, the caches covering position + 1 rows. Outputs are disjoint
+    /// from inputs.
+    #[kernel]
+    pub unsafe fn attn_decode_rope_append_batch(
+        q_in: *const f32,
+        q_out: *mut f32,
+        k_in: *const f32,
+        k_out: *mut f32,
+        v_in: *const f32,
+        rp0: u64, rp1: u64, rp2: u64, rp3: u64, rp4: u64, rp5: u64, rp6: u64, rp7: u64,
+        ap0: u64, ap1: u64, ap2: u64, ap3: u64, ap4: u64, ap5: u64, ap6: u64, ap7: u64,
+        kc0: u64, kc1: u64, kc2: u64, kc3: u64, kc4: u64, kc5: u64, kc6: u64, kc7: u64,
+        vc0: u64, vc1: u64, vc2: u64, vc3: u64, vc4: u64, vc5: u64, vc6: u64, vc7: u64,
+        q_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        theta_base: f32,
+    ) {
+        let seq = thread::blockIdx_y() as i32;
+        let h = thread::blockIdx_x() as i32;
+        let d = thread::threadIdx_x() as i32;
+        let rope_pos = match seq {
+            0 => rp0,
+            1 => rp1,
+            2 => rp2,
+            3 => rp3,
+            4 => rp4,
+            5 => rp5,
+            6 => rp6,
+            _ => rp7,
+        } as *const i32;
+        let is_q = h < q_heads;
+        let (input, out) = if is_q { (q_in, q_out) } else { (k_in, k_out) };
+        let heads = if is_q { q_heads } else { kv_heads };
+        let hh = if is_q { h } else { h - q_heads };
+        let base = ((seq as i64 * heads as i64 + hh as i64) * head_dim as i64) as usize;
+        unsafe {
+            let (mut k_cache, mut v_cache) = (core::ptr::null_mut::<u16>(), core::ptr::null_mut::<u16>());
+            let mut at = 0usize;
+            if !is_q {
+                let pos = match seq {
+            0 => ap0,
+            1 => ap1,
+            2 => ap2,
+            3 => ap3,
+            4 => ap4,
+            5 => ap5,
+            6 => ap6,
+            _ => ap7,
+        } as *const i32;
+                k_cache = match seq {
+            0 => kc0,
+            1 => kc1,
+            2 => kc2,
+            3 => kc3,
+            4 => kc4,
+            5 => kc5,
+            6 => kc6,
+            _ => kc7,
+        } as *mut u16;
+                v_cache = match seq {
+            0 => vc0,
+            1 => vc1,
+            2 => vc2,
+            3 => vc3,
+            4 => vc4,
+            5 => vc5,
+            6 => vc6,
+            _ => vc7,
+        } as *mut u16;
+                at = (*pos as i64 * kv_heads as i64 * head_dim as i64
+                    + hh as i64 * head_dim as i64) as usize;
+            }
+            let half = rope_dim >> 1;
+            let du = d as usize;
+            if d >= rope_dim {
+                let x = *input.add(base + du);
+                *out.add(base + du) = x;
+                if !is_q {
+                    *k_cache.add(at + du) = f2h(x);
+                    *v_cache.add(at + du) = f2h(*v_in.add(base + du));
+                }
+                return;
+            }
+            if d >= half {
+                return;
+            }
+            // Every load before the transcendental chain, not behind it.
+            let hu = half as usize;
+            let position = *rope_pos;
+            let x0 = *input.add(base + du);
+            let x1 = *input.add(base + du + hu);
+            let (v0, v1) = if is_q {
+                (0.0, 0.0)
+            } else {
+                (*v_in.add(base + du), *v_in.add(base + du + hu))
+            };
+            let freq = (theta_base as f64).powf(-2.0 * d as f64 / rope_dim as f64);
+            let angle = (position as f64 + 0.0) * freq;
+            let (sin_a, cos_a) = (angle.sin() as f32, angle.cos() as f32);
+            let y0 = x0.mul_add(cos_a, -(x1 * sin_a));
+            let y1 = x0.mul_add(sin_a, x1 * cos_a);
+            *out.add(base + du) = y0;
+            *out.add(base + du + hu) = y1;
+            if !is_q {
+                *k_cache.add(at + du) = f2h(y0);
+                *k_cache.add(at + du + hu) = f2h(y1);
+                *v_cache.add(at + du) = f2h(v0);
+                *v_cache.add(at + du + hu) = f2h(v1);
+            }
+        }
+    }
 }
 
 fn main() {}

@@ -1546,6 +1546,7 @@ impl GdnChunkedKernels {
 
         let ptx = compile(GDN_CHUNKED_SRC, "gdn_chunked").map_err(GdnChunkedError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
             normalize: module.load_function("gdn_chunk_normalize_qk")?,
             gram: module.load_function("gdn_chunk_gram")?,
@@ -1554,7 +1555,7 @@ impl GdnChunkedKernels {
             state_update: module.load_function("gdn_chunk_state_update")?,
             scan: module.load_function("gdn_scan_prefill")?,
             scan_fold: module.load_function("gdn_scan_prefill_fold")?,
-            scan_decay: module.load_function("gdn_scan_decay")?,
+            scan_decay: rust.load_function("gdn_scan_decay")?,
             prelude: module.load_function("gdn_scan_prelude")?,
             fold: true,
             head_dim,

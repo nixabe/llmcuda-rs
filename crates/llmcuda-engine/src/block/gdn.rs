@@ -5454,3 +5454,5 @@ mod tests {
 
 #[cfg(test)]
 mod normalization_tests;
+#[cfg(test)]
+mod rust_parity;

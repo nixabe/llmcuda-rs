@@ -182,7 +182,7 @@ const STATE_JT: u32 = 4;
 const STATE_VLANES: u32 = 8;
 const STATE_JLANES: u32 = 32;
 
-const GDN_CHUNKED_SRC: &str = r#"
+pub(crate) const GDN_CHUNKED_SRC: &str = r#"
 extern "C" {
 
 // Sum across a block of up to 1024 threads. Identical to the recurrent

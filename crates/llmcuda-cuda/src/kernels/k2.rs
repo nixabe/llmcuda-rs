@@ -370,15 +370,20 @@ pub struct K2Kernels {
     combine_residual: CudaFunction,
     gate: CudaFunction,
 }
+/// The compiled source: the quant unpackers `MOE_SRC` already has, then the K2
+/// kernels.
+pub(crate) fn source() -> String {
+    let prologue = super::moe::MOE_SRC
+        .split("// The GEMM prologue, with the format")
+        .next()
+        .unwrap();
+    format!("{prologue}\n{SRC}")
+}
 impl K2Kernels {
     /// Reuse the existing, tested quant unpackers; compile only their helpers.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, MoeError> {
-        let prologue = super::moe::MOE_SRC
-            .split("// The GEMM prologue, with the format")
-            .next()
-            .unwrap();
-        let src = format!("{prologue}\n{SRC}");
-        let module = ctx.load_module(compile(&src, "k2_horizon").map_err(MoeError::Compile)?)?;
+        let module =
+            ctx.load_module(compile(&source(), "k2_horizon").map_err(MoeError::Compile)?)?;
         Ok(Self {
             norm: module.load_function("k2_norm")?,
             route: module.load_function("k2_route")?,

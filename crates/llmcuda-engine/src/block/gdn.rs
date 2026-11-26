@@ -2584,6 +2584,9 @@ impl GdnBlock {
 
         let ptx = compile(GDN_BLOCK_SRC, "gdn_block").map_err(GdnBlockError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
+            llmcuda_cuda::kernels::RUST_KERNELS_PTX,
+        ))?;
 
         Ok(Self {
             layer_ops,
@@ -2641,11 +2644,11 @@ impl GdnBlock {
             alpha_beta_gates_q8_t1: module.load_function("gdn_alpha_beta_gates_q8_t1")?,
             alpha_beta_gates_q6k: module.load_function("gdn_alpha_beta_gates_q6k")?,
             alpha_beta_gates_q6k_t1: module.load_function("gdn_alpha_beta_gates_q6k_t1")?,
-            silu: module.load_function("gdn_silu")?,
-            split: module.load_function("gdn_split_qkv")?,
+            silu: rust.load_function("gdn_silu")?,
+            split: rust.load_function("gdn_split_qkv")?,
             silu_split: module.load_function("gdn_silu_split_qkv")?,
             conv_silu_split_step_batch: module.load_function("gdn_conv_silu_split_step_batch")?,
-            gates: module.load_function("gdn_gates")?,
+            gates: rust.load_function("gdn_gates")?,
             scratch: None,
             mixer: Mixer::Chunked,
             geometry,

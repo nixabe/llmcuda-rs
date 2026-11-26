@@ -1,13 +1,13 @@
 # Rust layer kernels
 
-This standalone experiment compiles `src/main.rs` with cuda-oxide from
+This standalone crate compiles `src/main.rs` with cuda-oxide from
 [NVIDIA/cuda-rust](https://github.com/NVIDIA/cuda-rust) at
 `f35d6ccc2e03a54e73e3796f415f11313e439d50` (0.4.0, Rust 1.99.1 with `rustc-dev`). The
 compiler used to live at `NVlabs/cuda-oxide`, which now redirects to that
 monorepo; cuda-oxide is its `cuda-oxide/` directory.
 The engine loads the result through cudarc. Which kernels launch from it, and
 what a port has to show before it does, is in
-[DEVELOPMENT.md](../../docs/DEVELOPMENT.md#rust-cuda-kernels). Normal builds
+[DEVELOPMENT.md](../docs/DEVELOPMENT.md#rust-cuda-kernels). Normal builds
 need no cuda-oxide. The embedded PTX is generated code, not an independently
 maintained kernel.
 
@@ -28,7 +28,7 @@ set `CUDA_OXIDE_BACKEND` to the matching `librustc_codegen_cuda.so`. Both must
 come from the pinned revision. Regenerate from the repository root:
 
 ```sh
-python3 experiments/cuda-oxide/regenerate.py
+python3 device-kernels/regenerate.py
 git diff -- crates/llmcuda-cuda/src/kernels/rust/tensor_add.ptx
 ```
 
@@ -106,7 +106,7 @@ here, each of which made a bit-identical port look like it had to stay C++:
 
 Non-coherent loads (`ld.global.nc`) and unrolling without grouping did not
 help. Measured results are in
-[BENCHMARKS.md](../../docs/BENCHMARKS.md#rust-kernel-authoring-can-keep-the-existing-launcher).
+[BENCHMARKS.md](../docs/BENCHMARKS.md#rust-kernel-authoring-can-keep-the-existing-launcher).
 
 The tiled attention kernel `attn_rope_partial_neox` reuses frequencies over
 16 tokens and reads the base position from device memory. Grids of at most 72

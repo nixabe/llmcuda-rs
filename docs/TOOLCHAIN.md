@@ -45,7 +45,7 @@ repository, [NVIDIA/cuda-rust `f35d6ccc`](https://github.com/NVIDIA/cuda-rust/tr
   13.2 for Ampere, Ada and Blackwell, 13.3 for Hopper. Nothing in it can be
   built for or run on the deployment cards, so it has never been measured here.
 
-[`experiments/cuda-oxide`](../experiments/cuda-oxide) holds the Rust source
+[`device-kernels`](../device-kernels) holds the Rust source
 of the ported kernels, with the raw-pointer ABIs and supported input/output
 aliasing their launchers in `layer_ops.rs` and `attention.rs` expect. For most
 of them it is the only source: the CUDA C++ was deleted once the port matched
@@ -68,7 +68,7 @@ rows and one ulp away from the fused CUDA C++ paths; the ones in the tree
 reduce in the original's order and are bit-identical.
 
 The compiler's host crates (`cuda-core`/`cuda-bindings`) require a CUDA 13.0+
-toolkit, which the engine does not; the experiment's README records how one
+toolkit, which the engine does not; the crate's README records how one
 was assembled beside the host's CUDA 12.8. Ordinary engine builds continue to
 use NVRTC for every kernel that is not embedded PTX.
 

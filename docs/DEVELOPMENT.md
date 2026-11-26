@@ -60,7 +60,7 @@ A kernel moves when its Rust port
 3. does not cost the model anything measurable in an interleaved A/B.
 
 It does not have to be faster. Once it has moved, the CUDA C++ is deleted and
-the Rust in [`experiments/cuda-oxide`](../experiments/cuda-oxide) is the only
+the Rust in [`device-kernels`](../device-kernels) is the only
 source; from then on the kernel is held by its CPU-reference test and by the
 tests that compare it exactly with the fused CUDA C++ paths. For step 1, load
 the kernel from both modules in a test (the commit that moved RMSNorm and the
@@ -85,7 +85,7 @@ between them.
 
 The embedded PTX is checked in, so no build needs cuda-oxide or CUDA toolkit
 headers. Regenerating it uses the separate toolchain in
-[`experiments/cuda-oxide`](../experiments/cuda-oxide). See
+[`device-kernels`](../device-kernels). See
 [TOOLCHAIN.md](TOOLCHAIN.md#rust-compiler-evaluation).
 
 ## Reference checkouts

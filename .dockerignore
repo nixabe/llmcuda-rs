@@ -2,6 +2,13 @@
 # tens of gigabytes and would be uploaded to the daemon on every build; the
 # builder stage keeps its own compilation cache in a BuildKit cache mount.
 /target
+# The kernel crate is a separate workspace with its own build tree and
+# compiler intermediates; the engine build reads only its sources.
+/device-kernels/target
+/device-kernels/.oxide-artifacts
+/device-kernels/*.ll
+/device-kernels/*.ptx
+/device-kernels/*.cubin
 /.git
 /.github
 

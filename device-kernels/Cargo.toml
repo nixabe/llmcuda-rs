@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
-# Keep the experimental compiler's nightly and dependencies out of the engine.
+# Keep the kernel compiler's toolchain and dependencies out of the engine.
 [workspace]
 
 [dependencies]

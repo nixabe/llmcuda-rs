@@ -694,7 +694,7 @@ from Rust, with the small MoE, Gated DeltaNet, K2, sampling, embedding,
 vision and decision kernels listed at `RUST_KERNELS_PTX`; the GEMVs, GEMMs,
 flash attention and the chunked Gated DeltaNet scan are CUDA C++. No kernel
 exists in both languages. Toolchain pin:
-[TOOLCHAIN.md](TOOLCHAIN.md), [`experiments/cuda-oxide`](../experiments/cuda-oxide).
+[TOOLCHAIN.md](TOOLCHAIN.md), [`device-kernels`](../device-kernels).
 The dense model and three-card serving were not measured.
 
 Kernel tables: twelve alternating CUDA-event pairs on GPU 0 (two processes of

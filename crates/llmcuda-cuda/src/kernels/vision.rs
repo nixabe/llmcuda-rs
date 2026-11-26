@@ -38,7 +38,7 @@ use super::compile;
 /// CUDA C++ source for the elementwise and reduction kernels.
 ///
 /// Kept as one translation unit so the whole set is one NVRTC invocation.
-pub(crate) const VISION_SRC: &str = r#"
+const VISION_SRC: &str = r#"
 extern "C" {
 
 // binary16 <-> fp32 by hand: NVRTC compiles from a string with no include
@@ -116,96 +116,6 @@ __global__ void vision_layer_norm(
         float b = h2f(beta[j]);
         float centered = (h2f(row[j]) - mean) * inv;
         dst[j] = f2h(centered * g + b);
-    }
-}
-
-// Rotates the query and key slices of the fused qkv buffer in place.
-// Layout per token: [q 0..hidden | k hidden..2*hidden | v untouched],
-// heads of head_dim within each slice. positions holds (row, col) per
-// token. Pairs (j, j + head_dim/2); pairs below the quarter rotate by the
-// patch row, the rest by the column, each with frequencies restarting at
-// theta^0 — GGML_ROPE_TYPE_VISION with independent sections, see
-// llmcuda_kernels::vision::tower.
-__global__ void vision_rope_qk(
-    unsigned short* __restrict__ qkv,
-    const int* __restrict__ positions,
-    int hidden,
-    int head_dim,
-    float theta_base)
-{
-    int token = blockIdx.x;
-    int slice = blockIdx.y;         // 0 = q, 1 = k
-    int head = blockIdx.z;
-    int j = threadIdx.x;            // pair index, [0, head_dim/2)
-    int half_dim = head_dim >> 1;
-    int quarter = head_dim >> 2;
-    if (j >= half_dim) return;
-
-    unsigned short* base = qkv + (long long)token * 3 * hidden + slice * hidden + head * head_dim;
-    int pos = j < quarter ? positions[2 * token] : positions[2 * token + 1];
-    int k = j < quarter ? j : j - quarter;
-    float freq = powf(theta_base, -(float)k / (float)quarter);
-    float angle = (float)pos * freq;
-    float sin_a, cos_a;
-    sincosf(angle, &sin_a, &cos_a);
-    float x0 = h2f(base[j]);
-    float x1 = h2f(base[j + half_dim]);
-    base[j] = f2h(x0 * cos_a - x1 * sin_a);
-    base[j + half_dim] = f2h(x0 * sin_a + x1 * cos_a);
-}
-
-__global__ void vision_softmax_rows(
-    unsigned short* __restrict__ scores,
-    int row_len)
-{
-    // One block per row, rows are (batch * n) in grid.x.
-    unsigned short* row = scores + (long long)blockIdx.x * row_len;
-    __shared__ float warp_red[32];
-
-    float local_max = -3.4e38f;
-    for (int j = threadIdx.x; j < row_len; j += blockDim.x) {
-        local_max = fmaxf(local_max, h2f(row[j]));
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffu, local_max, off));
-    }
-    if ((threadIdx.x & 31) == 0) warp_red[threadIdx.x >> 5] = local_max;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        int warps = (blockDim.x + 31) >> 5;
-        float v = threadIdx.x < warps ? warp_red[threadIdx.x] : -3.4e38f;
-        for (int off = 16; off > 0; off >>= 1) {
-            v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
-        }
-        if (threadIdx.x == 0) warp_red[0] = v;
-    }
-    __syncthreads();
-    float row_max = warp_red[0];
-    __syncthreads();
-
-    float total = 0.0f;
-    for (int j = threadIdx.x; j < row_len; j += blockDim.x) {
-        float e = expf(h2f(row[j]) - row_max);
-        row[j] = f2h(e);
-        total += e;
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        total += __shfl_down_sync(0xffffffffu, total, off);
-    }
-    if ((threadIdx.x & 31) == 0) warp_red[threadIdx.x >> 5] = total;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        int warps = (blockDim.x + 31) >> 5;
-        float v = threadIdx.x < warps ? warp_red[threadIdx.x] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down_sync(0xffffffffu, v, off);
-        }
-        if (threadIdx.x == 0) warp_red[0] = v;
-    }
-    __syncthreads();
-    float inv = 1.0f / warp_red[0];
-    for (int j = threadIdx.x; j < row_len; j += blockDim.x) {
-        row[j] = f2h(h2f(row[j]) * inv);
     }
 }
 
@@ -326,8 +236,8 @@ impl VisionKernels {
         Ok(Self {
             layer_norm: f("vision_layer_norm")?,
             gelu: r("vision_gelu")?,
-            rope_qk: f("vision_rope_qk")?,
-            softmax_rows: f("vision_softmax_rows")?,
+            rope_qk: r("vision_rope_qk")?,
+            softmax_rows: r("vision_softmax_rows")?,
             add_f16: r("vision_add_f16")?,
             half_to_float: r("vision_half_to_float")?,
             blas: CudaBlasLT::new(stream)?,

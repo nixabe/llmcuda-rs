@@ -1990,7 +1990,10 @@ mod kernels {
         }
     }
 
-    /// The binary16 scale at the head of a Q8_0 block, little-endian.
+    /// A binary16 block scale stored as two little-endian bytes, widened by
+    /// the hardware conversion, so it is bit-identical to the `half` crate's
+    /// `to_f32` on the host. The quantizer emits subnormal scales for
+    /// near-zero blocks, so that path is exercised.
     ///
     /// # Safety
     /// p covers two bytes.

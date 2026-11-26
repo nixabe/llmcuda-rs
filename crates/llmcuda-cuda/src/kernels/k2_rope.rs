@@ -10,7 +10,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use std::sync::Arc;
-pub(crate) const SRC: &str = r#"
+const SRC: &str = r#"
 __device__ __forceinline__ unsigned long long slot(int n,unsigned long long p0,unsigned long long p1,unsigned long long p2,unsigned long long p3,unsigned long long p4,unsigned long long p5,unsigned long long p6,unsigned long long p7){switch(n){case 0:return p0;case 1:return p1;case 2:return p2;case 3:return p3;case 4:return p4;case 5:return p5;case 6:return p6;default:return p7;}}
 __device__ __forceinline__ unsigned short half_bits(float v){unsigned short h;asm("cvt.rn.f16.f32 %0,%1;":"=h"(h):"f"(v));return h;}
 #if KV_KQ8 || KV_VQ8
@@ -25,15 +25,6 @@ __device__ __forceinline__ void kv8_store(unsigned short* cache,int q8,long long
 }
 #endif
 extern "C" {
-__global__ void k2_rotary_prepare(float* coefficients,int chunk,int rope_dim,float theta,int offset,
- unsigned long long p0,unsigned long long p1,unsigned long long p2,unsigned long long p3,unsigned long long p4,unsigned long long p5,unsigned long long p6,unsigned long long p7){
- int t=blockIdx.x*8+threadIdx.y,d=threadIdx.x,seq=blockIdx.y;if(t>=chunk || d>=rope_dim/2)return;
- const int* position=(const int*)slot(seq,p0,p1,p2,p3,p4,p5,p6,p7);
- double freq=pow((double)theta,-2.0*(double)d/(double)rope_dim);
- double pos=(double)(*position)+(double)t,angle=pos*freq;
- long long at=((long long)offset+seq*chunk+t)*rope_dim+2*d;
- coefficients[at]=(float)sin(angle);coefficients[at+1]=(float)cos(angle);
-}
 __global__ void k2_rotary_append(const float* q,float* qr,const float* k,float* kr,const float* v,const float* coefficients,
  unsigned long long ap0,unsigned long long ap1,unsigned long long ap2,unsigned long long ap3,unsigned long long ap4,unsigned long long ap5,unsigned long long ap6,unsigned long long ap7,
  unsigned long long kc0,unsigned long long kc1,unsigned long long kc2,unsigned long long kc3,unsigned long long kc4,unsigned long long kc5,unsigned long long kc6,unsigned long long kc7,
@@ -140,7 +131,7 @@ impl K2Rope {
         let module = ctx.load_module(compile(&source, "k2_rotary").map_err(MoeError::Compile)?)?;
         let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
-            prepare: module.load_function("k2_rotary_prepare")?,
+            prepare: rust.load_function("k2_rotary_prepare")?,
             apply: rust.load_function("k2_rotary_apply")?,
             append: module.load_function("k2_rotary_append")?,
             coefficients: stream.alloc_zeros(tokens * rope_dim)?,

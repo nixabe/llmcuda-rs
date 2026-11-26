@@ -36,8 +36,6 @@ use cudarc::driver::{
     CudaContext, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
 
-use super::compile;
-
 /// Elements per Q8_0 block.
 pub const QK8_0: usize = 32;
 /// Elements per k-quant superblock.
@@ -46,84 +44,6 @@ pub const QK_K: usize = 256;
 pub const BLOCK_Q8_0_BYTES: usize = 34;
 /// Serialized bytes per Q6_K superblock.
 pub const BLOCK_Q6_K_BYTES: usize = 210;
-
-/// CUDA C++ for both formats.
-///
-/// The blocks are read as raw bytes rather than through a struct, because the
-/// on-disk layout is packed and C++ struct padding rules would need
-/// `__attribute__((packed))` to match — a difference that would show up as
-/// every block after the first being misaligned.
-pub(crate) const DEQUANT_SRC: &str = r#"
-extern "C" {
-
-// Reinterpret two little-endian bytes as an IEEE half and widen to float.
-//
-// This uses the `cvt.f32.f16` PTX instruction directly rather than
-// `__half2float` from <cuda_fp16.h>. NVRTC compiles from a string with no
-// include path, so the toolkit headers are not reachable — and pulling them
-// in would make the crate need a CUDA *toolkit* at runtime rather than just
-// a driver, which is the whole point of `fallback-dynamic-loading`.
-//
-// Hand-rolling the widening in C++ would also work but has to get subnormal
-// halves right; the quantizer emits subnormal deltas for near-zero blocks, so
-// that path is exercised. `cvt.f32.f16` is the same hardware conversion
-// `__half2float` lowers to, which is what makes the result bit-identical to
-// the `half` crate's `to_f32` on the host. Inline PTX on sm_75 is verified
-// by the milestone-00 spike (`spike::inline_ptx`).
-__device__ __forceinline__ float load_half_le(const unsigned char* p) {
-    unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
-    float f;
-    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(bits));
-    return f;
-}
-
-// One thread per (superblock, half, l) triple; each writes four outputs.
-//
-// The superblock is processed as two 128-element halves. Within a half, 32
-// positions `l` each address four interleaved 6-bit codes at flat offsets
-// l, l+32, l+64, l+96, and `is = l/16` selects which of two per-16-element
-// int8 scales applies to each. Every code is (low4 | high2<<4) - 32, i.e. an
-// unsigned 6-bit value re-centered to [-32, 31].
-__global__ void dequantize_q6_k(
-    const unsigned char* __restrict__ src,
-    float* __restrict__ dst,
-    long long n_superblocks
-) {
-    long long t = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-    long long total = n_superblocks * 64;
-    if (t >= total) return;
-
-    long long sb = t / 64;
-    int rem  = (int)(t % 64);
-    int half = rem / 32;
-    int l    = rem % 32;
-
-    const unsigned char* base = src + sb * 210;
-    const unsigned char* ql = base + half * 64;
-    const unsigned char* qh = base + 128 + half * 32;
-    const signed char*   sc = (const signed char*)(base + 192 + half * 8);
-    float d = load_half_le(base + 208);
-
-    int is = l / 16;
-
-    int raw1 = (ql[l]      & 0xF) | ((qh[l] & 3) << 4);
-    int raw2 = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
-    int raw3 = (ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4);
-    int raw4 = (ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4);
-
-    float* y = dst + sb * 256 + half * 128;
-
-    // Operand order matches the scalar reference exactly: (d * scale) * q.
-    // Reassociating to d * (scale * q) is mathematically equal and rounds
-    // differently, which would cost bit-identical agreement for nothing.
-    y[l]      = d * (float)sc[is]     * (float)(raw1 - 32);
-    y[l + 32] = d * (float)sc[is + 2] * (float)(raw2 - 32);
-    y[l + 64] = d * (float)sc[is + 4] * (float)(raw3 - 32);
-    y[l + 96] = d * (float)sc[is + 6] * (float)(raw4 - 32);
-}
-
-}
-"#;
 
 /// Compiled dequantization kernels, ready to launch.
 pub struct Dequantizer {
@@ -179,12 +99,10 @@ const THREADS: u32 = 256;
 impl Dequantizer {
     /// Compile the kernels for `ctx`.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, DequantError> {
-        let ptx = compile(DEQUANT_SRC, "dequant").map_err(DequantError::Compile)?;
-        let module = ctx.load_module(ptx)?;
         let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
             q8_0: rust.load_function("dequantize_q8_0")?,
-            q6_k: module.load_function("dequantize_q6_k")?,
+            q6_k: rust.load_function("dequantize_q6_k")?,
         })
     }
 
@@ -286,7 +204,8 @@ mod tests {
         // operand order `d * scale * q`. This guards the comment above from
         // being quietly invalidated by a "simplification".
         assert!(
-            DEQUANT_SRC.contains("d * (float)sc[is]     * (float)(raw1 - 32)"),
+            crate::kernels::rust_kernel_source("dequantize_q6_k")
+                .contains("*y.add(l) = d * *sc.add(is) as f32 * (raw1 - 32) as f32;"),
             "Q6_K reassociated away from (d * scale) * q",
         );
         assert!(
@@ -304,6 +223,9 @@ mod tests {
             crate::kernels::rust_kernel_source("dequantize_q8_0")
                 .contains("*base.add(2 + (i % 32) as usize) as i8")
         );
-        assert!(DEQUANT_SRC.contains("(const signed char*)(base + 192"));
+        assert!(
+            crate::kernels::rust_kernel_source("dequantize_q6_k")
+                .contains("let sc = base.add(192 + half * 8) as *const i8;")
+        );
     }
 }

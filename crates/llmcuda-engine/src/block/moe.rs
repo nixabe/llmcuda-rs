@@ -269,33 +269,11 @@ pub(crate) const RMS_EPS_SUFFIX: &str = "attention.layer_norm_rms_epsilon";
 /// Every launch shape here comes from the geometry and the token count lives
 /// in the same `valid_tokens` device scalar the MoE kernels already gate on,
 /// so adding these does not cost the sequence its capturability.
-pub(crate) const GLUE_SRC: &str = r#"
+const GLUE_SRC: &str = r#"
 #define MOE_GATE_LANES 256
 extern "C" {
 
 extern __shared__ float llmcuda_moe_block_shared[];
-
-// Warp shuffles then one pass through shared memory. Copied from
-// `kernels/moe.rs` verbatim so the router projection's summation order
-// matches the one the routed GEMM already uses.
-__device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffff, v, offset);
-    }
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    if (lane == 0) scratch[warp] = v;
-    __syncthreads();
-
-    int n_warps = (blockDim.x + 31) >> 5;
-    float total = 0.0f;
-    if (threadIdx.x == 0) {
-        for (int w = 0; w < n_warps; ++w) total += scratch[w];
-        scratch[0] = total;
-    }
-    __syncthreads();
-    return scratch[0];
-}
 
 // logits[t][e] = dot(ffn_gate_inp row e, normed[t]).
 //
@@ -633,119 +611,6 @@ __global__ void __launch_bounds__(32 * EW) NAME(                               \
 // is what the one-warp shape is bound by at depth.
 ROUTER_LOGITS_WIDE(moe_block_router_logits_wide,    1)
 ROUTER_LOGITS_WIDE(moe_block_router_logits_wide_w8, 8)
-
-// The shared expert's gate and the combine that consumes it, in one launch.
-//
-// `moe_block_shared_gate` and `moe_block_combine` were two kernels with the
-// same grid — one block per token — where the first produced one scalar per
-// block and the second immediately read it. Two launches, a round trip
-// through global memory, and two kernel-launch floors for a total of about
-// 4,100 arithmetic operations per token.
-//
-// A decode step issues roughly 1,100 device operations, and the smallest of
-// them measure 2.5 us each against kernels that average 8.6: at this shape
-// the launch floor, not the work, is what the glue costs. This pair merged
-// cleanly because the dependency is *within* a block — the gate a block needs
-// is the one that block computed — so a `__syncthreads()` replaces a launch.
-//
-// `gate` is still written. Nothing downstream reads it, but it is the
-// quantity `build_layer_ffn` names and a differential test that wants to see
-// the gate on its own should not have to infer it from the output.
-//
-// Two outputs rather than one because the golden capture has a waypoint
-// either side of the residual add (`ffn_out-N` and `l_out-N`), and keeping
-// both makes a block that got the residual source wrong fail at `l_out` with
-// `ffn_out` still clean.
-//
-// The operand order is `build_layer_ffn`'s: the shared expert is gated first,
-// then added to the routed sum with the routed sum on the left.
-//
-// It also performs the routed sum itself, which `moe_reduce` used to do in a
-// launch of its own: `routed[t][j]` is the ascending-k sum of the `top_k`
-// contributions `MoeKernels::grouped_forward_partial` leaves in `partial`.
-// The loop is ascending and stays inside one thread, so it is the reference's
-// order and `moe_reduce`'s order alike, and the result is still written out
-// because `ffn_moe_out-N` is a golden waypoint `tests/moe_block.rs` gates on.
-//
-// grid: (max_tokens, Y), where the `Y` blocks of a token share its row
-// between them: block `y` takes the elements `y * blockDim.x + threadIdx.x`
-// and then every `Y * blockDim.x` after that. Two shapes are launched.
-//
-// - `Y = ceil(hidden / blockDim.x)` at decode width: one trip a block. This
-//   kernel moves `top_k * hidden` floats per token, and one block per token
-//   would put 64 KiB of that on a single one of the card's 72 SMs -- the
-//   failure mode `moe_reduce` had before it was split the same way. The
-//   price is that all `Y` blocks recompute the gate's dot product; it reads
-//   the same 16 KiB every time, so it is an L2 hit rather than a second trip
-//   to DRAM, and it is cheaper than the launch it replaces.
-// - `Y = 1` at prefill width, where there are more tokens than SMs and the
-//   split buys no parallelism: one block walks the whole row and the gate is
-//   computed once. Seven of the eight gate reads were 400 MB a layer at
-//   6,138 tokens on a kernel that is bound by its traffic.
-//
-// The two are bit-identical: the gate's lanes and reduction do not depend on
-// `Y`, and every output element is the same expression of the same operands.
-__global__ void moe_block_gate_and_combine(
-    const float* __restrict__ w,
-    const float* __restrict__ normed,
-    const float* __restrict__ partial,
-    const float* __restrict__ shexp,
-    const float* __restrict__ residual,
-    const int* __restrict__ valid_tokens,
-    int top_k,
-    int hidden,
-    float* __restrict__ gate,
-    float* __restrict__ routed,
-    float* __restrict__ ffn_out,
-    float* __restrict__ l_out
-) {
-    int t = blockIdx.x;
-    if (t >= *valid_tokens) return;
-
-    long long base = (long long)t * hidden;
-    const float* xs = normed + base;
-
-    // `1 / (1 + exp(-x))` is `ggml_sigmoid`'s own formula, and `expf` rather
-    // than the fast intrinsic for the same reason `layer_ops.rs`'s SwiGLU
-    // uses it: that intrinsic's error is relative to the result, not to the
-    // exponent. A drift test below asserts the intrinsic's name does not
-    // appear anywhere in this kernel, so do not name it here either.
-    // **The dot product runs on the first MOE_GATE_LANES threads only, at
-    // that stride, whatever the block's width is.** The gate is a
-    // floating-point sum, and widening *it* from 256 lanes to 1,024
-    // reassociates 2,048 products. That is not a hypothetical: it moved the
-    // gate enough for `tests/forward_pass.rs` to report block 31's relative
-    // error against llama.cpp growing 4.82x with the absolute error growing
-    // too, which is the shape of a real change rather than a magnitude
-    // collapse.
-    //
-    // Threads past MOE_GATE_LANES contribute a literal zero; `block_reduce_sum`
-    // sums the per-warp partials ascending, so those zeros land in the same
-    // places whatever the block's width is and the total is bit-identical at
-    // any width at or above MOE_GATE_LANES.
-    float s = 0.0f;
-    if (threadIdx.x < MOE_GATE_LANES) {
-        for (int j = threadIdx.x; j < hidden; j += MOE_GATE_LANES) {
-            s += w[j] * xs[j];
-        }
-    }
-    // Returns the total to every thread, which is what makes the barrier it
-    // already contains do double duty here.
-    s = block_reduce_sum(s, llmcuda_moe_block_shared);
-    float g = 1.0f / (1.0f + expf(-s));
-    if (threadIdx.x == 0 && blockIdx.y == 0) gate[t] = g;
-
-    long long pbase = (long long)t * top_k * hidden;
-    int step = gridDim.y * blockDim.x;
-    for (int j = blockIdx.y * blockDim.x + threadIdx.x; j < hidden; j += step) {
-        float r = 0.0f;
-        for (int k = 0; k < top_k; ++k) r += partial[pbase + (long long)k * hidden + j];
-        float v = r + shexp[base + j] * g;
-        routed[base + j] = r;
-        ffn_out[base + j] = v;
-        l_out[base + j]   = v + residual[base + j];
-    }
-}
 
 }
 "#;
@@ -1224,6 +1089,9 @@ impl MoeBlock {
         let layer_ops = LayerOpsKernels::new(ctx)?;
         let ptx = compile(GLUE_SRC, "moe_block").map_err(MoeBlockError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
+            llmcuda_cuda::kernels::RUST_KERNELS_PTX,
+        ))?;
         let buffers = moe.buffers(stream)?;
 
         let n = geometry.max_tokens * geometry.hidden;
@@ -1237,7 +1105,7 @@ impl MoeBlock {
             ],
             router_wide_min_tokens: router_wide_min_tokens_from_env(),
             router_wide_full_min_tokens: ROUTER_WIDE_FULL_MIN_TOKENS,
-            combine_fn: module.load_function("moe_block_gate_and_combine")?,
+            combine_fn: rust.load_function("moe_block_gate_and_combine")?,
             combine_row_min_tokens: combine_row_min_tokens_from_env(),
             moe,
             layer_ops,
@@ -1818,26 +1686,23 @@ mod tests {
         // implementation is most likely to leave out entirely: the gate must
         // be `1/(1+exp(-x))` of a dot product against a `[hidden]` vector, and
         // it must multiply the shared expert only — not the routed sum.
-        assert!(GLUE_SRC.contains("float g = 1.0f / (1.0f + expf(-s));"));
-        assert!(GLUE_SRC.contains("gate[t] = g;"));
+        // The kernel is Rust; these are its lines.
+        let combine = llmcuda_cuda::kernels::rust_kernel_source("moe_block_gate_and_combine");
+        assert!(combine.contains("let g = 1.0 / (1.0 + (-s).exp());"));
+        assert!(combine.contains("*gate.add(t as usize) = g;"));
         // The gate multiplies the shared expert alone, and the routed sum is
         // added to the gated result rather than gated with it.
-        assert!(GLUE_SRC.contains("float v = r + shexp[base + j] * g;"));
+        assert!(combine.contains("let v = (*shexp.add(at)).mul_add(g, r);"));
         assert!(
-            GLUE_SRC.contains("for (int k = 0; k < top_k; ++k) r += partial["),
+            combine.contains("while k < top_k {\n                    r += *p;"),
             "the routed sum this combine folded in must stay an ascending-k \
              accumulation inside one thread",
         );
         // Mirrored, because `COMBINE_THREADS` derives from it and the gate's
         // summation order depends on the two agreeing.
         assert!(GLUE_SRC.contains(&format!("#define MOE_GATE_LANES {GATE_LANES}")));
-        let start = GLUE_SRC
-            .find("void moe_block_gate_and_combine")
-            .expect("the fused gate-and-combine kernel is present");
-        assert!(
-            !GLUE_SRC[start..].contains("__expf"),
-            "the shared gate reverted to the fast intrinsic",
-        );
+        assert!(combine.contains(&format!("if tid < {GATE_LANES} {{")));
+        assert!(combine.contains(&format!("j += {GATE_LANES};")));
     }
 
     #[test]
@@ -1866,8 +1731,9 @@ mod tests {
         // so the block must produce both. Folding the residual into `ffn_out`
         // would still give the right `l_out` and would fail the golden's
         // intermediate waypoint — which is the point of having it.
-        assert!(GLUE_SRC.contains("ffn_out[base + j] = v;"));
-        assert!(GLUE_SRC.contains("l_out[base + j]   = v + residual[base + j];"));
+        let combine = llmcuda_cuda::kernels::rust_kernel_source("moe_block_gate_and_combine");
+        assert!(combine.contains("*ffn_out.add(at) = v;"));
+        assert!(combine.contains("*l_out.add(at) = v + *residual.add(at);"));
     }
 
     #[test]
@@ -1880,15 +1746,19 @@ mod tests {
             GLUE_SRC
                 .matches("const int* __restrict__ valid_tokens")
                 .count(),
-            4
+            3
         );
+        // The combine is Rust and takes the same device scalar.
+        let combine = llmcuda_cuda::kernels::rust_kernel_source("moe_block_gate_and_combine");
+        assert!(combine.contains("valid_tokens: *const i32,"));
+        assert!(combine.contains("if t >= *valid_tokens as i64 {"));
         // *Reading* it, not one particular spelling of the guard. The router
         // early-returned on it until it was tiled; now a warp carries eight
         // tokens, so it reads the scalar once and gates the store instead.
         // Asserting the `return` form would have made a correct rewrite look
         // like a rule-5 violation, which is the opposite of what this test is
         // for.
-        assert_eq!(GLUE_SRC.matches("*valid_tokens").count(), 3);
+        assert_eq!(GLUE_SRC.matches("*valid_tokens").count(), 2);
         // What rule 5 actually forbids: a launch bound the host had to know.
         // `max_tokens` may size a grid — it is a geometry constant — but no
         // kernel may compare against a *count* passed by value.

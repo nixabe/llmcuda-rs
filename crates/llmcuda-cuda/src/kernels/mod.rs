@@ -27,8 +27,6 @@ pub mod layer_ops;
 pub mod lm_head;
 pub mod mma;
 pub mod moe;
-#[cfg(test)]
-mod rust_parity;
 pub mod vision;
 
 use std::collections::HashMap;
@@ -64,7 +62,9 @@ pub const TARGET_ARCH: &str = "compute_75";
 /// `dec_attention_combine`, `dec_layer_norm`, `k2_rotary_apply`,
 /// `attn_flash_decode_combine_k2_batch`, `embed_q8_0`, `dequantize_q8_0`,
 /// `gdn_silu_split_qkv`, `gdn_conv_silu_split_step_batch`,
-/// `gdn_normalize_qk`, `gdn_chunk_normalize_qk` and `dense_rms_norm_narrow`.
+/// `gdn_normalize_qk`, `gdn_chunk_normalize_qk`, `dense_rms_norm_narrow`,
+/// `dequantize_q6_k`, `vision_softmax_rows`, `vision_rope_qk`,
+/// `k2_rotary_prepare` and `moe_block_gate_and_combine`.
 ///
 /// Both languages: `sigmoid_gate_mul` launches from here in its elementwise
 /// shape and `attn_rope_partial_neox` on small grids. Their other shapes, and

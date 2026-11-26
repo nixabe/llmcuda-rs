@@ -704,21 +704,22 @@ GPU 0, only the switch different, order rotated each round, box quiet; cells
 are round 0 / 1 / 2. Register counts are offline CUDA 12.8
 `ptxas -arch=sm_75`, not the driver's JIT.
 
-Every kernel that launches from Rust (70 entry points) against the all-C++
+Every kernel that launches from Rust (84 entry points) against the all-C++
 build, Qwen3.6:
 
 | N=3 | CUDA C++ tok/s | Rust kernels tok/s |
 | --- | --- | --- |
-| Decode at 2,048 per sequence, 64 steps after 4 warmup | 219.5 / 219.4 / 219.6 | 220.6 / 220.5 / 220.8 |
-| Decode at 32,768 per sequence, 64 steps after 4 warmup | 166.4 / 166.3 / 166.3 | 167.1 / 167.2 / 167.7 |
-| Prefill, one 2,048-token pass, 5 timed repetitions | 3668.36 / 3668.79 / 3657.43 | 3670.27 / 3674.18 / 3673.50 |
+| Decode at 2,048 per sequence, 64 steps after 4 warmup | 218.8 / 219.0 / 211.1 | 220.1 / 220.2 / 219.8 |
+| Decode at 32,768 per sequence, 64 steps after 4 warmup | 165.5 / 165.7 / 165.7 | 166.5 / 165.7 / 166.1 |
+| Prefill, one 2,048-token pass, 5 timed repetitions | 3662.25 / 3651.73 / 3652.16 | 3659.99 / 3662.05 / 3656.85 |
 
-Decode is 0.5% higher from Rust in every round at both depths, outside the
-rounds' own spread; the decode step's router is the largest kernel-level gain
-on that path (about 1.4 us a launch). Prefill is inside its within-process
-standard deviation (6.69–15.77 tok/s C++, 3.32–18.12 Rust). The moves
-are for one source language, not for speed. The dense model, the vision tower,
-the decision head and K2 are covered at kernel level only.
+The 211.1 is one stalled step (p50 13.69 ms against a 14.21 ms mean, latency
+sd 4.28 ms), not a slower build. Decode at 2K is 0.6% higher from Rust in the
+two clean rounds; at 32K it is between level and 0.6% higher. Prefill is
+inside its within-process standard deviation (3.09-24.33 tok/s C++,
+9.64-20.64 Rust). The moves are for one source language, not for speed. The
+dense model, the vision tower, the decision head and K2 are covered at kernel
+level only.
 
 **The compiler revision does not move these numbers.** PTX from cuda-oxide
 0.2.1 (`26754ae5`) and 0.4.0 (`f35d6ccc`) for the same Rust source differs by

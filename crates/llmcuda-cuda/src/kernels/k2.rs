@@ -384,6 +384,7 @@ impl K2Kernels {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, MoeError> {
         let module =
             ctx.load_module(compile(&source(), "k2_horizon").map_err(MoeError::Compile)?)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
             norm: module.load_function("k2_norm")?,
             route: module.load_function("k2_route")?,
@@ -397,10 +398,10 @@ impl K2Kernels {
             dispatch_prefix: module.load_function("k2_dispatch_prefix")?,
             dispatch_gather: module.load_function("k2_dispatch_gather")?,
             project_grouped: module.load_function("k2_project_grouped")?,
-            values: module.load_function("k2_values")?,
-            combine: module.load_function("k2_combine")?,
-            combine_residual: module.load_function("k2_combine_residual")?,
-            gate: module.load_function("k2_gate")?,
+            values: rust.load_function("k2_values")?,
+            combine: rust.load_function("k2_combine")?,
+            combine_residual: rust.load_function("k2_combine_residual")?,
+            gate: rust.load_function("k2_gate")?,
         })
     }
     /// Normalize contiguous groups with a full-width learned weight vector.

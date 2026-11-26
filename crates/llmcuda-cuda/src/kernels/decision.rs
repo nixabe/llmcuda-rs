@@ -43,13 +43,6 @@ use super::compile;
 
 /// The NVRTC translation unit.
 pub const DECISION_SRC: &str = r#"
-#define FMT_Q8_0 0
-#define FMT_BF16 1
-#define FMT_Q6K  2
-#define FMT_F16  3
-#define FMT_Q4_0 4
-#define FMT_Q4K  5
-#define FMT_Q5K  6
 
 #define GEMM_GELU    1
 #define GEMM_ACC     2
@@ -58,112 +51,9 @@ pub const DECISION_SRC: &str = r#"
 // NVRTC compiles without the toolkit headers, so no <math.h> INFINITY.
 #define DEC_INF __int_as_float(0x7f800000)
 
-__device__ __forceinline__ float warp_sum(float v) {
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
-
-__device__ __forceinline__ float warp_max(float v) {
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-    return v;
-}
-
-// Block-wide sum; blockDim.x a multiple of 32. Every thread gets the total.
-// The leading barrier makes back-to-back calls safe on the same `red`.
-__device__ float block_sum(float v, float* red) {
-    int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    v = warp_sum(v);
-    __syncthreads();
-    if (lane == 0) red[w] = v;
-    __syncthreads();
-    v = lane < nw ? red[lane] : 0.0f;
-    return warp_sum(v);
-}
-
-__device__ float block_max(float v, float* red) {
-    int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    v = warp_max(v);
-    __syncthreads();
-    if (lane == 0) red[w] = v;
-    __syncthreads();
-    v = lane < nw ? red[lane] : -DEC_INF;
-    return warp_max(v);
-}
-
 // PyTorch's default GELU, the exact erf form (`ggml_gelu_erf`).
 __device__ __forceinline__ float gelu_erf(float x) {
     return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f));
-}
-
-__device__ __forceinline__ float half_le(const unsigned char* p) {
-    unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
-    float f;
-    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(bits));
-    return f;
-}
-
-// `get_scale_min_k4` from ggml-quants.c, byte for byte.
-__device__ __forceinline__ void scale_min_k4(int j, const unsigned char* q, int* sc, int* m) {
-    if (j < 4) {
-        *sc = q[j] & 63;
-        *m = q[j + 4] & 63;
-    } else {
-        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
-    }
-}
-
-// Element `i` of one row in GGUF storage format `fmt`. Operand order follows
-// `llmcuda_kernels::quant` exactly and the affine k-quants are spelled with
-// `__fmul_rn`/`__fsub_rn` so no FMA contraction separates the two.
-__device__ float dequant_element(const unsigned char* row, int fmt, int i) {
-    switch (fmt) {
-    case FMT_Q8_0: {
-        const unsigned char* b = row + (i >> 5) * 34;
-        return (float)(signed char)b[2 + (i & 31)] * half_le(b);
-    }
-    case FMT_BF16: {
-        unsigned int bits = (unsigned int)row[2 * i] | ((unsigned int)row[2 * i + 1] << 8);
-        return __uint_as_float(bits << 16);
-    }
-    case FMT_F16:
-        return half_le(row + 2 * i);
-    case FMT_Q4_0: {
-        const unsigned char* b = row + (i >> 5) * 18;
-        int e = i & 31;
-        int byte = b[2 + (e & 15)];
-        int q = e < 16 ? (byte & 0xF) : (byte >> 4);
-        return (float)(q - 8) * half_le(b);
-    }
-    case FMT_Q6K: {
-        const unsigned char* b = row + (i >> 8) * 210;
-        int e = i & 255, half = e >> 7, r = e & 127, j = r >> 5, l = r & 31;
-        const unsigned char* ql = b + half * 64;
-        const unsigned char* qh = b + 128 + half * 32;
-        const signed char* sc = (const signed char*)(b + 192 + half * 8);
-        int lowbyte = ql[l + (j & 1) * 32];
-        int low = j < 2 ? (lowbyte & 0xF) : (lowbyte >> 4);
-        int high = (qh[l] >> (2 * j)) & 3;
-        float d = half_le(b + 208);
-        return d * (float)sc[(l >> 4) + 2 * j] * (float)((low | (high << 4)) - 32);
-    }
-    case FMT_Q4K:
-    case FMT_Q5K: {
-        const int five = fmt == FMT_Q5K;
-        const unsigned char* b = row + (i >> 8) * (five ? 176 : 144);
-        int e = i & 255, g = e >> 6, sub = (e >> 5) & 1, l = e & 31;
-        float d = half_le(b), dmin = half_le(b + 2);
-        int sc, m;
-        scale_min_k4(2 * g + sub, b + 4, &sc, &m);
-        int byte = b[(five ? 48 : 16) + g * 32 + l];
-        int code = sub == 0 ? (byte & 0xF) : (byte >> 4);
-        if (five) code += ((b[16 + l] >> (2 * g + sub)) & 1) << 4;
-        float d1 = __fmul_rn(d, (float)sc);
-        float m1 = __fmul_rn(dmin, (float)m);
-        return __fsub_rn(__fmul_rn(d1, (float)code), m1);
-    }
-    }
-    return 0.0f;
 }
 
 // Y[m][n] = epilogue(sum_k xin(m, k) * W[n][k]), with xin(m, k) = X[m][k] or,
@@ -504,130 +394,6 @@ __global__ void __launch_bounds__(128) dec_attention_128(
     attention_tile<128>(Q, ldq, K, ldk, V, ldv, O, ldo, part, nq, nk, heads, chunk, scale);
 }
 
-// out[s][c] = mean over the span's token ids of row `id` of an embedding
-// table stored as raw GGUF rows of `row_bytes` in format `fmt`.
-__global__ void dec_lexical(
-    const unsigned char* __restrict__ table, int fmt, long long row_bytes, int cols,
-    const int* __restrict__ tokens, const int* __restrict__ spans, int stride, int nspans,
-    float* __restrict__ out, long long ldo)
-{
-    int s = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nspans || c >= cols) return;
-    int start = spans[s * stride], end = spans[s * stride + 1];
-    float acc = 0.0f;
-    for (int t = start; t < end; ++t) acc += dequant_element(table + (long long)tokens[t] * row_bytes, fmt, c);
-    out[(long long)s * ldo + c] = acc / (float)(end - start);
-}
-
-// One block per question: softmax over its own options of
-// options[o] . base[q] * scale, the weighted option summary, and
-// fields[q] = base[q] + LN(summary) + gproj + type_embd[type(q)].
-// `weights` is [n_opts] scratch; each option's entry is touched only by its
-// owner's block. Dynamic shared memory: `width` floats.
-__global__ void dec_question_fields(
-    const float* __restrict__ opts, long long ldo, int n_opts,
-    const int* __restrict__ ospans, int ostride,
-    const float* __restrict__ base, long long ldb,
-    const float* __restrict__ gproj, const float* __restrict__ type_embd,
-    const int* __restrict__ qspans, int qstride,
-    const float* __restrict__ sg, const float* __restrict__ sb, float eps,
-    float* __restrict__ weights, float* __restrict__ fields, long long ldf,
-    int width, float scale)
-{
-    extern __shared__ float summary[];
-    __shared__ float red[32];
-    const int q = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = blockDim.x >> 5;
-    const float* bq = base + (long long)q * ldb;
-
-    for (int o = warp; o < n_opts; o += nw) {
-        if (ospans[o * ostride + 2] != q) continue;
-        const float* oo = opts + (long long)o * ldo;
-        float d = 0.0f;
-        for (int c = lane; c < width; c += 32) d += oo[c] * bq[c];
-        d = warp_sum(d);
-        if (lane == 0) weights[o] = d * scale;
-    }
-    __syncthreads();
-    float mx = -DEC_INF;
-    for (int o = tid; o < n_opts; o += blockDim.x)
-        if (ospans[o * ostride + 2] == q) mx = fmaxf(mx, weights[o]);
-    mx = block_max(mx, red);
-    float se = 0.0f;
-    for (int o = tid; o < n_opts; o += blockDim.x)
-        if (ospans[o * ostride + 2] == q) se += expf(weights[o] - mx);
-    se = block_sum(se, red);
-    for (int o = tid; o < n_opts; o += blockDim.x)
-        if (ospans[o * ostride + 2] == q) weights[o] = expf(weights[o] - mx) / se;
-    __syncthreads();
-
-    float s = 0.0f;
-    for (int c = tid; c < width; c += blockDim.x) {
-        float acc = 0.0f;
-        for (int o = 0; o < n_opts; ++o)
-            if (ospans[o * ostride + 2] == q) acc += weights[o] * opts[(long long)o * ldo + c];
-        summary[c] = acc;
-        s += acc;
-    }
-    const float mean = block_sum(s, red) / (float)width;
-    float v = 0.0f;
-    for (int c = tid; c < width; c += blockDim.x) {
-        float d = summary[c] - mean;
-        v += d * d;
-    }
-    const float rstd = 1.0f / sqrtf(block_sum(v, red) / (float)width + eps);
-    const int type = qspans[q * qstride + 2];
-    float* fq = fields + (long long)q * ldf;
-    for (int c = tid; c < width; c += blockDim.x) {
-        float ln = (summary[c] - mean) * rstd * sg[c] + sb[c];
-        fq[c] = bq[c] + ln + gproj[c] + type_embd[(long long)type * width + c];
-    }
-}
-
-// One block per option: the scorer's input features
-// [field, option, field * option, |field - option|], the cosine of field and
-// option, and the lexical prior cos(lexical, question mean + global).
-// aux[o] = (prior, cosine).
-__global__ void dec_features(
-    const float* __restrict__ fieldn, long long ldf,
-    const float* __restrict__ optn, long long ldo,
-    const int* __restrict__ ospans, int ostride, int n_opts,
-    const float* __restrict__ qmean, long long ldq, const float* __restrict__ global,
-    const float* __restrict__ lexical, long long ldl,
-    int hidden, int width, float* __restrict__ feat, long long ldfeat, float* __restrict__ aux)
-{
-    __shared__ float red[32];
-    const int o = blockIdx.x, tid = threadIdx.x;
-    if (o >= n_opts) return;
-    const int q = ospans[o * ostride + 2];
-    const float* f = fieldn + (long long)q * ldf;
-    const float* x = optn + (long long)o * ldo;
-    float* out = feat + (long long)o * ldfeat;
-    float ff = 0.0f, xx = 0.0f, fx = 0.0f;
-    for (int c = tid; c < width; c += blockDim.x) {
-        float a = f[c], b = x[c];
-        ff += a * a; xx += b * b; fx += a * b;
-        out[c] = a;
-        out[width + c] = b;
-        out[2 * width + c] = a * b;
-        out[3 * width + c] = fabsf(a - b);
-    }
-    const float* qm = qmean + (long long)q * ldq;
-    const float* lx = lexical + (long long)o * ldl;
-    float aa = 0.0f, ll = 0.0f, al = 0.0f;
-    for (int c = tid; c < hidden; c += blockDim.x) {
-        float a = qm[c] + global[c], b = lx[c];
-        aa += a * a; ll += b * b; al += a * b;
-    }
-    ff = block_sum(ff, red); xx = block_sum(xx, red); fx = block_sum(fx, red);
-    aa = block_sum(aa, red); ll = block_sum(ll, red); al = block_sum(al, red);
-    if (tid == 0) {
-        float cosine = fx / (fmaxf(sqrtf(ff), 1e-12f) * fmaxf(sqrtf(xx), 1e-12f));
-        float prior = al / (fmaxf(sqrtf(ll), 1e-12f) * fmaxf(sqrtf(aa), 1e-12f));
-        aux[o * 2] = prior;
-        aux[o * 2 + 1] = cosine;
-    }
-}
-
 }
 "#;
 
@@ -865,10 +631,10 @@ impl DecisionKernels {
             attention_128: f("dec_attention_128")?,
             attention_combine: r("dec_attention_combine")?,
             span_mean: r("dec_span_mean")?,
-            lexical: f("dec_lexical")?,
+            lexical: r("dec_lexical")?,
             add_owner_rows: r("dec_add_owner_rows")?,
-            question_fields: f("dec_question_fields")?,
-            features: f("dec_features")?,
+            question_fields: r("dec_question_fields")?,
+            features: r("dec_features")?,
             final_scores: r("dec_final_scores")?,
             sm_count,
         })

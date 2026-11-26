@@ -33,95 +33,6 @@ use cudarc::driver::{
 };
 use half::f16;
 
-use super::compile;
-
-/// CUDA C++ source for the elementwise and reduction kernels.
-///
-/// Kept as one translation unit so the whole set is one NVRTC invocation.
-pub(super) const VISION_SRC: &str = r#"
-extern "C" {
-
-// binary16 <-> fp32 by hand: NVRTC compiles from a string with no include
-// path, so cuda_fp16.h is not reachable — same convention as
-// `attention.rs`. Activations are stored binary16 and every kernel
-// computes in fp32.
-__device__ __forceinline__ float h2f(unsigned short h) {
-    float f;
-    asm("{ .reg .f16 a; mov.b16 a, %1; cvt.f32.f16 %0, a; }" : "=f"(f) : "h"(h));
-    return f;
-}
-__device__ __forceinline__ unsigned short f2h(float f) {
-    unsigned short h;
-    asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(f));
-    return h;
-}
-
-__global__ void vision_layer_norm(
-    const unsigned short* __restrict__ x,
-    unsigned short* __restrict__ out,
-    const unsigned short* __restrict__ gamma,
-    const unsigned short* __restrict__ beta,
-    int width,
-    float eps)
-{
-    // One block per row. Two-pass mean/variance in f32.
-    const unsigned short* row = x + (long long)blockIdx.x * width;
-    unsigned short* dst = out + (long long)blockIdx.x * width;
-
-    __shared__ float warp_sums[32];
-    float sum = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        sum += h2f(row[j]);
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        sum += __shfl_down_sync(0xffffffffu, sum, off);
-    }
-    if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = sum;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        int warps = (blockDim.x + 31) >> 5;
-        float v = threadIdx.x < warps ? warp_sums[threadIdx.x] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down_sync(0xffffffffu, v, off);
-        }
-        if (threadIdx.x == 0) warp_sums[0] = v;
-    }
-    __syncthreads();
-    float mean = warp_sums[0] / (float)width;
-    __syncthreads();
-
-    float var = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float d = h2f(row[j]) - mean;
-        var += d * d;
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        var += __shfl_down_sync(0xffffffffu, var, off);
-    }
-    if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = var;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        int warps = (blockDim.x + 31) >> 5;
-        float v = threadIdx.x < warps ? warp_sums[threadIdx.x] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down_sync(0xffffffffu, v, off);
-        }
-        if (threadIdx.x == 0) warp_sums[0] = v;
-    }
-    __syncthreads();
-    float inv = rsqrtf(warp_sums[0] / (float)width + eps);
-
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float g = h2f(gamma[j]);
-        float b = h2f(beta[j]);
-        float centered = (h2f(row[j]) - mean) * inv;
-        dst[j] = f2h(centered * g + b);
-    }
-}
-
-} // extern "C"
-"#;
-
 /// Errors from the vision device ops.
 #[derive(Debug)]
 pub enum VisionError {
@@ -219,13 +130,6 @@ pub struct VisionKernels {
 impl VisionKernels {
     /// Compile and load the kernels on `ctx`, binding GEMMs to `stream`.
     pub fn new(ctx: &Arc<CudaContext>, stream: Arc<CudaStream>) -> Result<Self, VisionError> {
-        let ptx = compile(VISION_SRC, "vision").map_err(VisionError::Build)?;
-        let module = ctx.load_module(ptx).map_err(VisionError::Driver)?;
-        let f = |name: &str| {
-            module
-                .load_function(name)
-                .map_err(|e| VisionError::Build(format!("{name}: {e}")))
-        };
         let rust = ctx
             .load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))
             .map_err(VisionError::Driver)?;
@@ -234,7 +138,7 @@ impl VisionKernels {
                 .map_err(|e| VisionError::Build(format!("{name}: {e}")))
         };
         Ok(Self {
-            layer_norm: f("vision_layer_norm")?,
+            layer_norm: r("vision_layer_norm")?,
             gelu: r("vision_gelu")?,
             rope_qk: r("vision_rope_qk")?,
             softmax_rows: r("vision_softmax_rows")?,

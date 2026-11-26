@@ -1035,7 +1035,19 @@ mod tests {
             rust_kernel("rms_norm_rows")
                 .contains("*x.add(base + j as usize) * inv * *weight.add(j as usize);")
         );
-        assert!(!RUST_KERNELS_SRC.contains("rsqrt"), "a norm took rsqrt");
+        // The vision LayerNorm does take it, as its original did; these do
+        // not.
+        for name in [
+            "inverse_rms",
+            "rms_norm_rows",
+            "rms_norm_swiglu_rows",
+            "rms_norm_swiglu_q8_rows",
+        ] {
+            assert!(
+                !crate::kernels::rust_kernel_source(name).contains("rsqrt"),
+                "{name} took rsqrt"
+            );
+        }
         for name in [
             "rms_norm_rows",
             "rms_norm_swiglu_rows",

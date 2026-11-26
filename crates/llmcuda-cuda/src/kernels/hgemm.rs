@@ -53,7 +53,7 @@ pub const HGEMM_BM: usize = 128;
 /// Contraction elements per stage; also the Q8_0 block, so one scale a row.
 pub const HGEMM_BK: usize = 32;
 
-pub(super) const HGEMM_SRC: &str = r#"
+const HGEMM_SRC: &str = r#"
 #define HG_BM 128
 #define HG_BK 32
 #define HG_GROUP 4
@@ -350,23 +350,6 @@ __device__ __forceinline__ void hg_gemm(
         hg_gemm<FMT, WN>(w, ws, x, out, part, M, N, K, ldo, accumulate, alpha, wscale, kps); \
     }
 
-// out[m][n] (+)= sum over z = 0, 1, ... of part[z][m][n], in that order, so the
-// result does not depend on which split finished first. Two columns a thread.
-// Split Q8_0 to resident fp16: `w16[i] = half(q[i] * d[i / 32])`, by the same
-// `hg_dequant4` the GEMM stages with, so the two paths read one weight.
-// A thread converts four weights; `n` is a multiple of 32.
-extern "C" __global__ void hg_q8_to_half_w(const signed char* __restrict__ wq,
-                                const unsigned short* __restrict__ ws,
-                                unsigned short* __restrict__ w16, long long n) {
-    long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
-    if (i >= n) return;
-    unsigned q = *(const unsigned*)(wq + i);
-    unsigned sc = ws[i >> 5];
-    unsigned lo, hi;
-    hg_dequant4(q, sc | (sc << 16), lo, hi);
-    *(uint2*)(w16 + i) = make_uint2(lo, hi);
-}
-
 HG_ENTRY(hg_q8_256, 0, 64, 1)
 HG_ENTRY(hg_q8_128, 0, 32, 2)
 HG_ENTRY(hg_bf16_256, 1, 64, 1)
@@ -578,7 +561,7 @@ impl HgemmKernels {
             bf16_128: module.load_function("hg_bf16_128")?,
             to_half: rust.load_function("hg_to_half")?,
             reduce: rust.load_function("hg_splitk_reduce")?,
-            q8_to_half_w: module.load_function("hg_q8_to_half_w")?,
+            q8_to_half_w: rust.load_function("hg_q8_to_half_w")?,
             sms,
             library: None,
         })

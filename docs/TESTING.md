@@ -369,11 +369,12 @@ operator reads 0.3–0.8. The decode-path check therefore asserts tight
 agreement up to the first position whose routing differs and a floor after
 it, and prints the applications that differ.
 
-**Not gated:** the prefill glue kernels (`ink_mix`, `ink_conv`, `ink_ctrl_*`, `ink_rel_table`, the dispatch and SiTU kernels) have no
-kernel-level differential test of their own, `ink_clip` excepted; they are
-exercised through `inkling_forward` against the capture, twelve positions
-deep. Nothing serves this model, so nothing under "Serving acceptance
-status" covers it.
+**Not gated:** the prefill glue kernels other than `ink_clip` (`ink_mix`,
+`ink_conv`, `ink_ctrl_*`, `ink_rel_table`, the dispatch and SiTU kernels)
+have no kernel-level differential test of their own; they are exercised
+through `inkling_forward` against the capture, twelve positions deep.
+Nothing serves this model, so nothing under "Serving acceptance status"
+covers it.
 
 ## Serving acceptance status
 

@@ -549,10 +549,14 @@ impl InklingKernels {
         if dim == 128 && !self.reference.load(core::sync::atomic::Ordering::Relaxed) {
             let (hd, n) = (heads as i32, tokens as i32);
             let mut b = stream.launch_builder(&self.attn_mma);
+            let null = 0u64;
             b.arg(q)
                 .arg(k_cache)
                 .arg(v_cache)
                 .arg(table)
+                .arg(&null)
+                .arg(&null)
+                .arg(&null)
                 .arg(&mut *out)
                 .arg(pos)
                 .arg(&w)
@@ -582,6 +586,76 @@ impl InklingKernels {
         // SAFETY: lengths checked; the caller's caches cover every position
         // up to the last row's, which only it can know.
         unsafe { b.launch(cfg((heads, tokens, 1), 256, 0)) }?;
+        Ok(())
+    }
+
+    /// Whether [`Self::attn_fused`] serves this geometry: the tensor-core
+    /// kernel with the bias computed in it, in place of
+    /// [`Self::rel_table`] and [`Self::attn`].
+    pub fn fuses_the_bias(&self, dim: usize, n_rel: usize) -> bool {
+        dim == 128 && n_rel == 16 && !self.reference.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// [`Self::attn`] with the relative-position bias computed in the
+    /// kernel from the rows' features `r` (`[tokens][heads][16]`), their
+    /// sink logits and the layer's `rel_bias` (`[extent][16]`), for the
+    /// distances each row reaches. Same scores as the table gives.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_fused(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: &CudaSlice<f32>,
+        k_cache: &CudaSlice<u16>,
+        v_cache: &CudaSlice<u16>,
+        r: &CudaSlice<f32>,
+        sink: &CudaSlice<f32>,
+        rel_bias: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        pos: &CudaSlice<i32>,
+        window: usize,
+        extent: usize,
+        heads: usize,
+        kv_heads: usize,
+        tokens: usize,
+    ) -> Result<(), InklingError> {
+        let dim = 128;
+        if !heads.is_multiple_of(kv_heads) {
+            return Err(InklingError::Shape("attention head geometry"));
+        }
+        need("attn q", q.len(), tokens * heads * dim)?;
+        need("attn out", out.len(), tokens * heads * dim)?;
+        need("attn r", r.len(), tokens * heads * 16)?;
+        need("attn sink", sink.len(), tokens * heads)?;
+        need("attn rel_bias", rel_bias.len(), extent * 16)?;
+        need("attn pos", pos.len(), 1)?;
+        let (w, e, kv, hd, n) = (
+            window as i32,
+            extent as i32,
+            kv_heads as i32,
+            heads as i32,
+            tokens as i32,
+        );
+        let scale = 1.0 / (dim as f32).sqrt();
+        let null = 0u64;
+        let mut b = stream.launch_builder(&self.attn_mma);
+        b.arg(q)
+            .arg(k_cache)
+            .arg(v_cache)
+            .arg(&null)
+            .arg(r)
+            .arg(sink)
+            .arg(rel_bias)
+            .arg(&mut *out)
+            .arg(pos)
+            .arg(&w)
+            .arg(&e)
+            .arg(&hd)
+            .arg(&kv)
+            .arg(&n)
+            .arg(&scale);
+        // SAFETY: lengths checked; the caller's caches cover every position
+        // up to the last row's, and the kernel reads no key past it.
+        unsafe { b.launch(cfg((heads, tokens.div_ceil(ATTN_MMA_ROWS), 1), 32, 0)) }?;
         Ok(())
     }
 
@@ -640,7 +714,7 @@ impl InklingKernels {
         need("gather xs", xs.len(), d.slots() * n)?;
         let (n_i, topk) = (n as i32, d.topk as i32);
         let (pairs, tile) = ((d.tokens * d.topk) as i32, INK_TILE as i32);
-        let grid = cfg((n.div_ceil(256), d.slots(), 1), 256, 0);
+        let grid = cfg((d.slots(), n.div_ceil(256), 1), 256, 0);
         let mut b = stream.launch_builder(&self.gather_half);
         b.arg(x)
             .arg(&d.sorted)
@@ -682,7 +756,7 @@ impl InklingKernels {
             .arg(&beta)
             .arg(&linear_beta);
         // SAFETY: lengths checked against the grid.
-        unsafe { b.launch(cfg((width.div_ceil(256), d.slots(), 1), 256, 0)) }?;
+        unsafe { b.launch(cfg((d.slots(), width.div_ceil(256), 1), 256, 0)) }?;
         Ok(())
     }
 
@@ -766,8 +840,17 @@ __device__ __forceinline__ void am_split2(float lo, float hi, unsigned& H, unsig
 
 // inkling2_loop attention for sixteen consecutive query rows of one head, on
 // the tensor cores: p_j = exp(s_j) / (1 + sum exp(s)),
-// s_j = q . k_j * scale + table[min(p - j, extent)], over cache rows j <= p
-// (and j > p - window when window > 0), p = pos[0] + row. head_dim is 128.
+// s_j = q . k_j * scale + bias(p - j) - sink, over cache rows j <= p (and
+// j > p - window when window > 0), p = pos[0] + row. head_dim is 128.
+//
+// The bias comes one of two ways. With `table` (rows x heads x (extent + 1),
+// the sink already subtracted, the last entry every distance past the
+// extent) it is a lookup, as the scalar kernel. Without, it is computed for
+// the distances a row actually reaches: bias(d) = rel_bias[d] . r[row][head]
+// over sixteen features for d < extent and zero past it, the row's features
+// held in registers. Filling the table for every row cost more than the
+// attention it fed: rows x heads x 1025 entries a layer, 150 MB at 1536
+// rows, most of them distances no key sits at.
 //
 // One warp a block, and nothing staged in shared memory. Eight keys a step:
 //
@@ -790,6 +873,8 @@ __device__ __forceinline__ void am_split2(float lo, float hi, unsigned& H, unsig
 extern "C" __global__ void __launch_bounds__(32) ink_attn_mma(
     const float* __restrict__ q, const unsigned short* __restrict__ k_cache,
     const unsigned short* __restrict__ v_cache, const float* __restrict__ table,
+    const float* __restrict__ r, const float* __restrict__ sink,
+    const float* __restrict__ rel_bias,
     float* __restrict__ out, const int* __restrict__ pos,
     int window, int extent, int heads, int kv_heads, int tokens, float scale
 ) {
@@ -824,6 +909,27 @@ extern "C" __global__ void __launch_bounds__(32) ink_attn_mma(
     }
     const float* tba = table + ((long long)ra * heads + h) * (extent + 1);
     const float* tbb = table + ((long long)rb * heads + h) * (extent + 1);
+    float rfa[16], rfb[16];
+    float sinka = 0.0f, sinkb = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        rfa[i] = 0.0f;
+        rfb[i] = 0.0f;
+    }
+    if (!table) {
+        if (oka) {
+            const float* rr = r + ((long long)ra * heads + h) * 16;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) rfa[i] = rr[i];
+            sinka = sink[(long long)ra * heads + h];
+        }
+        if (okb) {
+            const float* rr = r + ((long long)rb * heads + h) * 16;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) rfb[i] = rr[i];
+            sinkb = sink[(long long)rb * heads + h];
+        }
+    }
 
     float acc[16][4];
 #pragma unroll
@@ -867,8 +973,28 @@ extern "C" __global__ void __launch_bounds__(32) ink_attn_mma(
             const int j = jv + i;
             const bool va = oka && j <= pa && (window == 0 || j > pa - window);
             const bool vb = okb && j <= pb && (window == 0 || j > pb - window);
-            sa[i] = va ? c[i] * scale + tba[min(pa - j, extent)] : lowest;
-            sb[i] = vb ? c[2 + i] * scale + tbb[min(pb - j, extent)] : lowest;
+            float ba = 0.0f, bb = 0.0f;
+            if (table) {
+                if (va) ba = tba[min(pa - j, extent)];
+                if (vb) bb = tbb[min(pb - j, extent)];
+            } else {
+                // The table's entry, computed: the same ascending fused sum,
+                // then the sink.
+                if (va && pa - j < extent) {
+                    const float* br = rel_bias + (long long)(pa - j) * 16;
+#pragma unroll
+                    for (int f = 0; f < 16; ++f) ba = fmaf(br[f], rfa[f], ba);
+                }
+                if (vb && pb - j < extent) {
+                    const float* br = rel_bias + (long long)(pb - j) * 16;
+#pragma unroll
+                    for (int f = 0; f < 16; ++f) bb = fmaf(br[f], rfb[f], bb);
+                }
+                ba -= sinka;
+                bb -= sinkb;
+            }
+            sa[i] = va ? c[i] * scale + ba : lowest;
+            sb[i] = vb ? c[2 + i] * scale + bb : lowest;
         }
         float xa = fmaxf(sa[0], sa[1]), xb = fmaxf(sb[0], sb[1]);
         xa = fmaxf(xa, __shfl_xor_sync(0xffffffff, xa, 1));

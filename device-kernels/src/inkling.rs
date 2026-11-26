@@ -627,11 +627,12 @@ pub unsafe fn ink_attn(
 /// tile takes the row of the token its pair belongs to, as binary16, and
 /// records itself in `slot_of`; a padding slot takes zeros.
 ///
-/// grid: (ceil(n / block), slots).
+/// grid: (slots, ceil(n / block)): the slots on x, the one axis a pass of
+/// several thousand rows does not outgrow.
 ///
 /// # Safety
-/// x covers the routed tokens' rows of n floats; sorted covers gridDim.y
-/// entries, owners gridDim.y / tile; xs gridDim.y * n halves; slot_of
+/// x covers the routed tokens' rows of n floats; sorted covers gridDim.x
+/// entries, owners gridDim.x / tile; xs gridDim.x * n halves; slot_of
 /// `pairs` entries. A live slot's entry is a pair id below `pairs`, or
 /// `pairs` itself for padding.
 #[kernel]
@@ -646,8 +647,8 @@ pub unsafe fn ink_gather_half(
     pairs: i32,
     tile: i32,
 ) {
-    let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
-    let slot = thread::blockIdx_y() as usize;
+    let i = (thread::blockIdx_y() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+    let slot = thread::blockIdx_x() as usize;
     if i >= n as usize {
         return;
     }
@@ -672,11 +673,11 @@ pub unsafe fn ink_gather_half(
 /// of a live tile, as binary16 for the down projection:
 /// `beta * tanh(gate / beta) * sigmoid(gate) * lb * tanh(up / lb)`.
 ///
-/// grid: (ceil(width / block), slots).
+/// grid: (slots, ceil(width / block)).
 ///
 /// # Safety
-/// gate_up covers gridDim.y * 2 * width floats (gate then up per slot),
-/// out gridDim.y * width halves, owners gridDim.y / tile entries.
+/// gate_up covers gridDim.x * 2 * width floats (gate then up per slot),
+/// out gridDim.x * width halves, owners gridDim.x / tile entries.
 #[kernel]
 pub unsafe fn ink_situ_half(
     gate_up: *const f32,
@@ -687,8 +688,8 @@ pub unsafe fn ink_situ_half(
     beta: f32,
     linear_beta: f32,
 ) {
-    let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
-    let slot = thread::blockIdx_y() as usize;
+    let i = (thread::blockIdx_y() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
+    let slot = thread::blockIdx_x() as usize;
     let w = width as usize;
     if i >= w {
         return;

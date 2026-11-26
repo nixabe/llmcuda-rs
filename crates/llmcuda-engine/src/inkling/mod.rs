@@ -660,7 +660,9 @@ pub struct InklingPass {
     sink: CudaSlice<f32>,
     k_taps: CudaSlice<f32>,
     v_taps: CudaSlice<f32>,
-    table: CudaSlice<f32>,
+    /// The reference path's bias table, allocated the first time that
+    /// path runs: `rows * heads * (extent + 1)` floats nothing else needs.
+    table: Option<CudaSlice<f32>>,
     attended: CudaSlice<f32>,
     gate: CudaSlice<f32>,
     gate_sig: CudaSlice<f32>,
@@ -716,6 +718,11 @@ impl InklingPass {
     /// Allocate for passes of exactly `rows` rows.
     pub fn new(model: &Arc<InklingModel>, stream: &Arc<CudaStream>, rows: usize) -> Res<Self> {
         let c = &model.config;
+        // Several kernels take a block a row on a grid axis that ends at
+        // 65535.
+        if rows == 0 || rows > 65_535 {
+            return Err(bad(format!("a pass takes 1..=65535 rows, not {rows}")));
+        }
         let k = &model.k;
         let n = c.hidden_size as usize;
         let (heads, dim) = (c.attention.q_heads as usize, c.attention.head_dim as usize);
@@ -726,7 +733,6 @@ impl InklingPass {
             moe.experts_per_token as usize,
             moe.expert_intermediate as usize,
         );
-        let extent = k.sliding_window.max(k.relative_extent) as usize;
         let block_states = (c.num_layers / k.res_block) as usize + 1;
         let bank_states = ((k.loop_end - k.loop_start) / k.res_block) as usize;
         let dispatch = InkDispatch::new(stream, rows, topk, experts)?;
@@ -763,7 +769,7 @@ impl InklingPass {
             sink: f(rows * heads)?,
             k_taps: f(rows * taps)?,
             v_taps: f(rows * taps)?,
-            table: f(rows * heads * (extent + 1))?,
+            table: None,
             attended: f(rows * heads * dim)?,
             gate: f(rows * heads * dim)?,
             gate_sig: f(rows * heads * dim)?,
@@ -1220,17 +1226,27 @@ impl InklingPass {
             )?;
             row0 += r;
         }
-        model.kernels.rel_table(
-            stream,
-            &layer.rel_bias,
-            &self.r,
-            &self.sink,
-            &mut self.table,
-            n_rel,
-            extent,
-            heads,
-            rows,
-        )?;
+        // The reference path looks the bias up in a table of every
+        // distance for every row; the fused kernel computes what it reads.
+        let fused = model.kernels.fuses_the_bias(dim, n_rel);
+        if !fused {
+            if self.table.is_none() {
+                // Sized for the widest layer: sliding and full layers differ.
+                let widest = kc.sliding_window.max(kc.relative_extent) as usize;
+                self.table = Some(stream.alloc_zeros::<f32>(self.rows * heads * (widest + 1))?);
+            }
+            model.kernels.rel_table(
+                stream,
+                &layer.rel_bias,
+                &self.r,
+                &self.sink,
+                self.table.as_mut().expect("just allocated"),
+                n_rel,
+                extent,
+                heads,
+                rows,
+            )?;
+        }
 
         self.mark(stream, "conv, clips, bias table")?;
         // Append to each sequence's cache, then attend over it.
@@ -1248,23 +1264,45 @@ impl InklingPass {
                 model.hg.to_half(stream, &vview, &mut dst, r * kv)?;
             }
             let qv = unsafe { rows_of(stream, &self.q, row0, r, heads * dim) };
-            let tv = unsafe { rows_of(stream, &self.table, row0, r, heads * (extent + 1)) };
             let mut out = unsafe { rows_of(stream, &self.attended, row0, r, heads * dim) };
-            model.kernels.attn(
-                stream,
-                &qv,
-                &st.k,
-                &st.v,
-                &tv,
-                &mut out,
-                &seg.state.d_position,
-                window,
-                extent,
-                heads,
-                kv_heads,
-                dim,
-                r,
-            )?;
+            if fused {
+                let rv = unsafe { rows_of(stream, &self.r, row0, r, heads * n_rel) };
+                let sv = unsafe { rows_of(stream, &self.sink, row0, r, heads) };
+                model.kernels.attn_fused(
+                    stream,
+                    &qv,
+                    &st.k,
+                    &st.v,
+                    &rv,
+                    &sv,
+                    &layer.rel_bias,
+                    &mut out,
+                    &seg.state.d_position,
+                    window,
+                    extent,
+                    heads,
+                    kv_heads,
+                    r,
+                )?;
+            } else {
+                let table = self.table.as_ref().expect("filled above");
+                let tv = unsafe { rows_of(stream, table, row0, r, heads * (extent + 1)) };
+                model.kernels.attn(
+                    stream,
+                    &qv,
+                    &st.k,
+                    &st.v,
+                    &tv,
+                    &mut out,
+                    &seg.state.d_position,
+                    window,
+                    extent,
+                    heads,
+                    kv_heads,
+                    dim,
+                    r,
+                )?;
+            }
             row0 += r;
         }
 

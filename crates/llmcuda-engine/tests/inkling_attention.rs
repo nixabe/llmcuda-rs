@@ -57,7 +57,25 @@ fn prefill_attention_matches_an_f64_oracle_on_both_kernels() {
         };
         let k = half(rng.vec_f32(cache_rows * kv_heads * dim, -2.0, 2.0));
         let v = half(rng.vec_f32(cache_rows * kv_heads * dim, -4.0, 4.0));
-        let table = rng.vec_f32(tokens * heads * (extent + 1), -6.0, 6.0);
+        // The bias as the model has it: sixteen features a (row, head), a
+        // sink logit, and the layer's per-distance vectors. The table is
+        // what `ink_rel_table` makes of them, in its arithmetic.
+        let n_rel = 16usize;
+        let r = rng.vec_f32(tokens * heads * n_rel, -1.5, 1.5);
+        let sink = rng.vec_f32(tokens * heads, -2.0, 2.0);
+        let rel_bias = rng.vec_f32(extent * n_rel, -1.0, 1.0);
+        let mut table = vec![0.0f32; tokens * heads * (extent + 1)];
+        for row in 0..tokens * heads {
+            for d in 0..=extent {
+                let mut acc = 0.0f32;
+                if d < extent {
+                    for i in 0..n_rel {
+                        acc = rel_bias[d * n_rel + i].mul_add(r[row * n_rel + i], acc);
+                    }
+                }
+                table[row * (extent + 1) + d] = acc - sink[row];
+            }
+        }
 
         let f = |h: u16| f64::from(half::f16::from_bits(h).to_f32());
         let scale = 1.0 / (dim as f64).sqrt();
@@ -99,19 +117,48 @@ fn prefill_attention_matches_an_f64_oracle_on_both_kernels() {
             stream.clone_htod(&table).unwrap(),
         );
         let d_pos = stream.clone_htod(&[pos0 as i32]).unwrap();
-        for (name, scalar) in [("scalar", true), ("tensor-core", false)] {
+        let (d_r, d_sink, d_bias) = (
+            stream.clone_htod(&r).unwrap(),
+            stream.clone_htod(&sink).unwrap(),
+            stream.clone_htod(&rel_bias).unwrap(),
+        );
+        let mut tabled: Vec<u32> = Vec::new();
+        for (name, scalar, fused) in [
+            ("scalar", true, false),
+            ("tensor-core", false, false),
+            ("fused bias", false, true),
+        ] {
             kernels.use_reference_kernels(scalar);
             let sentinel = 7.25f32;
             let mut out = stream
                 .clone_htod(&vec![sentinel; (tokens + 1) * heads * dim])
                 .unwrap();
-            kernels
-                .attn(
-                    &stream, &d_q, &d_k, &d_v, &d_table, &mut out, &d_pos, window, extent, heads,
-                    kv_heads, dim, tokens,
-                )
-                .unwrap();
+            if fused {
+                assert!(kernels.fuses_the_bias(dim, n_rel));
+                kernels
+                    .attn_fused(
+                        &stream, &d_q, &d_k, &d_v, &d_r, &d_sink, &d_bias, &mut out, &d_pos,
+                        window, extent, heads, kv_heads, tokens,
+                    )
+                    .unwrap();
+            } else {
+                kernels
+                    .attn(
+                        &stream, &d_q, &d_k, &d_v, &d_table, &mut out, &d_pos, window, extent,
+                        heads, kv_heads, dim, tokens,
+                    )
+                    .unwrap();
+            }
             let got = stream.clone_dtoh(&out).unwrap();
+            // Computing the bias in the kernel is the table's arithmetic:
+            // the two tensor-core modes agree to the bit.
+            let bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            if fused {
+                let differing = bits.iter().zip(&tabled).filter(|(a, b)| a != b).count();
+                assert_eq!(differing, 0, "fused bias differs from the table");
+            } else if !scalar {
+                tabled = bits;
+            }
             assert!(
                 got[tokens * heads * dim..].iter().all(|x| *x == sentinel),
                 "{name}: wrote past the last row"

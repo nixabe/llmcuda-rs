@@ -39,6 +39,9 @@ if ".target sm_75\n" not in ptx or any(
         "hg_to_half", "vision_gelu", "vision_add_f16", "vision_half_to_float",
         "attn_kv_append", "dense_swiglu_narrow", "dec_add_owner_rows", "dec_span_mean",
         "dec_attention_combine", "k2_rotary_apply",
+        "attn_flash_decode_combine_k2_batch", "embed_q8_0", "dequantize_q8_0",
+        "gdn_silu_split_qkv", "gdn_conv_silu_split_step_batch", "gdn_normalize_qk",
+        "gdn_chunk_normalize_qk", "dense_rms_norm_narrow", "dec_layer_norm",
     )
 ):
     raise SystemExit("compiler output has the wrong target or entry point")

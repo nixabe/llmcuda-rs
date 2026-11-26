@@ -1026,7 +1026,8 @@ mod kernels {
         }
     }
 
-    /// Merge the per-split partial softmaxes of split decode attention.
+    /// Merge the per-split partial softmaxes of one sequence's decode
+    /// attention into this block's head and this thread's dimension.
     ///
     /// Each split carries its running maximum `m`, its normalizer `l` and its
     /// weighted value sum, all relative to its own maximum; they are rescaled
@@ -1035,14 +1036,13 @@ mod kernels {
     /// the subtraction never forms inf - inf; a split with no keys has
     /// `m = -inf` and contributes nothing.
     ///
-    /// grid: (q_heads,). block: head_dim threads, one per output dimension.
-    ///
     /// # Safety
     /// part_acc covers n_splits * q_heads * head_dim floats, part_m and
     /// part_l n_splits * q_heads, out q_heads * head_dim; out is disjoint
-    /// from the inputs. n_splits >= 1.
-    #[kernel]
-    pub unsafe fn attn_flash_decode_combine(
+    /// from the inputs. n_splits >= 1, blockIdx.x < q_heads and threadIdx.x <
+    /// head_dim.
+    #[device]
+    unsafe fn decode_combine(
         part_acc: *const f32,
         part_m: *const f32,
         part_l: *const f32,
@@ -1071,7 +1071,11 @@ mod kernels {
             let mut s = 0;
             while s < n_splits {
                 let ms = *m;
-                let f = if ms == f32::NEG_INFINITY { 0.0 } else { (ms - gm).exp() };
+                let f = if ms == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    (ms - gm).exp()
+                };
                 num = f.mul_add(*acc, num);
                 den = f.mul_add(*l, den);
                 m = m.wrapping_add(row);
@@ -1080,6 +1084,57 @@ mod kernels {
                 s += 1;
             }
             *out.add(h * head_dim as usize + d) = num / den;
+        }
+    }
+
+    /// Merge the per-split partial softmaxes of split decode attention.
+    ///
+    /// grid: (q_heads,). block: head_dim threads, one per output dimension.
+    ///
+    /// # Safety
+    /// As `decode_combine`.
+    #[kernel]
+    pub unsafe fn attn_flash_decode_combine(
+        part_acc: *const f32,
+        part_m: *const f32,
+        part_l: *const f32,
+        out: *mut f32,
+        q_heads: i32,
+        head_dim: i32,
+        n_splits: i32,
+    ) {
+        unsafe { decode_combine(part_acc, part_m, part_l, out, q_heads, head_dim, n_splits) }
+    }
+
+    /// `attn_flash_decode_combine` for a batch: `gridDim.y` sequences, each
+    /// with its own partials and its own output row block.
+    ///
+    /// grid: (q_heads, sequences). block: head_dim.
+    ///
+    /// # Safety
+    /// As `decode_combine`, with every buffer `gridDim.y` times as long.
+    #[kernel]
+    pub unsafe fn attn_flash_decode_combine_k2_batch(
+        part_acc: *const f32,
+        part_m: *const f32,
+        part_l: *const f32,
+        out: *mut f32,
+        q_heads: i32,
+        head_dim: i32,
+        n_splits: i32,
+    ) {
+        let seq = thread::blockIdx_y() as usize;
+        let per_seq = n_splits as usize * q_heads as usize;
+        unsafe {
+            decode_combine(
+                part_acc.add(seq * per_seq * head_dim as usize),
+                part_m.add(seq * per_seq),
+                part_l.add(seq * per_seq),
+                out.add(seq * q_heads as usize * head_dim as usize),
+                q_heads,
+                head_dim,
+                n_splits,
+            )
         }
     }
 
@@ -1932,6 +1987,429 @@ mod kernels {
                 }
             }
             u += 1;
+        }
+    }
+
+    /// The binary16 scale at the head of a Q8_0 block, little-endian.
+    ///
+    /// # Safety
+    /// p covers two bytes.
+    #[device]
+    unsafe fn load_half_le(p: *const u8) -> f32 {
+        unsafe { h2f(*p as u16 | ((*p.add(1) as u16) << 8)) }
+    }
+
+    /// Look up token embeddings in a Q8_0 table stored as raw GGUF rows:
+    /// 34-byte blocks of a binary16 scale and 32 int8 codes.
+    /// `out[t][j] = scale * code`.
+    ///
+    /// grid: (n_tokens,). block: any, striding the row.
+    ///
+    /// # Safety
+    /// table covers every row `ids` names, of hidden / 32 blocks; ids covers
+    /// n_tokens ints and out n_tokens * hidden floats. hidden is a multiple
+    /// of 32.
+    #[kernel]
+    pub unsafe fn embed_q8_0(
+        table: *const u8,
+        ids: *const i32,
+        out: *mut f32,
+        hidden: i32,
+        n_tokens: i32,
+    ) {
+        let t = thread::blockIdx_x() as i64;
+        if t >= n_tokens as i64 {
+            return;
+        }
+        let step = thread::blockDim_x() as i32;
+        unsafe {
+            let blocks = (hidden / 32) as i64;
+            let row = table.add((*ids.add(t as usize) as i64 * blocks * 34) as usize);
+            let dst = out.add((t * hidden as i64) as usize);
+            let mut j = thread::threadIdx_x() as i32;
+            while j < hidden {
+                let blk = row.add((j / 32) as usize * 34);
+                let d = load_half_le(blk);
+                let q = *blk.add(2 + (j % 32) as usize) as i8;
+                *dst.add(j as usize) = d * q as f32;
+                j += step;
+            }
+        }
+    }
+
+    /// Dequantize a flat Q8_0 tensor: `dst[i] = code * scale`.
+    ///
+    /// # Safety
+    /// src covers ceil(n_elements / 32) blocks of 34 bytes, dst n_elements
+    /// floats.
+    #[kernel]
+    pub unsafe fn dequantize_q8_0(src: *const u8, dst: *mut f32, n_elements: i64) {
+        let i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        if i >= n_elements {
+            return;
+        }
+        unsafe {
+            let base = src.add((i / 32 * 34) as usize);
+            let d = load_half_le(base);
+            let q = *base.add(2 + (i % 32) as usize) as i8;
+            *dst.add(i as usize) = q as f32 * d;
+        }
+    }
+
+    /// `gdn_silu` and `gdn_split_qkv` in one launch: the activated row is
+    /// written whole to `silu` and its three slices to q, k and v.
+    ///
+    /// The standalone pair wrote one buffer that the split immediately read.
+    /// `v / (1 + exp(-v))` is the same expression in the same order, so the
+    /// outputs are the same bits.
+    ///
+    /// grid: (value_heads, tokens). block: head_dim.
+    ///
+    /// # Safety
+    /// As `gdn_split_qkv`; silu covers the same extent as conv and is
+    /// disjoint from every other buffer.
+    #[kernel]
+    pub unsafe fn gdn_silu_split_qkv(
+        conv: *const f32,
+        silu: *mut f32,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        head_dim: i32,
+        qk_heads: i32,
+        value_heads: i32,
+    ) {
+        let h = thread::blockIdx_x() as i64;
+        let t = thread::blockIdx_y() as i64;
+        let d = thread::threadIdx_x() as i64;
+        let head_dim = head_dim as i64;
+        let key_dim = qk_heads as i64 * head_dim;
+        let conv_dim = 2 * key_dim + value_heads as i64 * head_dim;
+        unsafe {
+            let c = conv.add((t * conv_dim) as usize);
+            let sr = silu.add((t * conv_dim) as usize);
+            let iv = (2 * key_dim + h * head_dim + d) as usize;
+            let mut vv = *c.add(iv);
+            vv = vv / (1.0 + (-vv).exp());
+            *sr.add(iv) = vv;
+            *v.add(((t * value_heads as i64 + h) * head_dim + d) as usize) = vv;
+            if h < qk_heads as i64 {
+                let iq = (h * head_dim + d) as usize;
+                let ik = (key_dim + h * head_dim + d) as usize;
+                let (mut qv, mut kv) = (*c.add(iq), *c.add(ik));
+                qv = qv / (1.0 + (-qv).exp());
+                kv = kv / (1.0 + (-kv).exp());
+                *sr.add(iq) = qv;
+                *sr.add(ik) = kv;
+                let o = ((t * qk_heads as i64 + h) * head_dim + d) as usize;
+                *q.add(o) = qv;
+                *k.add(o) = kv;
+            }
+        }
+    }
+
+    /// The decode step's convolution, SiLU and q/k/v split in one launch for
+    /// up to eight sequences, each with its own convolution cache.
+    ///
+    /// Per channel this is `conv1d_step_batch`'s arithmetic exactly (the
+    /// same helper), then `gdn_silu_split_qkv`'s; the raw convolution is
+    /// kept in `conv_raw` because verification replays from it.
+    ///
+    /// grid: (value_heads, sequences <= 8). block: head_dim.
+    ///
+    /// # Safety
+    /// x, conv_raw and silu cover sequences * conv_dim floats; weight covers
+    /// conv_dim * conv_kernel; each used state pointer covers conv_dim *
+    /// (conv_kernel - 1) floats and belongs to one sequence; q, k and v as
+    /// `gdn_split_qkv`. All outputs are mutually disjoint.
+    #[kernel]
+    pub unsafe fn gdn_conv_silu_split_step_batch(
+        x: *const f32,
+        weight: *const f32,
+        s0: u64,
+        s1: u64,
+        s2: u64,
+        s3: u64,
+        s4: u64,
+        s5: u64,
+        s6: u64,
+        s7: u64,
+        conv_raw: *mut f32,
+        silu: *mut f32,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        head_dim: i32,
+        qk_heads: i32,
+        value_heads: i32,
+        conv_kernel: i32,
+    ) {
+        let h = thread::blockIdx_x() as i64;
+        let t = thread::blockIdx_y() as i64;
+        let d = thread::threadIdx_x() as i64;
+        let state = match t {
+            0 => s0,
+            1 => s1,
+            2 => s2,
+            3 => s3,
+            4 => s4,
+            5 => s5,
+            6 => s6,
+            _ => s7,
+        } as *mut f32;
+        let head_dim = head_dim as i64;
+        let key_dim = qk_heads as i64 * head_dim;
+        let conv_dim = 2 * key_dim + value_heads as i64 * head_dim;
+        let carry = conv_kernel - 1;
+        unsafe {
+            let xt = x.add((t * conv_dim) as usize);
+            let cr = conv_raw.add((t * conv_dim) as usize);
+            let sr = silu.add((t * conv_dim) as usize);
+            let iv = 2 * key_dim + h * head_dim + d;
+            let mut vv = conv_step_channel(
+                *xt.add(iv as usize),
+                weight.add((iv * conv_kernel as i64) as usize),
+                state.add((iv * carry as i64) as usize),
+                carry,
+            );
+            *cr.add(iv as usize) = vv;
+            vv = vv / (1.0 + (-vv).exp());
+            *sr.add(iv as usize) = vv;
+            *v.add(((t * value_heads as i64 + h) * head_dim + d) as usize) = vv;
+            if h < qk_heads as i64 {
+                let iq = h * head_dim + d;
+                let ik = key_dim + h * head_dim + d;
+                let mut qv = conv_step_channel(
+                    *xt.add(iq as usize),
+                    weight.add((iq * conv_kernel as i64) as usize),
+                    state.add((iq * carry as i64) as usize),
+                    carry,
+                );
+                let mut kv = conv_step_channel(
+                    *xt.add(ik as usize),
+                    weight.add((ik * conv_kernel as i64) as usize),
+                    state.add((ik * carry as i64) as usize),
+                    carry,
+                );
+                *cr.add(iq as usize) = qv;
+                *cr.add(ik as usize) = kv;
+                qv = qv / (1.0 + (-qv).exp());
+                kv = kv / (1.0 + (-kv).exp());
+                *sr.add(iq as usize) = qv;
+                *sr.add(ik as usize) = kv;
+                let o = ((t * qk_heads as i64 + h) * head_dim + d) as usize;
+                *q.add(o) = qv;
+                *k.add(o) = kv;
+            }
+        }
+    }
+
+    /// L2-normalize one head's query and key rows; the query is also scaled.
+    ///
+    /// `1 / sqrt(sum + eps)`: the epsilon is added to the sum of squares,
+    /// which is flash-linear-attention's l2norm, transformers'
+    /// (`x * rsqrt(sum + eps)`) and llama.cpp's since 5fdfa6282
+    /// (`build_gdn_l2_norm`). The form that floors the norm instead,
+    /// `1 / max(sqrt(sum), eps)`, is ggml_l2_norm's; on the real q_conv and
+    /// k_conv of blocks 0/4/20 the two differ by up to 2.148e-4 relative.
+    ///
+    /// A reciprocal square root would be faster and is not IEEE-exact;
+    /// dividing by sqrt keeps the kernel bit-comparable with its CPU
+    /// reference up to the reduction order.
+    ///
+    /// # Safety
+    /// base + threadIdx.x indexes all four buffers; block_reduce_sum's
+    /// launch contract holds with blockDim.x == head_dim.
+    #[device]
+    unsafe fn normalize_qk_row(
+        q_in: *const f32,
+        k_in: *const f32,
+        q_out: *mut f32,
+        k_out: *mut f32,
+        base: i64,
+        eps: f32,
+        scale: f32,
+    ) {
+        let at = (base + thread::threadIdx_x() as i64) as usize;
+        unsafe {
+            let (qv, kv) = (*q_in.add(at), *k_in.add(at));
+            let q_sq = block_reduce_sum(qv * qv);
+            // The next reduction overwrites the slot this one returned from.
+            thread::sync_threads();
+            let k_sq = block_reduce_sum(kv * kv);
+            thread::sync_threads();
+            *q_out.add(at) = qv * (1.0 / (q_sq + eps).sqrt()) * scale;
+            *k_out.add(at) = kv * (1.0 / (k_sq + eps).sqrt());
+        }
+    }
+
+    /// `normalize_qk_row` over one token's heads, for the recurrent step.
+    ///
+    /// grid: (heads,). block: head_dim, with a float of dynamic shared
+    /// memory per warp.
+    ///
+    /// # Safety
+    /// The four buffers cover gridDim.x * head_dim floats; outputs are
+    /// disjoint from inputs and each other.
+    #[kernel]
+    pub unsafe fn gdn_normalize_qk(
+        q_in: *const f32,
+        k_in: *const f32,
+        q_out: *mut f32,
+        k_out: *mut f32,
+        head_dim: i32,
+        eps: f32,
+        scale: f32,
+    ) {
+        let base = (thread::blockIdx_x() as i32 * head_dim) as i64;
+        unsafe { normalize_qk_row(q_in, k_in, q_out, k_out, base, eps, scale) }
+    }
+
+    /// `normalize_qk_row` over every head of every token of a chunk.
+    ///
+    /// grid: (tokens * heads,). block: head_dim, with a float of dynamic
+    /// shared memory per warp.
+    ///
+    /// # Safety
+    /// As `gdn_normalize_qk`.
+    #[kernel]
+    pub unsafe fn gdn_chunk_normalize_qk(
+        q_in: *const f32,
+        k_in: *const f32,
+        q_out: *mut f32,
+        k_out: *mut f32,
+        head_dim: i32,
+        eps: f32,
+        scale: f32,
+    ) {
+        let base = thread::blockIdx_x() as i64 * head_dim as i64;
+        unsafe { normalize_qk_row(q_in, k_in, q_out, k_out, base, eps, scale) }
+    }
+
+    /// The dense model's post-mixer RMSNorm, emitting both widths in one
+    /// pass: fp32 for the residual and binary16 for the tensor-core
+    /// projections. Same reduction and same division as `rms_norm_rows`.
+    ///
+    /// # Safety
+    /// As `rms_norm_rows`; out_h covers the same element count in halves.
+    #[kernel]
+    pub unsafe fn dense_rms_norm_narrow(
+        x: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+        out_h: *mut u16,
+        width: i32,
+        eps: f32,
+    ) {
+        let base = thread::blockIdx_x() as usize * width as usize;
+        let step = thread::blockDim_x() as i32;
+        unsafe {
+            let inv_rms = inverse_rms(x, width, eps);
+            let mut j = thread::threadIdx_x() as i32;
+            while j < width {
+                let at = base + j as usize;
+                let v = *x.add(at) * inv_rms * *weight.add(j as usize);
+                *out.add(at) = v;
+                *out_h.add(at) = f2h(v);
+                j += step;
+            }
+        }
+    }
+
+    /// The decision head's block sum: an xor-shuffle tree per warp, the warp
+    /// totals parked in shared memory, then a second tree over them.
+    ///
+    /// # Safety
+    /// Every thread of a 1-D block of at most 1024 threads, a multiple of
+    /// 32, participates.
+    #[device]
+    unsafe fn dec_block_sum(v: f32) -> f32 {
+        static mut RED: SharedArray<f32, 32> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x();
+        let (lane, w, nw) = (tid & 31, tid >> 5, thread::blockDim_x() >> 5);
+        let mut v = v;
+        let mut o = 16;
+        while o > 0 {
+            v += warp::shuffle_xor_f32_sync(u32::MAX, v, o);
+            o >>= 1;
+        }
+        unsafe {
+            thread::sync_threads();
+            if lane == 0 {
+                RED[w as usize] = v;
+            }
+            thread::sync_threads();
+            v = if lane < nw { RED[lane as usize] } else { 0.0 };
+        }
+        let mut o = 16;
+        while o > 0 {
+            v += warp::shuffle_xor_f32_sync(u32::MAX, v, o);
+            o >>= 1;
+        }
+        v
+    }
+
+    /// LayerNorm over each row, optionally recording the row's `(mean,
+    /// rstd)` and optionally writing the normalized row.
+    ///
+    /// grid: (rows,). block: a multiple of 32.
+    ///
+    /// # Safety
+    /// x covers rows of stride ldx with `cols` used; g and b cover cols.
+    /// stats is null or covers two floats a row; y is null or covers rows of
+    /// stride ldy and is disjoint from x.
+    #[kernel]
+    pub unsafe fn dec_layer_norm(
+        x: *const f32,
+        ldx: i64,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        g: *const f32,
+        b: *const f32,
+        stats: *mut f32,
+        y: *mut f32,
+        ldy: i64,
+    ) {
+        let r = thread::blockIdx_x() as i64;
+        if r >= rows as i64 {
+            return;
+        }
+        let tid = thread::threadIdx_x() as i32;
+        let step = thread::blockDim_x() as i32;
+        unsafe {
+            let xr = x.add((r * ldx) as usize);
+            let mut s = 0.0f32;
+            let mut c = tid;
+            while c < cols {
+                s += *xr.add(c as usize);
+                c += step;
+            }
+            let mean = dec_block_sum(s) / cols as f32;
+            let mut v = 0.0f32;
+            let mut c = tid;
+            while c < cols {
+                let d = *xr.add(c as usize) - mean;
+                // NVRTC contracts the original's v += d * d.
+                v = d.mul_add(d, v);
+                c += step;
+            }
+            let var = dec_block_sum(v) / cols as f32;
+            let rstd = 1.0 / (var + eps).sqrt();
+            if !stats.is_null() && tid == 0 {
+                *stats.add(2 * r as usize) = mean;
+                *stats.add(2 * r as usize + 1) = rstd;
+            }
+            if !y.is_null() {
+                let yr = y.add((r * ldy) as usize);
+                let mut c = tid;
+                while c < cols {
+                    let at = c as usize;
+                    *yr.add(at) = ((*xr.add(at) - mean) * rstd).mul_add(*g.add(at), *b.add(at));
+                    c += step;
+                }
+            }
         }
     }
 }

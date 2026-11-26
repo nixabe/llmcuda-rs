@@ -2208,8 +2208,8 @@ mod kernels {
     /// L2-normalize one head's query and key rows; the query is also scaled.
     ///
     /// `1 / sqrt(sum + eps)`: the epsilon is added to the sum of squares,
-    /// which is flash-linear-attention's l2norm, transformers'
-    /// (`x * rsqrt(sum + eps)`) and llama.cpp's since 5fdfa6282
+    /// which is flash-linear-attention's l2norm, transformers' and
+    /// llama.cpp's since 5fdfa6282
     /// (`build_gdn_l2_norm`). The form that floors the norm instead,
     /// `1 / max(sqrt(sum), eps)`, is ggml_l2_norm's; on the real q_conv and
     /// k_conv of blocks 0/4/20 the two differ by up to 2.148e-4 relative.

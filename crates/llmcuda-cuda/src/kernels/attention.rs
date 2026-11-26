@@ -3005,37 +3005,6 @@ __global__ void attn_flash_decode_warp_k2_128_batch(
     attn_k2_warp_body<128,4>(q,k,v,part_acc,part_m,part_l,q_heads,kv_heads,head_dim,key_offset,scale,n_splits);
 }
 __global__ void attn_flash_decode_warp_k2_128(const float* __restrict__ q,const unsigned short* __restrict__ k,const unsigned short* __restrict__ v,float* __restrict__ part_acc,float* __restrict__ part_m,float* __restrict__ part_l,int q_heads,int kv_heads,int head_dim,const int* key_offset,float scale,int n_splits){attn_k2_warp_body<128,4>(q,k,v,part_acc,part_m,part_l,q_heads,kv_heads,head_dim,key_offset,scale,n_splits);}
-__global__ void attn_flash_decode_combine_k2_batch(
-    const float* __restrict__ part_acc,
-    const float* __restrict__ part_m,
-    const float* __restrict__ part_l,
-    float* __restrict__ out,
-    int q_heads,
-    int head_dim,
-    int n_splits
-) {
-    int seq=blockIdx.y;
-    part_acc+=(long long)seq*n_splits*q_heads*head_dim;
-    part_m+=(long long)seq*n_splits*q_heads;part_l+=(long long)seq*n_splits*q_heads;
-    out+=(long long)seq*q_heads*head_dim;
-    int h = blockIdx.x;
-    int d = threadIdx.x;
-
-    // Split 0 always holds at least key 0, so this is never -inf and the
-    // subtraction below never forms inf - inf.
-    float gm = neg_inf();
-    for (int s = 0; s < n_splits; ++s) gm = fmaxf(gm, part_m[s * q_heads + h]);
-
-    float num = 0.0f;
-    float den = 0.0f;
-    for (int s = 0; s < n_splits; ++s) {
-        float ms = part_m[s * q_heads + h];
-        float f = (ms == neg_inf()) ? 0.0f : expf(ms - gm);
-        num += f * part_acc[((long long)s * q_heads + h) * (long long)head_dim + d];
-        den += f * part_l[s * q_heads + h];
-    }
-    out[(long long)h * (long long)head_dim + d] = num / den;
-}
 
 }
 "#;
@@ -3438,7 +3407,7 @@ impl AttentionKernels {
             decode_warp_k2_128_batch: module
                 .load_function("attn_flash_decode_warp_k2_128_batch")?,
             decode_warp_k2_batch: module.load_function("attn_flash_decode_warp_k2_batch")?,
-            decode_combine_k2_batch: module.load_function("attn_flash_decode_combine_k2_batch")?,
+            decode_combine_k2_batch: rust.load_function("attn_flash_decode_combine_k2_batch")?,
             decode_mma_wpo4: {
                 let f = module.load_function("attn_flash_decode_mma_wpo4")?;
                 f.set_attribute(

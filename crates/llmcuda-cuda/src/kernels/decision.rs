@@ -448,34 +448,6 @@ __device__ __forceinline__ void attention_tile(
 
 extern "C" {
 
-// One block per row: two-pass fp32 mean and variance. Writes (mean, rstd) to
-// `stats` when non-null and the normed row to `y` when non-null.
-__global__ void dec_layer_norm(
-    const float* __restrict__ x, long long ldx, int rows, int cols, float eps,
-    const float* __restrict__ g, const float* __restrict__ b,
-    float2* __restrict__ stats, float* __restrict__ y, long long ldy)
-{
-    __shared__ float red[32];
-    int r = blockIdx.x;
-    if (r >= rows) return;
-    const float* xr = x + (long long)r * ldx;
-    float s = 0.0f;
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) s += xr[c];
-    const float mean = block_sum(s, red) / (float)cols;
-    float v = 0.0f;
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
-        float d = xr[c] - mean;
-        v += d * d;
-    }
-    const float var = block_sum(v, red) / (float)cols;
-    const float rstd = 1.0f / sqrtf(var + eps);
-    if (stats && threadIdx.x == 0) stats[r] = make_float2(mean, rstd);
-    if (y) {
-        float* yr = y + (long long)r * ldy;
-        for (int c = threadIdx.x; c < cols; c += blockDim.x) yr[c] = (xr[c] - mean) * rstd * g[c] + b[c];
-    }
-}
-
 __global__ void __launch_bounds__(256, 2) dec_gemm_128(
     const float* X, long long ldx, const float* W, long long ldw, const float* bias,
     float* Y, long long ldy, int M, int N, int K, int kchunk,
@@ -903,7 +875,7 @@ impl DecisionKernels {
             )?
             .max(1) as usize;
         Ok(Self {
-            layer_norm: f("dec_layer_norm")?,
+            layer_norm: r("dec_layer_norm")?,
             gemm_128: f("dec_gemm_128")?,
             gemm_64: f("dec_gemm_64")?,
             splitk_reduce: f("dec_splitk_reduce")?,

@@ -53,7 +53,7 @@ pub const BLOCK_Q6_K_BYTES: usize = 210;
 /// on-disk layout is packed and C++ struct padding rules would need
 /// `__attribute__((packed))` to match — a difference that would show up as
 /// every block after the first being misaligned.
-pub(crate) const DEQUANT_SRC: &str = r#"
+const DEQUANT_SRC: &str = r#"
 extern "C" {
 
 // Reinterpret two little-endian bytes as an IEEE half and widen to float.
@@ -75,29 +75,6 @@ __device__ __forceinline__ float load_half_le(const unsigned char* p) {
     float f;
     asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(bits));
     return f;
-}
-
-// One thread per output element.
-//
-// `qs` for block b starts at b*34 + 2; the fp16 delta is the first two bytes
-// of the block. Reading the quant as `signed char` is load-bearing: the
-// codes are int8 on disk, and reading them unsigned would flip the sign of
-// roughly half of every tensor while leaving magnitudes plausible.
-__global__ void dequantize_q8_0(
-    const unsigned char* __restrict__ src,
-    float* __restrict__ dst,
-    long long n_elements
-) {
-    long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
-    if (i >= n_elements) return;
-
-    long long block = i / 32;
-    int lane = (int)(i % 32);
-    const unsigned char* base = src + block * 34;
-
-    float d = load_half_le(base);
-    signed char q = (signed char)base[2 + lane];
-    dst[i] = (float)q * d;
 }
 
 // One thread per (superblock, half, l) triple; each writes four outputs.
@@ -204,8 +181,9 @@ impl Dequantizer {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, DequantError> {
         let ptx = compile(DEQUANT_SRC, "dequant").map_err(DequantError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
-            q8_0: module.load_function("dequantize_q8_0")?,
+            q8_0: rust.load_function("dequantize_q8_0")?,
             q6_k: module.load_function("dequantize_q6_k")?,
         })
     }
@@ -312,7 +290,7 @@ mod tests {
             "Q6_K reassociated away from (d * scale) * q",
         );
         assert!(
-            DEQUANT_SRC.contains("(float)q * d"),
+            crate::kernels::rust_kernel_source("dequantize_q8_0").contains("q as f32 * d"),
             "Q8_0 reassociated away from q * d",
         );
     }
@@ -321,7 +299,11 @@ mod tests {
     fn quants_are_read_as_signed() {
         // Reading int8 codes as unsigned is the single most likely
         // transcription error here, and it produces plausible magnitudes.
-        assert!(DEQUANT_SRC.contains("(signed char)base[2 + lane]"));
+        // Q8_0 is Rust.
+        assert!(
+            crate::kernels::rust_kernel_source("dequantize_q8_0")
+                .contains("*base.add(2 + (i % 32) as usize) as i8")
+        );
         assert!(DEQUANT_SRC.contains("(const signed char*)(base + 192"));
     }
 }

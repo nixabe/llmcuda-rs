@@ -83,80 +83,8 @@ const STEP_WARPS: u32 = 4;
 /// this many per-sequence state pointer slots.
 pub const STEP_MAX_BATCH: usize = 8;
 
-pub(crate) const GDN_SRC: &str = r#"
+const GDN_SRC: &str = r#"
 extern "C" {
-
-// Sum across a block of up to 1024 threads.
-//
-// Warp shuffles first, then one round through shared memory. The tree order
-// differs from the reference's sequential sum, which is the dominant source
-// of disagreement between this kernel and the CPU — fp32 addition is not
-// associative. It is bounded and unbiased; see the module docs for the
-// tolerance this justifies.
-__device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffff, v, offset);
-    }
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    if (lane == 0) scratch[warp] = v;
-    __syncthreads();
-
-    int n_warps = (blockDim.x + 31) >> 5;
-    float total = 0.0f;
-    if (threadIdx.x == 0) {
-        for (int w = 0; w < n_warps; ++w) total += scratch[w];
-        scratch[0] = total;
-    }
-    __syncthreads();
-    return scratch[0];
-}
-
-// L2-normalize q and k per query/key head, and fold the 1/sqrt(head_dim)
-// output scale into q.
-//
-// The scale belongs on q rather than on the output because q appears only in
-// the final dot product and never in the state update, so the two placements
-// are identical arithmetic — this is the placement both upstream references
-// use.
-//
-// grid: one block per qk head. block: head_dim threads.
-__global__ void gdn_normalize_qk(
-    const float* __restrict__ q_in,
-    const float* __restrict__ k_in,
-    float* __restrict__ q_out,
-    float* __restrict__ k_out,
-    int head_dim,
-    float eps,
-    float scale
-) {
-    extern __shared__ float scratch[];
-    int head = blockIdx.x;
-    int j = threadIdx.x;
-    int base = head * head_dim;
-
-    float qv = q_in[base + j];
-    float kv = k_in[base + j];
-
-    float q_sq = block_reduce_sum(qv * qv, scratch);
-    __syncthreads();
-    float k_sq = block_reduce_sum(kv * kv, scratch);
-    __syncthreads();
-
-    // `1/sqrt(sum + eps)`: the epsilon is ADDED to the sum of squares, which
-    // is flash-linear-attention's l2norm and transformers' (`x * rsqrt(sum +
-    // eps)`), and llama.cpp's since 5fdfa6282 (`build_gdn_l2_norm`). The form
-    // that floors the norm instead, `1/max(sqrt(sum), eps)`, is
-    // ggml_l2_norm's; this kernel had it while llama.cpp's graph did, and on
-    // the real q_conv/k_conv of blocks 0/4/20 the two differ by up to
-    // 2.148e-4 relative (smallest sum of squares 2.327e-3).
-    //
-    // rsqrtf would be faster and is not IEEE-exact; dividing by sqrtf keeps
-    // this kernel bit-comparable with its CPU reference up to the reduction
-    // order.
-    q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;
-    k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));
-}
 
 // Sum across one warp, leaving the total in every lane.
 __device__ __forceinline__ float warp_reduce_sum(float v) {
@@ -400,8 +328,9 @@ impl GdnKernels {
         }
         let ptx = compile(GDN_SRC, "gdn").map_err(GdnError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
-            normalize: module.load_function("gdn_normalize_qk")?,
+            normalize: rust.load_function("gdn_normalize_qk")?,
             step: module.load_function("gdn_recurrent_step")?,
             head_dim,
             value_heads,
@@ -602,8 +531,9 @@ mod tests {
     fn the_scale_is_folded_into_q_only() {
         // Folding it into k as well would square it; folding it into neither
         // scales every GDN layer's output by 11.3x.
-        assert!(GDN_SRC.contains("q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;"));
-        assert!(GDN_SRC.contains("k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));"));
+        let row = crate::kernels::rust_kernel_source("normalize_qk_row");
+        assert!(row.contains("*q_out.add(at) = qv * (1.0 / (q_sq + eps).sqrt()) * scale;"));
+        assert!(row.contains("*k_out.add(at) = kv * (1.0 / (k_sq + eps).sqrt());"));
     }
 
     #[test]
@@ -616,12 +546,17 @@ mod tests {
         // blocks 0/4/20. Asserted structurally because no synthetic input at
         // a realistic scale distinguishes the two above the noise floor of
         // the differential gate.
+        // The normalizer is Rust, shared with the chunked path.
+        let row = crate::kernels::rust_kernel_source("normalize_qk_row");
         assert!(
-            !GDN_SRC.contains("fmaxf(sqrtf("),
+            !row.contains(".max("),
             "the L2 epsilon reverted to flooring the norm",
         );
-        assert!(GDN_SRC.contains("sqrtf(q_sq + eps)"));
-        assert!(GDN_SRC.contains("sqrtf(k_sq + eps)"));
+        assert!(row.contains("(q_sq + eps).sqrt()"));
+        assert!(row.contains("(k_sq + eps).sqrt()"));
+        assert!(
+            crate::kernels::rust_kernel_source("gdn_normalize_qk").contains("normalize_qk_row(")
+        );
     }
 
     #[test]

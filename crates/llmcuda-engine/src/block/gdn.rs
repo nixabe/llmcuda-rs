@@ -1056,198 +1056,6 @@ __global__ void gdn_proj_f32(
     }
 }
 
-// Slice the convolved q/k/v stream apart. No broadcast: q and k come out at
-// their own 16 heads and the mixer kernels do `qk_head = h % qk_heads`.
-//
-// The stream is [2 * qk_heads * head_dim | value_heads * head_dim] per token,
-// contiguous, which is the layout `attn_qkv.weight`'s output width implies and
-// `build_layer_attn_linear`'s three `ggml_view_4d` offsets confirm. The three
-// outputs are therefore exactly llama.cpp's `q_conv-N` / `k_conv-N`
-// (`[head_dim, qk_heads, tokens]`) and `v_conv_predelta-N`
-// (`[head_dim, value_heads, tokens]`) — the same shapes, not a widened form.
-//
-// This kernel **used to** materialise `qk_head = h % qk_heads` itself, because
-// both GDN kernels indexed `h / heads_per_kv` internally and had to be handed
-// an already-wide q and k. They index by modulo now, so the broadcast is
-// theirs and this is a plain slice.
-//
-// grid: (value_heads, tokens). block: head_dim threads. Blocks with
-// `h < qk_heads` write q and k as well as v, so the two ranges are covered by
-// one launch and the low 16 heads do the extra pair of stores.
-// conv_output_silu-N and the q/k/v split, in one launch.
-//
-// `gdn_silu` wrote one buffer that `gdn_split_qkv` immediately read, and the
-// split touches every element of it exactly once -- the value part once, and
-// the query and key parts once each -- so the nonlinearity can be applied on
-// the way through. `silu` is still written because the golden capture has a
-// waypoint on it, and because a block that got the split wrong would
-// otherwise have no intermediate to fail at.
-//
-// `v / (1 + exp(-v))` is the same expression `gdn_silu` used, in the same
-// order, so this is bit-identical to the pair it replaces.
-//
-// grid: (value_heads, tokens). block: head_dim.
-__global__ void gdn_silu_split_qkv(
-    const float* __restrict__ conv,
-    float* __restrict__ silu,
-    float* __restrict__ q,
-    float* __restrict__ k,
-    float* __restrict__ v,
-    int head_dim,
-    int qk_heads,
-    int value_heads
-) {
-    int h = blockIdx.x;
-    int t = blockIdx.y;
-    int d = threadIdx.x;
-
-    int key_dim  = qk_heads * head_dim;
-    int conv_dim = 2 * key_dim + value_heads * head_dim;
-
-    const float* c  = conv + (long long)t * conv_dim;
-    float*       sr = silu + (long long)t * conv_dim;
-
-    int iv = 2 * key_dim + h * head_dim + d;
-    float vv = c[iv];
-    vv = vv / (1.0f + expf(-vv));
-    sr[iv] = vv;
-    v[((long long)t * value_heads + h) * head_dim + d] = vv;
-
-    if (h < qk_heads) {
-        int iq = h * head_dim + d;
-        int ik = key_dim + h * head_dim + d;
-        float qv = c[iq];
-        float kv = c[ik];
-        qv = qv / (1.0f + expf(-qv));
-        kv = kv / (1.0f + expf(-kv));
-        sr[iq] = qv;
-        sr[ik] = kv;
-        long long o = ((long long)t * qk_heads + h) * head_dim + d;
-        q[o] = qv;
-        k[o] = kv;
-    }
-}
-
-// One decode token's convolution step, SiLU and q/k/v split in one launch.
-//
-// At decode width `conv1d_step_batch` (layer_ops) and `gdn_silu_split_qkv`
-// above were two launches per layer, the second reading back the 8,192
-// floats the first had just written: at one token that is a second launch
-// floor to move 32 KB through L2. Here the thread that convolves a channel
-// applies the SiLU to its own accumulator, so `conv_raw` is still written
-// (it is a captured waypoint) but never re-read.
-//
-// The convolution per channel is `conv1d_step_batch`'s, operand for
-// operand: the same `carry` register stage, the same `__fadd_rn(__fmul_rn)`
-// chain in tap order, the same in-place window advance. `gdn.rs`'s source
-// gate holds the two texts equal. The SiLU and the split are
-// `gdn_silu_split_qkv`'s. Only the thread-to-channel mapping differs, and
-// no arithmetic depends on it, so the outputs are bit-identical to the
-// two-launch form (`gdn_conv_silu_differential`).
-//
-// The per-sequence conv caches ride in as pointer slots like the recurrent
-// step's, so graph capture sees a fixed argument list.
-//
-// grid: (value_heads, n_seq). block: head_dim. `x` and `conv_raw`/`silu`
-// are `[n_seq][conv_dim]`, one token per sequence.
-#define GDN_MAX_CONV_KERNEL 8
-__device__ __forceinline__ float gdn_conv_step_channel(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    float* state,
-    int ch,
-    int conv_kernel
-) {
-    int carry = conv_kernel - 1;
-
-    float staged[GDN_MAX_CONV_KERNEL];
-    for (int j = 0; j < carry; ++j) {
-        staged[j] = state[(long long)ch * carry + j];
-    }
-    float xv0 = x[ch];
-
-    float acc = 0.0f;
-    for (int i = 0; i < conv_kernel; ++i) {
-        float xv = (i < carry) ? staged[i] : xv0;
-        acc = __fadd_rn(acc, __fmul_rn(xv, weight[(long long)ch * conv_kernel + i]));
-    }
-
-    for (int j = 0; j + 1 < carry; ++j) {
-        state[(long long)ch * carry + j] = staged[j + 1];
-    }
-    if (carry > 0) {
-        state[(long long)ch * carry + carry - 1] = xv0;
-    }
-    return acc;
-}
-
-__device__ __forceinline__ float gdn_silu_scalar(float v) {
-    return v / (1.0f + expf(-v));
-}
-
-__global__ void gdn_conv_silu_split_step_batch(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    unsigned long long s0, unsigned long long s1,
-    unsigned long long s2, unsigned long long s3,
-    unsigned long long s4, unsigned long long s5,
-    unsigned long long s6, unsigned long long s7,
-    float* __restrict__ conv_raw,
-    float* __restrict__ silu,
-    float* __restrict__ q,
-    float* __restrict__ k,
-    float* __restrict__ v,
-    int head_dim,
-    int qk_heads,
-    int value_heads,
-    int conv_kernel
-) {
-    int h = blockIdx.x;
-    int t = blockIdx.y;
-    int d = threadIdx.x;
-    float* state;
-    switch (t) {
-        case 0: state = (float*)s0; break;
-        case 1: state = (float*)s1; break;
-        case 2: state = (float*)s2; break;
-        case 3: state = (float*)s3; break;
-        case 4: state = (float*)s4; break;
-        case 5: state = (float*)s5; break;
-        case 6: state = (float*)s6; break;
-        default: state = (float*)s7; break;
-    }
-
-    int key_dim  = qk_heads * head_dim;
-    int conv_dim = 2 * key_dim + value_heads * head_dim;
-
-    const float* xt = x + (long long)t * conv_dim;
-    float*       cr = conv_raw + (long long)t * conv_dim;
-    float*       sr = silu + (long long)t * conv_dim;
-
-    int iv = 2 * key_dim + h * head_dim + d;
-    float vv = gdn_conv_step_channel(xt, weight, state, iv, conv_kernel);
-    cr[iv] = vv;
-    vv = gdn_silu_scalar(vv);
-    sr[iv] = vv;
-    v[((long long)t * value_heads + h) * head_dim + d] = vv;
-
-    if (h < qk_heads) {
-        int iq = h * head_dim + d;
-        int ik = key_dim + h * head_dim + d;
-        float qv = gdn_conv_step_channel(xt, weight, state, iq, conv_kernel);
-        float kv = gdn_conv_step_channel(xt, weight, state, ik, conv_kernel);
-        cr[iq] = qv;
-        cr[ik] = kv;
-        qv = gdn_silu_scalar(qv);
-        kv = gdn_silu_scalar(kv);
-        sr[iq] = qv;
-        sr[ik] = kv;
-        long long o = ((long long)t * qk_heads + h) * head_dim + d;
-        q[o] = qv;
-        k[o] = kv;
-    }
-}
-
 }
 
 // The split-layout projection family: out[t][n] = sum_k w[n][k] * x[t][k]
@@ -2566,8 +2374,8 @@ impl GdnBlock {
             alpha_beta_gates_q6k_t1: module.load_function("gdn_alpha_beta_gates_q6k_t1")?,
             silu: rust.load_function("gdn_silu")?,
             split: rust.load_function("gdn_split_qkv")?,
-            silu_split: module.load_function("gdn_silu_split_qkv")?,
-            conv_silu_split_step_batch: module.load_function("gdn_conv_silu_split_step_batch")?,
+            silu_split: rust.load_function("gdn_silu_split_qkv")?,
+            conv_silu_split_step_batch: rust.load_function("gdn_conv_silu_split_step_batch")?,
             gates: rust.load_function("gdn_gates")?,
             scratch: None,
             mixer: Mixer::Chunked,
@@ -5169,42 +4977,32 @@ mod tests {
 
     use super::*;
 
-    /// The fused decode-step kernel convolves a channel with the standalone
-    /// `conv1d_step_batch`'s arithmetic: taps in ascending order, each
-    /// product rounded before it is added, then the window shifted by one
-    /// with this token appended.
-    ///
-    /// The standalone kernel is Rust and this one CUDA C++, so the two can
-    /// no longer be compared as text. This pins the fused side; the Rust
-    /// side is pinned in `llmcuda-cuda`, and `gdn_conv_silu_differential`
-    /// compares the two kernels' outputs bit for bit.
+    /// The fused decode-step kernel and the standalone `conv1d_step_batch`
+    /// convolve a channel through one function, so the two cannot drift:
+    /// taps in ascending order, each product rounded before it is added,
+    /// then the window shifted by one with this token appended.
+    /// `gdn_conv_silu_differential` compares their outputs bit for bit.
     #[test]
-    fn the_fused_conv_step_keeps_the_standalone_convolutions_arithmetic() {
-        let at = GDN_BLOCK_SRC
-            .find("float gdn_conv_step_channel(")
-            .expect("present");
-        let body = &GDN_BLOCK_SRC[at..];
-        let body = &body[..body.find("return acc;").expect("it returns the sum")];
-        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
-        for line in [
-            "float staged[GDN_MAX_CONV_KERNEL];",
-            "staged[j] = state[(long long)ch * carry + j];",
-            "for (int i = 0; i < conv_kernel; ++i) {",
-            "float xv = (i < carry) ? staged[i] : xv0;",
-            "acc = __fadd_rn(acc, __fmul_rn(xv, weight[(long long)ch * conv_kernel + i]));",
-            "state[(long long)ch * carry + j] = staged[j + 1];",
-            "state[(long long)ch * carry + carry - 1] = xv0;",
-        ] {
-            assert!(flat.contains(line), "the fused convolution lost `{line}`");
+    fn the_fused_conv_step_shares_the_standalone_convolutions_arithmetic() {
+        for kernel in ["conv1d_step_batch", "gdn_conv_silu_split_step_batch"] {
+            assert!(
+                rust_kernel(kernel).contains("conv_step_channel("),
+                "{kernel} no longer convolves through the shared helper",
+            );
         }
+        let src = llmcuda_cuda::kernels::RUST_KERNELS_SRC;
+        let at = src
+            .find("unsafe fn conv_step_channel(")
+            .expect("the shared helper is present");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("it ends")];
+        assert!(body.contains("acc += *state.add(i as usize) * *weight.add(i as usize);"));
         assert!(
-            !flat.contains("acc +="),
-            "the accumulation reverted to a contractible form"
+            !body.contains("mul_add"),
+            "the convolution took a fused multiply-add"
         );
     }
 
-    /// One kernel of the Rust source: `gdn_silu`, `gdn_split_qkv` and
-    /// `gdn_gates` have no CUDA C++ twin.
+    /// One kernel of the Rust source, for those with no CUDA C++ twin.
     fn rust_kernel(name: &str) -> &'static str {
         let src = llmcuda_cuda::kernels::RUST_KERNELS_SRC;
         let start = src

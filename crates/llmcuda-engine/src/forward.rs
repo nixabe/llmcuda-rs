@@ -213,7 +213,7 @@ pub fn moe_block_size(tokens: usize) -> usize {
 pub(crate) const RMS_EPS_SUFFIX: &str = "attention.layer_norm_rms_epsilon";
 pub(crate) const ROPE_FREQ_BASE_SUFFIX: &str = "rope.freq_base";
 
-pub(crate) const EMBED_SRC: &str = r#"
+const EMBED_SRC: &str = r#"
 extern "C" {
 
 // Reinterpret two little-endian bytes as an IEEE half and widen to float.
@@ -258,42 +258,6 @@ __device__ __forceinline__ const unsigned char* embed_stage_row(
     }
     __syncthreads();
     return (const unsigned char*)stage;
-}
-
-// out[t][j] = dequantize(token_embd)[ids[t]][j] -- ggml's `get_rows` over a
-// Q8_0 table, which is what `model.input_embed` is.
-//
-// `token_embd.weight` is [hidden, vocab] in ggml order, so token `v`'s row is
-// `hidden` *contiguous* elements at `v * (hidden/32) * 34` bytes. Reading it
-// transposed gathers at stride `vocab` and produces a different model that
-// still generates text; `docs/ORACLE.md` section 6.3 proves the layout
-// bit-exactly against this same table.
-//
-// The arithmetic is `d * q` and nothing else, matching
-// `dequantize_row_q8_0`, so the result is bit-identical to the capture rather
-// than merely close.
-//
-// grid: (max_tokens). block: EMBED_THREADS, striding the row.
-__global__ void fwd_embed_q8_0(
-    const unsigned char* __restrict__ table,
-    const int* __restrict__ ids,
-    float* __restrict__ out,
-    int hidden,
-    int n_tokens
-) {
-    int t = blockIdx.x;
-    if (t >= n_tokens) return;
-
-    long long blocks = hidden / 32;
-    const unsigned char* row = table + (long long)ids[t] * blocks * 34;
-    float* dst = out + (long long)t * hidden;
-
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        const unsigned char* blk = row + (long long)(j / 32) * 34;
-        float d = load_half_le(blk);
-        signed char q = (signed char)blk[2 + (j % 32)];
-        dst[j] = d * (float)q;
-    }
 }
 
 // The same gather over any format the shipped files do *not* use.
@@ -1246,7 +1210,10 @@ impl Forward {
 
         let ptx = compile(EMBED_SRC, "forward_embed").map_err(ForwardError::Compile)?;
         let module = ctx.load_module(ptx)?;
-        let embed_q8_0 = module.load_function("fwd_embed_q8_0")?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
+            llmcuda_cuda::kernels::RUST_KERNELS_PTX,
+        ))?;
+        let embed_q8_0 = rust.load_function("embed_q8_0")?;
         let embed_quant = module.load_function("fwd_embed_quant")?;
 
         let layer_ops = LayerOpsKernels::new(ctx)?;
@@ -4563,9 +4530,11 @@ mod tests {
             llmcuda_cuda::kernels::dequant::BLOCK_Q6_K_BYTES
         );
         assert_eq!(BLOCK_Q6_K_BYTES, QK_K / 2 + QK_K / 4 + QK_K / 16 + 2);
+        // The Q8_0 gather is Rust.
         assert!(
-            EMBED_SRC
-                .contains("const unsigned char* row = table + (long long)ids[t] * blocks * 34;")
+            llmcuda_cuda::kernels::rust_kernel_source("embed_q8_0").contains(
+                "let row = table.add((*ids.add(t as usize) as i64 * blocks * 34) as usize);"
+            )
         );
         // The fallback gather's block strides, spelled as literals in the
         // kernel for the same reason 32 and 34 are.
@@ -4597,8 +4566,9 @@ mod tests {
         // equality rather than a tolerance. Reading the codes as unsigned
         // would flip the sign of about half the table while leaving every
         // magnitude plausible.
-        assert!(EMBED_SRC.contains("dst[j] = d * (float)q;"));
-        assert!(EMBED_SRC.contains("signed char q = (signed char)blk[2 + (j % 32)];"));
+        let embed = llmcuda_cuda::kernels::rust_kernel_source("embed_q8_0");
+        assert!(embed.contains("*dst.add(j as usize) = d * q as f32;"));
+        assert!(embed.contains("let q = *blk.add(2 + (j % 32) as usize) as i8;"));
     }
 
     #[test]

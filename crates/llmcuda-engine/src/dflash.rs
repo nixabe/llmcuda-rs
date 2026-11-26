@@ -47,7 +47,6 @@ use cudarc::driver::PushKernelArg;
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig};
 
 use llmcuda_cuda::kernels::attention::{AttentionError, AttentionKernels, AttnDecodeScratch};
-use llmcuda_cuda::kernels::compile;
 use llmcuda_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
 use llmcuda_cuda::kernels::lm_head::{
     ARGMAX_BLOCKS, HeadTensor, LmHeadError, LmHeadGeometry, LmHeadKernels,
@@ -61,46 +60,6 @@ use crate::viewslice::subslice;
 use crate::weights::DeviceWeights;
 
 const EMBED_THREADS: u32 = 256;
-
-/// The one glue kernel: a Q8_0 embedding-table gather, byte-for-byte the
-/// lookup `block/mtp.rs`'s `mtp_embed_q8_0` performs (and is tested
-/// through). Duplicated because NVRTC compiles from a string with no
-/// cross-string linking.
-pub(crate) const DFLASH_GLUE_SRC: &str = r#"
-extern "C" {
-
-__device__ __forceinline__ float load_half_le(const unsigned char* p) {
-    unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
-    float f;
-    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(bits));
-    return f;
-}
-
-// grid: (n_tokens). block: EMBED_THREADS, striding the row.
-__global__ void dflash_embed_q8_0(
-    const unsigned char* __restrict__ table,
-    const int* __restrict__ ids,
-    float* __restrict__ out,
-    int hidden,
-    int n_tokens
-) {
-    int t = blockIdx.x;
-    if (t >= n_tokens) return;
-
-    long long blocks = hidden / 32;
-    const unsigned char* row = table + (long long)ids[t] * blocks * 34;
-    float* dst = out + (long long)t * hidden;
-
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        const unsigned char* blk = row + (long long)(j / 32) * 34;
-        float d = load_half_le(blk);
-        signed char q = (signed char)blk[2 + (j % 32)];
-        dst[j] = d * (float)q;
-    }
-}
-
-}
-"#;
 
 /// Something went wrong loading or running the DFlash drafter.
 #[derive(Debug)]
@@ -438,12 +397,10 @@ impl DFlashForward {
         let w_token_embd = alias(Role::TokenEmbedding)?;
         let w_lm_head = alias(Role::LmHead)?;
 
-        let ptx = compile(DFLASH_GLUE_SRC, "dflash_glue").map_err(DFlashError::Compile)?;
-        let module = ctx.load_module(ptx)?;
         let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
             llmcuda_cuda::kernels::RUST_KERNELS_PTX,
         ))?;
-        let embed_fn = module.load_function("dflash_embed_q8_0")?;
+        let embed_fn = rust.load_function("embed_q8_0")?;
         let tap_fn = rust.load_function("dflash_tap")?;
         let taps = config.target_layers.len();
 

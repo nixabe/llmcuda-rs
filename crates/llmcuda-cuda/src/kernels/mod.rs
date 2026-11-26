@@ -27,8 +27,6 @@ pub mod layer_ops;
 pub mod lm_head;
 pub mod mma;
 pub mod moe;
-#[cfg(test)]
-mod rust_parity;
 pub mod vision;
 
 use std::collections::HashMap;
@@ -61,7 +59,10 @@ pub const TARGET_ARCH: &str = "compute_75";
 /// `mtp_concat_eh`, `dflash_tap`, `hg_to_half`, `vision_gelu`,
 /// `vision_add_f16`, `vision_half_to_float`, `attn_kv_append`,
 /// `dense_swiglu_narrow`, `dec_add_owner_rows`, `dec_span_mean`,
-/// `dec_attention_combine` and `k2_rotary_apply`.
+/// `dec_attention_combine`, `dec_layer_norm`, `k2_rotary_apply`,
+/// `attn_flash_decode_combine_k2_batch`, `embed_q8_0`, `dequantize_q8_0`,
+/// `gdn_silu_split_qkv`, `gdn_conv_silu_split_step_batch`,
+/// `gdn_normalize_qk`, `gdn_chunk_normalize_qk` and `dense_rms_norm_narrow`.
 ///
 /// Both languages: `sigmoid_gate_mul` launches from here in its elementwise
 /// shape and `attn_rope_partial_neox` on small grids. Their other shapes, and
@@ -82,6 +83,23 @@ pub const RUST_KERNELS_PTX: &str = include_str!("rust/tensor_add.ptx");
 /// so tests can pin the properties of a kernel that exist only in its
 /// source, as they do for the CUDA C++ ones.
 pub const RUST_KERNELS_SRC: &str = include_str!("../../../../experiments/cuda-oxide/src/main.rs");
+
+/// The text of one function of [`RUST_KERNELS_SRC`], kernel or device helper,
+/// from its `fn` line to its closing brace.
+///
+/// For tests that pin a property visible only in a kernel's source.
+///
+/// # Panics
+/// If the source has no function of that name.
+pub fn rust_kernel_source(name: &str) -> &'static str {
+    let src = RUST_KERNELS_SRC;
+    let at = src
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("the Rust kernel source has no `{name}`"));
+    let start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = at + src[at..].find("\n    }\n").expect("the function ends");
+    &src[start..end]
+}
 
 /// Compiled PTX, keyed by the source that produced it.
 ///

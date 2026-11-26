@@ -704,20 +704,19 @@ GPU 0, only the switch different, order rotated each round, box quiet; cells
 are round 0 / 1 / 2. Register counts are offline CUDA 12.8
 `ptxas -arch=sm_75`, not the driver's JIT.
 
-Every kernel that launches from Rust (61 entry points) against the all-C++
+Every kernel that launches from Rust (70 entry points) against the all-C++
 build, Qwen3.6:
 
 | N=3 | CUDA C++ tok/s | Rust kernels tok/s |
 | --- | --- | --- |
-| Decode at 2,048 per sequence, 64 steps after 4 warmup | 218.4 / 218.4 / 217.9 | 218.3 / 218.4 / 218.3 |
-| Decode at 32,768 per sequence, 64 steps after 4 warmup | 165.4 / 165.5 / 165.4 | 166.1 / 166.3 / 165.3 |
-| Prefill, one 2,048-token pass, 5 timed repetitions | 3646.87 / 3643.09 / 3650.26 | 3643.11 / 3642.13 / 3653.40 |
+| Decode at 2,048 per sequence, 64 steps after 4 warmup | 219.5 / 219.4 / 219.6 | 220.6 / 220.5 / 220.8 |
+| Decode at 32,768 per sequence, 64 steps after 4 warmup | 166.4 / 166.3 / 166.3 | 167.1 / 167.2 / 167.7 |
+| Prefill, one 2,048-token pass, 5 timed repetitions | 3668.36 / 3668.79 / 3657.43 | 3670.27 / 3674.18 / 3673.50 |
 
-Every cell is inside run-to-run spread (prefill within-process standard
-deviations: 3.98–15.49 tok/s C++, 3.91–8.56 Rust). The kernels moved are a
-small fraction of the pass, so neither their kernel-level gains (the fused
-decode convolution step, 14–26%) nor their losses (the MoE block tail, about
-0.3 us a launch; the one-token convolution step) show in the model. The moves
+Decode is 0.5% higher from Rust in every round at both depths, outside the
+rounds' own spread; the decode step's router is the largest kernel-level gain
+on that path (about 1.4 us a launch). Prefill is inside its within-process
+standard deviation (6.69–15.77 tok/s C++, 3.32–18.12 Rust). The moves
 are for one source language, not for speed. The dense model, the vision tower,
 the decision head and K2 are covered at kernel level only.
 

@@ -5,11 +5,16 @@ This standalone experiment compiles `src/main.rs` with cuda-oxide from
 `f35d6ccc2e03a54e73e3796f415f11313e439d50` (0.4.0, Rust 1.99.1 with `rustc-dev`). The
 compiler used to live at `NVlabs/cuda-oxide`, which now redirects to that
 monorepo; cuda-oxide is its `cuda-oxide/` directory.
-The engine's single opt-in `rust-kernels` feature loads residual add,
-standalone SwiGLU, sigmoid gating, softplus, both partial RoPE APIs, RMSNorm and
-fused RMSNorm/SwiGLU through cudarc. The feature forwards from the server and
-engine crates. Normal builds need no cuda-oxide. The
-embedded PTX is generated code, not an independently maintained kernel.
+The engine loads the result through cudarc. Which kernels launch from it, and
+what a port has to show before it does, is in
+[DEVELOPMENT.md](../../docs/DEVELOPMENT.md#rust-cuda-kernels). Normal builds
+need no cuda-oxide. The embedded PTX is generated code, not an independently
+maintained kernel.
+
+`regenerate.py` sets `CUDA_OXIDE_NO_FMA=1`: cuda-oxide otherwise lets the
+backend fuse any multiply into a following add, and several of these kernels
+are compared bit for bit with CUDA C++ originals that deny that fusion. A
+kernel fuses where its source says `mul_add`.
 
 Install the matching compiler, with the CUDA 13 toolkit and libclang available:
 
@@ -43,99 +48,58 @@ export BINDGEN_EXTRA_CLANG_ARGS='-isystem /usr/lib/gcc/x86_64-linux-gnu/13/inclu
 
 `cargo oxide doctor` still warns about the clang resource directory with this
 layout; the build succeeds. A cached build does not re-emit the PTX, so touch
-`src/main.rs` if `llmcuda_rust_device.ptx` is missing. The engine benchmark
-uses its ordinary CUDA 12.8 NVRTC dependency for the baseline.
+`src/main.rs` if `llmcuda_rust_device.ptx` is missing.
 
-Run outside the sandbox, with an idle GPU and no other builds or GPU work
-during timing:
+## Checking a kernel
+
+Run outside the sandbox, on an idle GPU:
 
 ```sh
-CUDA_VISIBLE_DEVICES=1 cargo run --release -p llmcuda-engine --bin bench_rust_add -- \
-  crates/llmcuda-cuda/src/kernels/rust/tensor_add.ptx tensor_add
-CUDA_VISIBLE_DEVICES=1 cargo test --release -p llmcuda-engine \
-  --features llmcuda-cuda/rust-kernels --test layer_ops_differential -- --nocapture
+CUDA_VISIBLE_DEVICES=0 cargo test --release -p llmcuda-cuda
+CUDA_VISIBLE_DEVICES=0 cargo test --release -p llmcuda-engine \
+  --test layer_ops_differential --test rust_kernels_differential \
+  --test gdn_tail_differential --test gdn_conv_silu_differential \
+  --test gdn_verify_differential --test attention_differential
 ```
 
-The narrow gate checks empty and ragged lengths, decode and prefill shapes,
-multiple grid strides, exact CPU agreement, both in-place aliases, guard
-elements, and graph replay. It reports six alternating pairs with reversed
-order on odd pairs. Each CUDA event interval contains 100 graph-captured
-launches. Small shapes therefore reflect repeated cache-hot execution;
-whole-model measurements are required before drawing an inference-speed claim.
+`llmcuda-cuda`'s unit tests read this source and the generated PTX: tap
+order, the rotary tail copy, the reduction's order, and that the convolution
+was compiled without an FMA. `layer_ops_differential` holds each kernel to
+its CPU reference. The Gated DeltaNet tests compare these kernels exactly
+with the fused CUDA C++ paths that share their arithmetic, which is what
+catches a port that is close but not identical.
 
-An optional third argument selects a baseline PTX containing `tensor_add`,
-instead of compiling the NVRTC baseline. This compares a compiler or kernel
-change directly with the previous Rust artifact. The gate includes all float
-alignments modulo 16, independently offset input/output pointers, and all
-four-float tail lengths; wider accesses must preserve the sliced-buffer ABI.
+## Porting another kernel
 
-To test inside the model, pass `--features llmcuda-cuda/rust-kernels` to
-`bench_forward`, `bench_decode_batch`, and the existing forward tests. Keep
-separate target directories for candidate and baseline, build both before
-timing, and alternate processes on the same card. The production default
-remains NVRTC while this feature is evaluated.
+1. Add the kernel here with the CUDA C++ launch ABI and regenerate.
+2. In a test, load both the CUDA C++ entry and the Rust one, run them on the
+   same inputs through the same launch geometry, and compare `to_bits()`.
+   Two things break this in a port that reads like a transcription: a
+   multiply-add NVRTC fuses and the Rust does not spell as `mul_add` (or the
+   reverse, where the C++ says `__fmul_rn`), and a reduction that adds in a
+   different order.
+3. Time both in alternating pairs, then confirm in the model
+   (`bench_decode_batch`, `bench_forward`) from two prebuilt target
+   directories. The port does not have to win; it has to not cost anything
+   measurable.
+4. Switch the launch site, delete the CUDA C++, and move the tests that read
+   its source to this one.
 
-The measured correctness and performance results are recorded in
+Shapes that lose from Rust keep their CUDA C++ and launch from here only
+under `rust-kernels`: standalone SwiGLU, per-row sigmoid gating, and the
+tiled attention RoPE above 256 blocks. `bench_rust_activations` and
+`bench_rust_rope` time those against their Rust ports and check both arms
+against the CPU references.
+
+Two things cuda-oxide does differently from NVRTC that have cost throughput
+here: a fixed-size local array stays in local memory rather than registers,
+and a `usize`/`i64` index product inside a loop is a 64-bit multiply per
+iteration. Walk a pointer instead. Measured results are in
 [BENCHMARKS.md](../../docs/BENCHMARKS.md#rust-kernel-authoring-can-keep-the-existing-launcher).
 
-The activation gate uses the same per-tensor tolerances as
-`layer_ops_differential`, checks both sigmoid shapes and the sigmoid waypoint,
-empty/ragged/grid-stride lengths, saturation, guarded buffers, supported exact
-aliases, and graph replay. Six alternating pairs time 100 captured launches
-per CUDA event interval, with reversed order on odd pairs:
-
-```sh
-CUDA_VISIBLE_DEVICES=1 cargo run --release -p llmcuda-engine --bin bench_rust_activations
-CUDA_VISIBLE_DEVICES=1 cargo test --release -p llmcuda-engine --features rust-kernels \
-  --test layer_ops_differential --test forward_pass -- --nocapture --test-threads=1
-```
-
-`bench_rust_activations` always compares the embedded Rust artifact against
-NVRTC, independently of feature selection. The historical `tensor_add.ptx`
-filename now contains all eight generated entries. Standalone SwiGLU is not
-used by the model's fused MoE/FFN paths. The current feature changes residual
-addition, sigmoid gating, the production tiled RoPE and both normalization
-paths in the forward pass. Standalone softplus and layer-ops RoPE are API
-ports; production uses other gate and rotary implementations. Combined-switch
-results are in [BENCHMARKS.md](../../docs/BENCHMARKS.md#rust-normalization-and-rotary-kernels-need-separate-kernel-and-model-gates).
-
-The normalization ports use two levels of warp shuffles and one block
-barrier, preserving exact division/square root and the dynamic shared-memory
-launch size. The final warp-partial reduction changes the addition order;
-CPU and model gates must pass without relaxed tolerances. Small fused rows
-keep the input and gate in registers across the reduction. They use the same
-`rust-kernels` switch.
-`bench_rust_norm` checks both outputs of fused normalization against the CPU
-RMSNorm/SwiGLU composition with the existing layer-op tolerances. It covers
-sub-warp and ragged widths, multiple grid-stride iterations, zero/sparse
-rows, two epsilon values, guards, in-place standalone RMSNorm, and graph
-replay before reporting six alternating CUDA-event pairs:
-
-```sh
-CUDA_VISIBLE_DEVICES=1 cargo run --release -p llmcuda-engine --bin bench_rust_norm
-```
-
-`bench_rust_rope` checks rotated spans against CPU `apply_rope`, exact tail
-bits (including signed zero), independent output sentinels, ragged/full/zero
-rotary spans, positions through `u32::MAX`, and graph replay. Its event pairs
-use positions starting at 2,048, including the 512-token per-sequence band
-in an N=3 1,536-row batch, plus 1,536-token individual calls.
-The standalone Rust kernel assigns one thread per rotated pair, sharing its double
-precision frequency, sine/cosine and input loads. The tail remains a copy.
-`bench_rust_activations` also checks softplus, including the overflow-guard
-boundary, and measures the 96-element decode and 49,152-element prefill shapes.
-
-```sh
-CUDA_VISIBLE_DEVICES=1 cargo run --release -p llmcuda-engine --bin bench_rust_rope
-```
-
-The production attention counterpart is `attn_rope_partial_neox`. It already
-shares pair calculations and reuses frequencies over 16 tokens in C++.
-Its Rust port preserves that band and reads the base position from device
-memory. Grids of at most 72 blocks use both halves of
-rotary threads for alternate tokens; larger grids keep 16-token frequency
-reuse. This heuristic targets the 72-SM RTX 8000 and preserves the launch ABI.
-`bench_rust_rope` measures both APIs separately, at the model's 10,000,000
-frequency base. Standalone speedups do not imply the same gain
-for the tiled production kernel. Fused batched decode rotary/append and
-multimodal IMRoPE remain CUDA C++.
+The tiled attention kernel `attn_rope_partial_neox` reuses frequencies over
+16 tokens and reads the base position from device memory. Grids of at most 72
+blocks use both halves of the rotary threads for alternate tokens; larger
+grids keep 16-token frequency reuse. This heuristic targets the 72-SM RTX
+8000. Fused batched decode rotary/append and multimodal IMRoPE remain CUDA
+C++.

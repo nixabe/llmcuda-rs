@@ -41,47 +41,56 @@ by accident. Everything device-gated funnels through
 abort — on a machine with no driver, because `cudarc` panics rather than
 erroring when it cannot find `libcuda` at all.
 
-### Optional Rust CUDA kernels
+### Rust CUDA kernels
 
-`rust-kernels` is a **compile-time Cargo feature, disabled by default**.
-Enable it when building the server:
+The layer ops are moving from CUDA C++ to Rust one kernel at a time. The Rust
+ones are compiled ahead of time by cuda-oxide and embedded as PTX; the list is
+on `RUST_KERNELS_PTX` in
+[`kernels/mod.rs`](../crates/llmcuda-cuda/src/kernels/mod.rs). Today that is
+residual addition, softplus, standalone partial RoPE, RMSNorm and both fused
+RMSNorm/SwiGLU forms, the four convolution kernels, the attention query/gate
+split and row positions, elementwise sigmoid gating, and the tiled attention
+RoPE on grids of at most 256 blocks.
+
+A kernel moves when its Rust port
+
+1. produces the same bits as the CUDA C++ original, run through the same
+   launcher on the same inputs,
+2. passes that kernel's own differential tests, and
+3. does not cost the model anything measurable in an interleaved A/B.
+
+It does not have to be faster. Once it has moved, the CUDA C++ is deleted and
+the Rust in [`experiments/cuda-oxide`](../experiments/cuda-oxide) is the only
+source; from then on the kernel is held by its CPU-reference test and by the
+tests that compare it exactly with the fused CUDA C++ paths. For step 1, load
+the kernel from both modules in a test (the commit that moved RMSNorm and the
+convolution did this for every layer op) and compare `to_bits()`.
+
+Two things make step 1 fail in a port that looks like a transcription:
+
+- **Fusion.** NVRTC fuses `a + b * c` into one FMA unless the source denies it
+  (`__fmul_rn`/`__fadd_rn`). The Rust PTX is built with fusion off, so a port
+  writes `mul_add` exactly where the original is fused and plain arithmetic
+  where it is not.
+- **Summation order.** A reduction has to add in the original's order. The
+  first RMSNorm port used a faster cross-warp tree and was one ulp away from
+  the fused Gated DeltaNet kernels, which are compared to it exactly.
+
+`rust-kernels` is a **compile-time Cargo feature, disabled by default**, that
+additionally selects the three ports that are bit-identical but slower at
+prefill sizes, and so still have their CUDA C++: standalone SwiGLU, per-row
+sigmoid gating and the attention RoPE on wide grids.
 
 ```sh
 cargo build --release -p llmcuda-server --features rust-kernels
-```
-
-This builds `target/release/llmcuda` with the migrated cuda-oxide kernels.
-The server feature forwards through `llmcuda-engine` to `llmcuda-cuda`. Engine
-benchmarks and tests can use the same flag:
-
-```sh
 cargo build --release -p llmcuda-engine --bin bench_decode_batch --features rust-kernels
-CUDA_VISIBLE_DEVICES=1 cargo test --release -p llmcuda-engine --features rust-kernels \
-  --test layer_ops_differential -- --nocapture
 ```
 
-The single `rust-kernels` feature selects every migrated kernel: residual
-addition, standalone SwiGLU, sigmoid gating (elementwise and per-row),
-softplus, standalone and tiled attention RoPE, RMSNorm and fused RMSNorm/SwiGLU.
-The model's fused MoE/FFN SwiGLU paths remain CUDA C++. All ports are disabled
-when the feature is omitted.
-
-The feature embeds checked-in PTX generated from pinned Rust source, so
-ordinary feature-enabled builds need neither cuda-oxide nor CUDA toolkit
-headers. Regenerating PTX uses the separate toolchain in
-[`experiments/cuda-oxide`](../experiments/cuda-oxide).
-
-To build the default CUDA C++ path again, omit the feature:
-
-```sh
-cargo build --release -p llmcuda-server
-```
-
-Kernel selection is fixed in the compiled binary. There is no runtime flag
-or environment variable to enable it. Cargo's `--all-features` also enables
-`rust-kernels`; the default feature lists are empty. See
-[TOOLCHAIN.md](TOOLCHAIN.md#rust-compiler-evaluation) for correctness checks
-and measured limitations.
+The embedded PTX is checked in, so no build needs cuda-oxide or CUDA toolkit
+headers. Regenerating it uses the separate toolchain in
+[`experiments/cuda-oxide`](../experiments/cuda-oxide). Kernel selection is
+fixed in the compiled binary; there is no runtime switch. See
+[TOOLCHAIN.md](TOOLCHAIN.md#rust-compiler-evaluation).
 
 ## Reference checkouts
 

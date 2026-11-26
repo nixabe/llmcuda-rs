@@ -738,27 +738,41 @@ pub struct LayerOpsKernels {
 }
 
 impl LayerOpsKernels {
-    /// Compile the CUDA C++ layer ops with NVRTC and load the Rust ones from
-    /// [`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX). Residual add,
-    /// elementwise sigmoid gating, softplus and partial RoPE are Rust; with
-    /// `rust-kernels`, so are SwiGLU, per-row sigmoid gating, RMSNorm and fused
-    /// RMSNorm/SwiGLU.
+    /// Load the layer ops: the Rust ones from
+    /// [`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX), which lists them, and
+    /// the rest compiled from CUDA C++ by NVRTC.
+    ///
     /// All loading happens before hot-path launches or graph capture.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
+        Self::load(ctx, false)
+    }
+
+    /// Every kernel from its CUDA C++ original.
+    ///
+    /// The oracle the Rust ports are compared against bit for bit
+    /// (`rust_kernels_differential`), and the other arm of an A/B. Not a
+    /// serving configuration.
+    pub fn cuda_cpp(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
+        Self::load(ctx, true)
+    }
+
+    fn load(ctx: &Arc<CudaContext>, all_cpp: bool) -> Result<Self, LayerOpsError> {
         let ptx = compile(LAYER_OPS_SRC, "layer_ops").map_err(LayerOpsError::Compile)?;
         let module = ctx.load_module(ptx)?;
-        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
-        #[cfg(feature = "rust-kernels")]
-        let migrated = &rust;
-        #[cfg(not(feature = "rust-kernels"))]
-        let migrated = &module;
+        let ported = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
+        let rust = if all_cpp { &module } else { &ported };
+        let opt_in = if cfg!(feature = "rust-kernels") {
+            rust
+        } else {
+            &module
+        };
         Ok(Self {
-            rms_norm: migrated.load_function("rms_norm_rows")?,
-            rms_norm_swiglu: migrated.load_function("rms_norm_swiglu_rows")?,
+            rms_norm: opt_in.load_function("rms_norm_rows")?,
+            rms_norm_swiglu: opt_in.load_function("rms_norm_swiglu_rows")?,
             rms_norm_swiglu_q8: module.load_function("rms_norm_swiglu_q8_rows")?,
             rope: rust.load_function("rope_partial")?,
-            swiglu: migrated.load_function("swiglu_mul")?,
-            sigmoid_gate: migrated.load_function("sigmoid_gate_mul")?,
+            swiglu: opt_in.load_function("swiglu_mul")?,
+            sigmoid_gate: opt_in.load_function("sigmoid_gate_mul")?,
             sigmoid_gate_elementwise: rust.load_function("sigmoid_gate_mul")?,
             add: rust.load_function("tensor_add")?,
             softplus: rust.load_function("softplus_elementwise")?,

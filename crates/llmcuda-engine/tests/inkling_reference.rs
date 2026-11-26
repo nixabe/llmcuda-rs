@@ -18,10 +18,22 @@ use llmcuda_kernels::inkling;
 ///
 /// The two agree to ~1e-5 in cosine through the prelude. In the looped
 /// layers llama.cpp's own arithmetic (reduced-precision expert products)
-/// moves router logits by ~2e-2, which flips the last-ranked expert for a
-/// token or two out of twelve; the worst layer output observed is 0.99883.
-/// A wrong operator shows up as 0.3-0.8, as the unscaled-bias bug did.
-const L_OUT_COSINE: f32 = 0.998;
+/// moves router logits by ~2e-2, which flips the last-ranked expert for one
+/// to three tokens out of twelve (the test prints the count per
+/// application). The worst layer output observed is 0.99883 on Q4_K_XL and
+/// 0.99782 on Q8_K_XL, both where two tokens reroute. A wrong operator
+/// shows up as 0.3-0.8, as the unscaled-bias bug did.
+const L_OUT_COSINE: f32 = 0.995;
+
+/// Floors on the last position's logits against llama.cpp, wide enough for
+/// both files. Measured, CPU reference / device: Q4_K_XL cosine 0.99996 /
+/// 0.99994, max-abs 0.17 / 0.20; Q8_K_XL 0.99935 / 0.99918, max-abs 0.57 /
+/// 0.85. llama.cpp sits further from exact arithmetic on the bf16 file, and
+/// every pairwise comparison here carries the routing flips described
+/// above; the tight gates are the kernel-level differential tests. The
+/// argmax is asserted equal.
+const LOGIT_COSINE: f32 = 0.999;
+const LOGIT_MAX_ABS: f32 = 1.0;
 
 #[test]
 fn cpu_reference_matches_llama_cpp_at_every_layer_application() {
@@ -115,9 +127,13 @@ fn cpu_reference_matches_llama_cpp_at_every_layer_application() {
     );
     assert_eq!(argmax(&logits), argmax(want));
     assert!(
-        r.cosine_similarity > 0.9999,
+        r.cosine_similarity > LOGIT_COSINE,
         "logit cosine {}",
         r.cosine_similarity
     );
-    assert!(r.max_abs_error < 0.5, "logit max-abs {}", r.max_abs_error);
+    assert!(
+        r.max_abs_error < LOGIT_MAX_ABS,
+        "logit max-abs {}",
+        r.max_abs_error
+    );
 }

@@ -1427,6 +1427,7 @@ fn tensor_f32(file: &GgufFile, name: &str, dims: &[usize]) -> Result<Vec<f32>, D
         GgmlType::Q4K => block(quant::dequantize_row_q4_k(bytes))?,
         GgmlType::Q5K => block(quant::dequantize_row_q5_k(bytes))?,
         GgmlType::Q6K => block(quant::dequantize_row_q6_k(bytes))?,
+        GgmlType::Nvfp4 => block(quant::dequantize_row_nvfp4(bytes))?,
     };
     let want: usize = dims.iter().product();
     if values.len() != want {

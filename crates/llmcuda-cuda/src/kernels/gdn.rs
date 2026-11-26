@@ -83,7 +83,7 @@ const STEP_WARPS: u32 = 4;
 /// this many per-sequence state pointer slots.
 pub const STEP_MAX_BATCH: usize = 8;
 
-const GDN_SRC: &str = r#"
+pub(crate) const GDN_SRC: &str = r#"
 extern "C" {
 
 // Sum across one warp, leaving the total in every lane.

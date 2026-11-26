@@ -24,6 +24,8 @@ pub mod image;
 pub(crate) mod prefix;
 pub mod router;
 pub mod runtime;
+#[cfg(test)]
+mod rust_parity;
 pub mod sampling;
 pub mod speculative;
 pub mod state;

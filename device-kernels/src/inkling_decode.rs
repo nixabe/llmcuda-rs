@@ -6,6 +6,7 @@
 //! weights (the loop controllers, the router) is its own kernel on a grid
 //! wide enough to use the whole card: one SM reads at about a seventieth of
 //! the bus, and a block a row doing those measured 1.2-1.8 ms a launch.
+
 //! Per-row state (cache and convolution carries) is reached through a
 //! pointer table, `[rows][6]`: key cache, value cache, then the key, value,
 //! attention-output and feed-forward carries.
@@ -583,7 +584,8 @@ pub unsafe fn ink_dec_kv(
 ///
 /// # Safety
 /// As `ink_attn` and `ink_clip`; `proj` rows hold the query, relative,
-/// sink and gate projections at their offsets; dim <= 128, n_rel <= 32.
+/// sink and gate projections at their offsets; dim is a multiple of 4 and
+/// at most 128, n_rel <= 32.
 #[kernel]
 pub unsafe fn ink_dec_attn(
     proj: *const f32,
@@ -612,6 +614,7 @@ pub unsafe fn ink_dec_attn(
     static mut R: SharedArray<f32, 32> = SharedArray::UNINIT;
     static mut P: SharedArray<f32, 256> = SharedArray::UNINIT;
     static mut ACC: SharedArray<f32, 128> = SharedArray::UNINIT;
+    static mut PV: SharedArray<f32, 1024> = SharedArray::UNINIT;
     static mut RUN: SharedArray<f32, 2> = SharedArray::UNINIT;
     let tid = thread::threadIdx_x() as i32;
     let h = thread::blockIdx_x() as usize;
@@ -666,13 +669,22 @@ pub unsafe fn ink_dec_attn(
             let j = j0 + tid;
             let mut s = LOWEST;
             if j <= p {
+                // Four binary16 a load, two running sums: the loads of a
+                // key row are what this loop waits on, and a thread taking
+                // them one element at a time measured 100 us a launch.
                 let kr = k_cache.add(j as usize * stride + kv * d);
-                let mut dot = 0.0f32;
+                let mut a0 = 0.0f32;
+                let mut a1 = 0.0f32;
                 let mut i = 0usize;
                 while i < d {
-                    dot = Q[i].mul_add(h2f(*kr.add(i)), dot);
-                    i += 1;
+                    let w = *(kr.add(i) as *const u64);
+                    a0 = Q[i].mul_add(h2f(w as u16), a0);
+                    a1 = Q[i + 1].mul_add(h2f((w >> 16) as u16), a1);
+                    a0 = Q[i + 2].mul_add(h2f((w >> 32) as u16), a0);
+                    a1 = Q[i + 3].mul_add(h2f((w >> 48) as u16), a1);
+                    i += 4;
                 }
+                let dot = a0 + a1;
                 let dist = p - j;
                 let mut bias = 0.0f32;
                 if dist < extent {
@@ -692,14 +704,40 @@ pub unsafe fn ink_dec_attn(
             let pj = if j <= p { (s - top).exp() } else { 0.0 };
             P[tid as usize] = pj;
             let chunk_sum = block_sum_256(pj);
-            if (tid as usize) < d {
+            // Values: thread (class c, quad q) sums four channels over the
+            // keys j = c mod 8, so every thread reads and a read is four
+            // channels wide; the eight classes are added in order after.
+            let class = tid >> 5;
+            let q4 = ((tid & 31) * 4) as usize;
+            if q4 < d {
                 let live = (p - j0 + 1).min(256);
-                let mut acc = ACC[tid as usize] * rescale;
-                let mut jj = 0;
+                let mut v0 = 0.0f32;
+                let mut v1 = 0.0f32;
+                let mut v2 = 0.0f32;
+                let mut v3 = 0.0f32;
+                let mut jj = class;
                 while jj < live {
-                    let v = *v_cache.add((j0 + jj) as usize * stride + kv * d + tid as usize);
-                    acc = P[jj as usize].mul_add(h2f(v), acc);
-                    jj += 1;
+                    let w = *(v_cache.add((j0 + jj) as usize * stride + kv * d + q4) as *const u64);
+                    let pj = P[jj as usize];
+                    v0 = pj.mul_add(h2f(w as u16), v0);
+                    v1 = pj.mul_add(h2f((w >> 16) as u16), v1);
+                    v2 = pj.mul_add(h2f((w >> 32) as u16), v2);
+                    v3 = pj.mul_add(h2f((w >> 48) as u16), v3);
+                    jj += 8;
+                }
+                let at = class as usize * 128 + q4;
+                PV[at] = v0;
+                PV[at + 1] = v1;
+                PV[at + 2] = v2;
+                PV[at + 3] = v3;
+            }
+            thread::sync_threads();
+            if (tid as usize) < d {
+                let mut acc = ACC[tid as usize] * rescale;
+                let mut c = 0usize;
+                while c < 8 {
+                    acc += PV[c * 128 + tid as usize];
+                    c += 1;
                 }
                 ACC[tid as usize] = acc;
             }

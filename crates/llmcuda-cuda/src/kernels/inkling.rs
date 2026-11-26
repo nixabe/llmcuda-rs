@@ -1646,7 +1646,7 @@ impl InklingDecodeKernels {
         log: Option<(f32, f32)>,
         rows: usize,
     ) -> Result<(), InklingError> {
-        if dim > 128 || n_rel > 32 || !heads.is_multiple_of(kv_heads) {
+        if dim > 128 || !dim.is_multiple_of(4) || n_rel > 32 || !heads.is_multiple_of(kv_heads) {
             return Err(InklingError::Shape("decode attention head geometry"));
         }
         need("dec attn proj", proj.len(), rows * o.ldo as usize)?;

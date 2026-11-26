@@ -61,10 +61,11 @@ fn last_hidden(
 ///
 /// The two are the same arithmetic in a different summation order and agree
 /// to ~3e-6 in cosine wherever they route alike. They do not always: the
-/// router's sigmoid top-8 has near-ties, and on the capture prompt five of
-/// twelve positions send one to four of their 48 layer applications to a
-/// different eighth expert (the test prints which). The worst such position
-/// measured 0.99908; llama.cpp against the CPU reference flips the same way
+/// router's sigmoid top-8 has near-ties, and on the capture prompt a few of
+/// the twelve positions send one to four of their 48 layer applications to
+/// a different eighth expert (the test prints which; two to five positions
+/// across the summation orders tried). The worst such position measured
+/// 0.99908; llama.cpp against the CPU reference flips the same way
 /// (`inkling_reference.rs`).
 const DECODE_COSINE: f32 = 0.998;
 

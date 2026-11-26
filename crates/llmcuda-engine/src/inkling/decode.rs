@@ -385,8 +385,14 @@ impl InklingDecode {
     }
 
     /// Seconds per stage since profiling was enabled, in first-seen order.
-    pub fn stage_seconds(&self) -> &[(&'static str, f64)] {
-        self.profile.as_ref().map_or(&[], |p| &p.stages)
+    pub fn stage_seconds(&mut self) -> Res<&[(&'static str, f64)]> {
+        match self.profile.as_mut() {
+            Some(p) => {
+                p.resolve()?;
+                Ok(&p.stages)
+            }
+            None => Ok(&[]),
+        }
     }
 
     fn mark(&mut self, stream: &Arc<CudaStream>, stage: &'static str) -> Res {
@@ -472,6 +478,7 @@ impl InklingDecode {
             eps,
             rows,
         )?;
+        self.mark(stream, "attn inputs: mix, norm")?;
         if let Some(w) = ctrl_qkv {
             model.dec.control(
                 stream,
@@ -489,7 +496,7 @@ impl InklingDecode {
                 rows,
             )?;
         }
-        self.mark(stream, "attn inputs")?;
+        self.mark(stream, "attn inputs: controllers")?;
         // One input: every projection reads plane 0.
         let ldo = d.offsets.ldo as usize;
         if let Some(p) = &d.q8 {
@@ -633,6 +640,7 @@ impl InklingDecode {
             eps,
             rows,
         )?;
+        self.mark(stream, "ffn input: conv, mix, norm")?;
         if let (Some(w), Some(msg)) = (ctrl_ffn, msg.as_deref()) {
             model.dec.control(
                 stream,
@@ -650,6 +658,7 @@ impl InklingDecode {
                 rows,
             )?;
         }
+        self.mark(stream, "ffn input: controller")?;
         model.dec.route(
             stream,
             &self.x_work,
@@ -666,7 +675,7 @@ impl InklingDecode {
         )?;
         *live += usize::from(opens);
 
-        self.mark(stream, "ffn input and routing")?;
+        self.mark(stream, "routing")?;
         if let Some(log) = self.route_log.as_mut() {
             log.extend(stream.clone_dtoh(&self.ids)?);
         }
@@ -829,6 +838,7 @@ impl InklingDecode {
                     4,
                     rows,
                 )?;
+                self.mark(stream, "loop messages")?;
                 self.layer(stream, slot, layer, &mut live, true)?;
             }
         }
@@ -859,7 +869,7 @@ impl InklingDecode {
             n,
             eps,
         )?;
-        self.mark(stream, "loop messages, output mix and norm")?;
+        self.mark(stream, "output mix and norm")?;
         for state in states.iter_mut() {
             state.position += 1;
         }

@@ -555,39 +555,69 @@ impl InklingState {
     }
 }
 
-/// Wall-clock per stage, each boundary synchronized: a diagnostic, and it
-/// costs the overlap a real pass has between host and device.
+/// Device time per stage, from CUDA events recorded at the stage
+/// boundaries and read back once the pass has finished.
+///
+/// Events rather than a synchronized host clock: synchronizing at every
+/// boundary measured ~115 us a stage of its own, which at a decode step's
+/// ~440 stages was more than twice the step.
 struct Profile {
-    last: std::time::Instant,
+    events: Vec<cudarc::driver::CudaEvent>,
+    /// The stage each recorded event closes; `None` opens a pass.
+    closes: Vec<Option<&'static str>>,
     stages: Vec<(&'static str, f64)>,
 }
 
 impl Profile {
     fn start() -> Self {
         Self {
-            last: std::time::Instant::now(),
+            events: Vec::new(),
+            closes: Vec::new(),
             stages: Vec::new(),
         }
     }
 
-    /// Forget the time since the last mark: what ran in between was not a
-    /// stage of this pass.
-    fn restart(&mut self, stream: &Arc<CudaStream>) -> Res {
-        stream.synchronize()?;
-        self.last = std::time::Instant::now();
+    fn record(&mut self, stream: &Arc<CudaStream>, closes: Option<&'static str>) -> Res {
+        let at = self.closes.len();
+        if at == self.events.len() {
+            self.events.push(
+                stream
+                    .context()
+                    .new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))?,
+            );
+        }
+        self.events[at].record(stream)?;
+        self.closes.push(closes);
         Ok(())
+    }
+
+    /// Open a pass: what ran since the last mark was not a stage of it.
+    fn restart(&mut self, stream: &Arc<CudaStream>) -> Res {
+        self.resolve()?;
+        self.record(stream, None)
     }
 
     /// Close the stage that just ran.
     fn mark(&mut self, stream: &Arc<CudaStream>, stage: &'static str) -> Res {
-        stream.synchronize()?;
-        let now = std::time::Instant::now();
-        let dt = now.duration_since(self.last).as_secs_f64();
-        self.last = now;
-        match self.stages.iter_mut().find(|(name, _)| *name == stage) {
-            Some((_, total)) => *total += dt,
-            None => self.stages.push((stage, dt)),
+        self.record(stream, Some(stage))
+    }
+
+    /// Wait for the recorded events and add their intervals to the stages.
+    fn resolve(&mut self) -> Res {
+        if let Some(last) = self.closes.len().checked_sub(1) {
+            self.events[last].synchronize()?;
         }
+        for at in 1..self.closes.len() {
+            let Some(stage) = self.closes[at] else {
+                continue;
+            };
+            let dt = f64::from(self.events[at - 1].elapsed_ms(&self.events[at])?) * 1e-3;
+            match self.stages.iter_mut().find(|(name, _)| *name == stage) {
+                Some((_, total)) => *total += dt,
+                None => self.stages.push((stage, dt)),
+            }
+        }
+        self.closes.clear();
         Ok(())
     }
 }
@@ -779,8 +809,14 @@ impl InklingPass {
     }
 
     /// Seconds per stage since profiling was enabled, in first-seen order.
-    pub fn stage_seconds(&self) -> &[(&'static str, f64)] {
-        self.profile.as_ref().map_or(&[], |p| &p.stages)
+    pub fn stage_seconds(&mut self) -> Res<&[(&'static str, f64)]> {
+        match self.profile.as_mut() {
+            Some(p) => {
+                p.resolve()?;
+                Ok(&p.stages)
+            }
+            None => Ok(&[]),
+        }
     }
 
     /// Close the stage that just ran.

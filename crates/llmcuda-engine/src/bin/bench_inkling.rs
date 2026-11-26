@@ -110,8 +110,8 @@ fn run(args: &[String]) -> Result<()> {
         }
         if profiling {
             for (what, stages) in [
-                ("prefill", prefill[0].1.stage_seconds()),
-                ("decode", decode.stage_seconds()),
+                ("prefill", prefill[0].1.stage_seconds()?.to_vec()),
+                ("decode", decode.stage_seconds()?.to_vec()),
             ] {
                 let total: f64 = stages.iter().map(|s| s.1).sum();
                 for (stage, seconds) in stages {

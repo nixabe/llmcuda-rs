@@ -46,6 +46,7 @@ if ".target sm_75\n" not in ptx or any(
         "k2_rotary_prepare", "moe_block_gate_and_combine",
         "gdn_proj_f32", "dec_final_scores", "gdn_norm_alpha_beta_gates",
         "gdn_recurrent_step", "argmax_prob",
+        "moe_route", "moe_dispatch_t1", "moe_route_dispatch_t1", "moe_align_block_size",
     )
 ):
     raise SystemExit("compiler output has the wrong target or entry point")

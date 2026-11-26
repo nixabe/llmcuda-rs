@@ -706,24 +706,22 @@ GPU 0, only the switch different, order rotated each round, box quiet; cells
 are round 0 / 1 / 2. Register counts are offline CUDA 12.8
 `ptxas -arch=sm_75`, not the driver's JIT.
 
-The layer-op, convolution and attention-helper kernels that launch from Rust,
-against the all-C++ build, Qwen3.6. The 48 small MoE, Gated DeltaNet, K2,
-sampling, fp16, vision, decision, embedding and glue kernels moved afterwards are not in this table: they were
-held bit for bit and timed at kernel level only (level with NVRTC except
-`k2_values`, 2.7% slower at 2,048 tokens, and the K2 dispatch passes, 0.5 us
-slower a step), with no model-level run.
+Every kernel that launches from Rust (61 entry points) against the all-C++
+build, Qwen3.6:
 
-| N=3 | CUDA C++ tok/s | Rust default tok/s |
+| N=3 | CUDA C++ tok/s | Rust kernels tok/s |
 | --- | --- | --- |
-| Decode at 2,048 per sequence, 64 steps after 4 warmup | 218.8 / 218.5 / 219.1 | 219.2 / 218.3 / 218.3 |
-| Decode at 32,768 per sequence, 64 steps after 4 warmup | 165.7 / 165.7 / 165.6 | 165.6 / 165.3 / 165.6 |
-| Prefill, one 2,048-token pass, 5 timed repetitions | 3648.09 / 3652.38 / 3653.34 | 3653.31 / 3657.21 / 3659.65 |
+| Decode at 2,048 per sequence, 64 steps after 4 warmup | 218.4 / 218.4 / 217.9 | 218.3 / 218.4 / 218.3 |
+| Decode at 32,768 per sequence, 64 steps after 4 warmup | 165.4 / 165.5 / 165.4 | 166.1 / 166.3 / 165.3 |
+| Prefill, one 2,048-token pass, 5 timed repetitions | 3646.87 / 3643.09 / 3650.26 | 3643.11 / 3642.13 / 3653.40 |
 
 Every cell is inside run-to-run spread (prefill within-process standard
-deviations: 0.67–26.09 tok/s C++, 10.13–18.89 Rust). The kernels moved are a
-small fraction of the pass, so neither their kernel-level gains nor the
-one-token convolution step's kernel-level loss shows in the model. The moves
-are for one source language, not for speed.
+deviations: 3.98–15.49 tok/s C++, 3.91–8.56 Rust). The kernels moved are a
+small fraction of the pass, so neither their kernel-level gains (the fused
+decode convolution step, 14–26%) nor their losses (the MoE block tail, about
+0.3 us a launch; the one-token convolution step) show in the model. The moves
+are for one source language, not for speed. The dense model, the vision tower,
+the decision head and K2 are covered at kernel level only.
 
 **The compiler revision does not move these numbers.** PTX from cuda-oxide
 0.2.1 (`26754ae5`) and 0.4.0 (`f35d6ccc`) for the same Rust source differs by

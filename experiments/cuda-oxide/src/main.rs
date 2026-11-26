@@ -1,4 +1,4 @@
-//! Experimental Rust implementations of layer_ops.rs elementwise kernels.
+//! Rust implementations of the layer-op and attention helper kernels.
 //! Raw pointers preserve the existing cudarc ABI, including in-place output.
 
 use cuda_device::{DynamicSharedArray, device, kernel, thread, warp};
@@ -203,14 +203,16 @@ mod kernels {
         }
     }
 
-    /// Two-level warp reduction with one block barrier.
-    /// Each warp reduces the immutable partials and broadcasts locally.
+    /// `block_reduce_sum` from the CUDA C++ layer ops, operation for operation:
+    /// a shuffle-down tree per warp, then thread 0 adds the warp totals in
+    /// ascending order. The order is the contract -- the fused Gated DeltaNet
+    /// kernels reduce the same way and are compared bit for bit.
     ///
     /// # Safety
     /// Every thread participates in a 1-D block of 32..=1024 threads, a
     /// multiple of 32. Dynamic shared memory holds one f32 per warp.
     #[device]
-    unsafe fn block_sum(mut v: f32) -> f32 {
+    unsafe fn block_reduce_sum(mut v: f32) -> f32 {
         let mut offset = 16;
         while offset > 0 {
             v += warp::shuffle_down_f32_sync(u32::MAX, v, offset);
@@ -223,27 +225,26 @@ mod kernels {
                 *scratch.add((tid >> 5) as usize) = v;
             }
             thread::sync_threads();
-            let lane = tid & 31;
-            let warps = thread::blockDim_x() / 32;
-            let mut total = if lane < warps {
-                *scratch.add(lane as usize)
-            } else {
-                0.0
-            };
-            let mut offset = 16;
-            while offset > 0 {
-                total += warp::shuffle_down_f32_sync(u32::MAX, total, offset);
-                offset >>= 1;
+            if tid == 0 {
+                let warps = (thread::blockDim_x() + 31) >> 5;
+                let mut total = 0.0f32;
+                let mut w = 0;
+                while w < warps {
+                    total += *scratch.add(w as usize);
+                    w += 1;
+                }
+                *scratch = total;
             }
-            warp::shuffle_f32_sync(u32::MAX, total, 0)
+            thread::sync_threads();
+            *scratch
         }
     }
 
-    /// Compute the inverse RMS with the parallel reduction and exact division.
+    /// Inverse RMS of this block's row, with the reference's exact division.
     ///
     /// # Safety
-    /// x covers width floats for every grid row, width > 0, and block_sum's
-    /// collective participation and shared-memory requirements hold.
+    /// x covers width floats for every grid row, width > 0, and
+    /// block_reduce_sum's launch contract holds.
     #[device]
     unsafe fn inverse_rms(x: *const f32, width: i32, eps: f32) -> f32 {
         let base = thread::blockIdx_x() as usize * width as usize;
@@ -256,7 +257,7 @@ mod kernels {
                 partial = v.mul_add(v, partial);
                 j += thread::blockDim_x() as i32;
             }
-            1.0 / (block_sum(partial) / width as f32 + eps).sqrt()
+            1.0 / (block_reduce_sum(partial) / width as f32 + eps).sqrt()
         }
     }
 
@@ -303,30 +304,6 @@ mod kernels {
         eps: f32,
     ) {
         unsafe {
-            // Small head rows fit one element per thread. Keep both operands
-            // live across the reduction and overlap the gate's math with it.
-            if width <= thread::blockDim_x() as i32 {
-                let j = thread::threadIdx_x() as i32;
-                let base = thread::blockIdx_x() as usize * width as usize;
-                let v = if j < width {
-                    *x.add(base + j as usize)
-                } else {
-                    0.0
-                };
-                let g = if j < width {
-                    *gate.add(base + j as usize)
-                } else {
-                    0.0
-                };
-                let silu = g / (1.0 + (-g).exp());
-                let inv = 1.0 / (block_sum(v * v) / width as f32 + eps).sqrt();
-                if j < width {
-                    let nv = v * inv * *weight.add(j as usize);
-                    *normed.add(base + j as usize) = nv;
-                    *out.add(base + j as usize) = silu * nv;
-                }
-                return;
-            }
             let inv = inverse_rms(x, width, eps);
             let base = thread::blockIdx_x() as usize * width as usize;
             let mut j = thread::threadIdx_x() as i32;
@@ -336,6 +313,291 @@ mod kernels {
                 let g = *gate.add(base + j as usize);
                 *out.add(base + j as usize) = (g / (1.0 + (-g).exp())) * nv;
                 j += thread::blockDim_x() as i32;
+            }
+        }
+    }
+
+    /// Fused RMSNorm/SwiGLU that hands int8 quants and one scale per 32
+    /// elements to the integer tensor cores, one element a thread.
+    ///
+    /// # Safety
+    /// x/gate cover gridDim.x * width floats, weight covers width, q covers
+    /// gridDim.x * width bytes and scales gridDim.x * width / 32 floats.
+    /// blockDim.x == width, a multiple of 32 and at most 1024.
+    #[kernel]
+    pub unsafe fn rms_norm_swiglu_q8_rows(
+        x: *const f32,
+        weight: *const f32,
+        gate: *const f32,
+        q: *mut i8,
+        scales: *mut f32,
+        width: i32,
+        eps: f32,
+    ) {
+        let j = thread::threadIdx_x() as usize;
+        let base = thread::blockIdx_x() as usize * width as usize;
+        unsafe {
+            let v = *x.add(base + j);
+            let sum_sq = block_reduce_sum(v * v);
+            let inv_rms = 1.0 / (sum_sq / width as f32 + eps).sqrt();
+            let nv = v * inv_rms * *weight.add(j);
+            let g = *gate.add(base + j);
+            let o = (g / (1.0 + (-g).exp())) * nv;
+
+            let mut a = o.abs();
+            let mut off = 16;
+            while off > 0 {
+                a = a.max(warp::shuffle_xor_f32_sync(u32::MAX, a, off));
+                off >>= 1;
+            }
+            let d = if a > 0.0 { a / 127.0 } else { 1.0 };
+            let inv = if a > 0.0 { 127.0 / a } else { 0.0 };
+            let mut qi = (o * inv).round_ties_even() as i32;
+            qi = if qi < -127 {
+                -127
+            } else if qi > 127 {
+                127
+            } else {
+                qi
+            };
+            *q.add(base + j) = qi as i8;
+            if j & 31 == 0 {
+                *scales.add((base + j) >> 5) = d;
+            }
+        }
+    }
+
+    /// Causal depthwise convolution over `[tokens][channels]`, reading the
+    /// carried cache for positions before this batch. Taps accumulate in
+    /// ascending order, each product rounded before it is added: the PTX is
+    /// built without implicit fusion, which is what keeps this bit-identical
+    /// to the scalar reference.
+    ///
+    /// # Safety
+    /// x/out cover gridDim.y * channels floats, weight covers channels *
+    /// conv_kernel, state covers channels * (conv_kernel - 1); out is
+    /// disjoint from the inputs. 1 <= conv_kernel.
+    #[kernel]
+    pub unsafe fn conv1d_causal_depthwise(
+        x: *const f32,
+        weight: *const f32,
+        state: *const f32,
+        out: *mut f32,
+        channels: i32,
+        conv_kernel: i32,
+    ) {
+        let ch = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        if ch >= channels {
+            return;
+        }
+        let t = thread::blockIdx_y() as i32;
+        let carry = conv_kernel - 1;
+        // Tap i reads position `t - carry + i`: this batch when that is
+        // non-negative, else cache slot `t + i`. One multiply each, then the
+        // pointers walk.
+        let first = t - carry;
+        unsafe {
+            let mut xp = x.offset((first as i64 * channels as i64 + ch as i64) as isize);
+            let mut sp = state.offset((ch as i64 * carry as i64 + t as i64) as isize);
+            let mut wp = weight.offset((ch as i64 * conv_kernel as i64) as isize);
+            let mut acc = 0.0f32;
+            let mut i = 0;
+            while i < conv_kernel {
+                let xv = if first + i >= 0 { *xp } else { *sp };
+                acc += xv * *wp;
+                xp = xp.wrapping_offset(channels as isize);
+                sp = sp.wrapping_add(1);
+                wp = wp.wrapping_add(1);
+                i += 1;
+            }
+            *out.offset((t as i64 * channels as i64 + ch as i64) as isize) = acc;
+        }
+    }
+
+    /// One channel's one-token convolution step: output, then the cache
+    /// shifted by one with this token appended.
+    ///
+    /// The shift runs oldest slot first and each slot takes its successor,
+    /// so no slot is read after it is written and nothing needs staging.
+    ///
+    /// # Safety
+    /// state covers `carry` floats owned by this thread and weight covers
+    /// `carry + 1`.
+    #[device]
+    unsafe fn conv_step_channel(xv0: f32, weight: *const f32, state: *mut f32, carry: i32) -> f32 {
+        unsafe {
+            let mut acc = 0.0f32;
+            let mut i = 0;
+            while i < carry {
+                acc += *state.add(i as usize) * *weight.add(i as usize);
+                i += 1;
+            }
+            acc += xv0 * *weight.add(carry as usize);
+            let mut j = 0;
+            while j + 1 < carry {
+                *state.add(j as usize) = *state.add((j + 1) as usize);
+                j += 1;
+            }
+            if carry > 0 {
+                *state.add((carry - 1) as usize) = xv0;
+            }
+            acc
+        }
+    }
+
+    /// The whole convolution for a one-token step, cache advanced in place.
+    ///
+    /// # Safety
+    /// x/out cover channels floats, weight channels * conv_kernel, state
+    /// channels * (conv_kernel - 1); 1 <= conv_kernel.
+    #[kernel]
+    pub unsafe fn conv1d_step(
+        x: *const f32,
+        weight: *const f32,
+        state: *mut f32,
+        out: *mut f32,
+        channels: i32,
+        conv_kernel: i32,
+    ) {
+        let ch = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        if ch >= channels {
+            return;
+        }
+        let carry = conv_kernel - 1;
+        unsafe {
+            *out.add(ch as usize) = conv_step_channel(
+                *x.add(ch as usize),
+                weight.offset((ch as i64 * conv_kernel as i64) as isize),
+                state.offset((ch as i64 * carry as i64) as isize),
+                carry,
+            );
+        }
+    }
+
+    /// `conv1d_step` over up to eight sequences, one grid.y slice each; the
+    /// per-sequence caches arrive as eight address slots.
+    ///
+    /// # Safety
+    /// As `conv1d_step` per slice; x/out cover gridDim.y * channels floats
+    /// and slots 0..gridDim.y hold distinct valid cache addresses.
+    #[kernel]
+    pub unsafe fn conv1d_step_batch(
+        x: *const f32,
+        weight: *const f32,
+        s0: u64,
+        s1: u64,
+        s2: u64,
+        s3: u64,
+        s4: u64,
+        s5: u64,
+        s6: u64,
+        s7: u64,
+        out: *mut f32,
+        channels: i32,
+        conv_kernel: i32,
+    ) {
+        let ch = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        if ch >= channels {
+            return;
+        }
+        let z = thread::blockIdx_y() as i32;
+        let state = match z {
+            0 => s0,
+            1 => s1,
+            2 => s2,
+            3 => s3,
+            4 => s4,
+            5 => s5,
+            6 => s6,
+            _ => s7,
+        } as *mut f32;
+        let carry = conv_kernel - 1;
+        let at = (z as i64 * channels as i64 + ch as i64) as isize;
+        unsafe {
+            *out.offset(at) = conv_step_channel(
+                *x.offset(at),
+                weight.offset((ch as i64 * conv_kernel as i64) as isize),
+                state.offset((ch as i64 * carry as i64) as isize),
+                carry,
+            );
+        }
+    }
+
+    /// Advance the convolution cache to the last conv_kernel - 1 inputs.
+    ///
+    /// Safe in place without staging: slot j takes either a value of `x` or
+    /// cache slot `j + seq_len`, always a later slot than any already
+    /// written, and a thread owns its channel's whole cache row.
+    ///
+    /// # Safety
+    /// x covers seq_len * channels floats with seq_len >= 1, state channels
+    /// * (conv_kernel - 1); 1 <= conv_kernel and the launch is nonempty, 1-D.
+    #[kernel]
+    pub unsafe fn conv1d_update_state(
+        x: *const f32,
+        state: *mut f32,
+        seq_len: i32,
+        channels: i32,
+        conv_kernel: i32,
+    ) {
+        let carry = conv_kernel - 1;
+        let stride = thread::blockDim_x() as i64 * thread::gridDim_x() as i64;
+        let mut ch = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        unsafe {
+            while ch < channels as i64 {
+                let row = state.offset((ch * carry as i64) as isize);
+                let mut j = 0;
+                while j < carry {
+                    let u = seq_len - carry + j;
+                    *row.add(j as usize) = if u >= 0 {
+                        *x.offset((u as i64 * channels as i64 + ch) as isize)
+                    } else {
+                        *row.add((u + carry) as usize)
+                    };
+                    j += 1;
+                }
+                ch += stride;
+            }
+        }
+    }
+
+    /// De-interleave the packed query/gate projection, one head per block.
+    ///
+    /// # Safety
+    /// packed covers gridDim.x * q_heads * 2 * head_dim floats; q and gate
+    /// each cover gridDim.x * q_heads * head_dim and are disjoint from packed
+    /// and each other. gridDim.y == q_heads and blockDim.x == head_dim.
+    #[kernel]
+    pub unsafe fn attn_split_query_gate(
+        packed: *const f32,
+        q: *mut f32,
+        gate: *mut f32,
+        q_heads: i32,
+        head_dim: i32,
+    ) {
+        let t = thread::blockIdx_x() as i64;
+        let h = thread::blockIdx_y() as i64;
+        let d = thread::threadIdx_x() as i64;
+        let row = t * q_heads as i64 * 2 * head_dim as i64;
+        let dst = (t * q_heads as i64 + h) * head_dim as i64 + d;
+        unsafe {
+            *q.add(dst as usize) = *packed.add((row + 2 * h * head_dim as i64 + d) as usize);
+            *gate.add(dst as usize) =
+                *packed.add((row + (2 * h + 1) * head_dim as i64 + d) as usize);
+        }
+    }
+
+    /// Row positions `position[0] + i` for a prefill chunk.
+    ///
+    /// # Safety
+    /// position covers one int, out covers n, and the 1-D launch is nonempty.
+    #[kernel]
+    pub unsafe fn attn_row_positions(position: *const i32, out: *mut i32, n: i32) {
+        let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        if i < n {
+            unsafe {
+                *out.add(i as usize) = (*position).wrapping_add(i);
             }
         }
     }

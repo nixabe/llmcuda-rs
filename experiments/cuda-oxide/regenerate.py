@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Rebuild the pinned Rust kernel and refresh the engine's embedded PTX."""
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 
@@ -13,6 +14,9 @@ source_before = SOURCE.read_bytes()
 subprocess.run(
     ["cargo", "oxide", "build", "--arch", "sm_75", "--", "--release", "--locked"],
     cwd=HERE,
+    # No implicit mul+add fusion: a kernel fuses where the source says
+    # `mul_add` and nowhere else, so its rounding is readable from the source.
+    env={**os.environ, "CUDA_OXIDE_NO_FMA": "1"},
     check=True,
 )
 if SOURCE.read_bytes() != source_before:
@@ -23,7 +27,9 @@ if ".target sm_75\n" not in ptx or any(
     for entry in (
         "tensor_add", "swiglu_mul", "sigmoid_gate_mul",
         "rms_norm_rows", "rms_norm_swiglu_rows", "softplus_elementwise", "rope_partial",
-        "attn_rope_partial_neox",
+        "attn_rope_partial_neox", "attn_split_query_gate", "attn_row_positions",
+        "rms_norm_swiglu_q8_rows", "conv1d_causal_depthwise", "conv1d_step",
+        "conv1d_step_batch", "conv1d_update_state",
     )
 ):
     raise SystemExit("compiler output has the wrong target or entry point")

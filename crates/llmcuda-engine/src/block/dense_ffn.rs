@@ -239,7 +239,7 @@ pub const DENSE_REPACK_INT8: bool = true;
 /// exactly the thing `tests/forward_pass.rs` checks for. So the token bound
 /// comes from the same `valid_tokens` device scalar the MoE kernels gate on,
 /// and the launch shape comes from the geometry — AGENTS.md rule 5.
-const GLUE_SRC: &str = r#"
+pub(crate) const GLUE_SRC: &str = r#"
 extern "C" {
 
 // The post-mixer RMSNorm, emitting both widths in one pass.

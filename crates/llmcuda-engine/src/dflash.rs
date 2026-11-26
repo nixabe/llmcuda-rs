@@ -66,7 +66,7 @@ const EMBED_THREADS: u32 = 256;
 /// lookup `block/mtp.rs`'s `mtp_embed_q8_0` performs (and is tested
 /// through). Duplicated because NVRTC compiles from a string with no
 /// cross-string linking.
-const DFLASH_GLUE_SRC: &str = r#"
+pub(crate) const DFLASH_GLUE_SRC: &str = r#"
 extern "C" {
 
 __device__ __forceinline__ float load_half_le(const unsigned char* p) {

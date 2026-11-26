@@ -65,7 +65,7 @@ const EMBED_THREADS: u32 = 256;
 /// `ggml_concat(.., dim = 0)`, e_norm first. One module because NVRTC
 /// compiles from a string with no include path and no cross-string linking,
 /// same reason `forward.rs`'s `EMBED_SRC` is inline.
-const MTP_GLUE_SRC: &str = r#"
+pub(crate) const MTP_GLUE_SRC: &str = r#"
 extern "C" {
 
 __device__ __forceinline__ float load_half_le(const unsigned char* p) {

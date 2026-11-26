@@ -53,7 +53,7 @@ pub const BLOCK_Q6_K_BYTES: usize = 210;
 /// on-disk layout is packed and C++ struct padding rules would need
 /// `__attribute__((packed))` to match — a difference that would show up as
 /// every block after the first being misaligned.
-const DEQUANT_SRC: &str = r#"
+pub(crate) const DEQUANT_SRC: &str = r#"
 extern "C" {
 
 // Reinterpret two little-endian bytes as an IEEE half and widen to float.

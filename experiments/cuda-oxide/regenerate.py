@@ -33,6 +33,9 @@ if ".target sm_75\n" not in ptx or any(
         "moe_swiglu", "moe_reduce", "gdn_silu", "gdn_split_qkv", "gdn_gates",
         "gdn_scan_decay", "k2_combine", "k2_combine_residual", "k2_values", "k2_gate",
         "attn_flash_decode_combine",
+        "argmax_partial", "argmax_final", "hg_splitk_reduce", "k2_dispatch_count",
+        "k2_dispatch_prefix", "k2_dispatch_gather", "k2_norm", "dense_ffn_add_residual",
+        "mtp_concat_eh", "dflash_tap", "moe_align_count",
     )
 ):
     raise SystemExit("compiler output has the wrong target or entry point")

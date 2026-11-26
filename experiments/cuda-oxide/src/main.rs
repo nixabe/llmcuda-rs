@@ -13,7 +13,7 @@
 //! CUDA C++ kernels that share their arithmetic; do not reorder a sum or
 //! change which products fuse without changing those too.
 
-use cuda_device::{DynamicSharedArray, device, kernel, thread, warp};
+use cuda_device::{DynamicSharedArray, SharedArray, device, kernel, thread, warp};
 use cuda_host::cuda_module;
 
 #[cuda_module]
@@ -1078,6 +1078,514 @@ mod kernels {
                 s += 1;
             }
             *out.add(h * head_dim as usize + d) = num / den;
+        }
+    }
+
+    /// Keep the larger of two argmax candidates, the lower index on a tie.
+    ///
+    /// A NaN never wins (`NaN > x` and `NaN == x` are both false), which is
+    /// what the scalar reference does.
+    #[device]
+    fn argmax_merge(bv: f32, bi: i32, v: f32, i: i32) -> (f32, i32) {
+        if v > bv || (v == bv && i < bi) {
+            (v, i)
+        } else {
+            (bv, bi)
+        }
+    }
+
+    /// Reduce one block's per-thread candidates to thread 0.
+    ///
+    /// Every thread seeds from element 0 rather than from a -inf sentinel, so
+    /// a vector that is entirely NaN answers 0, as the scalar reference does:
+    /// its running best never moves off index 0. A sentinel would answer "no
+    /// candidate" instead, and the two would disagree on the one input where
+    /// disagreement is hardest to spot.
+    ///
+    /// # Safety
+    /// Every thread of a 256-thread 1-D block participates.
+    #[device]
+    unsafe fn argmax_reduce_block(bv: f32, bi: i32) -> (f32, i32) {
+        static mut SV: SharedArray<f32, 8> = SharedArray::UNINIT;
+        static mut SI: SharedArray<i32, 8> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x();
+        let (mut bv, mut bi) = (bv, bi);
+        let mut off = 16;
+        while off > 0 {
+            let ov = warp::shuffle_down_f32_sync(u32::MAX, bv, off);
+            let oi = warp::shuffle_down_sync(u32::MAX, bi as u32, off) as i32;
+            (bv, bi) = argmax_merge(bv, bi, ov, oi);
+            off >>= 1;
+        }
+        unsafe {
+            if tid & 31 == 0 {
+                SV[(tid >> 5) as usize] = bv;
+                SI[(tid >> 5) as usize] = bi;
+            }
+            thread::sync_threads();
+            if tid == 0 {
+                let mut w = 1;
+                while w < 8 {
+                    (bv, bi) = argmax_merge(bv, bi, SV[w], SI[w]);
+                    w += 1;
+                }
+            }
+        }
+        (bv, bi)
+    }
+
+    /// Greedy sampling, first pass: each block's best `(value, index)` over a
+    /// grid-strided share of `x`. Lowest index wins a tie at every level, so
+    /// the answer does not depend on the grid.
+    ///
+    /// # Safety
+    /// x covers n >= 1 floats; pv and pi cover gridDim.x entries. The block
+    /// is 256 threads.
+    #[kernel]
+    pub unsafe fn argmax_partial(x: *const f32, n: i32, pv: *mut f32, pi: *mut i32) {
+        let block = thread::blockIdx_x();
+        let tid = thread::threadIdx_x();
+        let stride = (thread::gridDim_x() * 256) as i32;
+        unsafe {
+            let (mut bv, mut bi) = (*x, 0i32);
+            let mut i = (block * 256 + tid) as i32;
+            while i < n {
+                (bv, bi) = argmax_merge(bv, bi, *x.add(i as usize), i);
+                i += stride;
+            }
+            (bv, bi) = argmax_reduce_block(bv, bi);
+            if tid == 0 {
+                *pv.add(block as usize) = bv;
+                *pi.add(block as usize) = bi;
+            }
+        }
+    }
+
+    /// Greedy sampling, second pass: the best of the per-block candidates.
+    ///
+    /// # Safety
+    /// pv and pi cover n >= 1 entries, out one int. One 256-thread block.
+    #[kernel]
+    pub unsafe fn argmax_final(pv: *const f32, pi: *const i32, n: i32, out: *mut i32) {
+        let tid = thread::threadIdx_x();
+        unsafe {
+            let (mut bv, mut bi) = (*pv, *pi);
+            let mut i = tid as i32;
+            while i < n {
+                (bv, bi) = argmax_merge(bv, bi, *pv.add(i as usize), *pi.add(i as usize));
+                i += 256;
+            }
+            (bv, bi) = argmax_reduce_block(bv, bi);
+            let _ = bv;
+            if tid == 0 {
+                *out = bi;
+            }
+        }
+    }
+
+    /// Sum the split-K partial products of a tensor-core GEMM, ascending
+    /// split, two adjacent outputs a thread; optionally add into `out`.
+    ///
+    /// # Safety
+    /// part covers splits * M * N floats; out covers M rows of stride ldo
+    /// with N columns used. M * N is even. out is disjoint from part.
+    #[kernel]
+    pub unsafe fn hg_splitk_reduce(
+        part: *const f32,
+        out: *mut f32,
+        m_rows: i32,
+        n_cols: i32,
+        ldo: i32,
+        splits: i32,
+        accumulate: i32,
+    ) {
+        let i = (thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64)
+            * 2;
+        let mn = m_rows as i64 * n_cols as i64;
+        if i >= mn {
+            return;
+        }
+        let (m, n) = (i / n_cols as i64, i % n_cols as i64);
+        unsafe {
+            let mut p = part.add(i as usize);
+            let (mut v0, mut v1) = (*p, *p.add(1));
+            let mut z = 1;
+            while z < splits {
+                p = p.wrapping_add(mn as usize);
+                v0 += *p;
+                v1 += *p.add(1);
+                z += 1;
+            }
+            let o = out.add((m * ldo as i64 + n) as usize);
+            if accumulate != 0 {
+                v0 = *o + v0;
+                v1 = *o.add(1) + v1;
+            }
+            *o = v0;
+            *o.add(1) = v1;
+        }
+    }
+
+    /// K2 dispatch, pass one: how many of this lane's contiguous slice of
+    /// flat `(token, slot)` ids route to this block's expert. The prefix of
+    /// lane counts keeps the original route order without host counts or an
+    /// atomic scatter.
+    ///
+    /// grid: (experts,). block: 128.
+    ///
+    /// # Safety
+    /// ids covers pairs ints, counts gridDim.x * 128.
+    #[kernel]
+    pub unsafe fn k2_dispatch_count(ids: *const i32, counts: *mut i32, pairs: i32) {
+        let e = thread::blockIdx_x() as i32;
+        let t = thread::threadIdx_x() as i32;
+        let chunk = (pairs + 127) / 128;
+        let end = if (t + 1) * chunk < pairs { (t + 1) * chunk } else { pairs };
+        let mut n = 0i32;
+        let mut f = t * chunk;
+        unsafe {
+            while f < end {
+                n += (*ids.add(f as usize) == e) as i32;
+                f += 1;
+            }
+            *counts.add((e * 128 + t) as usize) = n;
+        }
+    }
+
+    /// K2 dispatch, pass two: each expert's padded run start, and the owner
+    /// of every tile (`-1` for an unused one).
+    ///
+    /// grid: (1,). block: 128, one thread per expert.
+    ///
+    /// # Safety
+    /// counts covers experts * 128 ints, starts experts, owners capacity.
+    /// experts <= 128 and tile > 0.
+    #[kernel]
+    pub unsafe fn k2_dispatch_prefix(
+        counts: *const i32,
+        starts: *mut i32,
+        owners: *mut i32,
+        experts: i32,
+        capacity: i32,
+        tile: i32,
+    ) {
+        static mut TOTALS: SharedArray<i32, 128> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as i32;
+        unsafe {
+            let mut n = 0i32;
+            if t < experts {
+                let mut j = 0;
+                while j < 128 {
+                    n += *counts.add((t * 128 + j) as usize);
+                    j += 1;
+                }
+            }
+            TOTALS[t as usize] = (n + tile - 1) / tile * tile;
+            let mut b = t;
+            while b < capacity {
+                *owners.add(b as usize) = -1;
+                b += 128;
+            }
+            thread::sync_threads();
+            let mut start = 0i32;
+            let mut e = 0;
+            while e < t {
+                start += TOTALS[e as usize];
+                e += 1;
+            }
+            if t < experts {
+                *starts.add(t as usize) = start;
+                let end = start + TOTALS[t as usize];
+                let mut f = start;
+                while f < end {
+                    *owners.add((f / tile) as usize) = t;
+                    f += tile;
+                }
+            }
+        }
+    }
+
+    /// K2 dispatch, pass three: write this expert's flat ids in their
+    /// original order from its run start, then pad the run to a whole tile
+    /// with `pairs`.
+    ///
+    /// grid: (experts,). block: 128.
+    ///
+    /// # Safety
+    /// ids covers pairs ints, counts gridDim.x * 128, starts gridDim.x;
+    /// sorted covers every padded run. tile > 0.
+    #[kernel]
+    pub unsafe fn k2_dispatch_gather(
+        ids: *const i32,
+        counts: *const i32,
+        starts: *const i32,
+        sorted: *mut i32,
+        pairs: i32,
+        tile: i32,
+    ) {
+        static mut PREFIX: SharedArray<i32, 128> = SharedArray::UNINIT;
+        let e = thread::blockIdx_x() as i32;
+        let t = thread::threadIdx_x() as i32;
+        let chunk = (pairs + 127) / 128;
+        unsafe {
+            let own = *counts.add((e * 128 + t) as usize);
+            PREFIX[t as usize] = own;
+            thread::sync_threads();
+            let mut d = 1;
+            while d < 128 {
+                let v = if t >= d { PREFIX[(t - d) as usize] } else { 0 };
+                thread::sync_threads();
+                PREFIX[t as usize] += v;
+                thread::sync_threads();
+                d *= 2;
+            }
+            let total = PREFIX[127];
+            let start = *starts.add(e as usize);
+            let mut cursor = start + PREFIX[t as usize] - own;
+            let end = if (t + 1) * chunk < pairs { (t + 1) * chunk } else { pairs };
+            let mut f = t * chunk;
+            while f < end {
+                if *ids.add(f as usize) == e {
+                    *sorted.add(cursor as usize) = f;
+                    cursor += 1;
+                }
+                f += 1;
+            }
+            let padded = (total + tile - 1) / tile * tile;
+            let mut f = total + t;
+            while f < padded {
+                *sorted.add((start + f) as usize) = pairs;
+                f += 128;
+            }
+        }
+    }
+
+    /// Grouped RMSNorm for K2: each block normalizes one group of one token,
+    /// `y = (x / sqrt(mean(x^2) + eps)) * w`, with the group's own mean.
+    ///
+    /// The reduction is a shuffle-down tree per warp, then thread 0 adds the
+    /// eight warp totals in ascending order.
+    ///
+    /// grid: (tokens * groups,). block: 256.
+    ///
+    /// # Safety
+    /// x and y cover tokens * width floats and w covers width; groups divides
+    /// width. Only y may exactly alias x.
+    #[kernel]
+    pub unsafe fn k2_norm(
+        x: *const f32,
+        w: *const f32,
+        y: *mut f32,
+        width: i32,
+        groups: i32,
+        eps: f32,
+    ) {
+        static mut SUMS: SharedArray<f32, 8> = SharedArray::UNINIT;
+        let block = thread::blockIdx_x() as i32;
+        let tid = thread::threadIdx_x();
+        let step = thread::blockDim_x() as i32;
+        let (g, token, part) = (block % groups, block / groups, width / groups);
+        let base = token as i64 * width as i64 + (g * part) as i64;
+        unsafe {
+            let xb = x.add(base as usize);
+            let mut acc = 0.0f32;
+            let mut j = tid as i32;
+            while j < part {
+                let v = *xb.add(j as usize);
+                // NVRTC contracts the original's acc += x * x.
+                acc = v.mul_add(v, acc);
+                j += step;
+            }
+            let mut d = 16;
+            while d > 0 {
+                acc += warp::shuffle_down_f32_sync(u32::MAX, acc, d);
+                d >>= 1;
+            }
+            if tid & 31 == 0 {
+                SUMS[(tid >> 5) as usize] = acc;
+            }
+            thread::sync_threads();
+            if tid == 0 {
+                let mut sum = 0.0f32;
+                let mut i = 0;
+                while i < 8 {
+                    sum += SUMS[i];
+                    i += 1;
+                }
+                SUMS[0] = 1.0 / (sum / part as f32 + eps).sqrt();
+            }
+            thread::sync_threads();
+            let scale = SUMS[0];
+            let wb = w.add((g * part) as usize);
+            let yb = y.add(base as usize);
+            let mut j = tid as i32;
+            while j < part {
+                *yb.add(j as usize) = (*xb.add(j as usize) * scale) * *wb.add(j as usize);
+                j += step;
+            }
+        }
+    }
+
+    /// `l_out[t][j] = ffn_out[t][j] + residual[t][j]`, for live tokens only.
+    ///
+    /// The row is split over `gridDim.y` blocks for the same reason the MoE
+    /// combine's is: one block per token would put a 20 KiB row on one SM.
+    ///
+    /// # Safety
+    /// The three buffers cover gridDim.x * hidden floats, valid_tokens one
+    /// int. l_out may exactly alias an input.
+    #[kernel]
+    pub unsafe fn dense_ffn_add_residual(
+        ffn_out: *const f32,
+        residual: *const f32,
+        valid_tokens: *const i32,
+        hidden: i32,
+        l_out: *mut f32,
+    ) {
+        let t = thread::blockIdx_x() as i64;
+        unsafe {
+            if t >= *valid_tokens as i64 {
+                return;
+            }
+            let base = (t * hidden as i64) as usize;
+            let stride = (thread::gridDim_y() * thread::blockDim_x()) as i32;
+            let mut j =
+                (thread::blockIdx_y() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+            while j < hidden {
+                let at = base + j as usize;
+                *l_out.add(at) = *ffn_out.add(at) + *residual.add(at);
+                j += stride;
+            }
+        }
+    }
+
+    /// `out[t] = [e_norm[t] | h_norm[t]]`: the MTP head's concatenated input.
+    ///
+    /// grid: (n_tokens,). block: any, striding the row.
+    ///
+    /// # Safety
+    /// e_norm and h_norm cover n_tokens * hidden floats, out twice that; out
+    /// is disjoint from both.
+    #[kernel]
+    pub unsafe fn mtp_concat_eh(
+        e_norm: *const f32,
+        h_norm: *const f32,
+        out: *mut f32,
+        hidden: i32,
+        n_tokens: i32,
+    ) {
+        let t = thread::blockIdx_x() as i64;
+        if t >= n_tokens as i64 {
+            return;
+        }
+        let step = thread::blockDim_x() as i32;
+        unsafe {
+            let e = e_norm.add((t * hidden as i64) as usize);
+            let h = h_norm.add((t * hidden as i64) as usize);
+            let dst = out.add((t * 2 * hidden as i64) as usize);
+            let mut j = thread::threadIdx_x() as i32;
+            while j < hidden {
+                *dst.add(j as usize) = *e.add(j as usize);
+                *dst.add((hidden + j) as usize) = *h.add(j as usize);
+                j += step;
+            }
+        }
+    }
+
+    /// One target-layer tap into the concatenated feature rows:
+    /// `aux[row][tap * hidden + j] = src[row][j]`.
+    ///
+    /// grid: (rows,). block: any, striding the row.
+    ///
+    /// # Safety
+    /// src covers rows * hidden floats, aux rows * taps * hidden; disjoint.
+    #[kernel]
+    pub unsafe fn dflash_tap(
+        src: *const f32,
+        aux: *mut f32,
+        hidden: i32,
+        taps: i32,
+        tap: i32,
+        rows: i32,
+    ) {
+        let r = thread::blockIdx_x() as i64;
+        if r >= rows as i64 {
+            return;
+        }
+        let step = thread::blockDim_x() as i32;
+        unsafe {
+            let s = src.add((r * hidden as i64) as usize);
+            let d = aux.add(((r * taps as i64 + tap as i64) * hidden as i64) as usize);
+            let mut j = thread::threadIdx_x() as i32;
+            while j < hidden {
+                *d.add(j as usize) = *s.add(j as usize);
+                j += step;
+            }
+        }
+    }
+
+    /// MoE alignment, pass one: fill the padded dispatch tables with their
+    /// sentinels and count the `(token, slot)` pairs routed to this block's
+    /// expert. Integer addition is associative, so the tree order of the
+    /// count cannot change it the way it would change a float sum.
+    ///
+    /// grid: (num_experts,). block: a power of two; dynamic shared memory
+    /// holds one int per thread.
+    ///
+    /// # Safety
+    /// topk_ids covers valid_tokens * top_k ints, sorted_token_ids
+    /// sorted_capacity, expert_ids expert_capacity, counts gridDim.x.
+    #[kernel]
+    pub unsafe fn moe_align_count(
+        topk_ids: *const i32,
+        valid_tokens: *const i32,
+        top_k: i32,
+        sorted_capacity: i32,
+        expert_capacity: i32,
+        sorted_token_ids: *mut i32,
+        expert_ids: *mut i32,
+        counts: *mut i32,
+    ) {
+        let scratch = DynamicSharedArray::<i32>::get();
+        let e = thread::blockIdx_x() as i32;
+        let tid = thread::threadIdx_x() as i32;
+        let block = thread::blockDim_x() as i32;
+        let gtid = e * block + tid;
+        let gstride = thread::gridDim_x() as i32 * block;
+        unsafe {
+            let numel = *valid_tokens * top_k;
+            let mut s = gtid;
+            while s < sorted_capacity {
+                *sorted_token_ids.add(s as usize) = numel;
+                s += gstride;
+            }
+            let mut b = gtid;
+            while b < expert_capacity {
+                *expert_ids.add(b as usize) = -1;
+                b += gstride;
+            }
+            let mut c = 0i32;
+            let mut i = tid;
+            while i < numel {
+                if *topk_ids.add(i as usize) == e {
+                    c += 1;
+                }
+                i += block;
+            }
+            *scratch.add(tid as usize) = c;
+            thread::sync_threads();
+            let mut s = block >> 1;
+            while s > 0 {
+                if tid < s {
+                    *scratch.add(tid as usize) += *scratch.add((tid + s) as usize);
+                }
+                thread::sync_threads();
+                s >>= 1;
+            }
+            if tid == 0 {
+                *counts.add(e as usize) = *scratch;
+            }
         }
     }
 }

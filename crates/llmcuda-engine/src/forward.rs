@@ -213,7 +213,7 @@ pub fn moe_block_size(tokens: usize) -> usize {
 pub(crate) const RMS_EPS_SUFFIX: &str = "attention.layer_norm_rms_epsilon";
 pub(crate) const ROPE_FREQ_BASE_SUFFIX: &str = "rope.freq_base";
 
-const EMBED_SRC: &str = r#"
+pub(crate) const EMBED_SRC: &str = r#"
 extern "C" {
 
 // Reinterpret two little-endian bytes as an IEEE half and widen to float.

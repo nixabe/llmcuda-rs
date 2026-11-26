@@ -129,6 +129,9 @@ impl ChatTemplate {
                 tools => (!tools.is_empty()).then(|| JinjaValue::from_serialize(&tools)),
                 add_generation_prompt => true,
                 enable_thinking => thinking,
+                // Inkling's template has no switch, only an effort level
+                // (default 0.9 when undefined); zero is its "no thinking".
+                reasoning_effort => (!thinking).then_some(0.0),
             })
             .map_err(|error| format!("chat template failed to render: {error:#}"))
     }

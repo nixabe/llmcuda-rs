@@ -297,6 +297,9 @@ pub(crate) struct Generation {
     /// The token that closes the model's reasoning span, if the prompt opened
     /// one.
     think_close: Option<i32>,
+    /// Set for a model that frames its reply in typed blocks; then the
+    /// block tokens open and close the reasoning span, and are not text.
+    blocks: Option<super::BlockMarkup>,
     reasoning_open: bool,
     trim_spans: bool,
     /// Set at the start of each span; cleared once that span has emitted
@@ -329,6 +332,13 @@ impl Generation {
             return Err(ApiError::bad_request(
                 dialect,
                 "this is a decision model: it generates no text; use /v1/systemone",
+            ));
+        }
+        if state.block_markup.is_some() && spec.tool_parser.is_some() {
+            return Err(ApiError::bad_request(
+                dialect,
+                "tool calls are not supported for this model yet: its replies are parsed for \
+                 thinking and text blocks only",
             ));
         }
         if spec.max_tokens == 0 {
@@ -412,7 +422,12 @@ impl Generation {
             stop: spec.stop,
             pending: String::new(),
             think_close: state.think_close_token,
-            reasoning_open: spec.thinking && state.think_close_token.is_some(),
+            blocks: state.block_markup,
+            // A block-framed reply says which span it is in; nothing is
+            // open until it does.
+            reasoning_open: state.block_markup.is_none()
+                && spec.thinking
+                && state.think_close_token.is_some(),
             trim_spans: spec.trim_spans,
             trim_span_start: spec.trim_spans,
             prompt_tokens: spec.prompt.len(),
@@ -560,6 +575,25 @@ impl Generation {
                 }
             };
             self.completion_tokens += 1;
+
+            // A block token is markup: it ends the span in progress, and a
+            // content-type token says which span the next text belongs to.
+            if let Some(blocks) = self.blocks
+                && [blocks.header, blocks.thinking, blocks.text, blocks.end].contains(&token)
+            {
+                let tail = std::mem::take(&mut self.pending);
+                let flushed = self.chunk(tail);
+                if token == blocks.thinking {
+                    self.reasoning_open = true;
+                } else if token == blocks.text {
+                    self.reasoning_open = false;
+                }
+                self.trim_span_start = self.trim_spans;
+                if flushed.is_some() {
+                    return Ok(flushed);
+                }
+                continue;
+            }
 
             // The reasoning span closes on its special token, or on explicit
             // delimiters (`</think>`, `<tool_call>`) appearing in output.

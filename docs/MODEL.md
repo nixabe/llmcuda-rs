@@ -717,10 +717,10 @@ rather than the llama.cpp fit-and-pad the chat path uses.
 [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF),
 `general.architecture = inkling2_loop`, in `UD-Q4_K_XL` and `UD-Q8_K_XL` (the
 repository's root files, which are byte-identical to its
-`Mainline_Support/` copies). **The engine runs its forward; nothing serves
-it.** `llmcuda-server` refuses the file by name, because the scheduler, the
-pager and the snapshot arena are built from an attention-and-GDN layer list
-that does not describe this model.
+`Mainline_Support/` copies). It has its own forward and its own device
+runtime behind the same scheduler, pager and HTTP surface as the other
+models, and serves text chat. What it does not do yet is listed at the end
+of this section.
 
 ## Structure
 
@@ -775,6 +775,22 @@ format is contracted from its stored bytes, converted to binary16 exactly.
   computes the same bits: 32 KiB a token for the eight full applications
   plus 640 MiB of rings at passes of up to 2,048 rows. At 128K positions
   that is 4.6 GiB a sequence against 24.0.
-- **Not yet**: a serving runtime, sampling, the chat template's tool and
-  thinking conventions, and the vision projector (`mmproj-F16.gguf`).
+- **Serving**: `llmcuda_engine::inkling::serve` answers a worker's device
+  thread in place of the Qwen runtime — admit, remove, execute a scheduler
+  step — so admission, the token budget and the pager are the shared ones.
+  The pager's two groups are this model's two kinds of cache: 32 KiB a
+  token for the full slots, 640 MiB a sequence for the rings. Prefill
+  passes are prebuilt at every power of two up to the chunk (at most 2,048
+  rows) and decode steps at every width up to `-s` (at most 8); every token
+  is chosen on the host from a row of logits, greedy or sampled.
+- **Chat format**: the file's own template, always (`--no-jinja` is
+  refused). The model writes its turn as blocks —
+  `<|message_model|><|content_thinking|>…<|end_message|>` then
+  `<|message_model|><|content_text|>…<|end_message|>` — and the server
+  routes them to reasoning and answer by block token. The template has no
+  thinking switch, only an effort level: thinking off renders effort 0,
+  which shortens the thinking block rather than removing it.
+- **Not yet**: prefix snapshots (every request prefills its whole prompt),
+  tool calls (a request with tools is answered 400), images
+  (`mmproj-F16.gguf`), and speculative decoding.
 

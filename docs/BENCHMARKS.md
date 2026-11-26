@@ -532,8 +532,8 @@ What the table does not say:
   the last four layers; 22.3 GiB resident) passes the same gates and ran
   once at 512: prefill 1,270 / 1,767 tok/s and decode 49.4 / 93.6 tok/s at
   N=1 / N=3. llama.cpp was not timed on it.
-- **Not served.** No runtime, scheduler, sampler or HTTP path drives this
-  forward yet, and the vision projector is not supported.
+- **Forward only.** The model is served, but nothing here went through the
+  server: no scheduler, sampling or HTTP in either column.
 
 Agreement with llama.cpp on a 12-token capture (`inkling_forward`; Q8_K_XL
 reads 0.99918 and 0.85, where llama.cpp itself sits further from exact

@@ -621,13 +621,19 @@ fn model_config_for(
     let file =
         llmcuda_gguf::GgufFile::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let config = ModelConfig::from_gguf(&file).map_err(|e| format!("{}: {e}", path.display()))?;
-    // One fact, said once, rather than every tensor the serving schema does
-    // not find.
+    // `inkling2_loop` has its own loader and no entry in the serving schema.
+    // Its resident size is the file's tensors plus the decode-shaped copies
+    // of each layer's attention projections: measured 3.1% over the file on
+    // UD-Q4_K_XL and 4.6% on UD-Q8_K_XL, budgeted at 6%.
     if config.inkling.is_some() {
-        return Err(format!(
-            "{}: {}",
-            path.display(),
-            llmcuda_engine::inkling::NOT_SERVED
+        let on_disk = std::fs::metadata(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        return Ok((
+            config,
+            file.get_str("general.name").map(str::to_owned),
+            false,
+            on_disk + on_disk * 6 / 100,
         ));
     }
     // The file's own name, for `/v1/models`. `ModelConfig::name` is the name
@@ -718,6 +724,24 @@ fn main() -> std::process::ExitCode {
         error!("--decision-max-tokens must be positive");
         return std::process::ExitCode::FAILURE;
     }
+    let is_inkling = model.inkling.is_some();
+    if is_inkling {
+        // What its runtime does not do is refused here, by flag, rather
+        // than at the first request.
+        let refusal = if args.no_jinja {
+            Some("its chat format is its own template; --no-jinja is unsupported")
+        } else if args.mmproj.is_some() {
+            Some("images are not supported for it yet; drop --mmproj")
+        } else if args.slots_per_worker > 8 {
+            Some("its decode step advances at most eight sequences; use -s 8 or fewer")
+        } else {
+            None
+        };
+        if let Some(why) = refusal {
+            error!("model            FAIL — inkling2_loop: {why}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
     if is_k2 && args.no_jinja {
         error!("K2-Horizon requires its IFM chat template; --no-jinja is unsupported");
         return std::process::ExitCode::FAILURE;
@@ -730,6 +754,10 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    if is_inkling && speculation != Speculation::None {
+        error!("speculation      FAIL — inkling2_loop has no drafter path; pass --spec-type none");
+        return std::process::ExitCode::FAILURE;
+    }
 
     // `--alias`, else what the file calls itself, else the architecture's
     // configuration name.
@@ -1072,6 +1100,9 @@ fn main() -> std::process::ExitCode {
         // resume from a prefix (a restored prefix has no final hidden states
         // for the head to read), so an arena would pin host RAM nothing reads.
         _ if decisions => SnapshotArenaSize::NONE,
+        // No prefix snapshots for this architecture yet: its runtime never
+        // retains one.
+        _ if is_inkling => SnapshotArenaSize::NONE,
         Some(size::FULL_COVERAGE) => full_coverage,
         Some(budget) => for_budget(budget),
         // Default to full coverage, bounded by a share of what the host can
@@ -1189,7 +1220,7 @@ fn main() -> std::process::ExitCode {
     // process. On the default it is a preference: the hand-written ChatML
     // serves instead, and the reason is said out loud rather than left to be
     // inferred from the output.
-    let jinja_required = args.jinja || is_k2;
+    let jinja_required = args.jinja || is_k2 || is_inkling;
     let chat_template = if args.no_jinja {
         None
     } else {

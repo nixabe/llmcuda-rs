@@ -260,6 +260,9 @@ fn dense_half(d: &Dense) -> HalfWeight<'_> {
     }
 }
 
+/// The most sequences one decode step advances.
+pub(crate) const MAX_DECODE_ROWS: usize = DG_MAX_ROWS;
+
 /// Scratch for decode steps of exactly `rows` sequences.
 pub struct InklingDecode {
     model: Arc<InklingModel>,

@@ -106,6 +106,9 @@ struct AppState {
     /// The id of `</think>`, looked up once so the generation path can close
     /// the reasoning span on a token comparison.
     think_close_token: Option<i32>,
+    /// The block tokens of a model whose reply is a list of typed blocks
+    /// (`inkling2_loop`), when the vocabulary has them.
+    block_markup: Option<BlockMarkup>,
     model: Arc<str>,
     default_max_tokens: u32,
     default_reasoning: bool,
@@ -383,6 +386,42 @@ fn worker_loop(state: AppState, worker: WorkerId) {
     }
 }
 
+/// The tokens that frame an Inkling reply. The model writes its own turn as
+/// blocks, each `<|message_model|>`, a content-type token, the content, and
+/// `<|end_message|>`:
+///
+/// ```text
+/// <|message_model|><|content_thinking|>...<|end_message|>
+/// <|message_model|><|content_text|>...<|end_message|>
+/// ```
+///
+/// so reasoning and answer are told apart by which block the text is in, not
+/// by a closing tag. (llama.cpp `common/parsers/inkling.cpp`,
+/// `common_chat_params_init_inkling`.)
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlockMarkup {
+    pub(crate) header: i32,
+    pub(crate) thinking: i32,
+    pub(crate) text: i32,
+    pub(crate) end: i32,
+}
+
+impl BlockMarkup {
+    fn from_tokenizer(tokenizer: &Tokenizer) -> Option<Self> {
+        let id = |token: &str| {
+            tokenizer
+                .token_to_id(token)
+                .and_then(|id| i32::try_from(id).ok())
+        };
+        Some(Self {
+            header: id("<|message_model|>")?,
+            thinking: id("<|content_thinking|>")?,
+            text: id("<|content_text|>")?,
+            end: id("<|end_message|>")?,
+        })
+    }
+}
+
 /// Bring up the HTTP surface over an already-loaded engine.
 pub async fn serve(
     engine: Engine,
@@ -394,7 +433,8 @@ pub async fn serve(
         .token_to_id(THINK_CLOSE)
         .or_else(|| tokenizer.token_to_id("</ifm|think>"))
         .and_then(|id| i32::try_from(id).ok());
-    if think_close_token.is_none() {
+    let block_markup = BlockMarkup::from_tokenizer(&tokenizer);
+    if think_close_token.is_none() && block_markup.is_none() {
         // Without it, everything the model emits is reported as answer text,
         // reasoning included. That is a visible quality difference, so it is
         // said out loud rather than discovered in the output.
@@ -463,6 +503,7 @@ pub async fn serve(
         submit_waiters: Arc::new(AtomicUsize::new(0)),
         api_key: config.api_key.map(Arc::from),
         think_close_token,
+        block_markup,
         model: Arc::from(config.model.as_str()),
         default_max_tokens: config.default_max_tokens,
         default_reasoning: config.default_reasoning,

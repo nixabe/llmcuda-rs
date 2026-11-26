@@ -464,7 +464,7 @@ pub unsafe fn ink_rel_table(
 /// # Safety
 /// Every thread of a 256-thread 1-D block participates.
 #[device]
-unsafe fn block_max_256(v: f32) -> f32 {
+pub(crate) unsafe fn block_max_256(v: f32) -> f32 {
     static mut RED: SharedArray<f32, 8> = SharedArray::UNINIT;
     let tid = thread::threadIdx_x();
     let mut v = v;
@@ -495,7 +495,7 @@ unsafe fn block_max_256(v: f32) -> f32 {
 /// # Safety
 /// Every thread of a 256-thread 1-D block participates.
 #[device]
-unsafe fn block_sum_256(v: f32) -> f32 {
+pub(crate) unsafe fn block_sum_256(v: f32) -> f32 {
     static mut RED: SharedArray<f32, 8> = SharedArray::UNINIT;
     let tid = thread::threadIdx_x();
     let mut v = v;

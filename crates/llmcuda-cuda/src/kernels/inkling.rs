@@ -677,8 +677,9 @@ impl InklingKernels {
 
 /// Token columns one decode-GEMM launch contracts.
 pub const DG_MAX_ROWS: usize = 8;
-/// Weight rows a decode-GEMM block owns: two warps of sixteen.
-pub const DG_BLOCK_ROWS: usize = 32;
+/// Weight rows a decode-GEMM block owns. Activation-plane boundaries must
+/// be multiples of it.
+pub const DG_BLOCK_ROWS: usize = 16;
 
 const DG_SRC: &str = r#"
 extern "C" {
@@ -742,12 +743,18 @@ __device__ __forceinline__ float dg_situ(float gate, float up, float beta, float
 // out[col][row] = alpha * sum_k half(x[col][k]) * half(w[row][k]), fp32
 // accumulate.
 //
-// No shared-memory staging. A warp owns sixteen weight rows and one
-// m16n8k8 fragment set; each lane builds its two A registers (rows g and
-// g + 8, k pair t) straight from the stored weights and reads its B register
-// (token g, k pair t) straight from the binary16 activations. Per k8 step
-// that is one activation load, two weight loads and one MMA for 128 weights
-// against all eight columns.
+// No shared-memory staging. A block owns sixteen weight rows; each of its
+// eight warps contracts one eighth of K for them with one m16n8k8 fragment
+// set, and the partial sums are added in warp order at the end. A lane
+// builds its two A registers (rows g and g + 8, k pair t) straight from the
+// stored weights and reads its B register (token g, k pair t) straight from
+// the binary16 activations: per k8 step, one activation load, two weight
+// loads and one MMA for 128 weights against all eight columns.
+//
+// Eight warps a tile rather than one because a warp walking its rows' whole
+// K is bound by the latency of its own loads, and a 8,608-row launch then
+// keeps under eight warps on an SM: measured 242 GB/s of weights for that
+// pack with one warp a tile (bench_inkling_dg).
 //
 // FMT 0: split Q8_0 (`w` int8 [rows][K], `ws` fp16 [rows][K/32]).
 // FMT 1: bf16 [rows][K], staged at `wscale`.
@@ -776,21 +783,18 @@ __device__ __forceinline__ void dg_gemm(
     float alpha, float wscale, float beta, float lb
 ) {
     __shared__ unsigned lut[256];
+    __shared__ float part[8][32][4];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int g = lane >> 2, t = lane & 3;
     if (FMT == 2) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const unsigned b = tid * 4 + i;
-            lut[b] = dg_fp4(b & 15u) | (dg_fp4(b >> 4) << 16);
-        }
+        lut[tid] = dg_fp4(tid & 15u) | (dg_fp4(tid >> 4) << 16);
         __syncthreads();
     }
 
     const unsigned short* xcol = nullptr;
     int row_a, row_b;
     if (MODE == 0) {
-        const int r0 = blockIdx.x * 32 + warp * 16;
+        const int r0 = blockIdx.x * 16;
         row_a = r0 + g;
         row_b = r0 + 8 + g;
         const int p = (r0 >= b1) + (r0 >= b2);
@@ -803,11 +807,11 @@ __device__ __forceinline__ void dg_gemm(
         if (escale) alpha *= escale[e];
         if (g == 0) xcol = x + (long long)(pair / topk) * K;
         if (MODE == 1) {
-            const int i0 = blockIdx.x * 16 + warp * 8;
+            const int i0 = blockIdx.x * 8;
             row_a = i0 + g;
             row_b = rows / 2 + i0 + g;
         } else {
-            const int r0 = blockIdx.x * 32 + warp * 16;
+            const int r0 = blockIdx.x * 16;
             row_a = r0 + g;
             row_b = r0 + 8 + g;
         }
@@ -816,47 +820,94 @@ __device__ __forceinline__ void dg_gemm(
     const int kblocks = K >> 5;
 
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    unsigned sa = 0, sb = 0;
-    const int steps = K >> 3;
-    for (int kk = 0; kk < steps; ++kk) {
-        unsigned a0 = 0, a1 = 0;
-        if (FMT == 0) {
-            if ((kk & 3) == 0) {
-                const int kb = kk >> 2;
-                sa = ok_a ? ws[(long long)row_a * kblocks + kb] : 0;
-                sb = ok_b ? ws[(long long)row_b * kblocks + kb] : 0;
-                sa |= sa << 16;
-                sb |= sb << 16;
-            }
-            const long long col = kk * 8 + 2 * t;
-            if (ok_a) a0 = dg_q8x2(*(const unsigned short*)(w + (long long)row_a * K + col), sa);
-            if (ok_b) a1 = dg_q8x2(*(const unsigned short*)(w + (long long)row_b * K + col), sb);
-        } else if (FMT == 1) {
-            const long long col = (kk * 8 + 2 * t) * 2;
-            if (ok_a) a0 = dg_bf16x2(*(const unsigned*)(w + (long long)row_a * K * 2 + col), wscale);
-            if (ok_b) a1 = dg_bf16x2(*(const unsigned*)(w + (long long)row_b * K * 2 + col), wscale);
-        } else {
-            const long long blk = (long long)(kk >> 3) * 36;
-            const int sub = (kk >> 1) & 3;
-            const unsigned char* pa = w + (long long)row_a * (K >> 6) * 36 + blk;
-            const unsigned char* pb = w + (long long)row_b * (K >> 6) * 36 + blk;
-            if ((kk & 1) == 0) {
-                sa = ok_a ? dg_ue4m3x2(pa[sub]) : 0;
-                sb = ok_b ? dg_ue4m3x2(pb[sub]) : 0;
-            }
-            const int at = 4 + sub * 8 + (kk & 1) * 4 + t;
-            if (ok_a) {
-                a0 = lut[pa[at]];
-                asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(a0) : "r"(sa));
-            }
-            if (ok_b) {
-                a1 = lut[pb[at]];
-                asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(a1) : "r"(sb));
+    // A warp's share of K, in 64-element chunks. The contraction is taken
+    // in a permuted k order: within a chunk, lane quarter t owns elements
+    // [16t, 16t + 16), and MMA step s contracts its pair 2s, 2s + 1. Weights
+    // and activations are permuted alike, so the sum is the same set of
+    // products, and a lane's whole chunk is one or two wide loads a row
+    // instead of eight narrow ones. Loading a pair at a time put sixteen
+    // cache lines through the load pipeline every step and held the launch
+    // near 250 GB/s of weights; staging the wide loads through shared
+    // memory to keep the natural order was slower still (bench_inkling_dg).
+    const int chunks = K >> 6;
+    const int share = (chunks + 7) / 8;
+    const int ch0 = warp * share, ch1 = min(ch0 + share, chunks);
+    for (int ch = ch0; ch < ch1; ++ch) {
+        unsigned a[2][8];
+#pragma unroll
+        for (int hb = 0; hb < 2; ++hb) {
+            const int row = hb ? row_b : row_a;
+            const bool ok = hb ? ok_b : ok_a;
+            unsigned* h = a[hb];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) h[i] = 0u;
+            if (ok) {
+                if (FMT == 0) {
+                    const uint4 q = *(const uint4*)(w + (long long)row * K + ch * 64 + t * 16);
+                    unsigned sc = ws[(long long)row * kblocks + ch * 2 + (t >> 1)];
+                    sc |= sc << 16;
+                    h[0] = dg_q8x2(q.x, sc);
+                    h[1] = dg_q8x2(q.x >> 16, sc);
+                    h[2] = dg_q8x2(q.y, sc);
+                    h[3] = dg_q8x2(q.y >> 16, sc);
+                    h[4] = dg_q8x2(q.z, sc);
+                    h[5] = dg_q8x2(q.z >> 16, sc);
+                    h[6] = dg_q8x2(q.w, sc);
+                    h[7] = dg_q8x2(q.w >> 16, sc);
+                } else if (FMT == 1) {
+                    const uint4* p = (const uint4*)(w + ((long long)row * K + ch * 64 + t * 16) * 2);
+                    const uint4 v0 = p[0], v1 = p[1];
+                    h[0] = dg_bf16x2(v0.x, wscale);
+                    h[1] = dg_bf16x2(v0.y, wscale);
+                    h[2] = dg_bf16x2(v0.z, wscale);
+                    h[3] = dg_bf16x2(v0.w, wscale);
+                    h[4] = dg_bf16x2(v1.x, wscale);
+                    h[5] = dg_bf16x2(v1.y, wscale);
+                    h[6] = dg_bf16x2(v1.z, wscale);
+                    h[7] = dg_bf16x2(v1.w, wscale);
+                } else {
+                    // Sub-block t of this row's block: its scale byte and
+                    // its eight bytes, each byte one fp16 pair in byte order.
+                    const unsigned char* blk = w + ((long long)row * chunks + ch) * 36;
+                    const unsigned sc = dg_ue4m3x2(blk[t]);
+                    const unsigned d0 = *(const unsigned*)(blk + 4 + t * 8);
+                    const unsigned d1 = *(const unsigned*)(blk + 8 + t * 8);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        h[i] = lut[(d0 >> (8 * i)) & 255u];
+                        h[4 + i] = lut[(d1 >> (8 * i)) & 255u];
+                    }
+#pragma unroll
+                    for (int i = 0; i < 8; ++i)
+                        asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(h[i]) : "r"(sc));
+                }
             }
         }
-        const unsigned b = xcol ? *(const unsigned*)(xcol + kk * 8 + 2 * t) : 0u;
-        dg_mma(c, a0, a1, b);
+        uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
+        if (xcol) {
+            const uint4* xp = (const uint4*)(xcol + ch * 64 + t * 16);
+            x0 = xp[0];
+            x1 = xp[1];
+        }
+        dg_mma(c, a[0][0], a[1][0], x0.x);
+        dg_mma(c, a[0][1], a[1][1], x0.y);
+        dg_mma(c, a[0][2], a[1][2], x0.z);
+        dg_mma(c, a[0][3], a[1][3], x0.w);
+        dg_mma(c, a[0][4], a[1][4], x1.x);
+        dg_mma(c, a[0][5], a[1][5], x1.y);
+        dg_mma(c, a[0][6], a[1][6], x1.z);
+        dg_mma(c, a[0][7], a[1][7], x1.w);
     }
+
+    // Partials, summed by the first warp in warp order.
+#pragma unroll
+    for (int i = 0; i < 4; ++i) part[warp][lane][i] = c[i];
+    __syncthreads();
+    if (warp != 0) return;
+#pragma unroll
+    for (int wv = 1; wv < 8; ++wv)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) c[i] += part[wv][lane][i];
 
     // c[0], c[1]: row_a at token columns 2t, 2t + 1; c[2], c[3]: row_b.
     if (MODE == 0) {
@@ -892,7 +943,7 @@ __device__ __forceinline__ void dg_gemm(
 }
 
 #define DG_ENTRY(NAME, FMT, MODE)                                                        \
-    extern "C" __global__ void __launch_bounds__(64) NAME(                               \
+    extern "C" __global__ void __launch_bounds__(256) NAME(                               \
         const unsigned char* __restrict__ w, const unsigned short* __restrict__ ws,      \
         const unsigned short* __restrict__ x, void* __restrict__ out,                    \
         const int* __restrict__ ids, const float* __restrict__ escale,                   \
@@ -1027,7 +1078,7 @@ impl DecodeGemm {
             .arg(&beta)
             .arg(&lb);
         // SAFETY: every caller length-checks its operands against the grid.
-        unsafe { b.launch(cfg((grid.0, grid.1, 1), 64, 0)) }?;
+        unsafe { b.launch(cfg((grid.0, grid.1, 1), 256, 0)) }?;
         Ok(())
     }
 
@@ -1051,9 +1102,9 @@ impl DecodeGemm {
         b2: usize,
     ) -> Result<(), InklingError> {
         use cudarc::driver::DevicePtrMut;
-        if tokens == 0 || tokens > DG_MAX_ROWS || !k.is_multiple_of(32) {
+        if tokens == 0 || tokens > DG_MAX_ROWS || !k.is_multiple_of(64) {
             return Err(InklingError::Shape(
-                "decode GEMM takes 1..=8 rows, K a multiple of 32",
+                "decode GEMM takes 1..=8 rows, K a multiple of 64",
             ));
         }
         if !b1.is_multiple_of(DG_BLOCK_ROWS) || !b2.is_multiple_of(DG_BLOCK_ROWS) || b1 > b2 {
@@ -1153,7 +1204,7 @@ impl DecodeGemm {
             0,
             (wstride, wsstride),
             [alpha, wscale, beta, linear_beta],
-            ((rows / 2).div_ceil(16), pairs),
+            ((rows / 2).div_ceil(8), pairs),
         )
     }
 
@@ -1228,5 +1279,536 @@ impl DecodeGemm {
                 )
             }
         }
+    }
+}
+
+/// Per-row state pointers a decode kernel takes: key cache, value cache,
+/// then the key, value, attention-output and feed-forward carries.
+pub const DEC_ROW_POINTERS: usize = 6;
+
+/// The fused decode glue (`device-kernels/src/inkling_decode.rs`): what a
+/// layer does between its GEMMs when every row is the next position of its
+/// own sequence. Each launch covers all rows; a row's own state is reached
+/// through `ptrs`, `[rows][DEC_ROW_POINTERS]` device addresses.
+pub struct InklingDecodeKernels {
+    inputs: CudaFunction,
+    kv: CudaFunction,
+    attn: CudaFunction,
+    ffn_in: CudaFunction,
+    ffn_out: CudaFunction,
+    gate: CudaFunction,
+    ctrl: CudaFunction,
+    norm: CudaFunction,
+    router: CudaFunction,
+    route: CudaFunction,
+}
+
+/// Where a layer's projections sit in a row of the projection pack's
+/// output, in floats. A negative tap offset means the layer has none.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjOffsets {
+    /// Row stride of the pack output.
+    pub ldo: i32,
+    /// Query projection.
+    pub q: i32,
+    /// Relative-position projection.
+    pub rel: i32,
+    /// Sink projection.
+    pub sink: i32,
+    /// Output-gate projection.
+    pub gate: i32,
+    /// Key projection.
+    pub k: i32,
+    /// Value projection.
+    pub v: i32,
+    /// Key convolution taps.
+    pub k_taps: i32,
+    /// Value convolution taps.
+    pub v_taps: i32,
+}
+
+/// A loop controller's fp32 weights: `down` `[rank][2n]`, `gain` and
+/// `forget` `[n][rank]`; three of each, concatenated, for the Q, K and V
+/// controllers of [`InklingDecodeKernels::inputs`].
+#[derive(Clone, Copy)]
+pub struct ControlWeights<'a> {
+    /// Gate read.
+    pub down: &'a CudaSlice<f32>,
+    /// Gain write.
+    pub gain: &'a CudaSlice<f32>,
+    /// Forget write.
+    pub forget: &'a CudaSlice<f32>,
+    /// Controller rank; divides 256 and is at most 64.
+    pub rank: usize,
+}
+
+fn opt<T>(s: Option<&CudaSlice<T>>, stream: &Arc<CudaStream>) -> u64 {
+    use cudarc::driver::DevicePtr;
+    s.map_or(0, |s| s.device_ptr(stream).0)
+}
+
+impl InklingDecodeKernels {
+    /// Load the entry points.
+    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, InklingError> {
+        let m = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
+        Ok(Self {
+            inputs: m.load_function("ink_dec_inputs")?,
+            kv: m.load_function("ink_dec_kv")?,
+            attn: m.load_function("ink_dec_attn")?,
+            ffn_in: m.load_function("ink_dec_ffn_in")?,
+            ffn_out: m.load_function("ink_dec_ffn_out")?,
+            gate: m.load_function("ink_dec_gate")?,
+            ctrl: m.load_function("ink_dec_ctrl")?,
+            norm: m.load_function("ink_dec_norm")?,
+            router: m.load_function("ink_dec_router")?,
+            route: m.load_function("ink_dec_route")?,
+        })
+    }
+
+    /// Attention inputs of every row: depth mixing over `stack` (`states`
+    /// planes, `[rows][n]` each) and `cur` when `queries` is given, then
+    /// the input norms into `out` (binary16 planes `[3][rows][n]`). With
+    /// `msgs` (`[3][rows][n]`) the three inputs are instead left in `work`
+    /// with their inverse RMS in `inv`, for [`Self::control`] to finish.
+    /// Returns how many distinct planes there are.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inputs(
+        &self,
+        stream: &Arc<CudaStream>,
+        cur: &CudaSlice<f32>,
+        stack: &CudaSlice<f32>,
+        queries: Option<(&CudaSlice<f32>, usize)>,
+        msgs: Option<&CudaSlice<f32>>,
+        norms: &CudaSlice<f32>,
+        work: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<u16>,
+        inv: &mut CudaSlice<f32>,
+        n: usize,
+        states: usize,
+        eps: f32,
+        rows: usize,
+    ) -> Result<usize, InklingError> {
+        let n_queries = queries.map_or(0, |q| q.1);
+        if states + 1 > MIX_MAX_STATES || n_queries > 3 {
+            return Err(InklingError::Shape(
+                "decode inputs: too many states or queries",
+            ));
+        }
+        need("dec inputs cur", cur.len(), rows * n)?;
+        need("dec inputs stack", stack.len(), states * rows * n)?;
+        need("dec inputs work", work.len(), 3 * rows * n)?;
+        need("dec inputs out", out.len(), 3 * rows * n)?;
+        need("dec inputs inv", inv.len(), rows * 6)?;
+        let n_norms = norms.len() / n;
+        if n_norms == 0 {
+            return Err(InklingError::Shape("decode inputs: no norm weight"));
+        }
+        if let Some(m) = msgs {
+            need("dec inputs msgs", m.len(), 3 * rows * n)?;
+        }
+        if let Some((q, count)) = queries {
+            need("dec inputs queries", q.len(), count * n)?;
+        }
+        let q_ptr = opt(queries.map(|q| q.0), stream);
+        let m_ptr = opt(msgs, stream);
+        let (n_i, s, q, nn) = (n as i32, states as i32, n_queries as i32, n_norms as i32);
+        let mut b = stream.launch_builder(&self.inputs);
+        b.arg(cur)
+            .arg(stack)
+            .arg(&q_ptr)
+            .arg(&m_ptr)
+            .arg(norms)
+            .arg(&mut *work)
+            .arg(&mut *out)
+            .arg(&mut *inv)
+            .arg(&n_i)
+            .arg(&s)
+            .arg(&q)
+            .arg(&nn)
+            .arg(&eps);
+        // SAFETY: lengths checked; 256 threads with the reductions' dynamic
+        // shared memory.
+        unsafe { b.launch(cfg((rows, 1, 1), 256, REDUCE_SHARED)) }?;
+        Ok(if msgs.is_some() { 3 } else { n_queries.max(1) })
+    }
+
+    /// Loop controllers and norms over `ctrls` planes of `x`
+    /// (`[ctrls][rows][n]`, in place): the gate read, the gain/forget
+    /// update against `msg`, then the RMS norm into `out` (binary16, in
+    /// byte order when `byte_order`). `inv` is what [`Self::inputs`] or
+    /// [`Self::ffn_in`] left; `gate` is `[rows][ctrls][rank]` scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn control(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &mut CudaSlice<f32>,
+        msg: &CudaSlice<f32>,
+        c: ControlWeights<'_>,
+        norms: &CudaSlice<f32>,
+        out: &mut CudaSlice<u16>,
+        inv: &CudaSlice<f32>,
+        gate: &mut CudaSlice<f32>,
+        n: usize,
+        ctrls: usize,
+        eps: f32,
+        byte_order: bool,
+        rows: usize,
+    ) -> Result<(), InklingError> {
+        if c.rank == 0 || c.rank > 64 || ctrls == 0 {
+            return Err(InklingError::Shape("controller rank must be 1..=64"));
+        }
+        let n_norms = norms.len() / n;
+        if n_norms == 0 {
+            return Err(InklingError::Shape("decode control: no norm weight"));
+        }
+        for (what, len, want) in [
+            ("dec control x", x.len(), ctrls * rows * n),
+            ("dec control msg", msg.len(), ctrls * rows * n),
+            ("dec control out", out.len(), ctrls * rows * n),
+            ("dec control inv", inv.len(), rows * ctrls * 2),
+            ("dec control gate", gate.len(), rows * ctrls * c.rank),
+            ("dec control down", c.down.len(), ctrls * c.rank * 2 * n),
+            ("dec control gain", c.gain.len(), ctrls * n * c.rank),
+            ("dec control forget", c.forget.len(), ctrls * n * c.rank),
+        ] {
+            need(what, len, want)?;
+        }
+        let (n_i, r, cc, nn, nv) = (
+            n as i32,
+            c.rank as i32,
+            ctrls as i32,
+            n_norms as i32,
+            i32::from(byte_order),
+        );
+        let mut b = stream.launch_builder(&self.gate);
+        b.arg(&*x)
+            .arg(msg)
+            .arg(inv)
+            .arg(c.down)
+            .arg(&mut *gate)
+            .arg(&n_i)
+            .arg(&r)
+            .arg(&cc);
+        // SAFETY: lengths checked.
+        unsafe { b.launch(cfg((c.rank, rows * ctrls, 1), 256, REDUCE_SHARED)) }?;
+        let mut b = stream.launch_builder(&self.ctrl);
+        b.arg(&mut *x)
+            .arg(msg)
+            .arg(&*gate)
+            .arg(c.gain)
+            .arg(c.forget)
+            .arg(&n_i)
+            .arg(&r)
+            .arg(&cc);
+        // SAFETY: lengths checked.
+        unsafe { b.launch(cfg((n.div_ceil(256), rows * ctrls, 1), 256, 0)) }?;
+        let mut b = stream.launch_builder(&self.norm);
+        b.arg(&mut *x)
+            .arg(norms)
+            .arg(&mut *out)
+            .arg(&n_i)
+            .arg(&nn)
+            .arg(&eps)
+            .arg(&nv);
+        // SAFETY: lengths checked.
+        unsafe { b.launch(cfg((ctrls, rows, 1), 256, REDUCE_SHARED)) }?;
+        Ok(())
+    }
+
+    /// Sigmoid top-k routing of rows of `x` (`[rows][n]`, fp32): router
+    /// logits into `logits` (`[rows][experts]`), then `ids` and `weights`
+    /// (`[rows][topk]`), the weights normalized and times `weight_scale`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        router: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        logits: &mut CudaSlice<f32>,
+        ids: &mut CudaSlice<i32>,
+        weights: &mut CudaSlice<f32>,
+        n: usize,
+        experts: usize,
+        topk: usize,
+        weight_scale: f32,
+        rows: usize,
+    ) -> Result<(), InklingError> {
+        if experts == 0
+            || experts > 256
+            || !experts.is_multiple_of(8)
+            || topk > 32
+            || topk > experts
+            || n < 32
+        {
+            return Err(InklingError::Shape(
+                "decode routing: experts a multiple of 8 up to 256, top-k <= 32",
+            ));
+        }
+        need("dec route x", x.len(), rows * n)?;
+        need("dec route router", router.len(), experts * n)?;
+        need("dec route bias", bias.len(), experts)?;
+        need("dec route logits", logits.len(), rows * experts)?;
+        need("dec route ids", ids.len(), rows * topk)?;
+        need("dec route weights", weights.len(), rows * topk)?;
+        let (n_i, e, k) = (n as i32, experts as i32, topk as i32);
+        let mut b = stream.launch_builder(&self.router);
+        b.arg(x).arg(router).arg(&mut *logits).arg(&n_i).arg(&e);
+        // SAFETY: lengths checked.
+        unsafe { b.launch(cfg((experts / 8, rows, 1), 256, 0)) }?;
+        let mut b = stream.launch_builder(&self.route);
+        b.arg(&*logits)
+            .arg(bias)
+            .arg(&mut *ids)
+            .arg(&mut *weights)
+            .arg(&e)
+            .arg(&k)
+            .arg(&weight_scale);
+        // SAFETY: lengths checked.
+        unsafe { b.launch(cfg((rows, 1, 1), 256, 0)) }?;
+        Ok(())
+    }
+
+    /// Keys and values of every row: convolution over the row's carry, key
+    /// clip or value norm, and the append to the row's cache at `pos`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv(
+        &self,
+        stream: &Arc<CudaStream>,
+        proj: &CudaSlice<f32>,
+        ptrs: &CudaSlice<u64>,
+        pos: &CudaSlice<i32>,
+        k_conv: &CudaSlice<f32>,
+        v_conv: &CudaSlice<f32>,
+        o: ProjOffsets,
+        kv_heads: usize,
+        dim: usize,
+        taps: usize,
+        clip: f32,
+        eps: f32,
+        rows: usize,
+    ) -> Result<(), InklingError> {
+        if !dim.is_multiple_of(32) || dim > 128 {
+            return Err(InklingError::Shape(
+                "decode kv: head width must be 32..=128 in warps",
+            ));
+        }
+        need("dec kv proj", proj.len(), rows * o.ldo as usize)?;
+        need("dec kv ptrs", ptrs.len(), rows * DEC_ROW_POINTERS)?;
+        need("dec kv pos", pos.len(), rows)?;
+        need("dec kv k_conv", k_conv.len(), kv_heads * dim * taps)?;
+        need("dec kv v_conv", v_conv.len(), kv_heads * dim * taps)?;
+        let (kv, t) = (kv_heads as i32, taps as i32);
+        let mut b = stream.launch_builder(&self.kv);
+        b.arg(proj)
+            .arg(ptrs)
+            .arg(pos)
+            .arg(k_conv)
+            .arg(v_conv)
+            .arg(&o.ldo)
+            .arg(&o.k)
+            .arg(&o.v)
+            .arg(&o.k_taps)
+            .arg(&o.v_taps)
+            .arg(&kv)
+            .arg(&t)
+            .arg(&clip)
+            .arg(&eps);
+        // SAFETY: lengths checked; the pointer table is the caller's promise
+        // that each row's caches and carries are live and large enough.
+        unsafe { b.launch(cfg((2 * kv_heads, rows, 1), dim as u32, 0)) }?;
+        Ok(())
+    }
+
+    /// Attention of every row over its cache, clips and output gate
+    /// included; `out` is binary16 `[rows][heads][dim]`. `log` is the
+    /// logarithmic position scale of a full-attention layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn(
+        &self,
+        stream: &Arc<CudaStream>,
+        proj: &CudaSlice<f32>,
+        ptrs: &CudaSlice<u64>,
+        pos: &CudaSlice<i32>,
+        q_clip: &CudaSlice<f32>,
+        rel_clip: &CudaSlice<f32>,
+        rel_bias: &CudaSlice<f32>,
+        out: &mut CudaSlice<u16>,
+        o: ProjOffsets,
+        heads: usize,
+        kv_heads: usize,
+        dim: usize,
+        n_rel: usize,
+        window: usize,
+        extent: usize,
+        qk_clip: f32,
+        rel_bound: f32,
+        log: Option<(f32, f32)>,
+        rows: usize,
+    ) -> Result<(), InklingError> {
+        if dim > 128 || n_rel > 32 || !heads.is_multiple_of(kv_heads) {
+            return Err(InklingError::Shape("decode attention head geometry"));
+        }
+        need("dec attn proj", proj.len(), rows * o.ldo as usize)?;
+        need("dec attn ptrs", ptrs.len(), rows * DEC_ROW_POINTERS)?;
+        need("dec attn pos", pos.len(), rows)?;
+        need("dec attn q_clip", q_clip.len(), heads * dim)?;
+        need("dec attn rel_clip", rel_clip.len(), heads * n_rel)?;
+        need("dec attn rel_bias", rel_bias.len(), extent * n_rel)?;
+        need("dec attn out", out.len(), rows * heads * dim)?;
+        let (kv, d, nr, w, e) = (
+            kv_heads as i32,
+            dim as i32,
+            n_rel as i32,
+            window as i32,
+            extent as i32,
+        );
+        let (alpha, floor) = log.unwrap_or((-1.0, 1.0));
+        let mut b = stream.launch_builder(&self.attn);
+        b.arg(proj)
+            .arg(ptrs)
+            .arg(pos)
+            .arg(q_clip)
+            .arg(rel_clip)
+            .arg(rel_bias)
+            .arg(&mut *out)
+            .arg(&o.ldo)
+            .arg(&o.q)
+            .arg(&o.rel)
+            .arg(&o.sink)
+            .arg(&o.gate)
+            .arg(&kv)
+            .arg(&d)
+            .arg(&nr)
+            .arg(&w)
+            .arg(&e)
+            .arg(&qk_clip)
+            .arg(&rel_bound)
+            .arg(&alpha)
+            .arg(&floor);
+        // SAFETY: lengths checked; caches reached through the pointer table.
+        unsafe { b.launch(cfg((heads, rows, 1), 256, 0)) }?;
+        Ok(())
+    }
+
+    /// From the attention output projection to the feed-forward input:
+    /// output convolution and residual (or a new residual block when
+    /// `opens`, whose input becomes stack plane `states`), depth mixing
+    /// into `work`, then the norm (`work` in place and `out`, binary16, in
+    /// byte order when `byte_order`). With `msg` the norm is left to
+    /// [`Self::control`] and `inv` is written for it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ffn_in(
+        &self,
+        stream: &Arc<CudaStream>,
+        o_raw: &CudaSlice<f32>,
+        input: &CudaSlice<f32>,
+        conv_w: &CudaSlice<f32>,
+        ptrs: &CudaSlice<u64>,
+        stack: &mut CudaSlice<f32>,
+        query: &CudaSlice<f32>,
+        msg: Option<&CudaSlice<f32>>,
+        norm_w: &CudaSlice<f32>,
+        ffn_inp: &mut CudaSlice<f32>,
+        work: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<u16>,
+        inv: &mut CudaSlice<f32>,
+        n: usize,
+        states: usize,
+        opens: bool,
+        taps: usize,
+        byte_order: bool,
+        eps: f32,
+        rows: usize,
+    ) -> Result<(), InklingError> {
+        if states + usize::from(opens) + 1 > MIX_MAX_STATES {
+            return Err(InklingError::Shape("decode ffn: too many residual blocks"));
+        }
+        for (what, len, want) in [
+            ("dec ffn o_raw", o_raw.len(), rows * n),
+            ("dec ffn input", input.len(), rows * n),
+            ("dec ffn conv", conv_w.len(), n * taps),
+            (
+                "dec ffn stack",
+                stack.len(),
+                (states + usize::from(opens)) * rows * n,
+            ),
+            ("dec ffn query", query.len(), n),
+            ("dec ffn norm", norm_w.len(), n),
+            ("dec ffn ffn_inp", ffn_inp.len(), rows * n),
+            ("dec ffn work", work.len(), rows * n),
+            ("dec ffn ptrs", ptrs.len(), rows * DEC_ROW_POINTERS),
+            ("dec ffn inv", inv.len(), rows * 2),
+        ] {
+            need(what, len, want)?;
+        }
+        need("dec ffn out", out.len(), rows * n)?;
+        if let Some(m) = msg {
+            need("dec ffn msg", m.len(), rows * n)?;
+        }
+        let m_ptr = opt(msg, stream);
+        let ints = [
+            n as i32,
+            states as i32,
+            i32::from(opens),
+            taps as i32,
+            i32::from(byte_order),
+        ];
+        let mut b = stream.launch_builder(&self.ffn_in);
+        b.arg(o_raw)
+            .arg(input)
+            .arg(conv_w)
+            .arg(ptrs)
+            .arg(&mut *stack)
+            .arg(query)
+            .arg(&m_ptr)
+            .arg(norm_w)
+            .arg(&mut *ffn_inp)
+            .arg(&mut *work)
+            .arg(&mut *out)
+            .arg(&mut *inv);
+        for v in &ints {
+            b.arg(v);
+        }
+        b.arg(&eps);
+        // SAFETY: lengths checked; carries reached through the pointer table.
+        unsafe { b.launch(cfg((rows, 1, 1), 256, REDUCE_SHARED)) }?;
+        Ok(())
+    }
+
+    /// The end of a layer: `h = ffn_inp + conv(sum of the row's weighted
+    /// expert outputs)`. `partial` is `[rows * topk][n]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ffn_out(
+        &self,
+        stream: &Arc<CudaStream>,
+        partial: &CudaSlice<f32>,
+        ffn_inp: &CudaSlice<f32>,
+        conv_w: &CudaSlice<f32>,
+        ptrs: &CudaSlice<u64>,
+        h: &mut CudaSlice<f32>,
+        n: usize,
+        topk: usize,
+        taps: usize,
+        rows: usize,
+    ) -> Result<(), InklingError> {
+        need("dec out partial", partial.len(), rows * topk * n)?;
+        need("dec out ffn_inp", ffn_inp.len(), rows * n)?;
+        need("dec out conv", conv_w.len(), n * taps)?;
+        need("dec out ptrs", ptrs.len(), rows * DEC_ROW_POINTERS)?;
+        need("dec out h", h.len(), rows * n)?;
+        let (n_i, k, t) = (n as i32, topk as i32, taps as i32);
+        let mut b = stream.launch_builder(&self.ffn_out);
+        b.arg(partial)
+            .arg(ffn_inp)
+            .arg(conv_w)
+            .arg(ptrs)
+            .arg(&mut *h)
+            .arg(&n_i)
+            .arg(&k)
+            .arg(&t);
+        // SAFETY: lengths checked; carries reached through the pointer table.
+        unsafe { b.launch(cfg((n.div_ceil(256), rows, 1), 256, 0)) }?;
+        Ok(())
     }
 }

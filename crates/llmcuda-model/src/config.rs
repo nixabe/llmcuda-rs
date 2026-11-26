@@ -454,6 +454,8 @@ pub struct ModelConfig {
     pub k2: Option<K2Config>,
     /// A decision head in place of text generation (`clef`).
     pub decision: Option<DecisionConfig>,
+    /// The looped architecture's geometry (`inkling2_loop`).
+    pub inkling: Option<crate::inkling::InklingConfig>,
     /// The attention cache's element format. A serving choice; see
     /// [`KvCacheTypes`].
     pub kv_cache: KvCacheTypes,
@@ -498,6 +500,7 @@ impl ModelConfig {
             has_mtp: true,
             k2: None,
             decision: None,
+            inkling: None,
             kv_cache: KvCacheTypes::F16,
         }
     }
@@ -556,6 +559,7 @@ impl ModelConfig {
             has_mtp: true,
             k2: None,
             decision: None,
+            inkling: None,
             kv_cache: KvCacheTypes::F16,
         }
     }
@@ -610,6 +614,7 @@ impl ModelConfig {
                 route_scale_bits: 2.5f32.to_bits(),
             }),
             decision: None,
+            inkling: None,
             kv_cache: KvCacheTypes::F16,
         }
     }

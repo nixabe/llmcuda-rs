@@ -20,6 +20,7 @@ pub mod budget;
 pub mod config;
 pub mod dflash;
 pub mod gguf;
+pub mod inkling;
 mod metadata;
 pub mod verify;
 pub mod vision;
@@ -30,6 +31,7 @@ pub use config::{
     KvCacheTypes, LayerKind, ModelConfig, MoeConfig, UnknownArchitecture,
 };
 pub use dflash::DFlashConfig;
+pub use inkling::InklingConfig;
 pub use vision::VisionConfig;
 pub use weights::{Directory, Role, Section, TensorSpec, WeightError, WeightSchema};
 

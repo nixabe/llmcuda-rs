@@ -29,6 +29,9 @@ fn invalid(key: &str, reason: &str) -> ConfigLoadError {
 }
 
 pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
+    if file.get_str("general.architecture") == Some(crate::inkling::ARCHITECTURE) {
+        return crate::inkling::load(file);
+    }
     let architecture = match file.get_str("general.architecture") {
         Some("qwen35moe") => "qwen35moe",
         Some("qwen35") => "qwen35",
@@ -261,6 +264,7 @@ pub(crate) fn load(file: &GgufFile) -> Result<ModelConfig, ConfigLoadError> {
         has_mtp: mtp == 1,
         k2,
         decision,
+        inkling: None,
         kv_cache: crate::config::KvCacheTypes::F16,
     };
     let recurrent_key = key("attention.recurrent_layers");

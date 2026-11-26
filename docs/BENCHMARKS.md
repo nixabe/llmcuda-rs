@@ -528,16 +528,18 @@ What the table does not say:
   mask), so `-fa on` is inert here.
 - **`-ub 2048` is the whole prompt** at both depths; nothing deeper than 2K
   and no `-ub 4096` cell has been measured, on either side.
-- **Only the Q4_K_XL file has run.** Q8_K_XL (bf16 dense matrices, bf16
-  experts in the last four layers) loads through the same code and has not
-  been executed.
+- **Q8_K_XL has no pair.** That file (bf16 dense matrices, bf16 experts in
+  the last four layers; 22.3 GiB resident) passes the same gates and ran
+  once at 512: prefill 1,270 / 1,767 tok/s and decode 49.4 / 93.6 tok/s at
+  N=1 / N=3. llama.cpp was not timed on it.
 - **Not served.** No runtime, scheduler, sampler or HTTP path drives this
   forward yet, every sequence keeps a full-length cache for all 48
   applications (sliding layers need 1,024 rows), and the vision projector is
   not supported.
 
-Agreement with llama.cpp on a 12-token capture (`inkling_forward`): logits
-cosine 0.99994, max-abs 0.20, same argmax; the 48 layer outputs between
+Agreement with llama.cpp on a 12-token capture (`inkling_forward`; Q8_K_XL
+reads 0.99918 and 0.85, where llama.cpp itself sits further from exact
+arithmetic): logits cosine 0.99994, max-abs 0.20, same argmax; the 48 layer outputs between
 0.99883 and 0.99998. The residue is routing, not arithmetic: the sigmoid top-8
 router has near-ties, and any change of summation order sends one to four of
 a position's 48 applications to a different eighth expert on two to five of

@@ -13,7 +13,9 @@
 //! CUDA C++ kernels that share their arithmetic; do not reorder a sum or
 //! change which products fuse without changing those too.
 
-use cuda_device::{DynamicSharedArray, SharedArray, device, kernel, thread, warp};
+use cuda_device::{
+    DynamicSharedArray, SharedArray, device, kernel, ptx_asm, thread, warp,
+};
 use cuda_host::cuda_module;
 
 #[cuda_module]
@@ -1586,6 +1588,350 @@ mod kernels {
             if tid == 0 {
                 *counts.add(e as usize) = *scratch;
             }
+        }
+    }
+
+    /// fp32 to binary16, round to nearest even.
+    #[device]
+    fn f2h(f: f32) -> u16 {
+        let h: u16;
+        // SAFETY: a register-only conversion.
+        unsafe {
+            ptx_asm!(
+                "{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }",
+                out("=h") h,
+                in("f") f,
+            );
+        }
+        h
+    }
+
+    /// binary16 to fp32, exact.
+    #[device]
+    fn h2f(h: u16) -> f32 {
+        let f: f32;
+        // SAFETY: a register-only conversion.
+        unsafe {
+            ptx_asm!(
+                "{ .reg .f16 a; mov.b16 a, %1; cvt.f32.f16 %0, a; }",
+                out("=f") f,
+                in("h") h,
+            );
+        }
+        f
+    }
+
+    /// fp32 to fp16, round to nearest even, `n` elements.
+    ///
+    /// # Safety
+    /// x covers n floats and y n halves; the 1-D launch is nonempty.
+    #[kernel]
+    pub unsafe fn hg_to_half(x: *const f32, y: *mut u16, n: i64) {
+        let i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        if i < n {
+            unsafe {
+                *y.add(i as usize) = f2h(*x.add(i as usize));
+            }
+        }
+    }
+
+    /// GELU in place on fp16 activations: ggml's tanh approximation,
+    /// computed in fp32 and rounded back.
+    ///
+    /// # Safety
+    /// x covers n halves; the 1-D launch is nonempty.
+    #[kernel]
+    pub unsafe fn vision_gelu(x: *mut u16, n: i64) {
+        let i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        if i >= n {
+            return;
+        }
+        unsafe {
+            let v = h2f(*x.add(i as usize));
+            // NVRTC contracts the original's 1 + 0.044715 * v * v.
+            let inner = (0.797_884_56_f32 * v) * (0.044715_f32 * v).mul_add(v, 1.0);
+            *x.add(i as usize) = f2h((0.5 * v) * (1.0 + inner.tanh()));
+        }
+    }
+
+    /// `a += b` on fp16 activations, the sum taken in fp32 and rounded once.
+    ///
+    /// # Safety
+    /// a and b cover n halves; b does not partially overlap a.
+    #[kernel]
+    pub unsafe fn vision_add_f16(a: *mut u16, b: *const u16, n: i64) {
+        let i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        if i >= n {
+            return;
+        }
+        unsafe {
+            *a.add(i as usize) = f2h(h2f(*a.add(i as usize)) + h2f(*b.add(i as usize)));
+        }
+    }
+
+    /// fp16 to fp32, `n` elements.
+    ///
+    /// # Safety
+    /// src covers n halves and dst n floats.
+    #[kernel]
+    pub unsafe fn vision_half_to_float(src: *const u16, dst: *mut f32, n: i64) {
+        let i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        if i >= n {
+            return;
+        }
+        unsafe {
+            *dst.add(i as usize) = h2f(*src.add(i as usize));
+        }
+    }
+
+    /// Append this batch's roped keys and raw values to the fp16 cache, at
+    /// the absolute position the sequence has reached.
+    ///
+    /// This is a kernel rather than two device-to-device copies for one
+    /// reason: the destination offset was computed on the host, and a CUDA
+    /// graph records addresses, so a captured decode step would write the
+    /// same position forever. Reading the position from device memory is what
+    /// makes the step replayable (AGENTS.md rule 5). Both halves go in one
+    /// launch: same shape, same stride, independent copies.
+    ///
+    /// `span` is `n_tokens * row`; the cache is indexed by position, so the
+    /// destination base is one row per position and not one span.
+    ///
+    /// grid: (ceil(2 * span / block),).
+    ///
+    /// # Safety
+    /// key and value cover span floats; each cache covers (position + tokens)
+    /// rows of `row` halves; position covers one int.
+    #[kernel]
+    pub unsafe fn attn_kv_append(
+        key: *const f32,
+        value: *const f32,
+        k_cache: *mut u16,
+        v_cache: *mut u16,
+        position: *const i32,
+        span: i32,
+        row: i32,
+    ) {
+        let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        if i >= 2 * span {
+            return;
+        }
+        unsafe {
+            let at = *position as i64 * row as i64;
+            if i < span {
+                *k_cache.add((at + i as i64) as usize) = f2h(*key.add(i as usize));
+            } else {
+                let j = i - span;
+                *v_cache.add((at + j as i64) as usize) = f2h(*value.add(j as usize));
+            }
+        }
+    }
+
+    /// `act_h[i] = half(silu(gate[i]) * up[i])`: SwiGLU narrowed to fp16 in
+    /// the launch that computes it, because the down projection only ever
+    /// reads the narrowed form.
+    ///
+    /// libdevice exp, as the fp32 SwiGLU uses, so the two residencies stay
+    /// comparable byte for byte. It is not folded into the up projection's
+    /// epilogue: that runs on lane 0 only, and the transcendentals of a whole
+    /// row landing on one lane in thirty-two measured slower than this launch
+    /// (docs/BENCHMARKS.md).
+    ///
+    /// # Safety
+    /// gate and up cover n floats, act_h n halves.
+    #[kernel]
+    pub unsafe fn dense_swiglu_narrow(gate: *const f32, up: *const f32, act_h: *mut u16, n: i32) {
+        let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        if i >= n {
+            return;
+        }
+        unsafe {
+            let g = *gate.add(i as usize);
+            *act_h.add(i as usize) = f2h((g / (1.0 + (-g).exp())) * *up.add(i as usize));
+        }
+    }
+
+    /// `y[o][c] += src[owner(o)][c]`, the owner at `spans[o * stride + 2]`.
+    ///
+    /// grid: (ceil(cols / block), n).
+    ///
+    /// # Safety
+    /// y covers n rows of stride ldy, src every owner row of stride lds,
+    /// spans n * stride ints; y is disjoint from src.
+    #[kernel]
+    pub unsafe fn dec_add_owner_rows(
+        y: *mut f32,
+        ldy: i64,
+        src: *const f32,
+        lds: i64,
+        spans: *const i32,
+        stride: i32,
+        n: i32,
+        cols: i32,
+    ) {
+        let o = thread::blockIdx_y() as i32;
+        let c = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        if o >= n || c >= cols {
+            return;
+        }
+        unsafe {
+            let q = *spans.add((o * stride + 2) as usize);
+            let at = y.add((o as i64 * ldy + c as i64) as usize);
+            *at += *src.add((q as i64 * lds + c as i64) as usize);
+        }
+    }
+
+    /// `out[s][c]` = the mean over rows t of span s of `LayerNorm(x[t])[c]`,
+    /// from each row's precomputed `(mean, rstd)`. Spans are `(start, end)`
+    /// pairs at `spans + s * stride`.
+    ///
+    /// grid: (ceil(cols / block), nspans).
+    ///
+    /// # Safety
+    /// x covers every span row at stride ldx; stats holds a `(mean, rstd)`
+    /// pair per row; g and b cover cols; out covers nspans rows of stride
+    /// ldo.
+    #[kernel]
+    pub unsafe fn dec_span_mean(
+        x: *const f32,
+        ldx: i64,
+        cols: i32,
+        stats: *const f32,
+        g: *const f32,
+        b: *const f32,
+        spans: *const i32,
+        stride: i32,
+        nspans: i32,
+        out: *mut f32,
+        ldo: i64,
+    ) {
+        let s = thread::blockIdx_y() as i32;
+        let c = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        if s >= nspans || c >= cols {
+            return;
+        }
+        unsafe {
+            let start = *spans.add((s * stride) as usize);
+            let end = *spans.add((s * stride + 1) as usize);
+            let mut acc = 0.0f32;
+            let mut t = start;
+            while t < end {
+                let mean = *stats.add(2 * t as usize);
+                let rstd = *stats.add(2 * t as usize + 1);
+                acc = (*x.add((t as i64 * ldx + c as i64) as usize) - mean).mul_add(rstd, acc);
+                t += 1;
+            }
+            *out.add((s as i64 * ldo + c as i64) as usize) =
+                (acc / (end - start) as f32).mul_add(*g.add(c as usize), *b.add(c as usize));
+        }
+    }
+
+    /// Merge the key-split partials of the decision head's attention.
+    ///
+    /// `part` holds `splits * nq * heads` weighted value sums of `dh`
+    /// floats, then a `(max, normalizer)` pair per split, query and head.
+    /// Splits are rescaled to the global maximum and summed in ascending
+    /// order.
+    ///
+    /// grid: (nq, heads). block: one thread per head dimension.
+    ///
+    /// # Safety
+    /// part covers splits * nq * heads * (dh + 2) floats; out covers nq rows
+    /// of stride ldo with heads * dh columns used.
+    #[kernel]
+    pub unsafe fn dec_attention_combine(
+        part: *const f32,
+        splits: i32,
+        nq: i32,
+        heads: i32,
+        dh: i32,
+        out: *mut f32,
+        ldo: i64,
+    ) {
+        let q = thread::blockIdx_x() as i64;
+        let h = thread::blockIdx_y() as i64;
+        let d = thread::threadIdx_x() as i64;
+        if d >= dh as i64 {
+            return;
+        }
+        let per_split = nq as i64 * heads as i64;
+        let slot = q * heads as i64 + h;
+        unsafe {
+            let ml = part.add((splits as i64 * per_split * dh as i64) as usize);
+            let mut mx = f32::NEG_INFINITY;
+            let mut m = ml.add((slot * 2) as usize);
+            let mut z = 0;
+            while z < splits {
+                mx = mx.max(*m);
+                m = m.wrapping_add((per_split * 2) as usize);
+                z += 1;
+            }
+            let (mut num, mut den) = (0.0f32, 0.0f32);
+            let mut m = ml.add((slot * 2) as usize);
+            let mut v = part.add((slot * dh as i64 + d) as usize);
+            let mut z = 0;
+            while z < splits {
+                let w = (*m - mx).exp();
+                den = (*m.add(1)).mul_add(w, den);
+                num = (*v).mul_add(w, num);
+                m = m.wrapping_add((per_split * 2) as usize);
+                v = v.wrapping_add((per_split * dh as i64) as usize);
+                z += 1;
+            }
+            *out.add((q * ldo + h * dh as i64 + d) as usize) = num / den;
+        }
+    }
+
+    /// Rotate K2's attention rows by precomputed `(sin, cos)` coefficients,
+    /// eight tokens a block; dimensions past `rope_dim` are copied.
+    ///
+    /// grid: (ceil(tokens / 8), heads). block: `dim` threads.
+    ///
+    /// # Safety
+    /// input and out cover tokens * heads * dim floats and are disjoint;
+    /// coefficients covers (offset + tokens) * rope_dim.
+    #[kernel]
+    pub unsafe fn k2_rotary_apply(
+        input: *const f32,
+        out: *mut f32,
+        coefficients: *const f32,
+        heads: i32,
+        dim: i32,
+        rope_dim: i32,
+        offset: i32,
+        tokens: i32,
+    ) {
+        let t0 = (thread::blockIdx_x() * 8) as i32;
+        let h = thread::blockIdx_y() as i64;
+        let d = thread::threadIdx_x() as i32;
+        let half = rope_dim / 2;
+        if d >= half && d < rope_dim {
+            return;
+        }
+        let mut u = 0;
+        while u < 8 {
+            let t = t0 + u;
+            if t >= tokens {
+                break;
+            }
+            let base = ((t as i64 * heads as i64 + h) * dim as i64) as usize;
+            unsafe {
+                if d >= rope_dim {
+                    *out.add(base + d as usize) = *input.add(base + d as usize);
+                } else {
+                    let at = ((offset as i64 + t as i64) * rope_dim as i64 + 2 * d as i64) as usize;
+                    let (sin_a, cos_a) = (*coefficients.add(at), *coefficients.add(at + 1));
+                    let x0 = *input.add(base + d as usize);
+                    let x1 = *input.add(base + (d + half) as usize);
+                    *out.add(base + d as usize) = x0.mul_add(cos_a, -(x1 * sin_a));
+                    *out.add(base + (d + half) as usize) = x0.mul_add(sin_a, x1 * cos_a);
+                }
+            }
+            u += 1;
         }
     }
 }

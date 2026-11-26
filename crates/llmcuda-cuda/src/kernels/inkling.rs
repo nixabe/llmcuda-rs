@@ -517,7 +517,9 @@ impl InklingKernels {
     /// Attention of `tokens` consecutive rows over their sequence's cache
     /// (the attention loop of `inkling::hidden_states`): the rows sit at
     /// positions `pos[0]..`, and the caches already hold them. `window == 0`
-    /// is full attention. At head_dim 128 this is the tensor-core kernel:
+    /// is full attention; `ring` is the caches' row count when they are
+    /// rings (position `j` at row `j % ring`), `None` when they hold every
+    /// position. At head_dim 128 this is the tensor-core kernel:
     /// queries and probabilities as hi + lo binary16 pairs, fp32
     /// accumulation.
     #[allow(clippy::too_many_arguments)]
@@ -536,10 +538,12 @@ impl InklingKernels {
         kv_heads: usize,
         dim: usize,
         tokens: usize,
+        ring: Option<usize>,
     ) -> Result<(), InklingError> {
         if dim > 128 || !heads.is_multiple_of(kv_heads) {
             return Err(InklingError::Shape("attention head geometry"));
         }
+        let mask = row_mask(ring)?;
         need("attn q", q.len(), tokens * heads * dim)?;
         need("attn out", out.len(), tokens * heads * dim)?;
         need("attn table", table.len(), tokens * heads * (extent + 1))?;
@@ -564,7 +568,8 @@ impl InklingKernels {
                 .arg(&hd)
                 .arg(&kv)
                 .arg(&n)
-                .arg(&scale);
+                .arg(&scale)
+                .arg(&mask);
             // SAFETY: lengths checked; the caller's caches cover every
             // position up to the last row's, and the kernel reads no key
             // past it.
@@ -582,7 +587,8 @@ impl InklingKernels {
             .arg(&e)
             .arg(&kv)
             .arg(&d)
-            .arg(&scale);
+            .arg(&scale)
+            .arg(&mask);
         // SAFETY: lengths checked; the caller's caches cover every position
         // up to the last row's, which only it can know.
         unsafe { b.launch(cfg((heads, tokens, 1), 256, 0)) }?;
@@ -617,11 +623,13 @@ impl InklingKernels {
         heads: usize,
         kv_heads: usize,
         tokens: usize,
+        ring: Option<usize>,
     ) -> Result<(), InklingError> {
         let dim = 128;
         if !heads.is_multiple_of(kv_heads) {
             return Err(InklingError::Shape("attention head geometry"));
         }
+        let mask = row_mask(ring)?;
         need("attn q", q.len(), tokens * heads * dim)?;
         need("attn out", out.len(), tokens * heads * dim)?;
         need("attn r", r.len(), tokens * heads * 16)?;
@@ -652,7 +660,8 @@ impl InklingKernels {
             .arg(&hd)
             .arg(&kv)
             .arg(&n)
-            .arg(&scale);
+            .arg(&scale)
+            .arg(&mask);
         // SAFETY: lengths checked; the caller's caches cover every position
         // up to the last row's, and the kernel reads no key past it.
         unsafe { b.launch(cfg((heads, tokens.div_ceil(ATTN_MMA_ROWS), 1), 32, 0)) }?;
@@ -852,6 +861,9 @@ __device__ __forceinline__ void am_split2(float lo, float hi, unsigned& H, unsig
 // attention it fed: rows x heads x 1025 entries a layer, 150 MB at 1536
 // rows, most of them distances no key sits at.
 //
+// Position j is cache row `j & mask`: a ring of mask + 1 rows on a sliding
+// layer, every position (mask = INT_MAX) otherwise.
+//
 // One warp a block, and nothing staged in shared memory. Eight keys a step:
 //
 //   scores  C[query 16][key 8] = Q K^T. The sixteen query rows live in
@@ -876,7 +888,7 @@ extern "C" __global__ void __launch_bounds__(32) ink_attn_mma(
     const float* __restrict__ r, const float* __restrict__ sink,
     const float* __restrict__ rel_bias,
     float* __restrict__ out, const int* __restrict__ pos,
-    int window, int extent, int heads, int kv_heads, int tokens, float scale
+    int window, int extent, int heads, int kv_heads, int tokens, float scale, int mask
 ) {
     const int lane = threadIdx.x, g = lane >> 2, t = lane & 3;
     const int h = blockIdx.x, r0 = blockIdx.y * 16;
@@ -950,7 +962,8 @@ extern "C" __global__ void __launch_bounds__(32) ink_attn_mma(
         // only the load may be conditional.
         uint4 k0 = make_uint4(0, 0, 0, 0), k1 = k0, k2 = k0, k3 = k0;
         if (jk <= p_last) {
-            const uint4* kp = (const uint4*)(k_cache + (long long)jk * stride + kv * 128 + 32 * t);
+            const uint4* kp =
+                (const uint4*)(k_cache + (long long)(jk & mask) * stride + kv * 128 + 32 * t);
             k0 = kp[0];
             k1 = kp[1];
             k2 = kp[2];
@@ -1028,13 +1041,15 @@ extern "C" __global__ void __launch_bounds__(32) ink_attn_mma(
             wb[i] = 0u;
         }
         if (jv <= p_last) {
-            const uint4* vp = (const uint4*)(v_cache + (long long)jv * stride + kv * 128 + 16 * g);
+            const uint4* vp =
+                (const uint4*)(v_cache + (long long)(jv & mask) * stride + kv * 128 + 16 * g);
             const uint4 v0 = vp[0], v1 = vp[1];
             wa[0] = v0.x; wa[1] = v0.y; wa[2] = v0.z; wa[3] = v0.w;
             wa[4] = v1.x; wa[5] = v1.y; wa[6] = v1.z; wa[7] = v1.w;
         }
         if (jv + 1 <= p_last) {
-            const uint4* vp = (const uint4*)(v_cache + (long long)(jv + 1) * stride + kv * 128 + 16 * g);
+            const uint4* vp = (const uint4*)(v_cache + (long long)((jv + 1) & mask) * stride +
+                                             kv * 128 + 16 * g);
             const uint4 v0 = vp[0], v1 = vp[1];
             wb[0] = v0.x; wb[1] = v0.y; wb[2] = v0.z; wb[3] = v0.w;
             wb[4] = v1.x; wb[5] = v1.y; wb[6] = v1.z; wb[7] = v1.w;
@@ -1785,6 +1800,19 @@ pub struct ControlWeights<'a> {
     pub rank: usize,
 }
 
+/// The row mask of a cache: position `j` lives at row `j & mask`. A ring
+/// holds a power of two of rows; `None` is a cache that holds every
+/// position.
+fn row_mask(ring: Option<usize>) -> Result<i32, InklingError> {
+    match ring {
+        None => Ok(i32::MAX),
+        Some(rows) if rows.is_power_of_two() && rows <= 1 << 30 => Ok((rows - 1) as i32),
+        Some(_) => Err(InklingError::Shape(
+            "a ring cache holds a power of two of rows",
+        )),
+    }
+}
+
 fn opt<T>(s: Option<&CudaSlice<T>>, stream: &Arc<CudaStream>) -> u64 {
     use cudarc::driver::DevicePtr;
     s.map_or(0, |s| s.device_ptr(stream).0)
@@ -2029,8 +2057,10 @@ impl InklingDecodeKernels {
         taps: usize,
         clip: f32,
         eps: f32,
+        ring: Option<usize>,
         rows: usize,
     ) -> Result<(), InklingError> {
+        let mask = row_mask(ring)?;
         if !dim.is_multiple_of(32) || dim > 128 {
             return Err(InklingError::Shape(
                 "decode kv: head width must be 32..=128 in warps",
@@ -2056,7 +2086,8 @@ impl InklingDecodeKernels {
             .arg(&kv)
             .arg(&t)
             .arg(&clip)
-            .arg(&eps);
+            .arg(&eps)
+            .arg(&mask);
         // SAFETY: lengths checked; the pointer table is the caller's promise
         // that each row's caches and carries are live and large enough.
         unsafe { b.launch(cfg((2 * kv_heads, rows, 1), dim as u32, 0)) }?;
@@ -2087,8 +2118,10 @@ impl InklingDecodeKernels {
         qk_clip: f32,
         rel_bound: f32,
         log: Option<(f32, f32)>,
+        ring: Option<usize>,
         rows: usize,
     ) -> Result<(), InklingError> {
+        let mask = row_mask(ring)?;
         if dim > 128 || !dim.is_multiple_of(4) || n_rel > 32 || !heads.is_multiple_of(kv_heads) {
             return Err(InklingError::Shape("decode attention head geometry"));
         }
@@ -2128,7 +2161,8 @@ impl InklingDecodeKernels {
             .arg(&qk_clip)
             .arg(&rel_bound)
             .arg(&alpha)
-            .arg(&floor);
+            .arg(&floor)
+            .arg(&mask);
         // SAFETY: lengths checked; caches reached through the pointer table.
         unsafe { b.launch(cfg((heads, rows, 1), 256, 0)) }?;
         Ok(())

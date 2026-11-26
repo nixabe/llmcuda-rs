@@ -528,7 +528,9 @@ pub(crate) unsafe fn block_sum_256(v: f32) -> f32 {
 ///
 /// The cache is scanned 256 rows at a time with a running maximum, so the
 /// result does not depend on the cache length through anything but the
-/// rounding of the rescales. grid: (heads, tokens), 256 threads.
+/// rounding of the rescales. Position `j` is cache row `j & mask`: a ring of
+/// `mask + 1` rows for a sliding layer, `i32::MAX` for a cache that holds
+/// every position. grid: (heads, tokens), 256 threads.
 ///
 /// # Safety
 /// q and out cover gridDim.y * heads * dim floats, table gridDim.y * heads
@@ -547,6 +549,7 @@ pub unsafe fn ink_attn(
     kv_heads: i32,
     dim: i32,
     scale: f32,
+    mask: i32,
 ) {
     static mut P: SharedArray<f32, 256> = SharedArray::UNINIT;
     static mut ACC: SharedArray<f32, 128> = SharedArray::UNINIT;
@@ -582,7 +585,7 @@ pub unsafe fn ink_attn(
             let j = j0 + tid;
             let mut s = LOWEST;
             if j <= p {
-                let kr = k_cache.add(j as usize * stride + kv * d);
+                let kr = k_cache.add((j & mask) as usize * stride + kv * d);
                 let mut dot = 0.0f32;
                 let mut i = 0usize;
                 while i < d {
@@ -604,7 +607,8 @@ pub unsafe fn ink_attn(
                 let mut acc = ACC[tid as usize] * rescale;
                 let mut jj = 0;
                 while jj < live {
-                    let v = *v_cache.add((j0 + jj) as usize * stride + kv * d + tid as usize);
+                    let v = *v_cache
+                        .add(((j0 + jj) & mask) as usize * stride + kv * d + tid as usize);
                     acc = P[jj as usize].mul_add(h2f(v), acc);
                     jj += 1;
                 }

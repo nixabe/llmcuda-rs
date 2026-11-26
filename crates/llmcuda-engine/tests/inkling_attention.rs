@@ -110,6 +110,24 @@ fn prefill_attention_matches_an_f64_oracle_on_both_kernels() {
             }
         }
 
+        // The same keys and values as rings: position j at row j % ring,
+        // only the last `ring` positions kept. A ring has to cover the
+        // window plus the rows of the pass; full attention has none.
+        let ring = (window > 0).then(|| (window + tokens).next_power_of_two());
+        let as_ring = |cache: &[u16], ring: usize| -> Vec<u16> {
+            let row = kv_heads * dim;
+            let mut out = vec![0u16; ring * row];
+            for j in cache_rows.saturating_sub(ring)..cache_rows {
+                out[(j % ring) * row..][..row].copy_from_slice(&cache[j * row..][..row]);
+            }
+            out
+        };
+        let rings = ring.map(|ring| {
+            (
+                stream.clone_htod(&as_ring(&k, ring)).unwrap(),
+                stream.clone_htod(&as_ring(&v, ring)).unwrap(),
+            )
+        });
         let (d_q, d_k, d_v, d_table) = (
             stream.clone_htod(&q).unwrap(),
             stream.clone_htod(&k).unwrap(),
@@ -122,12 +140,21 @@ fn prefill_attention_matches_an_f64_oracle_on_both_kernels() {
             stream.clone_htod(&sink).unwrap(),
             stream.clone_htod(&rel_bias).unwrap(),
         );
-        let mut tabled: Vec<u32> = Vec::new();
-        for (name, scalar, fused) in [
-            ("scalar", true, false),
-            ("tensor-core", false, false),
-            ("fused bias", false, true),
+        // Each kernel's result on the plain caches, for its ring run.
+        let mut plain: [Vec<u32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (name, scalar, fused, ringed) in [
+            ("scalar", true, false, false),
+            ("tensor-core", false, false, false),
+            ("fused bias", false, true, false),
+            ("scalar, ring", true, false, true),
+            ("tensor-core, ring", false, false, true),
+            ("fused bias, ring", false, true, true),
         ] {
+            let (kc, vc, ring) = match (&rings, ringed) {
+                (Some((rk, rv)), true) => (rk, rv, ring),
+                (None, true) => continue,
+                _ => (&d_k, &d_v, None),
+            };
             kernels.use_reference_kernels(scalar);
             let sentinel = 7.25f32;
             let mut out = stream
@@ -137,32 +164,36 @@ fn prefill_attention_matches_an_f64_oracle_on_both_kernels() {
                 assert!(kernels.fuses_the_bias(dim, n_rel));
                 kernels
                     .attn_fused(
-                        &stream, &d_q, &d_k, &d_v, &d_r, &d_sink, &d_bias, &mut out, &d_pos,
-                        window, extent, heads, kv_heads, tokens,
+                        &stream, &d_q, kc, vc, &d_r, &d_sink, &d_bias, &mut out, &d_pos, window,
+                        extent, heads, kv_heads, tokens, ring,
                     )
                     .unwrap();
             } else {
                 kernels
                     .attn(
-                        &stream, &d_q, &d_k, &d_v, &d_table, &mut out, &d_pos, window, extent,
-                        heads, kv_heads, dim, tokens,
+                        &stream, &d_q, kc, vc, &d_table, &mut out, &d_pos, window, extent, heads,
+                        kv_heads, dim, tokens, ring,
                     )
                     .unwrap();
             }
             let got = stream.clone_dtoh(&out).unwrap();
-            // Computing the bias in the kernel is the table's arithmetic:
-            // the two tensor-core modes agree to the bit.
+            // A ring is the same rows somewhere else: each kernel agrees with
+            // itself to the bit. And computing the bias in the kernel is the
+            // table's arithmetic, so the two tensor-core modes do as well.
             let bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
-            if fused {
-                let differing = bits.iter().zip(&tabled).filter(|(a, b)| a != b).count();
-                assert_eq!(differing, 0, "fused bias differs from the table");
-            } else if !scalar {
-                tabled = bits;
+            let kind = usize::from(!scalar) + usize::from(fused);
+            let same = |a: &[u32], b: &[u32]| a.iter().zip(b).all(|(x, y)| x == y);
+            if ringed {
+                assert!(
+                    same(&bits, &plain[kind]),
+                    "{name} differs from its plain caches"
+                );
+            } else {
+                if fused {
+                    assert!(same(&bits, &plain[1]), "fused bias differs from the table");
+                }
+                plain[kind] = bits;
             }
-            assert!(
-                got[tokens * heads * dim..].iter().all(|x| *x == sentinel),
-                "{name}: wrote past the last row"
-            );
             let (mut worst, mut dot, mut gg, mut ww) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
             for (g, w) in got.iter().zip(&want) {
                 let g = f64::from(*g);
@@ -173,7 +204,7 @@ fn prefill_attention_matches_an_f64_oracle_on_both_kernels() {
             }
             let cos = dot / (gg.sqrt() * ww.sqrt());
             println!(
-                "{name:>11} tokens {tokens:3} pos {pos0:3} window {window:3} extent {extent:3}: max_abs {worst:.3e} 1-cos {:.3e}",
+                "{name:>17} tokens {tokens:3} pos {pos0:3} window {window:3} extent {extent:3}: max_abs {worst:.3e} 1-cos {:.3e}",
                 1.0 - cos
             );
             // Values are within +-4 and the weights sum to at most one; fp32

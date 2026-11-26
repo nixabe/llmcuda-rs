@@ -767,9 +767,14 @@ format is contracted from its stored bytes, converted to binary16 exactly.
   [TESTING.md](TESTING.md#the-looped-architecture-inkling2_loop).
 - **Tokenizer**: the server's tokenizer reads the `inkling2` pre-tokenizer
   and matches llama.cpp on the capture prompt.
+- **Cache**: keys and values are binary16, 4,096 bytes a position for each
+  of the 48 applications. `InklingState::new` keeps every position for all
+  of them, 196 KiB a token. `InklingState::bounded` gives the 40 sliding
+  applications a ring instead — the next power of two above the window plus
+  the widest pass, since a pass appends its rows before it attends — and
+  computes the same bits: 32 KiB a token for the eight full applications
+  plus 640 MiB of rings at passes of up to 2,048 rows. At 128K positions
+  that is 4.6 GiB a sequence against 24.0.
 - **Not yet**: a serving runtime, sampling, the chat template's tool and
-  thinking conventions, the vision projector (`mmproj-F16.gguf`), and a
-  bounded cache for the sliding layers — a sequence keeps full-length keys
-  and values for all 48 applications, 196 KiB a token, where 40 of them
-  need 1,024 rows.
+  thinking conventions, and the vision projector (`mmproj-F16.gguf`).
 

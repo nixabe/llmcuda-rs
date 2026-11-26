@@ -60,8 +60,19 @@ fn run(args: &[String]) -> Result<()> {
         let mut decode = InklingDecode::new(&model, &stream, n)?;
         let mut states = Vec::new();
         for _ in 0..n {
-            states.push(InklingState::new(&stream, &model, pp + tg + 1)?);
+            // Bounded sliding caches, as a server would hold them.
+            states.push(InklingState::bounded(
+                &stream,
+                &model,
+                pp + tg + 1,
+                chunk.min(pp),
+            )?);
         }
+        info!(
+            "caches: {:.1} MiB a sequence of {} positions",
+            states[0].cache_bytes() as f64 / (1u64 << 20) as f64,
+            pp + tg + 1
+        );
         let profiling = std::env::var_os("LLMCUDA_PROFILE").is_some();
         model.use_reference_kernels(std::env::var_os("LLMCUDA_INK_REFERENCE").is_some());
         if profiling {

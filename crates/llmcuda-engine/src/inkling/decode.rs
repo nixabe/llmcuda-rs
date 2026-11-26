@@ -271,6 +271,8 @@ pub struct InklingDecode {
     /// `[slots][rows][6]` device addresses, rebuilt each step.
     ptrs: CudaSlice<u64>,
     host_ptrs: Vec<u64>,
+    /// Each slot's ring rows this step, the same for every sequence in it.
+    rings: Vec<Option<usize>>,
     host_pos: Vec<i32>,
     embedded: CudaSlice<f32>,
     h: CudaSlice<f32>,
@@ -334,6 +336,7 @@ impl InklingDecode {
             d_pos: stream.alloc_zeros::<i32>(rows)?,
             ptrs: stream.alloc_zeros::<u64>(slots * rows * DEC_ROW_POINTERS)?,
             host_ptrs: vec![0; slots * rows * DEC_ROW_POINTERS],
+            rings: vec![None; slots],
             host_pos: vec![0; rows],
             embedded: f(rows * n)?,
             h: f(rows * n)?,
@@ -562,6 +565,7 @@ impl InklingDecode {
             taps,
             f32::from_bits(kc.qk_clip_bits),
             eps,
+            self.rings[slot],
             rows,
         )?;
         self.mark(stream, "keys and values")?;
@@ -594,6 +598,7 @@ impl InklingDecode {
                     kc.log_scale_floor as f32,
                 )
             }),
+            self.rings[slot],
             rows,
         )?;
         self.mark(stream, "attention")?;
@@ -756,6 +761,15 @@ impl InklingDecode {
             }
             self.host_pos[row] = state.position as i32;
             for (slot, s) in state.slots.iter().enumerate() {
+                // One launch covers every row, so the rows must agree on
+                // where a position lives.
+                if row == 0 {
+                    self.rings[slot] = s.ring;
+                } else if self.rings[slot] != s.ring {
+                    return Err(bad(
+                        "sequences in one step were built with different ring caches",
+                    ));
+                }
                 let at = (slot * rows + row) * DEC_ROW_POINTERS;
                 self.host_ptrs[at] = s.k.device_ptr(stream).0;
                 self.host_ptrs[at + 1] = s.v.device_ptr(stream).0;

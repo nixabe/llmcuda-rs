@@ -510,6 +510,9 @@ impl InklingModel {
 
 /// One layer application's share of a sequence's state.
 struct SlotState {
+    /// Rows of `k` and `v` when they are a ring: position `j` at row
+    /// `j % ring`. `None` when they hold every position.
+    ring: Option<usize>,
     k: CudaSlice<u16>,
     v: CudaSlice<u16>,
     k_carry: CudaSlice<f32>,
@@ -523,20 +526,61 @@ pub struct InklingState {
     slots: Vec<SlotState>,
     position: usize,
     capacity: usize,
+    /// The widest pass the ring caches leave room for.
+    max_pass_rows: usize,
     d_position: CudaSlice<i32>,
 }
 
 impl InklingState {
-    /// An empty sequence that can grow to `capacity` positions.
+    /// An empty sequence that can grow to `capacity` positions, every
+    /// layer application keeping keys and values for all of them.
     pub fn new(stream: &Arc<CudaStream>, model: &InklingModel, capacity: usize) -> Res<Self> {
+        Self::build(stream, model, capacity, None)
+    }
+
+    /// An empty sequence that can grow to `capacity` positions in passes of
+    /// at most `max_pass_rows` rows, with the sliding layers' caches bounded.
+    ///
+    /// A sliding layer reads `window` positions back from each row, and a
+    /// pass appends its rows before it attends, so `window + max_pass_rows`
+    /// rows are all it can reach. Its caches are rings of the next power of
+    /// two (position `j` at row `j % ring`), instead of `capacity` rows —
+    /// which at this model's 40 sliding applications of 48 is most of a
+    /// long sequence's memory. Results are the same bits.
+    pub fn bounded(
+        stream: &Arc<CudaStream>,
+        model: &InklingModel,
+        capacity: usize,
+        max_pass_rows: usize,
+    ) -> Res<Self> {
+        if max_pass_rows == 0 {
+            return Err(bad("a pass has at least one row"));
+        }
+        Self::build(stream, model, capacity, Some(max_pass_rows))
+    }
+
+    fn build(
+        stream: &Arc<CudaStream>,
+        model: &InklingModel,
+        capacity: usize,
+        max_pass_rows: Option<usize>,
+    ) -> Res<Self> {
         let n = model.config.hidden_size as usize;
         let kv = model.kv_width();
         let carry = model.k.conv_taps as usize - 1;
+        let layers = model.config.num_layers;
         let mut slots = Vec::with_capacity(model.slots());
-        for _ in 0..model.slots() {
+        for slot in 0..model.slots() {
+            let sliding = model.k.is_sliding(model.k.slot_layer(layers, slot as u32));
+            let ring = max_pass_rows
+                .filter(|_| sliding)
+                .map(|pass| (model.k.sliding_window as usize + pass).next_power_of_two())
+                .filter(|ring| *ring < capacity);
+            let rows = ring.unwrap_or(capacity);
             slots.push(SlotState {
-                k: stream.alloc_zeros::<u16>(capacity * kv)?,
-                v: stream.alloc_zeros::<u16>(capacity * kv)?,
+                ring,
+                k: stream.alloc_zeros::<u16>(rows * kv)?,
+                v: stream.alloc_zeros::<u16>(rows * kv)?,
                 k_carry: stream.alloc_zeros::<f32>(kv * carry)?,
                 v_carry: stream.alloc_zeros::<f32>(kv * carry)?,
                 attn_carry: stream.alloc_zeros::<f32>(n * carry)?,
@@ -547,8 +591,14 @@ impl InklingState {
             slots,
             position: 0,
             capacity,
+            max_pass_rows: max_pass_rows.unwrap_or(usize::MAX),
             d_position: stream.alloc_zeros::<i32>(1)?,
         })
+    }
+
+    /// Bytes of keys and values this sequence holds on the device.
+    pub fn cache_bytes(&self) -> usize {
+        self.slots.iter().map(|s| (s.k.len() + s.v.len()) * 2).sum()
     }
 
     /// Positions consumed so far.
@@ -729,6 +779,18 @@ unsafe fn rows_of<T>(
 impl InklingPass {
     /// Allocate for passes of exactly `rows` rows.
     pub fn new(model: &Arc<InklingModel>, stream: &Arc<CudaStream>, rows: usize) -> Res<Self> {
+        Self::with_logit_rows(model, stream, rows, rows)
+    }
+
+    /// As [`Self::new`], with room for the logits of only `logit_rows` rows
+    /// at a time: a row of logits is the vocabulary wide, and a server reads
+    /// one a pass.
+    pub fn with_logit_rows(
+        model: &Arc<InklingModel>,
+        stream: &Arc<CudaStream>,
+        rows: usize,
+        logit_rows: usize,
+    ) -> Res<Self> {
         let c = &model.config;
         // Several kernels take a block a row on a grid axis that ends at
         // 65535.
@@ -806,7 +868,7 @@ impl InklingPass {
             ffn_out: f(rows * n)?,
             final_norm: f(rows * n)?,
             final_h: hf(rows * n)?,
-            head_logits: f(rows * c.vocab_size as usize)?,
+            head_logits: f(logit_rows.min(rows) * c.vocab_size as usize)?,
         })
     }
 
@@ -1267,13 +1329,22 @@ impl InklingPass {
             let r = seg.rows;
             let at = seg.state.position;
             let st = &mut seg.state.slots[slot];
-            {
-                let kview = unsafe { rows_of(stream, &self.k, row0, r, kv) };
-                let mut dst = unsafe { rows_of(stream, &st.k, at, r, kv) };
-                model.hg.to_half(stream, &kview, &mut dst, r * kv)?;
-                let vview = unsafe { rows_of(stream, &self.v, row0, r, kv) };
-                let mut dst = unsafe { rows_of(stream, &st.v, at, r, kv) };
-                model.hg.to_half(stream, &vview, &mut dst, r * kv)?;
+            // A ring takes the rows in at most two runs: up to its end, then
+            // from its start.
+            let first = st.ring.map_or(r, |ring| r.min(ring - at % ring));
+            for (src0, dst0, count) in [
+                (row0, st.ring.map_or(at, |ring| at % ring), first),
+                (row0 + first, 0, r - first),
+            ] {
+                if count == 0 {
+                    continue;
+                }
+                let kview = unsafe { rows_of(stream, &self.k, src0, count, kv) };
+                let mut dst = unsafe { rows_of(stream, &st.k, dst0, count, kv) };
+                model.hg.to_half(stream, &kview, &mut dst, count * kv)?;
+                let vview = unsafe { rows_of(stream, &self.v, src0, count, kv) };
+                let mut dst = unsafe { rows_of(stream, &st.v, dst0, count, kv) };
+                model.hg.to_half(stream, &vview, &mut dst, count * kv)?;
             }
             let qv = unsafe { rows_of(stream, &self.q, row0, r, heads * dim) };
             let mut out = unsafe { rows_of(stream, &self.attended, row0, r, heads * dim) };
@@ -1295,6 +1366,7 @@ impl InklingPass {
                     heads,
                     kv_heads,
                     r,
+                    st.ring,
                 )?;
             } else {
                 let table = self.table.as_ref().expect("filled above");
@@ -1313,6 +1385,7 @@ impl InklingPass {
                     kv_heads,
                     dim,
                     r,
+                    st.ring,
                 )?;
             }
             row0 += r;
@@ -1544,6 +1617,12 @@ impl InklingPass {
             if seg.state.position + seg.rows > seg.state.capacity {
                 return Err(bad("a sequence would outgrow its cache"));
             }
+            if seg.rows > seg.state.max_pass_rows {
+                return Err(bad(format!(
+                    "a pass of {} rows is wider than the {} this sequence's ring caches were sized for",
+                    seg.rows, seg.state.max_pass_rows
+                )));
+            }
             stream.memcpy_htod(&[seg.state.position as i32], &mut seg.state.d_position)?;
         }
         if tokens.iter().any(|t| *t < 0 || *t as u32 >= c.vocab_size) {
@@ -1680,6 +1759,9 @@ impl InklingPass {
         let vocab = model.config.vocab_size as usize;
         if row0 + count > self.rows {
             return Err(bad("logit rows outside the pass"));
+        }
+        if count * vocab > self.head_logits.len() {
+            return Err(bad("more logit rows than this pass has room for"));
         }
         if let Some(p) = self.profile.as_mut() {
             p.restart(stream)?;

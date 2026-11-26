@@ -9,7 +9,9 @@
 
 //! Per-row state (cache and convolution carries) is reached through a
 //! pointer table, `[rows][6]`: key cache, value cache, then the key, value,
-//! attention-output and feed-forward carries.
+//! attention-output and feed-forward carries. A cache holds position `j` at
+//! row `j & mask`: a ring of `mask + 1` rows on a sliding layer, every
+//! position (`mask = i32::MAX`) on a full one.
 
 use crate::common::{block_reduce_sum, f2h, h2f};
 use crate::inkling::{block_max_256, block_sum_256};
@@ -515,6 +517,7 @@ pub unsafe fn ink_dec_kv(
     taps: i32,
     clip: f32,
     eps: f32,
+    mask: i32,
 ) {
     static mut RED: SharedArray<f32, 4> = SharedArray::UNINIT;
     let tid = thread::threadIdx_x() as usize;
@@ -569,7 +572,7 @@ pub unsafe fn ink_dec_kv(
             1.0 / (total / dim as f32 + eps).sqrt()
         };
         let cache = *ptrs.add(t * 6 + P_K_CACHE + which) as *mut u16;
-        let at = *pos.add(t) as usize * kv_heads as usize * dim + c;
+        let at = (*pos.add(t) & mask) as usize * kv_heads as usize * dim + c;
         *cache.add(at) = f2h(v * factor);
     }
 }
@@ -609,6 +612,7 @@ pub unsafe fn ink_dec_attn(
     rel_bound: f32,
     alpha: f32,
     floor: f32,
+    mask: i32,
 ) {
     static mut Q: SharedArray<f32, 128> = SharedArray::UNINIT;
     static mut R: SharedArray<f32, 32> = SharedArray::UNINIT;
@@ -672,7 +676,7 @@ pub unsafe fn ink_dec_attn(
                 // Four binary16 a load, two running sums: the loads of a
                 // key row are what this loop waits on, and a thread taking
                 // them one element at a time measured 100 us a launch.
-                let kr = k_cache.add(j as usize * stride + kv * d);
+                let kr = k_cache.add((j & mask) as usize * stride + kv * d);
                 let mut a0 = 0.0f32;
                 let mut a1 = 0.0f32;
                 let mut i = 0usize;
@@ -717,7 +721,8 @@ pub unsafe fn ink_dec_attn(
                 let mut v3 = 0.0f32;
                 let mut jj = class;
                 while jj < live {
-                    let w = *(v_cache.add((j0 + jj) as usize * stride + kv * d + q4) as *const u64);
+                    let w = *(v_cache.add(((j0 + jj) & mask) as usize * stride + kv * d + q4)
+                        as *const u64);
                     let pj = P[jj as usize];
                     v0 = pj.mul_add(h2f(w as u16), v0);
                     v1 = pj.mul_add(h2f((w >> 16) as u16), v1);

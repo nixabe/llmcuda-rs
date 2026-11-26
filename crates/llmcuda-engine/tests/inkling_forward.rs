@@ -375,3 +375,114 @@ fn device_forward_matches_llama_cpp_and_its_own_chunkings() {
         assert_eq!(r.max_abs_error, 0.0, "batching changed decode row {which}");
     }
 }
+
+/// A sequence whose sliding layers keep ring caches computes the same bits
+/// as one that keeps every position, through passes that wrap the rings,
+/// a ragged last pass, and decode steps after them.
+#[test]
+fn bounded_sliding_caches_change_no_bits() {
+    let Some((file, _)) = inkling_common::model_and_golden() else {
+        return;
+    };
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver present");
+        return;
+    }
+    let ctx = CudaContext::new(0).expect("device 0");
+    let stream = ctx.default_stream();
+    let model = Arc::new(InklingModel::load(&ctx, &stream, &file).expect("the model loads"));
+    let n = model.config().hidden_size as usize;
+    let vocab = model.config().vocab_size as u64;
+
+    // Window 1024 plus passes of 256 is a ring of 2048 rows; 2,600 prompt
+    // positions take it round once, and the 40-row tail straddles nothing
+    // the full-length caches do not also hold.
+    let (pass_rows, prompt, steps) = (256usize, 2_600usize, 6usize);
+    let capacity = prompt + steps;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let tokens: Vec<i32> = (0..capacity)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % vocab) as i32
+        })
+        .collect();
+
+    let mut full = InklingState::new(&stream, &model, capacity).expect("state");
+    let mut ring = InklingState::bounded(&stream, &model, capacity, pass_rows).expect("state");
+    println!(
+        "caches: {:.1} MiB full, {:.1} MiB bounded",
+        full.cache_bytes() as f64 / (1u64 << 20) as f64,
+        ring.cache_bytes() as f64 / (1u64 << 20) as f64
+    );
+    assert!(ring.cache_bytes() < full.cache_bytes());
+
+    let tail = prompt % pass_rows;
+    let mut wide = InklingPass::new(&model, &stream, pass_rows).expect("pass");
+    let mut narrow = InklingPass::new(&model, &stream, tail.max(1)).expect("pass");
+    let mut decode = InklingDecode::new(&model, &stream, 1).expect("decode");
+    let mut at = 0;
+    while at < capacity {
+        let rows = if at >= prompt {
+            1
+        } else {
+            pass_rows.min(prompt - at)
+        };
+        let mut hidden = Vec::new();
+        for state in [&mut full, &mut ring] {
+            let got = if at >= prompt {
+                decode
+                    .step(&stream, &mut [state], &tokens[at..at + 1])
+                    .expect("the step runs");
+                stream.clone_dtoh(decode.hidden()).expect("read back")
+            } else {
+                let pass = if rows == pass_rows {
+                    &mut wide
+                } else {
+                    &mut narrow
+                };
+                pass.run(
+                    &stream,
+                    &mut [Segment { state, rows }],
+                    &tokens[at..at + rows],
+                    None,
+                )
+                .expect("the pass runs");
+                stream.clone_dtoh(pass.hidden()).expect("read back")[..rows * n].to_vec()
+            };
+            hidden.push(got);
+        }
+        let differing = hidden[0]
+            .iter()
+            .zip(&hidden[1])
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            hidden[0].iter().all(|v| v.is_finite()),
+            "non-finite hidden state at position {at}"
+        );
+        assert_eq!(
+            differing,
+            0,
+            "positions {at}..{}: {differing} values differ",
+            at + rows
+        );
+        at += rows;
+    }
+    println!("{capacity} positions, the last {steps} decoded: bit-identical");
+
+    // A pass wider than the rings were sized for is refused, not wrapped
+    // over rows it still needs.
+    let mut state = InklingState::bounded(&stream, &model, capacity, 8).expect("state");
+    let refused = wide.run(
+        &stream,
+        &mut [Segment {
+            state: &mut state,
+            rows: pass_rows,
+        }],
+        &tokens[..pass_rows],
+        None,
+    );
+    assert!(refused.is_err(), "a pass wider than the ring allowance ran");
+}

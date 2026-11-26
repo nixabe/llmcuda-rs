@@ -58,8 +58,15 @@ fn distance(got: &[f32], want: &[f64]) -> (f64, f64) {
     (worst, 1.0 - dot / (gg.sqrt() * ww.sqrt()))
 }
 
-/// Row positions, window, extent, and the logarithmic position scale.
-type AttentionCase = (&'static [usize], usize, usize, Option<(f32, f32)>);
+/// Row positions, window, extent, the logarithmic position scale, and the
+/// caches' ring rows.
+type AttentionCase = (
+    &'static [usize],
+    usize,
+    usize,
+    Option<(f32, f32)>,
+    Option<usize>,
+);
 
 /// `ink_dec_attn`: clips, the position scale, the bias per distance, the
 /// sink, the window, the scan in 256-key chunks and the output gate, for
@@ -74,19 +81,23 @@ fn decode_attention_matches_an_f64_oracle_past_the_window_and_the_chunk() {
     let mut rng = Xorshift64Star::new(0xdeca77);
 
     // (positions of the rows, window, extent, log scale)
-    let cases: [AttentionCase; 4] = [
+    let cases: [AttentionCase; 6] = [
         // Sliding: one row before the window fills, one a chunk deep, one
         // past the window with four chunks to scan.
-        (&[5, 300, 1500], 1024, 1024, None),
+        (&[5, 300, 1500], 1024, 1024, None, None),
         // A window shorter than a chunk, cut mid-chunk.
-        (&[0, 255, 256, 700], 100, 100, None),
+        (&[0, 255, 256, 700], 100, 100, None, None),
         // Full attention with the position scale on (a floor small enough
         // that tau > 1 here) and a bias table shorter than the reach.
-        (&[3, 64, 900], 0, 64, Some((0.1, 8.0))),
+        (&[3, 64, 900], 0, 64, Some((0.1, 8.0)), None),
         // One row, exactly one full chunk.
-        (&[255], 0, 1024, Some((0.1, 8192.0))),
+        (&[255], 0, 1024, Some((0.1, 8192.0)), None),
+        // Ring caches: one row not yet round the ring, two that are, one of
+        // them with its window straddling the ring's end.
+        (&[700, 3000, 5000], 1024, 1024, None, Some(2048)),
+        (&[127, 128, 300], 100, 100, None, Some(128)),
     ];
-    for (positions, window, extent, log) in cases {
+    for (positions, window, extent, log, ring) in cases {
         let rows = positions.len();
         let o = ProjOffsets {
             ldo: (2 * heads * dim + heads * n_rel + heads) as i32,
@@ -113,9 +124,22 @@ fn decode_attention_matches_an_f64_oracle_past_the_window_and_the_chunk() {
             let len = (p + 1) * kv_heads * dim;
             let k = to_half(&rng.vec_f32(len, -2.0, 2.0));
             let v = to_half(&rng.vec_f32(len, -1.0, 1.0));
+            // The device sees position j at row j % ring, the last `ring`
+            // positions only; the oracle keeps the plain layout.
+            let on_device = |cache: &[u16]| -> Vec<u16> {
+                let Some(ring) = ring else {
+                    return cache.to_vec();
+                };
+                let row = kv_heads * dim;
+                let mut out = vec![0u16; ring * row];
+                for j in (p + 1).saturating_sub(ring)..=p {
+                    out[(j % ring) * row..][..row].copy_from_slice(&cache[j * row..][..row]);
+                }
+                out
+            };
             let (dk, dv) = (
-                stream.clone_htod(&k).unwrap(),
-                stream.clone_htod(&v).unwrap(),
+                stream.clone_htod(&on_device(&k)).unwrap(),
+                stream.clone_htod(&on_device(&v)).unwrap(),
             );
             ptrs[t * DEC_ROW_POINTERS] = dk.device_ptr(&stream).0;
             ptrs[t * DEC_ROW_POINTERS + 1] = dv.device_ptr(&stream).0;
@@ -227,6 +251,7 @@ fn decode_attention_matches_an_f64_oracle_past_the_window_and_the_chunk() {
                 qk_clip,
                 rel_bound,
                 log,
+                ring,
                 rows,
             )
             .unwrap();
@@ -234,7 +259,7 @@ fn decode_attention_matches_an_f64_oracle_past_the_window_and_the_chunk() {
         drop(device_caches);
         let (worst, one_minus_cos) = distance(&got, &want);
         println!(
-            "decode attention positions {positions:?} window {window} extent {extent} log {log:?}: max_abs {worst:.3e} 1-cos {one_minus_cos:.3e}"
+            "decode attention positions {positions:?} window {window} extent {extent} log {log:?} ring {ring:?}: max_abs {worst:.3e} 1-cos {one_minus_cos:.3e}"
         );
         // The result is binary16 of a value within +-1: half an ulp is at
         // most 2.4e-4, and the fp32 sums behind it add ~1e-5.
@@ -257,7 +282,8 @@ fn decode_keys_and_values_match_the_reference_convolution_step_by_step() {
     let (clip, eps) = (6.0f32, 1e-6f32);
     let mut rng = Xorshift64Star::new(0xc0de);
 
-    for dynamic in [false, true] {
+    // A ring shorter than the sequence: the last step lands on row 0.
+    for (dynamic, ring) in [(false, None), (true, None), (true, Some(8usize))] {
         let k_conv = rng.vec_f32(channels * taps, -0.5, 0.5);
         let v_conv = rng.vec_f32(channels * taps, -0.5, 0.5);
         let o = ProjOffsets {
@@ -310,7 +336,7 @@ fn decode_keys_and_values_match_the_reference_convolution_step_by_step() {
             kernels
                 .kv(
                     &stream, &d_proj, &d_ptrs, &d_pos, &d_k_conv, &d_v_conv, o, kv_heads, dim,
-                    taps, clip, eps, rows,
+                    taps, clip, eps, ring, rows,
                 )
                 .unwrap();
         }
@@ -351,10 +377,23 @@ fn decode_keys_and_values_match_the_reference_convolution_step_by_step() {
                 ("values", &state[t].1, &v_want),
             ] {
                 let got = from_half(&stream.clone_dtoh(cache).unwrap());
-                let want: Vec<f64> = want.iter().map(|x| f64::from(*x)).collect();
-                let (worst, one_minus_cos) = distance(&got, &want);
+                // In a ring, row r holds the newest step that maps to it.
+                let rows_kept = ring.unwrap_or(steps);
+                let mut want64 = vec![0.0f64; rows_kept * channels];
+                for step in 0..steps {
+                    let at = step % rows_kept;
+                    for (o, x) in want64[at * channels..][..channels]
+                        .iter_mut()
+                        .zip(&want[step * channels..][..channels])
+                    {
+                        *o = f64::from(*x);
+                    }
+                }
+                let got = &got[..rows_kept * channels];
+                let want = want64;
+                let (worst, one_minus_cos) = distance(got, &want);
                 println!(
-                    "decode {name} row {t} dynamic {dynamic}: max_abs {worst:.3e} 1-cos {one_minus_cos:.3e}"
+                    "decode {name} row {t} dynamic {dynamic} ring {ring:?}: max_abs {worst:.3e} 1-cos {one_minus_cos:.3e}"
                 );
                 // binary16 of values a few units wide: half an ulp at 4 is
                 // 9.8e-4.

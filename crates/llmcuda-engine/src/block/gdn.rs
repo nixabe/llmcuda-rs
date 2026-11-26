@@ -752,78 +752,6 @@ __global__ void NAME(                                                           
 GDN_GATES(gdn_alpha_beta_gates,    8)
 GDN_GATES(gdn_alpha_beta_gates_t1, 1)
 
-// Consumer-side input normalization for the target F32 gates at decode width.
-// Four virtual bands preserve rms_norm_rows' 1024-thread reduction tree.
-// Head zero publishes the normalized row for the other GDN projections.
-__global__ void gdn_norm_alpha_beta_gates(
-    const float* __restrict__ w_alpha,
-    const float* __restrict__ w_beta,
-    const float* __restrict__ x,
-    const float* __restrict__ dt_bias,
-    const float* __restrict__ ssm_a,
-    float* __restrict__ alpha,
-    float* __restrict__ beta_raw,
-    float* __restrict__ a_softplus,
-    float* __restrict__ log_decay,
-    float* __restrict__ beta,
-    int k_dim,
-    int heads,
-    int tokens,
-    const float* __restrict__ norm_weight,
-    float* __restrict__ normed,
-    float eps
-) {
-    int tid = threadIdx.x, lane = tid & 31;
-    int n = blockIdx.x, t = blockIdx.y;
-    extern __shared__ float data[];
-    float* scratch = data + k_dim;
-    for (int i = tid; i < k_dim; i += 256)
-        data[i] = x[(long long)t * k_dim + i];
-    __syncthreads();
-    // Emulate the original 1024-thread norm tree with four virtual bands.
-    for (int band = 0; band < 4; ++band) {
-        float partial = 0.0f;
-        for (int j = tid + band * 256; j < k_dim; j += 1024)
-            partial = __fmaf_rn(data[j], data[j], partial);
-        for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_down_sync(0xffffffff, partial, off);
-        if (lane == 0) scratch[band * 8 + (tid >> 5)] = partial;
-    }
-    __syncthreads();
-    if (tid == 0) {
-        float sum_sq = 0.0f;
-        for (int w = 0; w < 32; ++w) sum_sq += scratch[w];
-        scratch[0] = 1.0f / sqrtf(sum_sq / (float)k_dim + eps);
-    }
-    __syncthreads();
-    float inv_rms = scratch[0];
-    for (int j = tid; j < k_dim; j += 256) {
-        float normalized = data[j] * inv_rms * norm_weight[j];
-        data[j] = normalized;
-        // Other GDN projections still need the normalized row.
-        if (n == 0) normed[(long long)t * k_dim + j] = normalized;
-    }
-    __syncthreads();
-    if (tid >= 32) return;
-    float aa = 0.0f, bb = 0.0f;
-    for (int i = lane; i < k_dim; i += 32) {
-        aa += w_alpha[(long long)n * k_dim + i] * data[i];
-        bb += w_beta[(long long)n * k_dim + i] * data[i];
-    }
-    float a_sum = warp_reduce_sum(aa);
-    float b_sum = warp_reduce_sum(bb);
-    if (lane == 0) {
-        long long i = (long long)t * heads + n;
-        alpha[i] = a_sum;
-        beta_raw[i] = b_sum;
-        float a = a_sum + dt_bias[n];
-        float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
-        a_softplus[i] = sp;
-        log_decay[i] = sp * ssm_a[n];
-        beta[i] = 1.0f / (1.0f + expf(-b_sum));
-    }
-}
-
 
 // The same kernel over Q8_0 `ssm_alpha` / `ssm_beta`.
 //
@@ -1030,31 +958,6 @@ __global__ void NAME(                                                           
 
 GDN_GATES_Q6K(gdn_alpha_beta_gates_q6k,    8)
 GDN_GATES_Q6K(gdn_alpha_beta_gates_q6k_t1, 1)
-
-__global__ void gdn_proj_f32(
-    const float* __restrict__ weight,
-    const float* __restrict__ x,
-    float* __restrict__ out,
-    int k_dim,
-    int n_rows
-) {
-    int lane = threadIdx.x;
-    int n    = blockIdx.x * blockDim.y + threadIdx.y;
-    if (n >= n_rows) return;
-    int t = blockIdx.y;
-
-    const float* row = weight + (long long)n * k_dim;
-    const float* xr  = x + (long long)t * k_dim;
-
-    float acc = 0.0f;
-    for (int i = lane; i < k_dim; i += 32) {
-        acc += row[i] * xr[i];
-    }
-    acc = warp_reduce_sum(acc);
-    if (lane == 0) {
-        out[(long long)t * n_rows + n] = acc;
-    }
-}
 
 }
 
@@ -2355,7 +2258,7 @@ impl GdnBlock {
                 module.load_function("gdn_proj_split_pair_t8")?,
                 module.load_function("gdn_proj_split_pair_t16")?,
             ],
-            proj_f32: module.load_function("gdn_proj_f32")?,
+            proj_f32: rust.load_function("gdn_proj_f32")?,
             proj_quant: [
                 module.load_function("gdn_proj_qgeneric_q8_0")?,
                 module.load_function("gdn_proj_qgeneric_q4_0")?,
@@ -2367,7 +2270,7 @@ impl GdnBlock {
             ],
             alpha_beta_gates: module.load_function("gdn_alpha_beta_gates")?,
             alpha_beta_gates_t1: module.load_function("gdn_alpha_beta_gates_t1")?,
-            norm_alpha_beta_gates: module.load_function("gdn_norm_alpha_beta_gates")?,
+            norm_alpha_beta_gates: rust.load_function("gdn_norm_alpha_beta_gates")?,
             alpha_beta_gates_q8: module.load_function("gdn_alpha_beta_gates_q8")?,
             alpha_beta_gates_q8_t1: module.load_function("gdn_alpha_beta_gates_q8_t1")?,
             alpha_beta_gates_q6k: module.load_function("gdn_alpha_beta_gates_q6k")?,
@@ -5075,7 +4978,11 @@ mod tests {
             GDN_BLOCK_SRC
                 .contains("const unsigned char* row = weight + (long long)n * blocks * 34;")
         );
-        assert!(GDN_BLOCK_SRC.contains("const float* row = weight + (long long)n * k_dim;"));
+        // The fp32 projection is Rust.
+        assert!(
+            rust_kernel("gdn_proj_f32")
+                .contains("let row = weight.add((n as i64 * k_dim as i64) as usize);")
+        );
     }
 
     #[test]

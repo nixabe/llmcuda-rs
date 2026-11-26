@@ -3177,12 +3177,26 @@ mod kernels {
     /// out  = S q
     /// ```
     ///
-    /// A lane owns four adjacent columns of each 128-column chunk, so a row
-    /// of up to 512 columns is covered by one warp; the two contractions are
-    /// fused chains in ascending column order within the lane, reduced by an
-    /// xor shuffle tree. The decayed row is carried between the two passes in
-    /// registers rather than re-read, which is why the chunks are spelled
-    /// out.
+    /// The order follows the reference exactly: decay the state, form the
+    /// correction against the *decayed* state, apply the outer-product
+    /// update, then read the output from the *updated* state. Reordering any
+    /// of these is a plausible-looking change that silently produces a
+    /// different model.
+    ///
+    /// The kernel is bandwidth-bound: 2 MiB of state read and written per
+    /// layer per sequence. Its first form gave each state row a block, one
+    /// thread per key index, with two block-wide reductions on the hot path,
+    /// and moved state at 44% of the card's streaming roofline. One warp per
+    /// row is the structure that fits: a lane owns four adjacent columns of
+    /// each 128-column chunk, read and written as one 16-byte vector, so a
+    /// warp keeps 512 contiguous bytes in flight; both reductions are
+    /// five-shuffle butterflies with no barrier and no shared memory; and
+    /// the decayed row is carried between the two passes in registers, which
+    /// is why the chunks are spelled out rather than looped.
+    ///
+    /// libdevice exp for the decay, not an approximate one: it multiplies
+    /// the whole state every token, so a systematic bias compounds over the
+    /// context rather than averaging out.
     ///
     /// grid: (ceil(head_dim / rows per block), value heads, sequences <= 8).
     /// block: 32 threads per row.
@@ -3250,7 +3264,12 @@ mod kernels {
                         let j = ($c << 7) + j0;
                         let kv = load4(kq.add(j));
                         let sv = load4(row.add(j));
-                        let sv = [sv[0] * decay, sv[1] * decay, sv[2] * decay, sv[3] * decay];
+                        let sv = [
+                            sv[0] * decay,
+                            sv[1] * decay,
+                            sv[2] * decay,
+                            sv[3] * decay,
+                        ];
                         partial = sv[0].mul_add(kv[0], partial);
                         partial = sv[1].mul_add(kv[1], partial);
                         partial = sv[2].mul_add(kv[2], partial);

@@ -628,25 +628,6 @@ __global__ void dec_features(
     }
 }
 
-// One warp per option: residual = scorer_out(h) and the final combination
-// prior_scale * prior + gate * (joint_scale * cosine + residual).
-__global__ void dec_final_scores(
-    const float* __restrict__ h, long long ldh, int n_opts, int width,
-    const float* __restrict__ w_out, float b_out, const float* __restrict__ aux,
-    float prior_scale, float joint_scale, float gate, float* __restrict__ scores)
-{
-    int o = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    if (o >= n_opts) return;
-    const float* hr = h + (long long)o * ldh;
-    float d = 0.0f;
-    for (int c = lane; c < width; c += 32) d += hr[c] * w_out[c];
-    d = warp_sum(d);
-    if (lane == 0) {
-        float joint = joint_scale * aux[o * 2 + 1] + (d + b_out);
-        scores[o] = prior_scale * aux[o * 2] + gate * joint;
-    }
-}
-
 }
 "#;
 
@@ -888,7 +869,7 @@ impl DecisionKernels {
             add_owner_rows: r("dec_add_owner_rows")?,
             question_fields: f("dec_question_fields")?,
             features: f("dec_features")?,
-            final_scores: f("dec_final_scores")?,
+            final_scores: r("dec_final_scores")?,
             sm_count,
         })
     }

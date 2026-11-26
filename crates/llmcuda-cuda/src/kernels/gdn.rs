@@ -59,8 +59,6 @@ use cudarc::driver::{
     PushKernelArg,
 };
 
-use super::compile;
-
 /// The epsilon inside the L2 normalization.
 ///
 /// It is **added to the sum of squares, under the root** — see the
@@ -82,163 +80,6 @@ const STEP_WARPS: u32 = 4;
 /// Widest batch one `gdn_recurrent_step` launch covers — the kernel carries
 /// this many per-sequence state pointer slots.
 pub const STEP_MAX_BATCH: usize = 8;
-
-pub(crate) const GDN_SRC: &str = r#"
-extern "C" {
-
-// Sum across one warp, leaving the total in every lane.
-__device__ __forceinline__ float warp_reduce_sum(float v) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_xor_sync(0xffffffff, v, offset);
-    }
-    return v;
-}
-
-// One recurrent step of the gated delta rule, for every value head at once.
-//
-// grid: (head_dim / warps_per_block, n_v_heads) — one *warp* per state row.
-// block: `STEP_BLOCK` threads.
-//
-// This kernel is purely bandwidth-bound — 2 MiB of state read and written
-// per layer per sequence — and its first form gave each state row a whole
-// block, one thread per key index. That put two block-wide reductions on the
-// hot path: two `__syncthreads`, a shared-memory round trip and a serial
-// cross-warp sum for every row, and it moved state at 44% of the card's
-// streaming roofline (measured at N=3, 14.4 us for 4.19 MB). The module docs
-// rejected one *thread* per row because 128 floats cannot stay in registers
-// across the correction; one *warp* per row is the structure between the
-// two: the row lives in four `float4` registers per lane, both reductions
-// are five-shuffle butterflies with no barrier and no shared memory at all,
-// and each lane's loads are 16-byte vectors, so a warp keeps 512 contiguous
-// bytes in flight where a block-per-row thread kept 4.
-//
-// The order of operations follows the reference exactly: decay the state,
-// form the delta correction against the *decayed* state, apply the
-// outer-product update, then read the output from the *updated* state.
-// Reordering any of these is a plausible-looking change that silently
-// produces a different model. The reduction order *within* each dot product
-// changed — four sequential per-lane adds, then a butterfly, against the
-// old shuffle-down-plus-serial-warp-combine — which is the ordinary
-// reassociation the tolerance in `gdn_differential.rs` re-measures.
-//
-// `expf`, not the fast `__expf` intrinsic, as before: the decay multiplies
-// the whole state every token, so a systematic bias compounds over the
-// context rather than averaging out.
-//
-// A lane owns four consecutive key indices per 128-element chunk; the
-// STEP_MAX_CHUNKS guard unrolls fully so the chunk states stay in
-// registers. `head_dim` is validated host-side to be a multiple of 128 and
-// at most 128 * STEP_MAX_CHUNKS.
-#define STEP_MAX_CHUNKS 4
-
-// grid.z is the sequence. Each sequence's state is its own allocation, so
-// the eight pointer slots below are scalar launch parameters -- baked into
-// the graph at capture exactly like the single-sequence launch's `state`
-// argument was, and selected by a warp-uniform switch rather than a local
-// array so no spill is possible. q/k/v, the gates and the output are the
-// batch scratch buffers, indexed by the same per-token strides the caller
-// already allocates them with. A sequence's arithmetic depends only on its
-// own z slice, which is what keeps batch and single-stream decode
-// bit-identical through this kernel by construction.
-__global__ void gdn_recurrent_step(
-    unsigned long long s0, unsigned long long s1,
-    unsigned long long s2, unsigned long long s3,
-    unsigned long long s4, unsigned long long s5,
-    unsigned long long s6, unsigned long long s7,
-    const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
-    const float* __restrict__ log_decay,
-    const float* __restrict__ beta,
-    float* __restrict__ out,
-    int head_dim,
-    int qk_heads
-) {
-    int lane = threadIdx.x & 31;
-    int vi = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    int h  = blockIdx.y;
-    int z  = blockIdx.z;
-    if (vi >= head_dim) return;
-    float* state;
-    switch (z) {
-        case 0: state = (float*)s0; break;
-        case 1: state = (float*)s1; break;
-        case 2: state = (float*)s2; break;
-        case 3: state = (float*)s3; break;
-        case 4: state = (float*)s4; break;
-        case 5: state = (float*)s5; break;
-        case 6: state = (float*)s6; break;
-        default: state = (float*)s7; break;
-    }
-
-    // **Modulo, not division.** llama.cpp's fused op is
-    // `fastmodulo(h_idx, n_k_heads)` and its fallback broadcasts with
-    // `ggml_repeat_4d`, which tiles. See the module docs for the measurement
-    // that discriminates the two against the captured `final_output-N`.
-    int qk_head = h % qk_heads;
-    int n_v_heads = gridDim.y;
-    int qk_base = (z * qk_heads + qk_head) * head_dim;
-    int v_base  = (z * n_v_heads + h) * head_dim;
-    int g_at    = z * n_v_heads + h;
-
-    int chunks = head_dim >> 7;
-    int j0 = 4 * lane;
-
-    float decay = expf(log_decay[g_at]);
-    long long row = ((long long)h * head_dim + vi) * head_dim;
-
-    // 1. Decay, held in registers rather than written and re-read, and the
-    //    delta correction's dot product against the *decayed* state.
-    float4 s[STEP_MAX_CHUNKS];
-    float4 kc[STEP_MAX_CHUNKS];
-    float partial = 0.0f;
-    #pragma unroll
-    for (int c = 0; c < STEP_MAX_CHUNKS; ++c) {
-        if (c < chunks) {
-            int j = (c << 7) + j0;
-            kc[c] = *(const float4*)(k + qk_base + j);
-            float4 sv = *(const float4*)(state + row + j);
-            sv.x *= decay; sv.y *= decay; sv.z *= decay; sv.w *= decay;
-            s[c] = sv;
-            partial += sv.x * kc[c].x;
-            partial += sv.y * kc[c].y;
-            partial += sv.z * kc[c].z;
-            partial += sv.w * kc[c].w;
-        }
-    }
-
-    // 2. Delta correction against the decayed state.
-    float predicted = warp_reduce_sum(partial);
-    float vcorr = beta[g_at] * (v[v_base + vi] - predicted);
-
-    // 3. Outer-product update, and the output's dot product from the
-    //    *updated* state.
-    partial = 0.0f;
-    #pragma unroll
-    for (int c = 0; c < STEP_MAX_CHUNKS; ++c) {
-        if (c < chunks) {
-            int j = (c << 7) + j0;
-            float4 sv = s[c];
-            sv.x += vcorr * kc[c].x;
-            sv.y += vcorr * kc[c].y;
-            sv.z += vcorr * kc[c].z;
-            sv.w += vcorr * kc[c].w;
-            *(float4*)(state + row + j) = sv;
-            float4 qv = *(const float4*)(q + qk_base + j);
-            partial += sv.x * qv.x;
-            partial += sv.y * qv.y;
-            partial += sv.z * qv.z;
-            partial += sv.w * qv.w;
-        }
-    }
-
-    // 4. Output from the updated state.
-    float o = warp_reduce_sum(partial);
-    if (lane == 0) out[v_base + vi] = o;
-}
-
-}
-"#;
 
 /// Something went wrong compiling or launching a GDN kernel.
 #[derive(Debug)]
@@ -326,12 +167,10 @@ impl GdnKernels {
                 qk_heads,
             });
         }
-        let ptx = compile(GDN_SRC, "gdn").map_err(GdnError::Compile)?;
-        let module = ctx.load_module(ptx)?;
         let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
             normalize: rust.load_function("gdn_normalize_qk")?,
-            step: module.load_function("gdn_recurrent_step")?,
+            step: rust.load_function("gdn_recurrent_step")?,
             head_dim,
             value_heads,
             qk_heads,
@@ -509,20 +348,22 @@ mod tests {
         // way to get this rule subtly wrong: it stays finite, stays fluent,
         // and is a different model. The ordering is asserted structurally
         // because no synthetic input distinguishes the two cheaply.
-        let update = GDN_SRC
-            .find("sv.x += vcorr * kc[c].x;")
+        let step = crate::kernels::rust_kernel_source("gdn_recurrent_step");
+        let update = step
+            .find("vcorr.mul_add(kv[0], sv[0]),")
             .expect("update present");
-        let output = GDN_SRC
-            .find("float o = warp_reduce_sum(partial);")
+        let output = step
+            .find("let o = warp_xor_sum(partial);")
             .expect("output read present");
         assert!(update < output, "output is read before the state update");
     }
 
     #[test]
     fn the_correction_is_formed_against_the_decayed_state() {
-        let decay = GDN_SRC.find("sv.x *= decay;").expect("decay present");
-        let predicted = GDN_SRC
-            .find("float predicted = warp_reduce_sum(partial);")
+        let step = crate::kernels::rust_kernel_source("gdn_recurrent_step");
+        let decay = step.find("sv[0] * decay,").expect("decay present");
+        let predicted = step
+            .find("let predicted = warp_xor_sum(partial);")
             .expect("correction present");
         assert!(decay < predicted, "correction uses the undecayed state");
     }
@@ -569,9 +410,10 @@ mod tests {
         // Division is finite, fluent and a different model; the numeric
         // discrimination lives in
         // `gdn_differential.rs::the_query_key_head_broadcast_is_modulo_not_division`.
-        assert!(GDN_SRC.contains("int qk_head = h % qk_heads;"));
+        let step = crate::kernels::rust_kernel_source("gdn_recurrent_step");
+        assert!(step.contains("(z * qk_heads + h % qk_heads) * head_dim"));
         assert!(
-            !GDN_SRC.contains("heads_per_kv"),
+            !step.contains("heads_per_kv"),
             "the kernel still takes the sharing ratio, which only a division \
              mapping needs",
         );

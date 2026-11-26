@@ -4893,11 +4893,7 @@ mod tests {
                 "{kernel} no longer convolves through the shared helper",
             );
         }
-        let src = llmcuda_cuda::kernels::RUST_KERNELS_SRC;
-        let at = src
-            .find("unsafe fn conv_step_channel(")
-            .expect("the shared helper is present");
-        let body = &src[at..at + src[at..].find("\n    }\n").expect("it ends")];
+        let body = rust_kernel("conv_step_channel");
         assert!(body.contains("acc += *state.add(i as usize) * *weight.add(i as usize);"));
         assert!(
             !body.contains("mul_add"),
@@ -4907,12 +4903,7 @@ mod tests {
 
     /// One kernel of the Rust source, for those with no CUDA C++ twin.
     fn rust_kernel(name: &str) -> &'static str {
-        let src = llmcuda_cuda::kernels::RUST_KERNELS_SRC;
-        let start = src
-            .find(&format!("    pub unsafe fn {name}("))
-            .unwrap_or_else(|| panic!("the Rust source no longer has `{name}`"));
-        let end = src[start..].find("\n    }\n").expect("the kernel ends");
-        &src[start..start + end]
+        llmcuda_cuda::kernels::rust_kernel_source(name)
     }
 
     fn geometry() -> GdnGeometry {

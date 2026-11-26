@@ -6,11 +6,19 @@ from pathlib import Path
 import subprocess
 
 HERE = Path(__file__).resolve().parent
-SOURCE = HERE / "src/main.rs"
+SOURCES = sorted((HERE / "src").glob("*.rs"))
 OUTPUT = HERE.parent / "crates/llmcuda-cuda/src/kernels/rust/tensor_add.ptx"
 REVISION = "f35d6ccc2e03a54e73e3796f415f11313e439d50"
 
-source_before = SOURCE.read_bytes()
+
+def read_sources():
+    """Every source file's name and bytes, in one digestible stream."""
+    return b"".join(
+        path.name.encode() + b"\0" + path.read_bytes() + b"\0" for path in SOURCES
+    )
+
+
+source_before = read_sources()
 subprocess.run(
     ["cargo", "oxide", "build", "--arch", "sm_75", "--", "--release", "--locked"],
     cwd=HERE,
@@ -19,7 +27,7 @@ subprocess.run(
     env={**os.environ, "CUDA_OXIDE_NO_FMA": "1"},
     check=True,
 )
-if SOURCE.read_bytes() != source_before:
+if read_sources() != source_before or SOURCES != sorted((HERE / "src").glob("*.rs")):
     raise SystemExit("Rust source changed during compilation; refusing to publish PTX")
 ptx = (HERE / "llmcuda_rust_device.ptx").read_text()
 if ".target sm_75\n" not in ptx or any(
@@ -56,9 +64,9 @@ if ".target sm_75\n" not in ptx or any(
 ):
     raise SystemExit("compiler output has the wrong target or entry point")
 header = (
-    "// Generated from device-kernels/src/main.rs; do not edit.\n"
+    "// Generated from device-kernels/src/*.rs; do not edit.\n"
     f"// cuda-oxide (NVIDIA/cuda-rust): {REVISION}; Rust 1.99.1; sm_75\n"
-    f"// Rust source SHA-256: {hashlib.sha256(source_before).hexdigest()}\n"
+    f"// Rust source SHA-256 (each file's name and bytes, NUL-terminated, by name): {hashlib.sha256(source_before).hexdigest()}\n"
 )
 # libdevice inline PTX can carry trailing spaces; normalize only whitespace.
 OUTPUT.write_text(header + "\n".join(line.rstrip() for line in ptx.splitlines()) + "\n")

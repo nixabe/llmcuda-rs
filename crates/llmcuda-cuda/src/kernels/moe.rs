@@ -6408,9 +6408,7 @@ mod tests {
         // `p` is a register array, and indexing it by the winner spills it to
         // local memory.
         assert!(
-            route.contains(
-                "if bi >= 0 && lane + 480 == bi {\n                        p[15] = -1.0;"
-            )
+            route.contains("if bi >= 0 && lane + 480 == bi {\n                    p[15] = -1.0;")
         );
         assert!(!route.contains("p[bi"));
     }

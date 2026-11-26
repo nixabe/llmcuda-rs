@@ -1694,7 +1694,7 @@ mod tests {
         // added to the gated result rather than gated with it.
         assert!(combine.contains("let v = (*shexp.add(at)).mul_add(g, r);"));
         assert!(
-            combine.contains("while k < top_k {\n                    r += *p;"),
+            combine.contains("while k < top_k {\n                r += *p;"),
             "the routed sum this combine folded in must stay an ascending-k \
              accumulation inside one thread",
         );

@@ -877,17 +877,9 @@ mod tests {
     use super::super::{RUST_KERNELS_PTX, RUST_KERNELS_SRC};
     use super::*;
 
-    /// One Rust kernel's source, from its signature to the next doc comment
-    /// at kernel indentation.
+    /// One Rust kernel's source.
     fn rust_kernel(name: &str) -> &'static str {
-        let open = format!("    pub unsafe fn {name}(");
-        let from = RUST_KERNELS_SRC
-            .find(&open)
-            .unwrap_or_else(|| panic!("the Rust source no longer has `{name}`"));
-        let len = RUST_KERNELS_SRC[from..]
-            .find("\n    }\n")
-            .unwrap_or_else(|| panic!("`{name}` has no end"));
-        &RUST_KERNELS_SRC[from..from + len]
+        crate::kernels::rust_kernel_source(name)
     }
 
     /// One entry point or device function of the embedded PTX.
@@ -912,7 +904,7 @@ mod tests {
         // multiplied by cos(0) and added to x*sin(0) — correct to an ulp and
         // a failure of the differential gate.
         assert!(rust_kernel("rope_partial").contains(
-            "if j >= rope_dim {\n                *out.add(base + j as usize) = *x.add(base + j as usize);\n            }"
+            "if j >= rope_dim {\n            *out.add(base + j as usize) = *x.add(base + j as usize);\n        }"
         ));
     }
 
@@ -1063,11 +1055,7 @@ mod tests {
         // the Gated DeltaNet and dense-FFN kernels, which are compared to
         // these norms bit for bit. A parallel second tree is faster at
         // narrow rows and one ulp away.
-        let from = RUST_KERNELS_SRC
-            .find("unsafe fn block_reduce_sum(")
-            .expect("the reduction is present");
-        let body = &RUST_KERNELS_SRC[from..];
-        let body = &body[..body.find("\n    }\n").expect("it ends")];
+        let body = rust_kernel("block_reduce_sum");
         assert!(body.contains("v += warp::shuffle_down_f32_sync(u32::MAX, v, offset);"));
         assert!(body.contains("if tid == 0 {"));
         assert!(body.contains("total += *scratch.add(w as usize);"));
@@ -1113,7 +1101,9 @@ mod tests {
         assert!(body.contains("if broadcast == 0 {"));
         assert!(body.contains("let mut row = i / width;"));
         // The row is carried along the walk, and must wrap with the column.
-        assert!(body.contains("if col >= width {\n                        col -= width;\n                        row += 1;"));
+        assert!(body.contains(
+            "if col >= width {\n                    col -= width;\n                    row += 1;"
+        ));
     }
 
     #[test]
@@ -1125,7 +1115,7 @@ mod tests {
         // "every sig entry was written" sentinel check meaningful.
         assert!(
             rust_kernel("sigmoid_gate_mul")
-                .contains("if col == 0 {\n                        *sig.add(row as usize) = s;"),
+                .contains("if col == 0 {\n                    *sig.add(row as usize) = s;"),
             "the broadcast sigmoid lost its single-writer guard",
         );
     }

@@ -1,6 +1,6 @@
-# Rust layer kernels
+# Rust device kernels
 
-This standalone crate compiles `src/main.rs` with cuda-oxide from
+This standalone crate compiles `src/` with cuda-oxide from
 [NVIDIA/cuda-rust](https://github.com/NVIDIA/cuda-rust) at
 `f35d6ccc2e03a54e73e3796f415f11313e439d50` (0.4.0, Rust 1.99.1 with `rustc-dev`). The
 compiler used to live at `NVlabs/cuda-oxide`, which now redirects to that
@@ -48,7 +48,33 @@ export BINDGEN_EXTRA_CLANG_ARGS='-isystem /usr/lib/gcc/x86_64-linux-gnu/13/inclu
 
 `cargo oxide doctor` still warns about the clang resource directory with this
 layout; the build succeeds. A cached build does not re-emit the PTX, so touch
-`src/main.rs` if `llmcuda_rust_device.ptx` is missing.
+a source file if `llmcuda_rust_device.ptx` is missing.
+
+## Layout
+
+One module per kernel family, named after the launcher that loads it where
+there is one. Kernels are `#[kernel]` functions at item level; a device
+helper lives in the module that uses it, or in `common` when more than one
+does.
+
+| Module | Kernels |
+| --- | --- |
+| `layer_ops` | residual add, SwiGLU, sigmoid gating, RMSNorm and its fused forms, softplus, standalone RoPE, the causal depthwise convolution |
+| `attention` | query/gate split, RoPE, KV-cache appends, the decode combine |
+| `moe` | routing, dispatch, alignment, and the block's activation, reduce and gate-and-combine |
+| `gdn` | the prelude's splits, gates and normalizers, the fp32 projection, the recurrent decode step |
+| `k2` | combine, values, gate, norm, dispatch passes, the rotary table, apply and cache append |
+| `sampling` | block and final argmax, argmax with its probability |
+| `gemm` | binary16 conversions, the split-K reduce, activation quantization, Q8_0 repacks |
+| `vision` | the vision tower's elementwise and row kernels |
+| `decision` | the decision head's LayerNorm, reductions, gathers, features and scores |
+| `dense` | the dense FFN's narrow-layout kernels |
+| `quant` | embedding gathers and whole-tensor dequantization |
+| `glue` | the MTP concat and the DFlash tap |
+| `common` | block and warp reductions, binary16 conversion, strided contractions, the convolution step |
+
+`regenerate.py` carries the list of entry points the PTX must export; add a
+new kernel's name there.
 
 ## Checking a kernel
 

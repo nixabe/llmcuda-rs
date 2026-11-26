@@ -88,7 +88,24 @@ pub const RUST_KERNELS_PTX: &str = include_str!("rust/tensor_add.ptx");
 /// Not compiled here; the engine's toolchain cannot build it. It is carried
 /// so tests can pin the properties of a kernel that exist only in its
 /// source, as they do for the CUDA C++ ones.
-pub const RUST_KERNELS_SRC: &str = include_str!("../../../../device-kernels/src/main.rs");
+///
+/// One file per kernel family, concatenated; every function is at item level
+/// in its file, which [`rust_kernel_source`] relies on.
+pub const RUST_KERNELS_SRC: &str = concat!(
+    include_str!("../../../../device-kernels/src/attention.rs"),
+    include_str!("../../../../device-kernels/src/common.rs"),
+    include_str!("../../../../device-kernels/src/decision.rs"),
+    include_str!("../../../../device-kernels/src/dense.rs"),
+    include_str!("../../../../device-kernels/src/gdn.rs"),
+    include_str!("../../../../device-kernels/src/gemm.rs"),
+    include_str!("../../../../device-kernels/src/glue.rs"),
+    include_str!("../../../../device-kernels/src/k2.rs"),
+    include_str!("../../../../device-kernels/src/layer_ops.rs"),
+    include_str!("../../../../device-kernels/src/moe.rs"),
+    include_str!("../../../../device-kernels/src/quant.rs"),
+    include_str!("../../../../device-kernels/src/sampling.rs"),
+    include_str!("../../../../device-kernels/src/vision.rs"),
+);
 
 /// The text of one function of [`RUST_KERNELS_SRC`], kernel or device helper,
 /// from its `fn` line to its closing brace.
@@ -103,7 +120,7 @@ pub fn rust_kernel_source(name: &str) -> &'static str {
         .find(&format!("fn {name}("))
         .unwrap_or_else(|| panic!("the Rust kernel source has no `{name}`"));
     let start = src[..at].rfind('\n').map_or(0, |i| i + 1);
-    let end = at + src[at..].find("\n    }\n").expect("the function ends");
+    let end = at + src[at..].find("\n}\n").expect("the function ends");
     &src[start..end]
 }
 

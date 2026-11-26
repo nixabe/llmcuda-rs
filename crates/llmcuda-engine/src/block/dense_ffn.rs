@@ -1444,12 +1444,7 @@ mod tests {
 
     /// `dense_ffn_add_residual`, which has no CUDA C++ twin.
     fn rust_add_residual() -> &'static str {
-        let src = llmcuda_cuda::kernels::RUST_KERNELS_SRC;
-        let start = src
-            .find("    pub unsafe fn dense_ffn_add_residual(")
-            .expect("the Rust source has the residual add");
-        let end = src[start..].find("\n    }\n").expect("the kernel ends");
-        &src[start..start + end]
+        llmcuda_cuda::kernels::rust_kernel_source("dense_ffn_add_residual")
     }
 
     /// The two copies of the split-layout projection GEMV read the weights

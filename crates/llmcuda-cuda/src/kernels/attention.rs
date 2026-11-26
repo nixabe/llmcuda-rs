@@ -4577,7 +4577,7 @@ mod tests {
         );
         let imrope = crate::kernels::rust_kernel_source("attn_rope_partial_imrope");
         assert!(imrope.contains(
-            "if d >= rope_dim {\n                *out.add(base + d as usize) = *input.add(base + d as usize);"
+            "if d >= rope_dim {\n            *out.add(base + d as usize) = *input.add(base + d as usize);"
         ));
     }
 

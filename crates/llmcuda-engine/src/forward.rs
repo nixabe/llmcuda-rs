@@ -4405,7 +4405,7 @@ mod tests {
         // with the batch and stays replayable from a captured graph.
         assert!(
             llmcuda_cuda::kernels::rust_kernel_source("fwd_embed_quant")
-                .contains("if t >= n_tokens {\n            return;")
+                .contains("if t >= n_tokens {\n        return;")
         );
     }
 

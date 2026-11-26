@@ -691,6 +691,394 @@ mod kernels {
             }
         }
     }
+
+    /// SwiGLU for the shared expert's tensor-core path: one elementwise pass
+    /// between the two projections, which cannot fuse it because a projection
+    /// knows nothing about what its output feeds.
+    ///
+    /// `g / (1 + exp(-g))`, as `llmcuda_kernels::norm::silu` and the fp32
+    /// shared-expert kernel write it, not the algebraically equal
+    /// `g * sigmoid(g)`.
+    ///
+    /// # Safety
+    /// gate, up and out cover n floats; the 1-D launch is nonempty. Output
+    /// may exactly alias an input.
+    #[kernel]
+    pub unsafe fn moe_swiglu(gate: *const f32, up: *const f32, n: i64, out: *mut f32) {
+        let i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        if i >= n {
+            return;
+        }
+        unsafe {
+            let g = *gate.add(i as usize);
+            *out.add(i as usize) = (g / (1.0 + (-g).exp())) * *up.add(i as usize);
+        }
+    }
+
+    /// fp32 sum of each token's top-k routed contributions.
+    ///
+    /// grid: (max_tokens, ceil(hidden / block)). The second dimension is the
+    /// point at one token: a block per token would be one block on a 72-SM
+    /// card summing eight 2,048-float vectors, which is all launch latency.
+    /// The k loop is ascending and inside one thread, so contributions are
+    /// added in selection order exactly as the reference adds them.
+    ///
+    /// # Safety
+    /// partial covers max_tokens * top_k * hidden floats, out covers
+    /// max_tokens * hidden, valid_tokens one int; out is disjoint from
+    /// partial.
+    #[kernel]
+    pub unsafe fn moe_reduce(
+        partial: *const f32,
+        valid_tokens: *const i32,
+        top_k: i32,
+        hidden: i32,
+        out: *mut f32,
+    ) {
+        let token = thread::blockIdx_x() as i64;
+        let h = (thread::blockIdx_y() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        unsafe {
+            if token >= *valid_tokens as i64 || h >= hidden {
+                return;
+            }
+            let mut p = partial.add((token * top_k as i64 * hidden as i64 + h as i64) as usize);
+            let mut acc = 0.0f32;
+            let mut k = 0;
+            while k < top_k {
+                acc += *p;
+                p = p.wrapping_add(hidden as usize);
+                k += 1;
+            }
+            *out.add((token * hidden as i64 + h as i64) as usize) = acc;
+        }
+    }
+
+    /// `out = silu(x)`, elementwise: `x / (1 + exp(-x))`, which is
+    /// `ggml_cuda_op_silu_single` verbatim. libdevice exp, not an approximate
+    /// one: the fast intrinsic's error is relative to the result rather than
+    /// to the exponent, and this is not a bottleneck.
+    ///
+    /// # Safety
+    /// x and out cover n floats; the 1-D launch is nonempty. Output may
+    /// exactly alias the input.
+    #[kernel]
+    pub unsafe fn gdn_silu(x: *const f32, out: *mut f32, n: i64) {
+        let stride = thread::blockDim_x() as i64 * thread::gridDim_x() as i64;
+        let mut i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        while i < n {
+            unsafe {
+                let v = *x.add(i as usize);
+                *out.add(i as usize) = v / (1.0 + (-v).exp());
+            }
+            i += stride;
+        }
+    }
+
+    /// Split a convolved Gated DeltaNet row `[q | k | v]` into its three
+    /// per-head tensors. Queries and keys have `qk_heads` heads, values
+    /// `value_heads`; the grid covers the value heads and the first
+    /// `qk_heads` blocks also write q and k.
+    ///
+    /// grid: (value_heads, tokens). block: head_dim.
+    ///
+    /// # Safety
+    /// conv covers tokens * (2 * qk_heads + value_heads) * head_dim floats;
+    /// q and k cover tokens * qk_heads * head_dim and v covers tokens *
+    /// value_heads * head_dim; outputs are disjoint from conv and each other.
+    #[kernel]
+    pub unsafe fn gdn_split_qkv(
+        conv: *const f32,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        head_dim: i32,
+        qk_heads: i32,
+        value_heads: i32,
+    ) {
+        let h = thread::blockIdx_x() as i64;
+        let t = thread::blockIdx_y() as i64;
+        let d = thread::threadIdx_x() as i64;
+        let head_dim = head_dim as i64;
+        let key_dim = qk_heads as i64 * head_dim;
+        let conv_dim = 2 * key_dim + value_heads as i64 * head_dim;
+        unsafe {
+            let c = conv.add((t * conv_dim) as usize);
+            *v.add(((t * value_heads as i64 + h) * head_dim + d) as usize) =
+                *c.add((2 * key_dim + h * head_dim + d) as usize);
+            if h < qk_heads as i64 {
+                let o = ((t * qk_heads as i64 + h) * head_dim + d) as usize;
+                *q.add(o) = *c.add((h * head_dim + d) as usize);
+                *k.add(o) = *c.add((key_dim + h * head_dim + d) as usize);
+            }
+        }
+    }
+
+    /// The per-head decay and write gates.
+    ///
+    /// ```text
+    /// a_softplus = softplus(alpha + ssm_dt.bias)
+    /// log_decay  = a_softplus * ssm_a          <- already the log-decay
+    /// beta       = sigmoid(beta_raw)
+    /// ```
+    ///
+    /// `ssm_a` is stored already negated, so the product is the log of a
+    /// decay in (0, 1] and must not be negated again. The softplus is
+    /// `ggml_cuda_op_softplus` verbatim, including its x > 20 passthrough,
+    /// which matters because a lost passthrough overflows exp rather than
+    /// saturating.
+    ///
+    /// # Safety
+    /// alpha, beta_raw and the three outputs cover n floats (n = tokens *
+    /// heads); dt_bias and ssm_a cover heads. Outputs are disjoint from the
+    /// inputs and each other. The 1-D launch is nonempty.
+    #[kernel]
+    pub unsafe fn gdn_gates(
+        alpha: *const f32,
+        beta_raw: *const f32,
+        dt_bias: *const f32,
+        ssm_a: *const f32,
+        a_softplus: *mut f32,
+        log_decay: *mut f32,
+        beta: *mut f32,
+        heads: i32,
+        n: i64,
+    ) {
+        let stride = thread::blockDim_x() as i64 * thread::gridDim_x() as i64;
+        let mut i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        while i < n {
+            unsafe {
+                let h = (i % heads as i64) as usize;
+                let a = *alpha.add(i as usize) + *dt_bias.add(h);
+                let sp = if a > 20.0 { a } else { (1.0 + a.exp()).ln() };
+                *a_softplus.add(i as usize) = sp;
+                *log_decay.add(i as usize) = sp * *ssm_a.add(h);
+                *beta.add(i as usize) = 1.0 / (1.0 + (-*beta_raw.add(i as usize)).exp());
+            }
+            i += stride;
+        }
+    }
+
+    /// `exp(log_decay)` for the whole pass, once.
+    ///
+    /// The unfolded scan takes this exponential in every lane of every warp
+    /// of a head, on every token; the folded scan reads it from here instead.
+    /// It is the same libdevice exp on the same operand, so the decay is the
+    /// same bits.
+    ///
+    /// # Safety
+    /// log_decay and decay cover n floats; the 1-D launch is nonempty.
+    #[kernel]
+    pub unsafe fn gdn_scan_decay(log_decay: *const f32, decay: *mut f32, n: i64) {
+        let stride = thread::blockDim_x() as i64 * thread::gridDim_x() as i64;
+        let mut i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        while i < n {
+            unsafe {
+                *decay.add(i as usize) = (*log_decay.add(i as usize)).exp();
+            }
+            i += stride;
+        }
+    }
+
+    /// The weighted sum of one output column over a token's top-k
+    /// projections, ascending k, each product fused into the running sum.
+    ///
+    /// # Safety
+    /// p points at the token's first projection for this column and w at its
+    /// first weight; p is read at topk strides of `rows`, w at topk floats.
+    #[device]
+    unsafe fn k2_weighted(p: *const f32, w: *const f32, rows: i32, topk: i32) -> f32 {
+        let (mut p, mut w) = (p, w);
+        let mut a = 0.0f32;
+        let mut k = 0;
+        while k < topk {
+            unsafe {
+                a = (*p).mul_add(*w, a);
+            }
+            p = p.wrapping_add(rows as usize);
+            w = w.wrapping_add(1);
+            k += 1;
+        }
+        a
+    }
+
+    /// `out[t][j] = sum_k p[t][k][j] * w[t][k]`.
+    ///
+    /// grid: (ceil(rows / block), tokens).
+    ///
+    /// # Safety
+    /// p covers tokens * topk * rows floats, w tokens * topk, out tokens *
+    /// rows; out is disjoint from the inputs.
+    #[kernel]
+    pub unsafe fn k2_combine(p: *const f32, w: *const f32, out: *mut f32, rows: i32, topk: i32) {
+        let j = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        let t = thread::blockIdx_y() as i64;
+        if j >= rows {
+            return;
+        }
+        unsafe {
+            let a = k2_weighted(
+                p.add((t * topk as i64 * rows as i64 + j as i64) as usize),
+                w.add((t * topk as i64) as usize),
+                rows,
+                topk,
+            );
+            *out.add((t * rows as i64 + j as i64) as usize) = a;
+        }
+    }
+
+    /// `k2_combine` followed by the two adds it used to feed: `ffn = routed +
+    /// shared`, then `out = x + ffn`, each rounded as the separate
+    /// `tensor_add` launches did.
+    ///
+    /// # Safety
+    /// As `k2_combine`; shared, x, ffn and out cover tokens * rows floats.
+    /// ffn and out are disjoint from each other and from p and w; out may
+    /// exactly alias x.
+    #[kernel]
+    pub unsafe fn k2_combine_residual(
+        p: *const f32,
+        w: *const f32,
+        shared: *const f32,
+        x: *const f32,
+        ffn: *mut f32,
+        out: *mut f32,
+        rows: i32,
+        topk: i32,
+    ) {
+        let j = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        let t = thread::blockIdx_y() as i64;
+        if j >= rows {
+            return;
+        }
+        unsafe {
+            let a = k2_weighted(
+                p.add((t * topk as i64 * rows as i64 + j as i64) as usize),
+                w.add((t * topk as i64) as usize),
+                rows,
+                topk,
+            );
+            let i = (t * rows as i64 + j as i64) as usize;
+            let f = a + *shared.add(i);
+            *ffn.add(i) = f;
+            *out.add(i) = *x.add(i) + f;
+        }
+    }
+
+    /// `out[t][j] = sum_k silu(p[t][k][j]) * w[t][k]`, ascending k, each
+    /// product fused into the running sum.
+    ///
+    /// # Safety
+    /// As `k2_combine`.
+    #[kernel]
+    pub unsafe fn k2_values(
+        projections: *const f32,
+        weights: *const f32,
+        out: *mut f32,
+        rows: i32,
+        topk: i32,
+    ) {
+        let j = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as i32;
+        let token = thread::blockIdx_y() as i64;
+        if j >= rows {
+            return;
+        }
+        unsafe {
+            let mut p = projections.add((token * topk as i64 * rows as i64 + j as i64) as usize);
+            let mut w = weights.add((token * topk as i64) as usize);
+            let mut acc = 0.0f32;
+            let mut k = 0;
+            while k < topk {
+                let v = *p;
+                acc = (v / (1.0 + (-v).exp())).mul_add(*w, acc);
+                p = p.wrapping_add(rows as usize);
+                w = w.wrapping_add(1);
+                k += 1;
+            }
+            *out.add((token * rows as i64 + j as i64) as usize) = acc;
+        }
+    }
+
+    /// `out = x * softplus2(gate)`, the base-2 softplus: the gate is scaled
+    /// by ln 2, taken through the overflow-free `max(v, 0) + log1p(exp(-|v|))`
+    /// and scaled back by 1 / ln 2.
+    ///
+    /// # Safety
+    /// x, gate and out cover n floats; the 1-D launch is nonempty. Output may
+    /// exactly alias an input.
+    #[kernel]
+    pub unsafe fn k2_gate(x: *const f32, gate: *const f32, out: *mut f32, n: i64) {
+        let i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        if i >= n {
+            return;
+        }
+        unsafe {
+            let v = *gate.add(i as usize) * 0.693_147_2_f32;
+            let sp = v.max(0.0) + (-v.abs()).exp().ln_1p();
+            *out.add(i as usize) = *x.add(i as usize) * (sp * 1.442_695_f32);
+        }
+    }
+
+    /// Merge the per-split partial softmaxes of split decode attention.
+    ///
+    /// Each split carries its running maximum `m`, its normalizer `l` and its
+    /// weighted value sum, all relative to its own maximum; they are rescaled
+    /// to the global maximum and summed in ascending split order. Split 0
+    /// always holds at least key 0, so the global maximum is never -inf and
+    /// the subtraction never forms inf - inf; a split with no keys has
+    /// `m = -inf` and contributes nothing.
+    ///
+    /// grid: (q_heads,). block: head_dim threads, one per output dimension.
+    ///
+    /// # Safety
+    /// part_acc covers n_splits * q_heads * head_dim floats, part_m and
+    /// part_l n_splits * q_heads, out q_heads * head_dim; out is disjoint
+    /// from the inputs. n_splits >= 1.
+    #[kernel]
+    pub unsafe fn attn_flash_decode_combine(
+        part_acc: *const f32,
+        part_m: *const f32,
+        part_l: *const f32,
+        out: *mut f32,
+        q_heads: i32,
+        head_dim: i32,
+        n_splits: i32,
+    ) {
+        let h = thread::blockIdx_x() as usize;
+        let d = thread::threadIdx_x() as usize;
+        let row = q_heads as usize;
+        unsafe {
+            let mut gm = f32::NEG_INFINITY;
+            let mut m = part_m.add(h);
+            let mut s = 0;
+            while s < n_splits {
+                gm = gm.max(*m);
+                m = m.wrapping_add(row);
+                s += 1;
+            }
+
+            let mut m = part_m.add(h);
+            let mut l = part_l.add(h);
+            let mut acc = part_acc.add(h * head_dim as usize + d);
+            let (mut num, mut den) = (0.0f32, 0.0f32);
+            let mut s = 0;
+            while s < n_splits {
+                let ms = *m;
+                let f = if ms == f32::NEG_INFINITY { 0.0 } else { (ms - gm).exp() };
+                num = f.mul_add(*acc, num);
+                den = f.mul_add(*l, den);
+                m = m.wrapping_add(row);
+                l = l.wrapping_add(row);
+                acc = acc.wrapping_add(row * head_dim as usize);
+                s += 1;
+            }
+            *out.add(h * head_dim as usize + d) = num / den;
+        }
+    }
 }
 
 fn main() {}

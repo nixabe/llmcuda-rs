@@ -47,6 +47,7 @@ pub mod decision;
 pub mod f16;
 pub mod gdn;
 pub mod gemv;
+pub mod inkling;
 pub mod mma;
 pub mod moe;
 pub mod mrope;

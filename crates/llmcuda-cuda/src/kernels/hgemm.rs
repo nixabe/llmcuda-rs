@@ -53,7 +53,7 @@ pub const HGEMM_BM: usize = 128;
 /// Contraction elements per stage; also the Q8_0 block, so one scale a row.
 pub const HGEMM_BK: usize = 32;
 
-const HGEMM_SRC: &str = r#"
+pub(super) const HGEMM_SRC: &str = r#"
 #define HG_BM 128
 #define HG_BK 32
 #define HG_GROUP 4

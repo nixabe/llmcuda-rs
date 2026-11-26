@@ -1820,536 +1820,7 @@ moe_expert_down_mma_impl(
 
 extern "C" {
 
-// -------------------------------------------------------------------------
-// 1. Routing: softmax over all experts, top-k, renormalize.
-// -------------------------------------------------------------------------
-//
-// grid: one block per token slot (always `max_tokens`, never the live count).
-// block: THREADS threads, strided over the experts.
-//
-// This transcribes `llmcuda_kernels::moe::router::route_token`:
-//   probs = softmax(logits); rank by (prob desc, index asc); take k;
-//   weights = prob / sum(selected probs).
-//
-// Two details are the whole correctness story:
-//
-// - **Selection is by probability, not by logit.** Softmax is monotonic so
-//   the two orderings agree, but the reference's tie-break fires on equal
-//   *probabilities*, and reproducing it means comparing the same quantity.
-// - **Ties go to the lower expert index.** Every reduction below carries the
-//   index alongside the value for exactly this reason. Without it a tie
-//   resolves by whichever thread happened to win the shuffle, which is not
-//   even stable across runs.
-//
-// `sum_exp` is reduced in a tree here and sequentially in the reference, so
-// the two differ in the last ulp — but it divides every probability equally,
-// so the *ordering* (and therefore the selection) is untouched, and it
-// cancels out of the renormalized weights almost exactly.
-// The routing itself, so the fused one-token kernel below can run it without
-// a second copy of two hundred lines. Every barrier inside is reached by every
-// thread of the block, which is what makes it safe to call from a
-// `__device__` function.
-__device__ void route_token(
-    const float* __restrict__ logits,
-    int token,
-    int num_experts,
-    int top_k,
-    float* probs,
-    float* rval,
-    int* ridx,
-    int* __restrict__ topk_ids,
-    float* __restrict__ topk_weights
-) {
 
-    const float* row = logits + (long long)token * num_experts;
-
-    // --- max logit (exact: max is associative and rounds nothing) ---------
-    float local = row[0];
-    for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
-        local = fmaxf(local, row[e]);
-    }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        local = fmaxf(local, __shfl_down_sync(0xffffffff, local, off));
-    }
-    if ((threadIdx.x & 31) == 0) rval[threadIdx.x >> 5] = local;
-    __syncthreads();
-    float max_logit = rval[0];
-    for (int w = 1; w < (int)(blockDim.x >> 5); ++w) max_logit = fmaxf(max_logit, rval[w]);
-    __syncthreads();
-
-    // --- exp, sum, normalize ---------------------------------------------
-    float esum = 0.0f;
-    for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
-        float p = expf(row[e] - max_logit);
-        probs[e] = p;
-        esum += p;
-    }
-    // **This one keeps its shared-memory tree.** The other two reductions in
-    // this kernel were replaced with warp shuffles because `fmaxf` and
-    // "greatest value, lowest index on a tie" are associative *and*
-    // commutative, so their answers do not depend on the shape of the
-    // reduction. A floating-point sum is neither, and this one divides every
-    // probability. Reshaping it moved the renormalized routing weights in
-    // their last bits, which was enough for `tests/forward_pass.rs` to report
-    // a genuine ranking disagreement with llama.cpp at rank 4 of the top 8.
-    //
-    // Nine barriers, against the eighty-one the other two shed between them.
-    rval[threadIdx.x] = esum;
-    __syncthreads();
-    // The same additions in the same order, with the last five steps under a
-    // warp barrier instead of a block barrier: once `s <= 16` every reader and
-    // every writer is lane 0..31 of warp 0, and `__syncwarp` fences shared
-    // memory for them. Five `__syncthreads()` on a kernel that runs as one
-    // block, forty times a decode step.
-    for (int s = blockDim.x >> 1; s > 16; s >>= 1) {
-        if (threadIdx.x < s) rval[threadIdx.x] += rval[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x < 32) {
-        #pragma unroll
-        for (int s = 16; s > 0; s >>= 1) {
-            if (threadIdx.x < s) rval[threadIdx.x] += rval[threadIdx.x + s];
-            __syncwarp();
-        }
-    }
-    __syncthreads();
-    float sum_exp = rval[0];
-    // `probs` stays *unnormalized* in shared memory. The only consumer is the
-    // selection warp below, which divides in registers -- `probs[e] /
-    // sum_exp` is the same float either way -- so the pass that used to write
-    // the normalized array back, and the barrier after it, are gone.
-
-    // --- k successive argmax passes, ties to the lower index --------------
-    //
-    // Equivalent to the reference's full sort-then-truncate, and cheaper:
-    // k is 8 against 256 experts. A selected expert is masked with -1.0f,
-    // which no softmax probability can reach, so it can never be re-picked.
-    // **On one warp, and with no barriers at all.** The block-wide form cost
-    // two `__syncthreads()` and a serial pass over the warp winners per
-    // selected expert — sixteen barriers and eight serial passes for eight
-    // experts, in a kernel that runs as a single block on a 72-SM card, so
-    // the whole machine waits through them forty times a decode step.
-    //
-    // "Greatest value, lowest index on a tie" is associative *and*
-    // commutative, so the answer does not depend on the shape of the
-    // reduction the way a floating-point sum would — which is what makes it
-    // safe to change the shape at all, on a quantity that selects experts.
-    // That is the same argument the softmax denominator above cannot make,
-    // which is why that one still reduces through shared memory.
-    //
-    // Each lane holds its experts' probabilities in registers, and the
-    // butterfly shuffle leaves the winner in *every* lane, so the lane that
-    // owns it masks it in place. The mask loop is fully unrolled with a
-    // predicate rather than indexed by the winner, because a dynamic index
-    // into a register array spills it to local memory and undoes the point.
-    // The selected weights' running total, accumulated on lane 0 as they are
-    // chosen. Declared out here because the renormalize below reads it, and
-    // only lane 0 ever writes it. See that block for why it is a register.
-    float sel_sum = 0.0f;
-    if (threadIdx.x < 32) {
-        int lane = threadIdx.x;
-        float p[MOE_ROUTE_LANE_EXPERTS];
-        #pragma unroll
-        for (int i = 0; i < MOE_ROUTE_LANE_EXPERTS; ++i) {
-            int e = lane + 32 * i;
-            p[i] = (e < num_experts) ? probs[e] / sum_exp : -1.0f;
-        }
-        for (int j = 0; j < top_k; ++j) {
-            float bv = -1.0f;
-            int   bi = -1;
-            #pragma unroll
-            for (int i = 0; i < MOE_ROUTE_LANE_EXPERTS; ++i) {
-                int e = lane + 32 * i;
-                if (p[i] > bv || (p[i] == bv && (bi < 0 || e < bi))) { bv = p[i]; bi = e; }
-            }
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                float cv = __shfl_xor_sync(0xffffffff, bv, off);
-                int   ci = __shfl_xor_sync(0xffffffff, bi, off);
-                if (cv > bv || (cv == bv && ci >= 0 && (bi < 0 || ci < bi))) { bv = cv; bi = ci; }
-            }
-            #pragma unroll
-            for (int i = 0; i < MOE_ROUTE_LANE_EXPERTS; ++i) {
-                if (bi >= 0 && lane + 32 * i == bi) p[i] = -1.0f;
-            }
-            if (lane == 0) {
-                topk_ids[(long long)token * top_k + j] = bi;
-                // The weight is *not* stored to global here. It is the
-                // denominator's j-th term and the numerator of the j-th
-                // output, and both consumers are this same lane a few
-                // instructions later; a global store followed by a global
-                // load of the address just written is a dependent round trip
-                // per selected expert. `rval` is dead from here — the
-                // softmax denominator it held was read into `sum_exp`
-                // before this loop, no barrier follows, and no other warp
-                // touches it again — so it is the staging the epilogue
-                // wants. `top_k <= blockDim.x` bounds the index.
-                rval[j] = bv;
-                sel_sum += bv;
-            }
-        }
-    }
-
-    // --- renormalize over just the selected k -----------------------------
-    //
-    // Summed in selection order by a single thread, matching the reference's
-    // `ranked.iter().map(|&(_, p)| p).sum()`. k is 8; parallelizing this
-    // would only add a reduction-order difference for nothing.
-    //
-    // `sel_sum` accumulated `bv` in ascending `j` in the loop above, which is
-    // the same addition of the same eight floats in the same order the
-    // read-back loop performed. That equality is the whole claim: fp32
-    // addition is not associative and these weights multiply the expert
-    // outputs, so a reordering here would move the block's output in its last
-    // bits. Nothing is reordered — only the operands' storage moved from
-    // global to shared and a register.
-    if (threadIdx.x == 0) {
-        long long b = (long long)token * top_k;
-        if (sel_sum > 0.0f) {
-            for (int j = 0; j < top_k; ++j) topk_weights[b + j] = rval[j] / sel_sum;
-        } else {
-            // Unreachable with a real softmax (every entry is > 0), but the
-            // reference guards it rather than propagating NaN, so this does
-            // too.
-            for (int j = 0; j < top_k; ++j) topk_weights[b + j] = 1.0f / (float)top_k;
-        }
-    }
-}
-
-// grid: (max_tokens,). block: MOE_THREADS.
-__global__ void moe_route(
-    const float* __restrict__ logits,
-    const int* __restrict__ valid_tokens,
-    int num_experts,
-    int top_k,
-    int* __restrict__ topk_ids,
-    float* __restrict__ topk_weights
-) {
-    int token = blockIdx.x;
-    if (token >= *valid_tokens) return;
-    float* probs = llmcuda_shared;
-    float* rval  = llmcuda_shared + num_experts;
-    int*   ridx  = (int*)(rval + blockDim.x);
-    route_token(logits, token, num_experts, top_k, probs, rval, ridx,
-                topk_ids, topk_weights);
-}
-
-
-// -------------------------------------------------------------------------
-// 2. Sorted-token indirection, into fixed-size buffers.
-// -------------------------------------------------------------------------
-//
-// Two launches, both at grids fixed by `MoeGeometry`: **one block per
-// expert**, THREADS threads. The first version ran the whole thing in a
-// single block — one SM of 72 — and its own docs admitted it was "not tuned
-// for large prefill batches". Both phases are `O(num_experts * numel)` in
-// total work (a 256-bin histogram with no atomics is a scan per bin), so on
-// one block that is 8,192 serial iterations at a 512-token step; spread one
-// expert per block it is 32.
-//
-// Phase 1 counts and fills; phase 2 scans and scatters. The split is a
-// launch rather than a grid-wide barrier because the exclusive prefix sum
-// over per-expert padded counts is a genuine global dependency and Turing
-// has no device-wide sync inside a kernel.
-//
-// `numel = valid_tokens * top_k` is simultaneously the number of valid flat
-// indices and the padding sentinel (`padding_sentinel` in the reference is
-// exactly `num_tokens * top_k`), so a consumer's test is `flat >= numel`.
-//
-// The sentinel and INACTIVE_EXPERT fills cover the **whole capacity**, not
-// just `num_tokens_post_pad`. Filling only the live prefix would leave a
-// previous, longer step's entries visible past it — tokens that no longer
-// exist, pointing into a token array that has since shrunk. They ride on
-// phase 1 because they depend on nothing phase 1 computes, and spreading
-// them over `num_experts` blocks costs nothing.
-//
-// grid: (num_experts, 1, 1). Block `e` owns expert `e`.
-// The whole dispatch table in one block, for a one-token pass.
-//
-// `moe_align_count` and `moe_align_block_size` are shaped for a batch: 256
-// blocks, a block-wide tree reduction to count one expert's selections, a
-// 256-element serial prefix sum recomputed in every block, and a Hillis-Steele
-// scan per 256 flat pairs to place them. At one token there are **eight** flat
-// pairs. Every block was spending sixteen barriers and a 256-add serial scan
-// to discover that seven of its 256 threads had nothing to do, and the pair
-// cost 0.37 ms of a 10.3 ms decode step between them -- more than the shared
-// expert's entire feed-forward.
-//
-// With `numel` at eight, a thread can simply read all eight ids twice: once to
-// count its expert's selections and once to place them in ascending flat
-// order, which is the same order the scan produced. That makes the counts
-// private to a thread, which removes the reduction, the intermediate
-// `counts` array and the second launch along with it.
-//
-// The barriers that remain are real: the fill must land before the scatter
-// overwrites part of it, and the prefix sum must be complete before any
-// thread reads its base.
-//
-// The prefix sum itself was thread 0 walking 256 dependent shared-memory
-// adds -- about 4 us of the 11.7 us this block costs at one token, forty
-// times a step, with 255 threads waiting at the barrier. It is now a
-// shuffle scan inside each warp and a walk over the warp totals, which is
-// the same integer sum in a different association; integer addition is
-// associative, so the values are identical. `warp_sums` is
-// `blockDim.x / 32` ints of shared memory. A block narrower than the expert
-// count keeps the serial walk.
-//
-// grid: (1,). block: MOE_THREADS.
-__device__ void dispatch_token(
-    const int* __restrict__ topk_ids,
-    const int* __restrict__ valid_tokens,
-    int top_k,
-    int num_experts,
-    int block_size,
-    int sorted_capacity,
-    int expert_capacity,
-    int* cumsum,
-    int* warp_sums,
-    int* __restrict__ sorted_token_ids,
-    int* __restrict__ expert_ids,
-    int* __restrict__ num_tokens_post_pad
-) {
-    int tid = threadIdx.x;
-    int numel = (*valid_tokens) * top_k;
-
-    for (int s = tid; s < sorted_capacity; s += blockDim.x) sorted_token_ids[s] = numel;
-    for (int b = tid; b < expert_capacity; b += blockDim.x) expert_ids[b] = -1;
-
-    // An expert with no tokens gets *zero* blocks, not a padded-empty one —
-    // the reference's `CEILDIV(0, block_size) == 0`.
-    for (int e = tid; e < num_experts; e += blockDim.x) {
-        int c = 0;
-        for (int i = 0; i < numel; ++i) {
-            if (topk_ids[i] == e) ++c;
-        }
-        cumsum[e + 1] = ((c + block_size - 1) / block_size) * block_size;
-    }
-    __syncthreads();
-
-    if (num_experts <= (int)blockDim.x) {
-        int lane = tid & 31;
-        int warp = tid >> 5;
-        int v = (tid < num_experts) ? cumsum[tid + 1] : 0;
-        for (int o = 1; o < 32; o <<= 1) {
-            int n = __shfl_up_sync(0xffffffffu, v, o);
-            if (lane >= o) v += n;
-        }
-        if (lane == 31) warp_sums[warp] = v;
-        __syncthreads();
-        int carry = 0;
-        for (int w = 0; w < warp; ++w) carry += warp_sums[w];
-        v += carry;
-        if (tid < num_experts) cumsum[tid + 1] = v;
-        if (tid == 0) cumsum[0] = 0;
-        if (tid == num_experts - 1) *num_tokens_post_pad = v;
-    } else if (tid == 0) {
-        cumsum[0] = 0;
-        for (int i = 0; i < num_experts; ++i) cumsum[i + 1] += cumsum[i];
-        *num_tokens_post_pad = cumsum[num_experts];
-    }
-    __syncthreads();
-
-    for (int e = tid; e < num_experts; e += blockDim.x) {
-        int base = cumsum[e];
-        int w = 0;
-        for (int i = 0; i < numel; ++i) {
-            if (topk_ids[i] == e) {
-                int slot = base + w;
-                if (slot < sorted_capacity) sorted_token_ids[slot] = i;
-                ++w;
-            }
-        }
-        int first = cumsum[e] / block_size;
-        int last  = cumsum[e + 1] / block_size;
-        for (int b = first; b < last && b < expert_capacity; ++b) expert_ids[b] = e;
-    }
-}
-
-// grid: (1,). block: MOE_THREADS.
-__global__ void moe_dispatch_t1(
-    const int* __restrict__ topk_ids,
-    const int* __restrict__ valid_tokens,
-    int top_k,
-    int num_experts,
-    int block_size,
-    int sorted_capacity,
-    int expert_capacity,
-    int* __restrict__ sorted_token_ids,
-    int* __restrict__ expert_ids,
-    int* __restrict__ num_tokens_post_pad
-) {
-    int* cumsum = (int*)llmcuda_shared;
-    dispatch_token(topk_ids, valid_tokens, top_k, num_experts, block_size,
-                   sorted_capacity, expert_capacity, cumsum,
-                   cumsum + num_experts + 1,
-                   sorted_token_ids, expert_ids, num_tokens_post_pad);
-}
-
-// Routing and the dispatch table it feeds, in one launch.
-//
-// Both run as a single block at one token, one immediately after the other,
-// with nothing between them but the eight expert ids the first wrote. Two
-// launches for that is two kernel floors -- about 13 us of a 9.8 ms decode
-// step across forty layers -- to move eight integers through global memory
-// and back.
-//
-// The `__syncthreads()` between them is what makes the hand-off legal: lane 0
-// of warp 0 wrote `topk_ids`, and a block barrier fences those writes for
-// every thread that is about to read them.
-//
-// grid: (1,). block: MOE_THREADS. Shared: probs + rval + ridx + cumsum +
-// warp sums.
-__global__ void moe_route_dispatch_t1(
-    const float* __restrict__ logits,
-    const int* __restrict__ valid_tokens,
-    int num_experts,
-    int top_k,
-    int block_size,
-    int sorted_capacity,
-    int expert_capacity,
-    int* __restrict__ topk_ids,
-    float* __restrict__ topk_weights,
-    int* __restrict__ sorted_token_ids,
-    int* __restrict__ expert_ids,
-    int* __restrict__ num_tokens_post_pad
-) {
-    if (*valid_tokens < 1) return;
-    float* probs  = llmcuda_shared;
-    float* rval   = llmcuda_shared + num_experts;
-    int*   ridx   = (int*)(rval + blockDim.x);
-    int*   cumsum = ridx + blockDim.x;
-
-    route_token(logits, 0, num_experts, top_k, probs, rval, ridx,
-                topk_ids, topk_weights);
-    __syncthreads();
-    dispatch_token(topk_ids, valid_tokens, top_k, num_experts, block_size,
-                   sorted_capacity, expert_capacity, cumsum,
-                   cumsum + num_experts + 1,
-                   sorted_token_ids, expert_ids, num_tokens_post_pad);
-}
-
-
-// grid: (num_experts, 1, 1). Block `e` places expert `e`'s tokens.
-//
-// **The ordering guarantee is why the cursor is not an atomic counter.**
-// The reference places an expert's tokens in ascending flat `(token, k)`
-// index. A cursor bumped atomically gives whatever order the warps happened
-// to arrive in, which is not reproducible run to run and would make an exact
-// comparison against the reference impossible. Instead the block walks the
-// flat array in ascending tiles and a per-tile exclusive scan hands each hit
-// its rank — the same placement the reference's sequential append produces,
-// arrived at in parallel.
-__global__ void moe_align_block_size(
-    const int* __restrict__ topk_ids,
-    const int* __restrict__ valid_tokens,
-    const int* __restrict__ counts,
-    int top_k,
-    int num_experts,
-    int block_size,
-    int sorted_capacity,
-    int expert_capacity,
-    int* __restrict__ sorted_token_ids,
-    int* __restrict__ expert_ids,
-    int* __restrict__ num_tokens_post_pad,
-    // Additive: live-row count for each `block_size`-wide dispatch bucket,
-    // `bucket_live[b] = clamp(counts[expert_ids[b]] - (b - first) *
-    // block_size, 0, block_size)`. An expert's tokens land at a *contiguous*
-    // prefix of its span (phase 3's scatter always advances `written` from
-    // zero), so a consuming kernel can get any sub-tile's live-row count from
-    // one load and a clamp instead of walking `sorted_token_ids` and scanning
-    // for the sentinel itself. Untouched kernels never read this array, so
-    // this is a pure addition to the table, not a reshape of it.
-    int* __restrict__ bucket_live
-) {
-    int* cumsum = (int*)llmcuda_shared;              // num_experts + 1
-    int* scan   = cumsum + num_experts + 1;       // blockDim.x
-
-    int numel = (*valid_tokens) * top_k;
-    int e = blockIdx.x;
-    int tid = threadIdx.x;
-
-    // 1. per-expert counts, padded up to a whole number of blocks. An expert
-    //    with no tokens gets *zero* blocks, not a padded-empty one — the
-    //    reference's `CEILDIV(0, block_size) == 0`.
-    for (int i = tid; i < num_experts; i += blockDim.x) {
-        int c = counts[i];
-        cumsum[i + 1] = ((c + block_size - 1) / block_size) * block_size;
-    }
-    __syncthreads();
-
-    // 2. exclusive prefix sum, recomputed identically in every block rather
-    //    than read from a third launch: 256 integer adds against a kernel
-    //    launch is not a close call, and integer addition is associative so
-    //    every block lands on the same cumsum.
-    if (tid == 0) {
-        cumsum[0] = 0;
-        for (int i = 0; i < num_experts; ++i) cumsum[i + 1] += cumsum[i];
-        if (e == 0) *num_tokens_post_pad = cumsum[num_experts];
-    }
-    __syncthreads();
-
-    // 3. scatter in ascending flat index.
-    //
-    // Each warp owns one contiguous run of the flat array, in warp order, and
-    // walks it 32 entries at a time. A ballot gives the warp its hits in
-    // lane order, which is flat-index order, so a hit's rank inside the
-    // 32-entry chunk is a popcount of the lanes below it and the warp's
-    // running total is a register. The only thing a warp needs from the
-    // others is how many hits the warps before it found, which is one count
-    // a warp and one barrier: the first walk counts, the second places.
-    //
-    // This was a block-wide prefix scan per 256-entry tile -- nineteen
-    // barriers a tile, 192 tiles at 6,138 tokens, in every one of the 256
-    // blocks -- for the same ranks. Integer counts, so the table is the same
-    // table.
-    int base = cumsum[e];
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    int n_warps = blockDim.x >> 5;
-    int chunks = (numel + 31) >> 5;
-    int per_warp = (chunks + n_warps - 1) / n_warps;
-    int c0 = warp * per_warp;
-    int c1 = c0 + per_warp < chunks ? c0 + per_warp : chunks;
-
-    int found = 0;
-    for (int c = c0; c < c1; ++c) {
-        int i = c * 32 + lane;
-        unsigned int hits = __ballot_sync(0xffffffff, i < numel && topk_ids[i] == e);
-        found += __popc(hits);
-    }
-    if (lane == 0) scan[warp] = found;
-    __syncthreads();
-
-    int written = base;
-    for (int w = 0; w < warp; ++w) written += scan[w];
-    for (int c = c0; c < c1; ++c) {
-        int i = c * 32 + lane;
-        bool hit = i < numel && topk_ids[i] == e;
-        unsigned int hits = __ballot_sync(0xffffffff, hit);
-        if (hit) {
-            int slot = written + __popc(hits & ((1u << lane) - 1u));
-            if (slot < sorted_capacity) sorted_token_ids[slot] = i;
-        }
-        written += __popc(hits);
-    }
-
-    // 4. claim this expert's blocks, and record each one's live-row count
-    //    alongside: `counts[e]` real tokens fill the prefix of expert e's
-    //    span from phase 3's scatter, so bucket `b`'s live count is
-    //    `counts[e]` less however many of those already fell in the buckets
-    //    before it.
-    int first = cumsum[e] / block_size;
-    int last  = cumsum[e + 1] / block_size;
-    int c = counts[e];
-    for (int b = first + tid; b < last && b < expert_capacity; b += blockDim.x) {
-        expert_ids[b] = e;
-        int live = c - (b - first) * block_size;
-        if (live < 0) live = 0;
-        if (live > block_size) live = block_size;
-        bucket_live[b] = live;
-    }
-}
 
 // -------------------------------------------------------------------------
 // 3. Grouped GEMM: gate/up + SwiGLU, then down.
@@ -5066,11 +4537,11 @@ impl MoeKernels {
         let mma_m = if narrow { MMA_M_NARROW } else { MMA_M };
         let fused_iq = !narrow;
         Ok(Self {
-            route: module.load_function("moe_route")?,
-            dispatch_t1: module.load_function("moe_dispatch_t1")?,
-            route_dispatch_t1: module.load_function("moe_route_dispatch_t1")?,
+            route: rust.load_function("moe_route")?,
+            dispatch_t1: rust.load_function("moe_dispatch_t1")?,
+            route_dispatch_t1: rust.load_function("moe_route_dispatch_t1")?,
             align_count: rust.load_function("moe_align_count")?,
-            align: module.load_function("moe_align_block_size")?,
+            align: rust.load_function("moe_align_block_size")?,
             expert_ffn: [
                 module.load_function("moe_expert_ffn_q6k")?,
                 module.load_function("moe_expert_ffn_q8")?,
@@ -6838,14 +6309,20 @@ mod tests {
         // `llmcuda_kernels::moe::dispatch`, and consumers test `flat >= numel`.
         // A sentinel of, say, -1 would still "work" for the fill but would
         // make `flat / top_k` index before the token array.
-        assert!(MOE_SRC.contains("int numel = (*valid_tokens) * top_k;"));
-        assert!(MOE_SRC.contains("sorted_token_ids[s] = numel;"));
+        // The tables are filled by the Rust dispatch; the C++ consumers test
+        // the sentinel.
+        let dispatch = crate::kernels::rust_kernel_source("dispatch_token");
+        assert!(dispatch.contains("let numel = *valid_tokens * top_k;"));
+        assert!(dispatch.contains("*sorted_token_ids.add(s as usize) = numel;"));
         assert!(MOE_SRC.contains("if (flat >= numel) return;"));
     }
 
     #[test]
     fn inactive_blocks_are_minus_one() {
-        assert!(MOE_SRC.contains("expert_ids[b] = -1;"));
+        assert!(
+            crate::kernels::rust_kernel_source("dispatch_token")
+                .contains("*expert_ids.add(b as usize) = -1;")
+        );
         assert!(MOE_SRC.contains("if (e < 0) return;"));
     }
 
@@ -6856,17 +6333,12 @@ mod tests {
         // reproducible run to run and cannot be compared exactly. Scoped to
         // the dispatch kernel's body rather than the whole source so that a
         // legitimate atomic elsewhere would not trip it.
-        let start = MOE_SRC
-            .find("void moe_align_block_size")
-            .expect("dispatch kernel present");
-        let end = MOE_SRC[start..]
-            .find("void moe_expert_ffn")
-            .expect("next kernel present")
-            + start;
-        assert!(
-            !MOE_SRC[start..end].contains("atomic"),
-            "the dispatch scatter must not use atomics; ordering is the contract",
-        );
+        for kernel in ["moe_align_block_size", "dispatch_token"] {
+            assert!(
+                !crate::kernels::rust_kernel_source(kernel).contains("atomic"),
+                "the dispatch scatter must not use atomics; ordering is the contract",
+            );
+        }
     }
 
     #[test]
@@ -6927,12 +6399,20 @@ mod tests {
         // owns, and the cross-lane butterfly that merges the lanes. The
         // second is what makes the selection independent of the reduction's
         // shape, which is the property the kernel's own comment rests on.
-        assert!(MOE_SRC.contains("if (p[i] > bv || (p[i] == bv && (bi < 0 || e < bi)))"));
-        assert!(MOE_SRC.contains("if (cv > bv || (cv == bv && ci >= 0 && (bi < 0 || ci < bi)))"));
+        let route = crate::kernels::rust_kernel_source("route_token");
+        assert!(route.contains("if p[0] > bv || (p[0] == bv && (bi < 0 || lane + 0 < bi)) {"));
+        assert!(route.contains("if p[15] > bv || (p[15] == bv && (bi < 0 || lane + 480 < bi)) {"));
+        assert!(route.contains("if cv > bv || (cv == bv && ci >= 0 && (bi < 0 || ci < bi)) {"));
         // And the mask that stops a selected expert being picked again must
-        // stay a predicated sweep, not a dynamic index: `p` is a register
-        // array, and indexing it by the winner spills it to local memory.
-        assert!(MOE_SRC.contains("if (bi >= 0 && lane + 32 * i == bi) p[i] = -1.0f;"));
+        // stay a predicated sweep over literal indices, not a dynamic index:
+        // `p` is a register array, and indexing it by the winner spills it to
+        // local memory.
+        assert!(
+            route.contains(
+                "if bi >= 0 && lane + 480 == bi {\n                        p[15] = -1.0;"
+            )
+        );
+        assert!(!route.contains("p[bi"));
     }
 
     #[test]

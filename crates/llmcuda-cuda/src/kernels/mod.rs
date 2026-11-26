@@ -27,8 +27,6 @@ pub mod layer_ops;
 pub mod lm_head;
 pub mod mma;
 pub mod moe;
-#[cfg(test)]
-mod rust_parity;
 pub mod vision;
 
 use std::collections::HashMap;
@@ -68,8 +66,9 @@ pub const TARGET_ARCH: &str = "compute_75";
 /// `dequantize_q6_k`, `vision_softmax_rows`, `vision_rope_qk`,
 /// `k2_rotary_prepare`, `moe_block_gate_and_combine`, `gdn_recurrent_step`,
 /// `gdn_norm_alpha_beta_gates`, `gdn_proj_f32`, `dec_final_scores` and
-/// `argmax_prob`, `swiglu_mul`, `sigmoid_gate_mul` and
-/// `attn_rope_partial_neox`. No kernel exists in both languages.
+/// `argmax_prob`, `swiglu_mul`, `sigmoid_gate_mul`, `attn_rope_partial_neox`,
+/// `moe_route`, `moe_dispatch_t1`, `moe_route_dispatch_t1` and
+/// `moe_align_block_size`. No kernel exists in both languages.
 ///
 /// The PTX is built with implicit multiply-add fusion off
 /// (`CUDA_OXIDE_NO_FMA`): a kernel fuses where its source says `mul_add` and

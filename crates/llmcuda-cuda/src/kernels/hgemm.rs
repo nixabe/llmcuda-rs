@@ -599,6 +599,7 @@ impl HgemmKernels {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, HgemmError> {
         let ptx = compile(HGEMM_SRC, "hgemm").map_err(HgemmError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         let sms = ctx.attribute(
             cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
         )? as usize;
@@ -608,7 +609,7 @@ impl HgemmKernels {
             bf16_256: module.load_function("hg_bf16_256")?,
             bf16_128: module.load_function("hg_bf16_128")?,
             to_half: module.load_function("hg_to_half")?,
-            reduce: module.load_function("hg_splitk_reduce")?,
+            reduce: rust.load_function("hg_splitk_reduce")?,
             q8_to_half_w: module.load_function("hg_q8_to_half_w")?,
             sms,
             library: None,

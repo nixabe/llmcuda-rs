@@ -248,37 +248,6 @@ __global__ void k2_project_grouped(const unsigned char* w, int quant, const floa
         if(threadIdx.x==0 && flats[b]<tokens*topk) out[(long long)flats[b]*rows+row]=acc[b];
     }
 }
-__global__ void k2_combine(const float* p,const float* w,float* out,int rows,int topk) {
-    int j=blockIdx.x*blockDim.x+threadIdx.x,t=blockIdx.y;if(j>=rows)return;
-    float a=0;for(int k=0;k<topk;++k) a+=p[((long long)t*topk+k)*rows+j]*w[t*topk+k];
-    out[(long long)t*rows+j]=a;
-}
-// k2_combine followed by the two adds it used to feed: ffn = routed + shared,
-// then out = x + ffn, each rounded as the separate tensor_add launches did.
-__global__ void k2_combine_residual(const float* p,const float* w,const float* shared,const float* x,float* ffn,float* out,int rows,int topk) {
-    int j=blockIdx.x*blockDim.x+threadIdx.x,t=blockIdx.y;if(j>=rows)return;
-    float a=0;for(int k=0;k<topk;++k) a+=p[((long long)t*topk+k)*rows+j]*w[t*topk+k];
-    long long i=(long long)t*rows+j;
-    float f=__fadd_rn(a,shared[i]);
-    ffn[i]=f;out[i]=__fadd_rn(x[i],f);
-}
-__global__ void k2_values(const float* projections, const float* weights, float* out, int rows, int topk) {
-    int j=blockIdx.x*blockDim.x+threadIdx.x, token=blockIdx.y;
-    if (j>=rows) return;
-    float acc=0.0f;
-    for (int k=0;k<topk;++k) {
-        float v=projections[((long long)token*topk+k)*rows+j];
-        acc += (v/(1.0f+expf(-v))) * weights[token*topk+k];
-    }
-    out[(long long)token*rows+j]=acc;
-}
-__global__ void k2_gate(const float* x, const float* gate, float* out, long long n) {
-    long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;
-    if(i>=n)return;
-    float v=gate[i]*0.6931471805599453f;
-    float sp=fmaxf(v,0.0f)+log1pf(expf(-fabsf(v)));
-    out[i]=x[i]*(sp*1.4426950408889634f);
-}
 }
 "#;
 

@@ -706,8 +706,11 @@ GPU 0, only the switch different, order rotated each round, box quiet; cells
 are round 0 / 1 / 2. Register counts are offline CUDA 12.8
 `ptxas -arch=sm_75`, not the driver's JIT.
 
-Every kernel that launches from Rust by default, against the all-C++ build,
-Qwen3.6:
+The layer-op, convolution and attention-helper kernels that launch from Rust,
+against the all-C++ build, Qwen3.6. The eleven small MoE, Gated DeltaNet, K2
+and decode-combine kernels moved afterwards are not in this table: they were
+held bit for bit and timed at kernel level only (level with NVRTC except
+`k2_values`, 2.7% slower at 2,048 tokens), with no model-level run.
 
 | N=3 | CUDA C++ tok/s | Rust default tok/s |
 | --- | --- | --- |

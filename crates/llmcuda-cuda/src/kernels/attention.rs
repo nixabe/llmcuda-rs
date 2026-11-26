@@ -2069,35 +2069,6 @@ __global__ void attn_flash_decode_split(
     }
 }
 
-// grid: (q_heads,). block: head_dim threads, one per output dimension.
-__global__ void attn_flash_decode_combine(
-    const float* __restrict__ part_acc,
-    const float* __restrict__ part_m,
-    const float* __restrict__ part_l,
-    float* __restrict__ out,
-    int q_heads,
-    int head_dim,
-    int n_splits
-) {
-    int h = blockIdx.x;
-    int d = threadIdx.x;
-
-    // Split 0 always holds at least key 0, so this is never -inf and the
-    // subtraction below never forms inf - inf.
-    float gm = neg_inf();
-    for (int s = 0; s < n_splits; ++s) gm = fmaxf(gm, part_m[s * q_heads + h]);
-
-    float num = 0.0f;
-    float den = 0.0f;
-    for (int s = 0; s < n_splits; ++s) {
-        float ms = part_m[s * q_heads + h];
-        float f = (ms == neg_inf()) ? 0.0f : expf(ms - gm);
-        num += f * part_acc[((long long)s * q_heads + h) * (long long)head_dim + d];
-        den += f * part_l[s * q_heads + h];
-    }
-    out[(long long)h * (long long)head_dim + d] = num / den;
-}
-
 // ---------------------------------------------------------------------------
 // Flash decoding on the tensor cores, with Q split into a fp16 high half and
 // a fp16 residual instead of the single fp16 rounding attn_flash_causal_mma

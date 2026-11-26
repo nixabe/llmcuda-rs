@@ -182,7 +182,7 @@ const STATE_JT: u32 = 4;
 const STATE_VLANES: u32 = 8;
 const STATE_JLANES: u32 = 32;
 
-pub(crate) const GDN_CHUNKED_SRC: &str = r#"
+const GDN_CHUNKED_SRC: &str = r#"
 extern "C" {
 
 // Sum across a block of up to 1024 threads. Identical to the recurrent
@@ -655,25 +655,6 @@ __global__ void gdn_scan_prefill(
     }
 }
 
-
-// `exp(log_decay)` for the whole pass, once.
-//
-// `gdn_scan_prefill` takes the exponential in every lane of every warp of a
-// head, on every token: `head_dim / SCAN_COLS` warps computing one scalar the
-// head shares. `gdn_scan_prefill_fold` reads it from here instead. The call
-// is the same `expf` on the same operand, so the decay is the same bits.
-//
-// grid: any. block: any.
-__global__ void gdn_scan_decay(
-    const float* __restrict__ log_decay,
-    float* __restrict__ decay,
-    long long n
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        decay[i] = expf(log_decay[i]);
-    }
-}
 
 // Four per-lane partial sums to four warp totals in six shuffles.
 //
@@ -2370,7 +2351,11 @@ mod tests {
         // kernel must not take one of its own, fast or otherwise.
         let fold = kernel_text("gdn_scan_prefill_fold");
         assert!(!fold.contains("expf("), "the folded scan reads its decay");
-        assert!(kernel_text("gdn_scan_decay").contains("decay[i] = expf(log_decay[i]);"));
+        // `gdn_scan_decay` is Rust; its `exp` is libdevice's, as `expf` is.
+        assert!(
+            crate::kernels::RUST_KERNELS_SRC
+                .contains("*decay.add(i as usize) = (*log_decay.add(i as usize)).exp();")
+        );
         assert!(kernel_text("gdn_scan_prelude").contains("decay_out[ht] = expf(log_decay[ht]);"));
         assert!(!GDN_CHUNKED_SRC.contains("__expf("));
     }

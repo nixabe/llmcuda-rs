@@ -1,4 +1,5 @@
-//! The engine's Rust CUDA kernels: layer ops and attention helpers.
+//! The engine's Rust CUDA kernels: layer ops and the small MoE, Gated
+//! DeltaNet, K2 and attention kernels.
 //!
 //! This is the only source for the kernels the engine launches from the
 //! embedded PTX; there is no CUDA C++ twin. Raw pointers keep the cudarc

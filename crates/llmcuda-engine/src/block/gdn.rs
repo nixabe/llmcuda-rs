@@ -1056,24 +1056,6 @@ __global__ void gdn_proj_f32(
     }
 }
 
-// out = silu(x), elementwise.
-//
-// `expf`, not `__expf`, for the same reason `layer_ops.rs` gives: the fast
-// intrinsic's error is relative to the result rather than to the exponent, and
-// this is not a bottleneck. The formula is `ggml_cuda_op_silu_single`'s
-// verbatim: x / (1 + exp(-x)).
-__global__ void gdn_silu(
-    const float* __restrict__ x,
-    float* __restrict__ out,
-    long long n
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        float v = x[i];
-        out[i] = v / (1.0f + expf(-v));
-    }
-}
-
 // Slice the convolved q/k/v stream apart. No broadcast: q and k come out at
 // their own 16 heads and the mixer kernels do `qk_head = h % qk_heads`.
 //
@@ -1263,68 +1245,6 @@ __global__ void gdn_conv_silu_split_step_batch(
         long long o = ((long long)t * qk_heads + h) * head_dim + d;
         q[o] = qv;
         k[o] = kv;
-    }
-}
-
-__global__ void gdn_split_qkv(
-    const float* __restrict__ conv,
-    float* __restrict__ q,
-    float* __restrict__ k,
-    float* __restrict__ v,
-    int head_dim,
-    int qk_heads,
-    int value_heads
-) {
-    int h = blockIdx.x;
-    int t = blockIdx.y;
-    int d = threadIdx.x;
-
-    int key_dim  = qk_heads * head_dim;
-    int conv_dim = 2 * key_dim + value_heads * head_dim;
-
-    const float* c = conv + (long long)t * conv_dim;
-
-    v[((long long)t * value_heads + h) * head_dim + d] =
-        c[2 * key_dim + h * head_dim + d];
-
-    if (h < qk_heads) {
-        long long o = ((long long)t * qk_heads + h) * head_dim + d;
-        q[o] = c[h * head_dim + d];
-        k[o] = c[key_dim + h * head_dim + d];
-    }
-}
-
-// The per-head decay and write gates.
-//
-//   a_softplus = softplus(alpha + ssm_dt.bias)
-//   log_decay  = a_softplus * ssm_a          <- already the log-decay
-//   beta       = sigmoid(beta_raw)
-//
-// `ssm_a` is stored already negated, so the product is the log of a decay in
-// (0, 1] and must not be negated again. The softplus is
-// `ggml_cuda_op_softplus`'s verbatim, including its x > 20 passthrough, which
-// matters because a lost passthrough overflows `expf` rather than saturating.
-//
-// grid-stride over tokens * heads.
-__global__ void gdn_gates(
-    const float* __restrict__ alpha,
-    const float* __restrict__ beta_raw,
-    const float* __restrict__ dt_bias,
-    const float* __restrict__ ssm_a,
-    float* __restrict__ a_softplus,
-    float* __restrict__ log_decay,
-    float* __restrict__ beta,
-    int heads,
-    long long n
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        int h = (int)(i % heads);
-        float a = alpha[i] + dt_bias[h];
-        float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
-        a_softplus[i] = sp;
-        log_decay[i] = sp * ssm_a[h];
-        beta[i] = 1.0f / (1.0f + expf(-beta_raw[i]));
     }
 }
 
@@ -5283,11 +5203,15 @@ mod tests {
         );
     }
 
-    /// Where a snippet starts in the kernel source, or a failure naming it.
-    fn at(needle: &str) -> usize {
-        GDN_BLOCK_SRC
-            .find(needle)
-            .unwrap_or_else(|| panic!("kernel source no longer contains `{needle}`"))
+    /// One kernel of the Rust source: `gdn_silu`, `gdn_split_qkv` and
+    /// `gdn_gates` have no CUDA C++ twin.
+    fn rust_kernel(name: &str) -> &'static str {
+        let src = llmcuda_cuda::kernels::RUST_KERNELS_SRC;
+        let start = src
+            .find(&format!("    pub unsafe fn {name}("))
+            .unwrap_or_else(|| panic!("the Rust source no longer has `{name}`"));
+        let end = src[start..].find("\n    }\n").expect("the kernel ends");
+        &src[start..start + end]
     }
 
     fn geometry() -> GdnGeometry {
@@ -5303,10 +5227,9 @@ mod tests {
         // appear. What this file must not do is re-introduce a broadcast on
         // top of that, which would pair every value head with query/key head
         // `(h % 16) % 16` at 2x the Gram work and *still* look correct.
-        let body =
-            &GDN_BLOCK_SRC[at("__global__ void gdn_split_qkv(")..at("__global__ void gdn_gates(")];
+        let body = rust_kernel("gdn_split_qkv");
         assert!(
-            body.contains("if (h < qk_heads) {"),
+            body.contains("if h < qk_heads as i64 {"),
             "the split no longer writes q and k at their own head count",
         );
         assert!(
@@ -5327,8 +5250,8 @@ mod tests {
         // negative — so `softplus(alpha + dt_bias) * ssm_a` *is* the log-decay.
         // A second negation makes the state grow instead of decay, which stays
         // finite over 19 tokens and diverges over a real context.
-        assert!(GDN_BLOCK_SRC.contains("log_decay[i] = sp * ssm_a[h];"));
-        let body = &GDN_BLOCK_SRC[at("__global__ void gdn_gates(")..];
+        let body = rust_kernel("gdn_gates");
+        assert!(body.contains("*log_decay.add(i as usize) = sp * *ssm_a.add(h);"));
         assert!(!body.contains("-ssm_a"), "ssm_a was negated a second time");
         assert!(!body.contains("-sp *"), "the softplus was negated");
     }
@@ -5338,7 +5261,10 @@ mod tests {
         // `ggml_cuda_op_softplus` is `(x > 20) ? x : log(1 + exp(x))`. Dropping
         // the branch overflows `expf` at x > 88 and returns inf rather than
         // saturating, which would poison every subsequent decay.
-        assert!(GDN_BLOCK_SRC.contains("float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));"));
+        assert!(
+            rust_kernel("gdn_gates")
+                .contains("let sp = if a > 20.0 { a } else { (1.0 + a.exp()).ln() };")
+        );
     }
 
     #[test]
@@ -5457,5 +5383,3 @@ mod tests {
 
 #[cfg(test)]
 mod normalization_tests;
-#[cfg(test)]
-mod rust_parity;

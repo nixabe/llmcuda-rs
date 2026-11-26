@@ -3394,28 +3394,6 @@ __global__ void moe_expert_ffn_mma_q8(
 }
 
 
-// SwiGLU for the shared expert's tensor-core path.
-//
-// The fp32 shared-expert kernel fuses this into its epilogue; the tensor-core
-// path cannot, because `mma_q8_0_proj_split` is a projection and knows nothing
-// about what its output feeds. One elementwise pass over `[max_tokens]
-// [intermediate]` is a rounding error against the two projections it sits
-// between.
-//
-// `x / (1 + exp(-x))`, exactly as `llmcuda_kernels::norm::silu` and the fp32
-// kernel above write it — not the algebraically equal `x * sigmoid(x)`.
-__global__ void moe_swiglu(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    long long n,
-    float* __restrict__ out
-) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g = gate[i];
-    out[i] = (g / (1.0f + expf(-g))) * up[i];
-}
-
 // The shared expert at one token, for the same reason as
 // `moe_expert_ffn_gemv`: at this shape the tiled kernel's staging and barriers
 // buy nothing, because each dequantized weight is multiplied once.
@@ -4051,39 +4029,6 @@ MOE_FUSED_DOWN_ENTRY(moe_fused_down_flat_t##TT##_q8_q8,   TT, MOE_FLAT_DOWN_ARGS
 MOE_FUSED_FLAT_WIDTH(2)
 MOE_FUSED_FLAT_WIDTH(3)
 MOE_FUSED_FLAT_WIDTH(4)
-
-// -------------------------------------------------------------------------
-// 4. fp32 weighted sum of each token's top-k contributions.
-// -------------------------------------------------------------------------
-//
-// grid: max_tokens. Ascending k, matching the reference's per-token loop.
-// grid: (max_tokens, ceil(hidden / THREADS)).
-//
-// The second grid dimension is the whole point at one token. A block per
-// token means *one block* on a 72-SM card summing eight 2,048-float vectors:
-// 72 KiB of traffic in 5.2 us, which is 14 GB/s and entirely the launch's
-// own latency. Splitting the row gives the same work eight blocks.
-//
-// The k loop stays ascending and stays inside one thread, so the summation
-// order is untouched — the routed contributions of one expert are added in
-// selection order exactly as the reference adds them.
-__global__ void moe_reduce(
-    const float* __restrict__ partial,
-    const int* __restrict__ valid_tokens,
-    int top_k,
-    int hidden,
-    float* __restrict__ out
-) {
-    int token = blockIdx.x;
-    if (token >= *valid_tokens) return;
-    int h = blockIdx.y * blockDim.x + threadIdx.x;
-    if (h >= hidden) return;
-    float acc = 0.0f;
-    for (int k = 0; k < top_k; ++k) {
-        acc += partial[((long long)token * top_k + k) * hidden + h];
-    }
-    out[(long long)token * hidden + h] = acc;
-}
 
 // -------------------------------------------------------------------------
 // 5. The shared expert, hoisted out of the routed path.

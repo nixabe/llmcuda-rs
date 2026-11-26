@@ -27,8 +27,6 @@ pub mod layer_ops;
 pub mod lm_head;
 pub mod mma;
 pub mod moe;
-#[cfg(test)]
-mod rust_parity;
 pub mod vision;
 
 use std::collections::HashMap;
@@ -52,7 +50,10 @@ pub const TARGET_ARCH: &str = "compute_75";
 ///
 /// Rust only: `tensor_add`, `softplus_elementwise`, `rope_partial`,
 /// `rms_norm_rows`, `rms_norm_swiglu_rows`, `rms_norm_swiglu_q8_rows`, the
-/// four `conv1d_*` kernels, `attn_split_query_gate` and `attn_row_positions`.
+/// four `conv1d_*` kernels, `attn_split_query_gate`, `attn_row_positions`,
+/// `attn_flash_decode_combine`, `moe_swiglu`, `moe_reduce`, `gdn_silu`,
+/// `gdn_split_qkv`, `gdn_gates`, `gdn_scan_decay`, `k2_combine`,
+/// `k2_combine_residual`, `k2_values` and `k2_gate`.
 ///
 /// Both languages: `sigmoid_gate_mul` launches from here in its elementwise
 /// shape and `attn_rope_partial_neox` on small grids. Their other shapes, and

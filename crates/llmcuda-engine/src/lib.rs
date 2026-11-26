@@ -21,6 +21,7 @@ pub mod dflash;
 pub mod engine;
 pub mod forward;
 pub mod image;
+pub mod inkling;
 pub(crate) mod prefix;
 pub mod router;
 pub mod runtime;

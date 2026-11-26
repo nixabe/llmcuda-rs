@@ -65,7 +65,7 @@ const EMBED_THREADS: u32 = 256;
 /// `ggml_concat(.., dim = 0)`, e_norm first. One module because NVRTC
 /// compiles from a string with no include path and no cross-string linking,
 /// same reason `forward.rs`'s `EMBED_SRC` is inline.
-pub(crate) const MTP_GLUE_SRC: &str = r#"
+const MTP_GLUE_SRC: &str = r#"
 extern "C" {
 
 __device__ __forceinline__ float load_half_le(const unsigned char* p) {
@@ -95,25 +95,6 @@ __global__ void mtp_embed_q8_0(
         float d = load_half_le(blk);
         signed char q = (signed char)blk[2 + (j % 32)];
         dst[j] = d * (float)q;
-    }
-}
-
-// grid: (n_tokens). block: EMBED_THREADS, striding 2*hidden.
-__global__ void mtp_concat_eh(
-    const float* __restrict__ e_norm,
-    const float* __restrict__ h_norm,
-    float* __restrict__ out,
-    int hidden,
-    int n_tokens
-) {
-    int t = blockIdx.x;
-    if (t >= n_tokens) return;
-    const float* e = e_norm + (long long)t * hidden;
-    const float* h = h_norm + (long long)t * hidden;
-    float* dst = out + (long long)t * 2 * hidden;
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        dst[j] = e[j];
-        dst[hidden + j] = h[j];
     }
 }
 

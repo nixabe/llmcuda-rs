@@ -168,7 +168,7 @@ const ARGMAX_THREADS: u32 = 256;
 /// 970.
 pub const ARGMAX_BLOCKS: usize = 512;
 
-pub(crate) const LM_HEAD_SRC: &str = r#"
+const LM_HEAD_SRC: &str = r#"
 #define ARGMAX_THREADS 256
 #define LM_HEAD_STAGE_BLOCKS 16
 #define LM_HEAD_STAGE_U4 ((LM_HEAD_STAGE_BLOCKS * 34) / 16)
@@ -1112,38 +1112,6 @@ __device__ __forceinline__ void argmax_reduce_block(float& bv, int& bi) {
             argmax_merge(bv, bi, sv[w], si[w]);
         }
     }
-}
-
-extern "C" __global__ void argmax_partial(
-    const float* __restrict__ x,
-    int n,
-    float* __restrict__ pv,
-    int* __restrict__ pi
-) {
-    float bv = x[0];
-    int   bi = 0;
-    for (int i = blockIdx.x * ARGMAX_THREADS + threadIdx.x;
-         i < n;
-         i += gridDim.x * ARGMAX_THREADS) {
-        argmax_merge(bv, bi, x[i], i);
-    }
-    argmax_reduce_block(bv, bi);
-    if (threadIdx.x == 0) { pv[blockIdx.x] = bv; pi[blockIdx.x] = bi; }
-}
-
-extern "C" __global__ void argmax_final(
-    const float* __restrict__ pv,
-    const int* __restrict__ pi,
-    int n,
-    int* __restrict__ out
-) {
-    float bv = pv[0];
-    int   bi = pi[0];
-    for (int i = threadIdx.x; i < n; i += ARGMAX_THREADS) {
-        argmax_merge(bv, bi, pv[i], pi[i]);
-    }
-    argmax_reduce_block(bv, bi);
-    if (threadIdx.x == 0) out[0] = bi;
 }
 
 // Softmax probability of the row's maximum: p = 1 / sum(exp(x - max)).

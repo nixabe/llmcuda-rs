@@ -66,7 +66,7 @@ const EMBED_THREADS: u32 = 256;
 /// lookup `block/mtp.rs`'s `mtp_embed_q8_0` performs (and is tested
 /// through). Duplicated because NVRTC compiles from a string with no
 /// cross-string linking.
-pub(crate) const DFLASH_GLUE_SRC: &str = r#"
+const DFLASH_GLUE_SRC: &str = r#"
 extern "C" {
 
 __device__ __forceinline__ float load_half_le(const unsigned char* p) {
@@ -96,25 +96,6 @@ __global__ void dflash_embed_q8_0(
         float d = load_half_le(blk);
         signed char q = (signed char)blk[2 + (j % 32)];
         dst[j] = d * (float)q;
-    }
-}
-
-// One target-layer tap into the concatenated feature rows:
-// aux[row][tap*hidden + j] = src[row][j]. grid: (rows), block strides hidden.
-__global__ void dflash_tap(
-    const float* __restrict__ src,
-    float* __restrict__ aux,
-    int hidden,
-    int taps,
-    int tap,
-    int rows
-) {
-    int r = blockIdx.x;
-    if (r >= rows) return;
-    const float* s = src + (long long)r * hidden;
-    float* d = aux + ((long long)r * taps + tap) * hidden;
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        d[j] = s[j];
     }
 }
 

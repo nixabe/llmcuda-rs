@@ -53,7 +53,7 @@ pub const HGEMM_BM: usize = 128;
 /// Contraction elements per stage; also the Q8_0 block, so one scale a row.
 pub const HGEMM_BK: usize = 32;
 
-pub(crate) const HGEMM_SRC: &str = r#"
+const HGEMM_SRC: &str = r#"
 #define HG_BM 128
 #define HG_BK 32
 #define HG_GROUP 4
@@ -375,28 +375,6 @@ extern "C" __global__ void hg_q8_to_half_w(const signed char* __restrict__ wq,
     unsigned lo, hi;
     hg_dequant4(q, sc | (sc << 16), lo, hi);
     *(uint2*)(w16 + i) = make_uint2(lo, hi);
-}
-
-extern "C" __global__ void hg_splitk_reduce(
-    const float* __restrict__ part, float* __restrict__ out,
-    int M, int N, int ldo, int splits, int accumulate) {
-    const long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 2;
-    const long long mn = (long long)M * N;
-    if (i >= mn) return;
-    const long long m = i / N, n = i % N;
-    float2 v = *(const float2*)(part + i);
-    for (int z = 1; z < splits; ++z) {
-        const float2 p = *(const float2*)(part + z * mn + i);
-        v.x += p.x;
-        v.y += p.y;
-    }
-    float2* o = (float2*)(out + m * ldo + n);
-    if (accumulate) {
-        const float2 prior = *o;
-        v.x = prior.x + v.x;
-        v.y = prior.y + v.y;
-    }
-    *o = v;
 }
 
 HG_ENTRY(hg_q8_256, 0, 64, 1)

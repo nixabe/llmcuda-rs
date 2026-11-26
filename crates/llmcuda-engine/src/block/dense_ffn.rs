@@ -239,28 +239,8 @@ pub const DENSE_REPACK_INT8: bool = true;
 /// exactly the thing `tests/forward_pass.rs` checks for. So the token bound
 /// comes from the same `valid_tokens` device scalar the MoE kernels gate on,
 /// and the launch shape comes from the geometry — AGENTS.md rule 5.
-pub(crate) const GLUE_SRC: &str = r#"
+const GLUE_SRC: &str = r#"
 extern "C" {
-
-// l_out[t][j] = ffn_out[t][j] + residual[t][j], for live t only.
-//
-// The row is split over `gridDim.y` blocks for the same reason the MoE
-// combine's is: one block per token would put a 20 KiB row on one SM.
-__global__ void dense_ffn_add_residual(
-    const float* __restrict__ ffn_out,
-    const float* __restrict__ residual,
-    const int* __restrict__ valid_tokens,
-    int hidden,
-    float* __restrict__ l_out) {
-    int t = blockIdx.x;
-    if (t >= *valid_tokens) return;
-
-    long long base = (long long)t * hidden;
-    int stride = gridDim.y * blockDim.x;
-    for (int j = blockIdx.y * blockDim.x + threadIdx.x; j < hidden; j += stride) {
-        l_out[base + j] = ffn_out[base + j] + residual[base + j];
-    }
-}
 
 // The post-mixer RMSNorm, emitting both widths in one pass.
 //
@@ -1536,8 +1516,11 @@ mod tests {
         // AGENTS.md rule 5: no launch on this path may be bounded by a count
         // the host passed by value.
         assert!(GLUE_SRC.contains("const int* __restrict__ valid_tokens"));
-        assert!(GLUE_SRC.contains("if (t >= *valid_tokens) return;"));
         assert!(!GLUE_SRC.contains("int live_tokens"));
+        // The residual add is Rust; it reads the same device-side count.
+        let add = rust_add_residual();
+        assert!(add.contains("valid_tokens: *const i32,"));
+        assert!(add.contains("if t >= *valid_tokens as i64 {"));
     }
 
     #[test]
@@ -1545,7 +1528,19 @@ mod tests {
         // The dense counterpart of the MoE block's same check: folding the
         // residual into `ffn_out` would still give the right `l_out` and
         // would fail the golden's intermediate waypoint.
-        assert!(GLUE_SRC.contains("l_out[base + j] = ffn_out[base + j] + residual[base + j];"));
+        assert!(
+            rust_add_residual().contains("*l_out.add(at) = *ffn_out.add(at) + *residual.add(at);")
+        );
+    }
+
+    /// `dense_ffn_add_residual`, which has no CUDA C++ twin.
+    fn rust_add_residual() -> &'static str {
+        let src = llmcuda_cuda::kernels::RUST_KERNELS_SRC;
+        let start = src
+            .find("    pub unsafe fn dense_ffn_add_residual(")
+            .expect("the Rust source has the residual add");
+        let end = src[start..].find("\n    }\n").expect("the kernel ends");
+        &src[start..start + end]
     }
 
     /// The two copies of the split-layout projection GEMV read the weights

@@ -14,22 +14,6 @@ pub(crate) const K2_ROUTED_TILE: usize = 64;
 
 const SRC: &str = r#"
 extern "C" {
-__global__ void k2_norm(const float* x, const float* w, float* y, int width, int groups, float eps) {
-    int g = blockIdx.x % groups, token = blockIdx.x / groups, part = width / groups;
-    long long base = (long long)token * width + g * part;
-    float acc = 0.0f;
-    for (int j = threadIdx.x; j < part; j += blockDim.x) acc += x[base+j] * x[base+j];
-    for (int d = 16; d > 0; d >>= 1) acc += __shfl_down_sync(0xffffffff, acc, d);
-    __shared__ float sums[8];
-    if ((threadIdx.x & 31) == 0) sums[threadIdx.x >> 5] = acc;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float sum = 0.0f; for (int i = 0; i < 8; ++i) sum += sums[i];
-        sums[0] = 1.0f / sqrtf(sum / part + eps);
-    }
-    __syncthreads();
-    for (int j = threadIdx.x; j < part; j += blockDim.x) y[base+j] = (x[base+j] * sums[0]) * w[g*part+j];
-}
 // Parallel score evaluation and stable argmax. Equal scores select the lowest
 // expert index, as in the scalar scan. Lane zero retains the scalar top-k sum
 // order, so changing the reduction does not change the combine weights.
@@ -199,29 +183,6 @@ __global__ void k2_dispatch(const int* ids, int* sorted, int* owners,
     int end=starts[e]+(counts[e]+tile-1)/tile*tile;
     for(int f=cursor;f<end;++f) sorted[f]=pairs;
     for(int f=starts[e];f<end;f+=tile) owners[f/tile]=e;
-}
-// Each lane owns a contiguous slice of flat ids. The prefix of lane counts
-// keeps the original route order without host counts or atomic scatter.
-__global__ void k2_dispatch_count(const int* ids,int* counts,int pairs) {
-    int e=blockIdx.x,t=threadIdx.x,chunk=(pairs+127)/128;
-    int n=0;for(int f=t*chunk;f<min((t+1)*chunk,pairs);++f)n+=ids[f]==e;
-    counts[e*128+t]=n;
-}
-__global__ void k2_dispatch_prefix(const int* counts,int* starts,int* owners,int experts,int capacity,int tile) {
-    __shared__ int totals[128];int t=threadIdx.x,n=0;
-    if(t<experts)for(int j=0;j<128;++j)n+=counts[t*128+j];
-    totals[t]=(n+tile-1)/tile*tile;
-    for(int b=t;b<capacity;b+=128)owners[b]=-1;
-    __syncthreads();int start=0;for(int e=0;e<t;++e)start+=totals[e];
-    if(t<experts){starts[t]=start;for(int f=start;f<start+totals[t];f+=tile)owners[f/tile]=t;}
-}
-__global__ void k2_dispatch_gather(const int* ids,const int* counts,const int* starts,int* sorted,int pairs,int tile) {
-    int e=blockIdx.x,t=threadIdx.x,chunk=(pairs+127)/128;
-    __shared__ int prefix[128];prefix[t]=counts[e*128+t];__syncthreads();
-    for(int d=1;d<128;d*=2){int v=t>=d ? prefix[t-d] : 0;__syncthreads();prefix[t]+=v;__syncthreads();}
-    int total=prefix[127],cursor=starts[e]+prefix[t]-counts[e*128+t];
-    for(int f=t*chunk;f<min((t+1)*chunk,pairs);++f)if(ids[f]==e)sorted[cursor++]=f;
-    for(int f=total+t;f<(total+tile-1)/tile*tile;f+=128)sorted[starts[e]+f]=pairs;
 }
 __global__ void k2_project_grouped(const unsigned char* w, int quant, const float* x,
                                   const int* sorted, const int* owners, float* out,

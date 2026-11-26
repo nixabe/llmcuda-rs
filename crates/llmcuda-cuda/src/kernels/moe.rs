@@ -2230,41 +2230,6 @@ __global__ void moe_route_dispatch_t1(
 }
 
 
-__global__ void moe_align_count(
-    const int* __restrict__ topk_ids,
-    const int* __restrict__ valid_tokens,
-    int top_k,
-    int sorted_capacity,
-    int expert_capacity,
-    int* __restrict__ sorted_token_ids,
-    int* __restrict__ expert_ids,
-    int* __restrict__ counts
-) {
-    int* scratch = (int*)llmcuda_shared;
-    int numel = (*valid_tokens) * top_k;
-    int e = blockIdx.x;
-    int tid = threadIdx.x;
-
-    int gtid = blockIdx.x * blockDim.x + tid;
-    int gstride = gridDim.x * blockDim.x;
-    for (int s = gtid; s < sorted_capacity; s += gstride) sorted_token_ids[s] = numel;
-    for (int b = gtid; b < expert_capacity; b += gstride) expert_ids[b] = -1;
-
-    int c = 0;
-    for (int i = tid; i < numel; i += blockDim.x) {
-        if (topk_ids[i] == e) ++c;
-    }
-    scratch[tid] = c;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s) scratch[tid] += scratch[tid + s];
-        __syncthreads();
-    }
-    // Integer addition is associative, so the tree order here cannot change
-    // the count the way it would change a float sum.
-    if (tid == 0) counts[e] = scratch[0];
-}
-
 // grid: (num_experts, 1, 1). Block `e` places expert `e`'s tokens.
 //
 // **The ordering guarantee is why the cursor is not an atomic counter.**

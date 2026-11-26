@@ -707,10 +707,11 @@ are round 0 / 1 / 2. Register counts are offline CUDA 12.8
 `ptxas -arch=sm_75`, not the driver's JIT.
 
 The layer-op, convolution and attention-helper kernels that launch from Rust,
-against the all-C++ build, Qwen3.6. The eleven small MoE, Gated DeltaNet, K2
-and decode-combine kernels moved afterwards are not in this table: they were
+against the all-C++ build, Qwen3.6. The 22 small MoE, Gated DeltaNet, K2,
+sampling and glue kernels moved afterwards are not in this table: they were
 held bit for bit and timed at kernel level only (level with NVRTC except
-`k2_values`, 2.7% slower at 2,048 tokens), with no model-level run.
+`k2_values`, 2.7% slower at 2,048 tokens, and the K2 dispatch passes, 0.5 us
+slower a step), with no model-level run.
 
 | N=3 | CUDA C++ tok/s | Rust default tok/s |
 | --- | --- | --- |
@@ -1403,6 +1404,7 @@ Each row gives the decisive measurement and why it lost.
 | A parallel second shuffle reduction in Rust RMSNorm | Faster than NVRTC at narrow rows (fused 96 × 128 gained **4.8–11.9%**), but it adds the warp partials in a different order from `block_reduce_sum`, and the fused Gated DeltaNet kernels are compared to these norms with no tolerance. With it active five tests failed by one ulp: the normalized-gate consumer, the chunked-prefill decay check, both `gdn_tail_differential` quantization comparisons and wide repacked verify/rollback. Replaced by a port that reduces in the original's order. A faster reduction has to change every kernel that shares the order at once. |
 | Transcribing the convolution's register staging array and per-tap index into Rust | Bit-identical, but six alternating GPU 0 pairs on a 2,048-token chunk: **282.69 us NVRTC vs 407.78 us Rust (28.1–30.7% lower throughput)**, and the three-sequence step lost **13.7–14.7%**. cuda-oxide keeps the `[f32; 8]` array in local memory and emits a 64-bit multiply per tap where NVRTC does neither. Walking pointers and shifting the cache oldest slot first, with no staging, reads the same values: **296.9–304.8 vs 294.9–302.4 us**. `ld.global.nc` loads through inline PTX were tried first and moved it by about two points. |
 | Letting cuda-oxide fuse multiply-adds in the Rust kernels | Its default passes `-fp-contract=fast` to llc, which turned the convolution's `acc + x * w` into `fma.rn.f32`; the CUDA C++ kernel denies that with `__fadd_rn(acc, __fmul_rn(...))` to stay bit-identical to the scalar reference. Built with `CUDA_OXIDE_NO_FMA=1`; a port writes `mul_add` where NVRTC fuses the original. |
+| Moving `gdn_proj_f32` to Rust | Bit-identical and level at 2,048 tokens, but at one and three tokens **5.84–5.97 us Rust vs 4.26–4.40 us NVRTC** (six alternating pairs of 100 launches, 2,048 → 32 rows). NVRTC unrolls the 64-step strided contraction; cuda-oxide does not, and walking pointers instead of indexing changed nothing. The kernel stays CUDA C++. |
 | Updating cuda-oxide (0.2.1 `26754ae5` → 0.4.0 `f35d6ccc`) to speed up the Rust ports | Same source, both artifacts built with `rust-kernels`, three rotated rounds on GPU 0: N=3 decode **219.9 / 219.6 / 219.7 old vs 219.1 / 219.7 / 219.8 new** at 2K and **166.3 / 166.4 / 166.5 vs 166.2 / 160.8 (one stalled step) / 166.9** at 32K; 2,048-token prefill **3664.95 / 3653.32 / 3671.36 vs 3664.85 / 3673.64 / 3670.55**. The PTX differs by three instructions and four registers in total: the new unroller does not touch grid-stride loops. The update is kept for the supported toolchain (stable Rust 1.99.1, the `NVIDIA/cuda-rust` home), not for speed. `cutile-rs` in the same repository still excludes sm_75 and was not run. |
 | Promoting the optimized eight-port Rust bundle to the default backend | Three alternating Qwen3.6 GPU 1 N=3/2K pairs: **−0.05% to +0.05% decode**, **−0.35% to +0.09% prefill**, despite narrow wins for the fused GDN norm and key RoPE. Query RoPE and generic fused hidden-width normalization still lose narrow gates. `rust-kernels` stays opt-in. |
 | Removing a Rust RMSNorm barrier by repeating the serial warp-partial sum in every warp | Six alternating GPU 1 pairs vs NVRTC: hidden-width RMSNorm loses **11.4–12.7%** at 3 × 2,048 and **9.7–11.2%** at 1,536 × 2,048. Up to 32 repeated dependent additions per warp cost more than the barrier. The barrier stays, with thread 0 adding the warp totals as `block_reduce_sum` does. |

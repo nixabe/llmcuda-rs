@@ -820,6 +820,13 @@ impl Drop for DeviceRuntimeHandle {
 }
 
 impl DeviceRuntime {
+    // An unoptimized build of this function keeps every pass, cache and
+    // drafter it constructs in its own frame slot before moving it into
+    // `Self`, about 0.8 MB in all. It runs once, on the thread that starts
+    // the device, and the engine is built and tested in release, where the
+    // moves are elided. `unknown_lints` because the lint is newer than some
+    // nightlies this workspace is still built with.
+    #[allow(unknown_lints, clippy::large_unopt_stack_frames)]
     pub fn load(
         device_ordinal: usize,
         model_path: &Path,

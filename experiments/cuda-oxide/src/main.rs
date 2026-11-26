@@ -5299,6 +5299,91 @@ mod kernels {
             kv8_store(v_cache, vq8, pos, row, e, *vrow.add(du));
         }
     }
+
+    /// Quantize fp32 activations to int8 a 32-element block at a time: each
+    /// block's scale is its largest magnitude over 127, and a code is the
+    /// element times `127 / amax`, rounded to nearest even and clamped to
+    /// +-127. An all-zero block gets scale 1 and zero codes.
+    ///
+    /// grid: (rows, ceil(k_dim / 32 / blockDim.y)). block: (32, warps): a
+    /// warp is one block.
+    ///
+    /// # Safety
+    /// x and q cover rows * k_dim elements; scales covers rows * k_dim / 32.
+    /// k_dim is a multiple of 32.
+    #[kernel]
+    pub unsafe fn mma_quantize_rows_q8(x: *const f32, q: *mut i8, scales: *mut f32, k_dim: i32) {
+        let row = thread::blockIdx_x() as i64;
+        let block = (thread::blockIdx_y() * thread::blockDim_y() + thread::threadIdx_y()) as i32;
+        let lane = thread::threadIdx_x() as usize;
+        let blocks = k_dim / 32;
+        if block >= blocks {
+            return;
+        }
+        unsafe {
+            let base = (row * k_dim as i64 + (block * 32) as i64) as usize;
+            let v = *x.add(base + lane);
+            let mut a = v.abs();
+            let mut off = 16;
+            while off > 0 {
+                a = a.max(warp::shuffle_xor_f32_sync(u32::MAX, a, off));
+                off >>= 1;
+            }
+            let d = if a > 0.0 { a / 127.0 } else { 1.0 };
+            let inv = if a > 0.0 { 127.0 / a } else { 0.0 };
+            let qi = (v * inv).round_ties_even() as i32;
+            let qi = if qi < -127 { -127 } else if qi > 127 { 127 } else { qi };
+            *q.add(base + lane) = qi as i8;
+            if lane == 0 {
+                *scales.add((row * blocks as i64 + block as i64) as usize) = d;
+            }
+        }
+    }
+
+    /// Split GGUF Q8_0 blocks (a binary16 scale and 32 int8 codes) into a
+    /// contiguous code array and fp32 scales.
+    ///
+    /// grid: ceil(n_blocks / blockDim.y). block: (32, warps).
+    ///
+    /// # Safety
+    /// src covers n_blocks * 34 bytes, q n_blocks * 32, scales n_blocks.
+    #[kernel]
+    pub unsafe fn mma_repack_q8_0(src: *const u8, q: *mut i8, scales: *mut f32, n_blocks: i64) {
+        let b = thread::blockIdx_x() as i64 * thread::blockDim_y() as i64
+            + thread::threadIdx_y() as i64;
+        if b >= n_blocks {
+            return;
+        }
+        let lane = thread::threadIdx_x() as usize;
+        unsafe {
+            let blk = src.add((b * 34) as usize);
+            *q.add((b * 32) as usize + lane) = *blk.add(2 + lane) as i8;
+            if lane == 0 {
+                *scales.add(b as usize) = load_half_le(blk);
+            }
+        }
+    }
+
+    /// `mma_repack_q8_0` keeping the scales as binary16 bits.
+    ///
+    /// # Safety
+    /// As `mma_repack_q8_0`, scales covering n_blocks halves.
+    #[kernel]
+    pub unsafe fn mma_repack_q8_0_h(src: *const u8, q: *mut i8, scales: *mut u16, n_blocks: i64) {
+        let b = thread::blockIdx_x() as i64 * thread::blockDim_y() as i64
+            + thread::threadIdx_y() as i64;
+        if b >= n_blocks {
+            return;
+        }
+        let lane = thread::threadIdx_x() as usize;
+        unsafe {
+            let blk = src.add((b * 34) as usize);
+            *q.add((b * 32) as usize + lane) = *blk.add(2 + lane) as i8;
+            if lane == 0 {
+                *scales.add(b as usize) = *blk as u16 | ((*blk.add(1) as u16) << 8);
+            }
+        }
+    }
 }
 
 fn main() {}

@@ -3501,13 +3501,13 @@ impl AttentionKernels {
         #[cfg(not(feature = "rust-kernels"))]
         let migrated = &module;
         Ok(Self {
-            split: module.load_function("attn_split_query_gate")?,
+            split: rust.load_function("attn_split_query_gate")?,
             rope: migrated.load_function("attn_rope_partial_neox")?,
             rope_small: rust.load_function("attn_rope_partial_neox")?,
             rope_imrope: module.load_function("attn_rope_partial_imrope")?,
             flash: module.load_function("attn_flash_causal")?,
             flash_gqa: module.load_function("attn_flash_causal_gqa")?,
-            row_positions: module.load_function("attn_row_positions")?,
+            row_positions: rust.load_function("attn_row_positions")?,
             flash_mma: {
                 let f = module.load_function("attn_flash_causal_mma")?;
                 // Ask for the >48 KiB carveout before the first launch. Turing

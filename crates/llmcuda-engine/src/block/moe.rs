@@ -269,7 +269,7 @@ pub(crate) const RMS_EPS_SUFFIX: &str = "attention.layer_norm_rms_epsilon";
 /// Every launch shape here comes from the geometry and the token count lives
 /// in the same `valid_tokens` device scalar the MoE kernels already gate on,
 /// so adding these does not cost the sequence its capturability.
-const GLUE_SRC: &str = r#"
+pub(crate) const GLUE_SRC: &str = r#"
 #define MOE_GATE_LANES 256
 extern "C" {
 

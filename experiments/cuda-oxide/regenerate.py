@@ -44,6 +44,8 @@ if ".target sm_75\n" not in ptx or any(
         "gdn_chunk_normalize_qk", "dense_rms_norm_narrow", "dec_layer_norm",
         "dequantize_q6_k", "vision_softmax_rows", "vision_rope_qk",
         "k2_rotary_prepare", "moe_block_gate_and_combine",
+        "gdn_proj_f32", "dec_final_scores", "gdn_norm_alpha_beta_gates",
+        "gdn_recurrent_step", "argmax_prob",
     )
 ):
     raise SystemExit("compiler output has the wrong target or entry point")

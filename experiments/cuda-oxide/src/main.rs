@@ -2691,10 +2691,29 @@ mod kernels {
             let xs = normed.add(base);
             let mut s = 0.0f32;
             if tid < 256 {
+                // NVRTC contracts the original's s += w[j] * xs[j]. Eight
+                // steps an iteration, loads first, so they issue together.
                 let mut j = tid;
+                let (mut wp, mut xp) = (w.add(tid as usize), xs.add(tid as usize));
+                while j + 1792 < hidden {
+                    let a = (*wp.add(0), *wp.add(256), *wp.add(512), *wp.add(768), *wp.add(1024), *wp.add(1280), *wp.add(1536), *wp.add(1792));
+                    let b = (*xp.add(0), *xp.add(256), *xp.add(512), *xp.add(768), *xp.add(1024), *xp.add(1280), *xp.add(1536), *xp.add(1792));
+                    s = a.0.mul_add(b.0, s);
+                    s = a.1.mul_add(b.1, s);
+                    s = a.2.mul_add(b.2, s);
+                    s = a.3.mul_add(b.3, s);
+                    s = a.4.mul_add(b.4, s);
+                    s = a.5.mul_add(b.5, s);
+                    s = a.6.mul_add(b.6, s);
+                    s = a.7.mul_add(b.7, s);
+                    wp = wp.wrapping_add(2048);
+                    xp = xp.wrapping_add(2048);
+                    j += 2048;
+                }
                 while j < hidden {
-                    // NVRTC contracts the original's s += w[j] * xs[j].
-                    s = (*w.add(j as usize)).mul_add(*xs.add(j as usize), s);
+                    s = (*wp).mul_add(*xp, s);
+                    wp = wp.wrapping_add(256);
+                    xp = xp.wrapping_add(256);
                     j += 256;
                 }
             }
@@ -2705,15 +2724,25 @@ mod kernels {
             }
 
             let pbase = partial.add((t * top_k as i64 * hidden as i64) as usize);
-            let step = (thread::gridDim_y() * thread::blockDim_x()) as i32;
+            let stride = (thread::gridDim_y() * thread::blockDim_x()) as i32;
             let mut j = (thread::blockIdx_y() * thread::blockDim_x()) as i32 + tid;
             while j < hidden {
                 let mut p = pbase.add(j as usize);
                 let mut r = 0.0f32;
                 let mut k = 0;
+                let step = hidden as usize;
+                while k + 3 < top_k {
+                    let v = (*p, *p.add(step), *p.add(2 * step), *p.add(3 * step));
+                    r += v.0;
+                    r += v.1;
+                    r += v.2;
+                    r += v.3;
+                    p = p.wrapping_add(4 * step);
+                    k += 4;
+                }
                 while k < top_k {
                     r += *p;
-                    p = p.wrapping_add(hidden as usize);
+                    p = p.wrapping_add(step);
                     k += 1;
                 }
                 let at = base + j as usize;
@@ -2721,7 +2750,637 @@ mod kernels {
                 *routed.add(at) = r;
                 *ffn_out.add(at) = v;
                 *l_out.add(at) = v + *residual.add(at);
-                j += step;
+                j += stride;
+            }
+        }
+    }
+
+    /// A dense fp32 projection for the Gated DeltaNet gates: one warp per
+    /// output row, each lane contracting every 32nd element in ascending
+    /// order, then an xor shuffle tree.
+    ///
+    /// The contraction is unrolled by hand, four fused steps an iteration:
+    /// the compiler does not unroll it, and the single-step loop is a third
+    /// slower at decode sizes. The order of the fused additions is unchanged.
+    ///
+    /// grid: (ceil(n_rows / blockDim.y), tokens). block: (32, rows per block).
+    ///
+    /// # Safety
+    /// weight covers n_rows * k_dim floats, x gridDim.y * k_dim, out
+    /// gridDim.y * n_rows; out is disjoint from the inputs.
+    #[kernel]
+    pub unsafe fn gdn_proj_f32(
+        weight: *const f32,
+        x: *const f32,
+        out: *mut f32,
+        k_dim: i32,
+        n_rows: i32,
+    ) {
+        let lane = thread::threadIdx_x() as i32;
+        let n = (thread::blockIdx_x() * thread::blockDim_y() + thread::threadIdx_y()) as i32;
+        if n >= n_rows {
+            return;
+        }
+        let t = thread::blockIdx_y() as i64;
+        unsafe {
+            let row = weight.add((n as i64 * k_dim as i64) as usize);
+            let xr = x.add((t * k_dim as i64) as usize);
+            let acc = strided_dot(row, xr, lane, k_dim);
+            let acc = warp_xor_sum(acc);
+            if lane == 0 {
+                *out.add((t * n_rows as i64 + n as i64) as usize) = acc;
+            }
+        }
+    }
+
+    /// `sum a[i] * b[i]` over `i = first, first + 32, ...` below `len`, each
+    /// product fused into the running sum in ascending order.
+    ///
+    /// Sixteen steps an iteration with every load ahead of the fused chain:
+    /// a GPU thread issues in order, so loads interleaved with a dependent
+    /// chain wait on each other and loads issued together do not. The
+    /// plain loop is a third slower on a one-token launch.
+    ///
+    /// # Safety
+    /// a and b cover len floats.
+    #[device]
+    unsafe fn strided_dot(a: *const f32, b: *const f32, first: i32, len: i32) -> f32 {
+        let mut acc = 0.0f32;
+        let mut i = first;
+        unsafe {
+            let (mut pa, mut pb) = (a.add(first as usize), b.add(first as usize));
+            while i + 480 < len {
+                let a = (*pa.add(0), *pa.add(32), *pa.add(64), *pa.add(96), *pa.add(128), *pa.add(160), *pa.add(192), *pa.add(224), *pa.add(256), *pa.add(288), *pa.add(320), *pa.add(352), *pa.add(384), *pa.add(416), *pa.add(448), *pa.add(480));
+                let b = (*pb.add(0), *pb.add(32), *pb.add(64), *pb.add(96), *pb.add(128), *pb.add(160), *pb.add(192), *pb.add(224), *pb.add(256), *pb.add(288), *pb.add(320), *pb.add(352), *pb.add(384), *pb.add(416), *pb.add(448), *pb.add(480));
+                acc = a.0.mul_add(b.0, acc);
+                acc = a.1.mul_add(b.1, acc);
+                acc = a.2.mul_add(b.2, acc);
+                acc = a.3.mul_add(b.3, acc);
+                acc = a.4.mul_add(b.4, acc);
+                acc = a.5.mul_add(b.5, acc);
+                acc = a.6.mul_add(b.6, acc);
+                acc = a.7.mul_add(b.7, acc);
+                acc = a.8.mul_add(b.8, acc);
+                acc = a.9.mul_add(b.9, acc);
+                acc = a.10.mul_add(b.10, acc);
+                acc = a.11.mul_add(b.11, acc);
+                acc = a.12.mul_add(b.12, acc);
+                acc = a.13.mul_add(b.13, acc);
+                acc = a.14.mul_add(b.14, acc);
+                acc = a.15.mul_add(b.15, acc);
+                pa = pa.wrapping_add(512);
+                pb = pb.wrapping_add(512);
+                i += 512;
+            }
+            while i < len {
+                acc = (*pa).mul_add(*pb, acc);
+                pa = pa.wrapping_add(32);
+                pb = pb.wrapping_add(32);
+                i += 32;
+            }
+        }
+        acc
+    }
+
+    /// `strided_dot(a, x)` and `strided_dot(b, x)` in one pass over `x`.
+    /// Each chain is fused in ascending order exactly as the single form.
+    ///
+    /// # Safety
+    /// a, b and x cover len floats.
+    #[device]
+    unsafe fn strided_dot2(
+        a: *const f32,
+        b: *const f32,
+        x: *const f32,
+        first: i32,
+        len: i32,
+    ) -> (f32, f32) {
+        let (mut aa, mut bb) = (0.0f32, 0.0f32);
+        let mut i = first;
+        unsafe {
+            let mut pa = a.add(first as usize);
+            let mut pb = b.add(first as usize);
+            let mut px = x.add(first as usize);
+            while i + 480 < len {
+                let a = (*pa.add(0), *pa.add(32), *pa.add(64), *pa.add(96), *pa.add(128), *pa.add(160), *pa.add(192), *pa.add(224), *pa.add(256), *pa.add(288), *pa.add(320), *pa.add(352), *pa.add(384), *pa.add(416), *pa.add(448), *pa.add(480));
+                let b = (*pb.add(0), *pb.add(32), *pb.add(64), *pb.add(96), *pb.add(128), *pb.add(160), *pb.add(192), *pb.add(224), *pb.add(256), *pb.add(288), *pb.add(320), *pb.add(352), *pb.add(384), *pb.add(416), *pb.add(448), *pb.add(480));
+                let x = (*px.add(0), *px.add(32), *px.add(64), *px.add(96), *px.add(128), *px.add(160), *px.add(192), *px.add(224), *px.add(256), *px.add(288), *px.add(320), *px.add(352), *px.add(384), *px.add(416), *px.add(448), *px.add(480));
+                aa = a.0.mul_add(x.0, aa);
+                aa = a.1.mul_add(x.1, aa);
+                aa = a.2.mul_add(x.2, aa);
+                aa = a.3.mul_add(x.3, aa);
+                aa = a.4.mul_add(x.4, aa);
+                aa = a.5.mul_add(x.5, aa);
+                aa = a.6.mul_add(x.6, aa);
+                aa = a.7.mul_add(x.7, aa);
+                aa = a.8.mul_add(x.8, aa);
+                aa = a.9.mul_add(x.9, aa);
+                aa = a.10.mul_add(x.10, aa);
+                aa = a.11.mul_add(x.11, aa);
+                aa = a.12.mul_add(x.12, aa);
+                aa = a.13.mul_add(x.13, aa);
+                aa = a.14.mul_add(x.14, aa);
+                aa = a.15.mul_add(x.15, aa);
+                bb = b.0.mul_add(x.0, bb);
+                bb = b.1.mul_add(x.1, bb);
+                bb = b.2.mul_add(x.2, bb);
+                bb = b.3.mul_add(x.3, bb);
+                bb = b.4.mul_add(x.4, bb);
+                bb = b.5.mul_add(x.5, bb);
+                bb = b.6.mul_add(x.6, bb);
+                bb = b.7.mul_add(x.7, bb);
+                bb = b.8.mul_add(x.8, bb);
+                bb = b.9.mul_add(x.9, bb);
+                bb = b.10.mul_add(x.10, bb);
+                bb = b.11.mul_add(x.11, bb);
+                bb = b.12.mul_add(x.12, bb);
+                bb = b.13.mul_add(x.13, bb);
+                bb = b.14.mul_add(x.14, bb);
+                bb = b.15.mul_add(x.15, bb);
+                pa = pa.wrapping_add(512);
+                pb = pb.wrapping_add(512);
+                px = px.wrapping_add(512);
+                i += 512;
+            }
+            while i < len {
+                aa = (*pa).mul_add(*px, aa);
+                bb = (*pb).mul_add(*px, bb);
+                pa = pa.wrapping_add(32);
+                pb = pb.wrapping_add(32);
+                px = px.wrapping_add(32);
+                i += 32;
+            }
+        }
+        (aa, bb)
+    }
+
+    /// The sum of a value over the warp, by an xor shuffle tree.
+    #[device]
+    fn warp_xor_sum(v: f32) -> f32 {
+        let mut v = v;
+        let mut offset = 16;
+        while offset > 0 {
+            v += warp::shuffle_xor_f32_sync(u32::MAX, v, offset);
+            offset >>= 1;
+        }
+        v
+    }
+
+    /// One warp per option: the scorer's output projection, then the final
+    /// combination `prior_scale * prior + gate * (joint_scale * cosine +
+    /// residual)`.
+    ///
+    /// # Safety
+    /// h covers n_opts rows of stride ldh with `width` columns used, w_out
+    /// covers width, aux two floats per option, scores n_opts.
+    #[kernel]
+    pub unsafe fn dec_final_scores(
+        h: *const f32,
+        ldh: i64,
+        n_opts: i32,
+        width: i32,
+        w_out: *const f32,
+        b_out: f32,
+        aux: *const f32,
+        prior_scale: f32,
+        joint_scale: f32,
+        gate: f32,
+        scores: *mut f32,
+    ) {
+        let flat = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        let o = (flat >> 5) as i32;
+        let lane = (thread::threadIdx_x() & 31) as i32;
+        if o >= n_opts {
+            return;
+        }
+        unsafe {
+            let d = warp_xor_sum(strided_dot(h.add((o as i64 * ldh) as usize), w_out, lane, width));
+            if lane == 0 {
+                let joint = joint_scale.mul_add(*aux.add((o * 2 + 1) as usize), d + b_out);
+                *scores.add(o as usize) =
+                    prior_scale.mul_add(*aux.add((o * 2) as usize), gate * joint);
+            }
+        }
+    }
+
+    /// The Gated DeltaNet gate prelude in one launch: RMSNorm of the token's
+    /// hidden row, the alpha and beta projections of the normalized row for
+    /// one head, and that head's gates.
+    ///
+    /// Replaces two `gdn_proj_f32` launches and a `gdn_gates` launch and
+    /// keeps their arithmetic: the norm reduces in four bands of eight warp
+    /// totals that thread 0 adds in ascending order, each projection is the
+    /// warp contraction of `gdn_proj_f32`, and the gates are `gdn_gates`'
+    /// expressions. Block 0 of each token also writes the normalized row.
+    ///
+    /// grid: (heads, tokens). block: 256, with k_dim + 32 floats of dynamic
+    /// shared memory.
+    ///
+    /// # Safety
+    /// w_alpha and w_beta cover heads * k_dim floats; x and normed tokens *
+    /// k_dim; norm_weight k_dim; dt_bias and ssm_a heads; the five per-head
+    /// outputs tokens * heads. Outputs are disjoint from inputs and each
+    /// other. k_dim is at most 4096.
+    #[kernel]
+    pub unsafe fn gdn_norm_alpha_beta_gates(
+        w_alpha: *const f32,
+        w_beta: *const f32,
+        x: *const f32,
+        dt_bias: *const f32,
+        ssm_a: *const f32,
+        alpha: *mut f32,
+        beta_raw: *mut f32,
+        a_softplus: *mut f32,
+        log_decay: *mut f32,
+        beta: *mut f32,
+        k_dim: i32,
+        heads: i32,
+        _tokens: i32,
+        norm_weight: *const f32,
+        normed: *mut f32,
+        eps: f32,
+    ) {
+        let tid = thread::threadIdx_x() as i32;
+        let lane = tid & 31;
+        let n = thread::blockIdx_x() as i64;
+        let t = thread::blockIdx_y() as i64;
+        let data = DynamicSharedArray::<f32>::get();
+        unsafe {
+            let scratch = data.add(k_dim as usize);
+            let xr = x.add((t * k_dim as i64) as usize);
+            // Eight loads issued together, then the stores: a thread issues
+            // in order, and a load waiting on the previous store is the slow
+            // way through a row.
+            let mut i = tid;
+            let (mut xp, mut dp) = (xr.add(tid as usize), data.add(tid as usize));
+            while i + 1792 < k_dim {
+                let v = (*xp.add(0), *xp.add(256), *xp.add(512), *xp.add(768), *xp.add(1024), *xp.add(1280), *xp.add(1536), *xp.add(1792));
+                *dp.add(0) = v.0;
+                *dp.add(256) = v.1;
+                *dp.add(512) = v.2;
+                *dp.add(768) = v.3;
+                *dp.add(1024) = v.4;
+                *dp.add(1280) = v.5;
+                *dp.add(1536) = v.6;
+                *dp.add(1792) = v.7;
+                xp = xp.wrapping_add(2048);
+                dp = dp.wrapping_add(2048);
+                i += 2048;
+            }
+            while i < k_dim {
+                *dp = *xp;
+                xp = xp.wrapping_add(256);
+                dp = dp.wrapping_add(256);
+                i += 256;
+            }
+            thread::sync_threads();
+            let mut band = 0;
+            while band < 4 {
+                let mut partial = 0.0f32;
+                let mut j = tid + band * 256;
+                while j < k_dim {
+                    let v = *data.add(j as usize);
+                    partial = v.mul_add(v, partial);
+                    j += 1024;
+                }
+                let mut off = 16;
+                while off > 0 {
+                    partial += warp::shuffle_down_f32_sync(u32::MAX, partial, off);
+                    off >>= 1;
+                }
+                if lane == 0 {
+                    *scratch.add((band * 8 + (tid >> 5)) as usize) = partial;
+                }
+                band += 1;
+            }
+            thread::sync_threads();
+            if tid == 0 {
+                let mut sum_sq = 0.0f32;
+                let mut w = 0;
+                while w < 32 {
+                    sum_sq += *scratch.add(w);
+                    w += 1;
+                }
+                *scratch = 1.0 / (sum_sq / k_dim as f32 + eps).sqrt();
+            }
+            thread::sync_threads();
+            let inv_rms = *scratch;
+            let mut j = tid;
+            let mut dp = data.add(tid as usize);
+            let mut wp = norm_weight.add(tid as usize);
+            let mut np = normed.add((t * k_dim as i64) as usize + tid as usize);
+            while j + 1792 < k_dim {
+                let w = (*wp.add(0), *wp.add(256), *wp.add(512), *wp.add(768), *wp.add(1024), *wp.add(1280), *wp.add(1536), *wp.add(1792));
+                let d = (*dp.add(0), *dp.add(256), *dp.add(512), *dp.add(768), *dp.add(1024), *dp.add(1280), *dp.add(1536), *dp.add(1792));
+                let y = (d.0 * inv_rms * w.0, d.1 * inv_rms * w.1, d.2 * inv_rms * w.2, d.3 * inv_rms * w.3, d.4 * inv_rms * w.4, d.5 * inv_rms * w.5, d.6 * inv_rms * w.6, d.7 * inv_rms * w.7);
+                *dp.add(0) = y.0;
+                *dp.add(256) = y.1;
+                *dp.add(512) = y.2;
+                *dp.add(768) = y.3;
+                *dp.add(1024) = y.4;
+                *dp.add(1280) = y.5;
+                *dp.add(1536) = y.6;
+                *dp.add(1792) = y.7;
+                if n == 0 {
+                    *np.add(0) = y.0;
+                    *np.add(256) = y.1;
+                    *np.add(512) = y.2;
+                    *np.add(768) = y.3;
+                    *np.add(1024) = y.4;
+                    *np.add(1280) = y.5;
+                    *np.add(1536) = y.6;
+                    *np.add(1792) = y.7;
+                }
+                dp = dp.wrapping_add(2048);
+                wp = wp.wrapping_add(2048);
+                np = np.wrapping_add(2048);
+                j += 2048;
+            }
+            while j < k_dim {
+                let normalized = *dp * inv_rms * *wp;
+                *dp = normalized;
+                if n == 0 {
+                    *np = normalized;
+                }
+                dp = dp.wrapping_add(256);
+                wp = wp.wrapping_add(256);
+                np = np.wrapping_add(256);
+                j += 256;
+            }
+            thread::sync_threads();
+            if tid >= 32 {
+                return;
+            }
+            let row = (n * k_dim as i64) as usize;
+            let (aa, bb) = strided_dot2(w_alpha.add(row), w_beta.add(row), data, lane, k_dim);
+            let a_sum = warp_xor_sum(aa);
+            let b_sum = warp_xor_sum(bb);
+            if lane == 0 {
+                let i = (t * heads as i64 + n) as usize;
+                *alpha.add(i) = a_sum;
+                *beta_raw.add(i) = b_sum;
+                let a = a_sum + *dt_bias.add(n as usize);
+                let sp = if a > 20.0 { a } else { (1.0 + a.exp()).ln() };
+                *a_softplus.add(i) = sp;
+                *log_decay.add(i) = sp * *ssm_a.add(n as usize);
+                *beta.add(i) = 1.0 / (1.0 + (-b_sum).exp());
+            }
+        }
+    }
+
+    /// Four adjacent floats in one 128-bit load.
+    ///
+    /// # Safety
+    /// p is 16-byte aligned and covers four floats.
+    #[device]
+    unsafe fn load4(p: *const f32) -> [f32; 4] {
+        let (a, b, c, d): (f32, f32, f32, f32);
+        unsafe {
+            ptx_asm!(
+                "ld.global.v4.f32 {%0, %1, %2, %3}, [%4];",
+                out("=f") a,
+                out("=f") b,
+                out("=f") c,
+                out("=f") d,
+                in("l") p as u64,
+            );
+        }
+        [a, b, c, d]
+    }
+
+    /// Four adjacent floats in one 128-bit store.
+    ///
+    /// # Safety
+    /// p is 16-byte aligned and covers four floats this thread owns.
+    #[device]
+    unsafe fn store4(p: *mut f32, v: [f32; 4]) {
+        unsafe {
+            ptx_asm!(
+                "st.global.v4.f32 [%0], {%1, %2, %3, %4};",
+                in("l") p as u64,
+                in("f") v[0],
+                in("f") v[1],
+                in("f") v[2],
+                in("f") v[3],
+            );
+        }
+    }
+
+    /// One Gated DeltaNet decode step for up to eight sequences: decay the
+    /// state, read the prediction, write the delta-rule correction and
+    /// produce the output, one warp per state row.
+    ///
+    /// ```text
+    /// S    = S * exp(log_decay)
+    /// pred = S k
+    /// S    = S + beta * (v - pred) k^T
+    /// out  = S q
+    /// ```
+    ///
+    /// A lane owns four adjacent columns of each 128-column chunk, so a row
+    /// of up to 512 columns is covered by one warp; the two contractions are
+    /// fused chains in ascending column order within the lane, reduced by an
+    /// xor shuffle tree. The decayed row is carried between the two passes in
+    /// registers rather than re-read, which is why the chunks are spelled
+    /// out.
+    ///
+    /// grid: (ceil(head_dim / rows per block), value heads, sequences <= 8).
+    /// block: 32 threads per row.
+    ///
+    /// # Safety
+    /// Each used state pointer covers value_heads * head_dim * head_dim
+    /// floats and belongs to one sequence; q and k cover sequences * qk_heads
+    /// * head_dim; v and out sequences * value_heads * head_dim; log_decay
+    /// and beta sequences * value_heads. head_dim is a multiple of 128, at
+    /// most 512. out is disjoint from the inputs.
+    #[kernel]
+    pub unsafe fn gdn_recurrent_step(
+        s0: u64,
+        s1: u64,
+        s2: u64,
+        s3: u64,
+        s4: u64,
+        s5: u64,
+        s6: u64,
+        s7: u64,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        log_decay: *const f32,
+        beta: *const f32,
+        out: *mut f32,
+        head_dim: i32,
+        qk_heads: i32,
+    ) {
+        let tid = thread::threadIdx_x();
+        let lane = (tid & 31) as i32;
+        let vi = (thread::blockIdx_x() * (thread::blockDim_x() >> 5) + (tid >> 5)) as i32;
+        let h = thread::blockIdx_y() as i32;
+        let z = thread::blockIdx_z() as i32;
+        if vi >= head_dim {
+            return;
+        }
+        let state = match z {
+            0 => s0,
+            1 => s1,
+            2 => s2,
+            3 => s3,
+            4 => s4,
+            5 => s5,
+            6 => s6,
+            _ => s7,
+        } as *mut f32;
+        let n_v_heads = thread::gridDim_y() as i32;
+        let qk_base = ((z * qk_heads + h % qk_heads) * head_dim) as usize;
+        let v_base = ((z * n_v_heads + h) * head_dim) as usize;
+        let g_at = (z * n_v_heads + h) as usize;
+        let chunks = head_dim >> 7;
+        let j0 = (4 * lane) as usize;
+        unsafe {
+            let decay = (*log_decay.add(g_at)).exp();
+            let row = state.add(((h as i64 * head_dim as i64 + vi as i64) * head_dim as i64) as usize);
+            let kq = k.add(qk_base);
+            let qq = q.add(qk_base);
+            let zero = [0.0f32; 4];
+            let (mut s, mut kc) = ([zero; 4], [zero; 4]);
+            let mut partial = 0.0f32;
+            macro_rules! decay_and_predict {
+                ($c:literal) => {
+                    if $c < chunks {
+                        let j = ($c << 7) + j0;
+                        let kv = load4(kq.add(j));
+                        let sv = load4(row.add(j));
+                        let sv = [sv[0] * decay, sv[1] * decay, sv[2] * decay, sv[3] * decay];
+                        partial = sv[0].mul_add(kv[0], partial);
+                        partial = sv[1].mul_add(kv[1], partial);
+                        partial = sv[2].mul_add(kv[2], partial);
+                        partial = sv[3].mul_add(kv[3], partial);
+                        kc[$c] = kv;
+                        s[$c] = sv;
+                    }
+                };
+            }
+            decay_and_predict!(0);
+            decay_and_predict!(1);
+            decay_and_predict!(2);
+            decay_and_predict!(3);
+            let predicted = warp_xor_sum(partial);
+            let vcorr = *beta.add(g_at) * (*v.add(v_base + vi as usize) - predicted);
+
+            partial = 0.0;
+            macro_rules! correct_and_read {
+                ($c:literal) => {
+                    if $c < chunks {
+                        let j = ($c << 7) + j0;
+                        let (sv, kv) = (s[$c], kc[$c]);
+                        let sv = [
+                            vcorr.mul_add(kv[0], sv[0]),
+                            vcorr.mul_add(kv[1], sv[1]),
+                            vcorr.mul_add(kv[2], sv[2]),
+                            vcorr.mul_add(kv[3], sv[3]),
+                        ];
+                        store4(row.add(j), sv);
+                        let qv = load4(qq.add(j));
+                        partial = sv[0].mul_add(qv[0], partial);
+                        partial = sv[1].mul_add(qv[1], partial);
+                        partial = sv[2].mul_add(qv[2], partial);
+                        partial = sv[3].mul_add(qv[3], partial);
+                    }
+                };
+            }
+            correct_and_read!(0);
+            correct_and_read!(1);
+            correct_and_read!(2);
+            correct_and_read!(3);
+            let o = warp_xor_sum(partial);
+            if lane == 0 {
+                *out.add(v_base + vi as usize) = o;
+            }
+        }
+    }
+
+    /// The softmax probability of a row's maximum, `1 / sum(exp(x - max))`:
+    /// the confidence of the greedy token.
+    ///
+    /// One block walks the whole row, so each thread's strided loop is long;
+    /// it reads eight elements ahead of using them, which keeps the loads
+    /// from queueing behind the exponentials.
+    ///
+    /// # Safety
+    /// x covers n >= 1 floats, out one. One 256-thread block.
+    #[kernel]
+    pub unsafe fn argmax_prob(x: *const f32, n: i32, out: *mut f32) {
+        static mut SUMS: SharedArray<f32, 8> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x();
+        unsafe {
+            let (mut bv, mut bi) = (*x, 0i32);
+            let mut i = tid as i32;
+            let mut p = x.add(tid as usize);
+            while i + 1792 < n {
+                let v = (*p.add(0), *p.add(256), *p.add(512), *p.add(768), *p.add(1024), *p.add(1280), *p.add(1536), *p.add(1792));
+                (bv, bi) = argmax_merge(bv, bi, v.0, i + 0);
+                (bv, bi) = argmax_merge(bv, bi, v.1, i + 256);
+                (bv, bi) = argmax_merge(bv, bi, v.2, i + 512);
+                (bv, bi) = argmax_merge(bv, bi, v.3, i + 768);
+                (bv, bi) = argmax_merge(bv, bi, v.4, i + 1024);
+                (bv, bi) = argmax_merge(bv, bi, v.5, i + 1280);
+                (bv, bi) = argmax_merge(bv, bi, v.6, i + 1536);
+                (bv, bi) = argmax_merge(bv, bi, v.7, i + 1792);
+                p = p.wrapping_add(2048);
+                i += 2048;
+            }
+            while i < n {
+                (bv, bi) = argmax_merge(bv, bi, *p, i);
+                p = p.wrapping_add(256);
+                i += 256;
+            }
+            (bv, bi) = argmax_reduce_block(bv, bi);
+            let _ = bi;
+            if tid == 0 {
+                SUMS[0] = bv;
+            }
+            thread::sync_threads();
+            let row_max = SUMS[0];
+            thread::sync_threads();
+
+            let mut acc = 0.0f32;
+            let mut i = tid as i32;
+            let mut p = x.add(tid as usize);
+            while i + 1792 < n {
+                let v = (*p.add(0), *p.add(256), *p.add(512), *p.add(768), *p.add(1024), *p.add(1280), *p.add(1536), *p.add(1792));
+                acc += (v.0 - row_max).exp();
+                acc += (v.1 - row_max).exp();
+                acc += (v.2 - row_max).exp();
+                acc += (v.3 - row_max).exp();
+                acc += (v.4 - row_max).exp();
+                acc += (v.5 - row_max).exp();
+                acc += (v.6 - row_max).exp();
+                acc += (v.7 - row_max).exp();
+                p = p.wrapping_add(2048);
+                i += 2048;
+            }
+            while i < n {
+                acc += (*p - row_max).exp();
+                p = p.wrapping_add(256);
+                i += 256;
+            }
+            let mut off = 16;
+            while off > 0 {
+                acc += warp::shuffle_down_f32_sync(u32::MAX, acc, off);
+                off >>= 1;
+            }
+            if tid & 31 == 0 {
+                SUMS[(tid >> 5) as usize] = acc;
+            }
+            thread::sync_threads();
+            if tid == 0 {
+                let mut total = 0.0f32;
+                let mut w = 0;
+                while w < 8 {
+                    total += SUMS[w];
+                    w += 1;
+                }
+                *out = 1.0 / total;
             }
         }
     }

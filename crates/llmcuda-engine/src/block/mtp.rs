@@ -372,8 +372,11 @@ impl MtpBlock {
 
         let ptx = compile(MTP_GLUE_SRC, "mtp_glue").map_err(MtpBlockError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
+            llmcuda_cuda::kernels::RUST_KERNELS_PTX,
+        ))?;
         let embed_fn = module.load_function("mtp_embed_q8_0")?;
-        let concat_fn = module.load_function("mtp_concat_eh")?;
+        let concat_fn = rust.load_function("mtp_concat_eh")?;
         let layer_ops = LayerOpsKernels::new(ctx)?;
 
         let batch_fork = ctx.new_event(None)?;

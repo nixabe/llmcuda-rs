@@ -997,6 +997,9 @@ impl DenseFfnBlock {
         let layer_ops = LayerOpsKernels::new(ctx)?;
         let ptx = compile(GLUE_SRC, "dense_ffn_block").map_err(MoeBlockError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
+            llmcuda_cuda::kernels::RUST_KERNELS_PTX,
+        ))?;
         // Exactly one of the two int8 paths is provisioned, by width. The
         // GEMV's scratch is small enough to be unconditional; the tensor-core
         // staging arrays are not.
@@ -1053,7 +1056,7 @@ impl DenseFfnBlock {
         };
 
         Ok(Self {
-            add_residual_fn: module.load_function("dense_ffn_add_residual")?,
+            add_residual_fn: rust.load_function("dense_ffn_add_residual")?,
             moe,
             layer_ops,
             buffers,

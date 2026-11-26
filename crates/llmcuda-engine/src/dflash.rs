@@ -459,8 +459,11 @@ impl DFlashForward {
 
         let ptx = compile(DFLASH_GLUE_SRC, "dflash_glue").map_err(DFlashError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
+            llmcuda_cuda::kernels::RUST_KERNELS_PTX,
+        ))?;
         let embed_fn = module.load_function("dflash_embed_q8_0")?;
-        let tap_fn = module.load_function("dflash_tap")?;
+        let tap_fn = rust.load_function("dflash_tap")?;
         let taps = config.target_layers.len();
 
         Ok(Self {

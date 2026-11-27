@@ -167,6 +167,43 @@ fn requests_prefill_decode_and_complete_through_the_engine() {
         );
     }
 
+    // A request reserved for far more positions than the others decodes
+    // beside them: its caches and theirs are the same rings.
+    place(&mut engine, 8, &capture, SamplingParams::GREEDY);
+    place_for(&mut engine, 9, &other, SamplingParams::GREEDY, 6000);
+    let mixed = {
+        let mut generated: BTreeMap<u64, Vec<i32>> = BTreeMap::new();
+        let mut done = false;
+        let mut steps = 0;
+        while !done {
+            steps += 1;
+            assert!(steps < 100, "request 8 did not complete");
+            for (_, step) in engine
+                .step_devices()
+                .expect("a long and a short request step together")
+            {
+                for (id, token) in step.generated {
+                    generated.entry(id.0).or_default().push(token);
+                }
+                done |= step.completed.iter().any(|id| id.0 == 8);
+            }
+        }
+        generated
+    };
+    assert_eq!(
+        mixed[&8], together[&1],
+        "a long neighbour changed a sequence's tokens"
+    );
+    assert_eq!(
+        mixed[&9][..OUTPUT as usize],
+        together[&3][..],
+        "a long reservation changed its own tokens"
+    );
+    assert!(
+        engine.cancel(RequestId(9)),
+        "the long request was not resident"
+    );
+
     // The same prompt again, alone: places freed, and the same tokens.
     place(&mut engine, 4, &capture, SamplingParams::GREEDY);
     let alone = run(&engine, &[4]);

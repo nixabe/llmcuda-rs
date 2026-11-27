@@ -537,6 +537,9 @@ impl InklingState {
     /// two (position `j` at row `j % ring`), instead of `capacity` rows —
     /// which at this model's 40 sliding applications of 48 is most of a
     /// long sequence's memory. Results are the same bits.
+    ///
+    /// The ring's size depends on `max_pass_rows` alone, not on `capacity`:
+    /// sequences of any two lengths can share a decode step.
     pub fn bounded(
         stream: &Arc<CudaStream>,
         model: &InklingModel,
@@ -562,10 +565,12 @@ impl InklingState {
         let mut slots = Vec::with_capacity(model.slots());
         for slot in 0..model.slots() {
             let sliding = model.k.is_sliding(model.k.slot_layer(layers, slot as u32));
+            // A ring whatever the capacity, even where `capacity` rows would
+            // be fewer: a decode step takes one row mask for all its rows,
+            // so every sequence that may share a step holds the same ring.
             let ring = max_pass_rows
                 .filter(|_| sliding)
-                .map(|pass| (model.k.sliding_window as usize + pass).next_power_of_two())
-                .filter(|ring| *ring < capacity);
+                .map(|pass| (model.k.sliding_window as usize + pass).next_power_of_two());
             let rows = ring.unwrap_or(capacity);
             slots.push(SlotState {
                 ring,

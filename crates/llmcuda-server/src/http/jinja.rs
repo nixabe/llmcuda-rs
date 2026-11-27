@@ -45,6 +45,9 @@ use super::chat::{Conversation, Turn};
 /// A compiled `tokenizer.chat_template`, ready to render prompts.
 pub(crate) struct ChatTemplate {
     env: Environment<'static>,
+    /// The template has a `reasoning_effort` level and no `enable_thinking`
+    /// switch, so "thinking off" has to be said as an effort.
+    effort_is_the_switch: bool,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -64,6 +67,8 @@ impl ChatTemplate {
             .replace("{% endgeneration %}", "")
             .replace("{%- generation -%}", "{{- '' -}}")
             .replace("{%- endgeneration -%}", "{{- '' -}}");
+        let effort_is_the_switch =
+            source.contains("reasoning_effort") && !source.contains("enable_thinking");
         let mut env = Environment::new();
         env.set_unknown_method_callback(python_method);
         // This is a model prompt, not HTML. Minijinja's built-in emits
@@ -82,7 +87,10 @@ impl ChatTemplate {
         );
         env.add_template_owned("chat", source)
             .map_err(|error| format!("chat template does not parse: {error:#}"))?;
-        Ok(Arc::new(Self { env }))
+        Ok(Arc::new(Self {
+            env,
+            effort_is_the_switch,
+        }))
     }
 
     /// Render a conversation, ending with the assistant's generation prompt.
@@ -130,8 +138,14 @@ impl ChatTemplate {
                 add_generation_prompt => true,
                 enable_thinking => thinking,
                 // Inkling's template has no switch, only an effort level
-                // (default 0.9 when undefined); zero is its "no thinking".
-                reasoning_effort => (!thinking).then_some(0.0),
+                // (0.9 when undefined); zero is its "no thinking". It is
+                // left undefined otherwise: a template with string levels
+                // (K2's) takes a present `none` for a level and fails.
+                ..if self.effort_is_the_switch && !thinking {
+                    context! { reasoning_effort => 0.0 }
+                } else {
+                    context! {}
+                }
             })
             .map_err(|error| format!("chat template failed to render: {error:#}"))
     }
@@ -444,6 +458,30 @@ mod tests {
             .turns
             .push(Turn::ToolResults(vec!["contents".to_owned()]));
         conversation
+    }
+
+    /// An effort level is passed only to a template that has no thinking
+    /// switch. A present-but-none level is not "undefined" to a template
+    /// that takes `| default(...)` of it: K2's fell through to its
+    /// unsupported-level branch and failed to render with thinking on.
+    #[test]
+    fn an_effort_level_is_passed_only_where_it_is_the_switch() {
+        let mut conversation = Conversation::default();
+        conversation.turns.push(Turn::User("Hello".into()));
+        let levels = ChatTemplate::compile(
+            "{%- set effort = reasoning_effort | default('high') -%}\
+             {%- if enable_thinking is false -%}off{%- else -%}{{ 'think ' + effort }}{%- endif -%}"
+                .to_owned(),
+        )
+        .unwrap();
+        assert_eq!(levels.render(&conversation, true).unwrap(), "think high");
+        assert_eq!(levels.render(&conversation, false).unwrap(), "off");
+        let numeric = ChatTemplate::compile(
+            "{{- reasoning_effort if reasoning_effort is defined else 0.9 -}}".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(numeric.render(&conversation, true).unwrap(), "0.9");
+        assert_eq!(numeric.render(&conversation, false).unwrap(), "0.0");
     }
 
     #[test]

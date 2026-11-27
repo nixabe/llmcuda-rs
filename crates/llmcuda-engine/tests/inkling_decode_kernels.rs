@@ -14,7 +14,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
 use llmcuda_cuda::device::driver_available;
 use llmcuda_cuda::kernels::inkling::{
-    ControlWeights, DEC_ROW_POINTERS, InklingDecodeKernels, ProjOffsets,
+    ControlWeights, DEC_ATTN_PARTS, DEC_ROW_POINTERS, InklingDecodeKernels, ProjOffsets,
 };
 use llmcuda_kernels::inkling as reference;
 use llmcuda_kernels::rng::Xorshift64Star;
@@ -81,7 +81,7 @@ fn decode_attention_matches_an_f64_oracle_past_the_window_and_the_chunk() {
     let mut rng = Xorshift64Star::new(0xdeca77);
 
     // (positions of the rows, window, extent, log scale)
-    let cases: [AttentionCase; 6] = [
+    let cases: [AttentionCase; 7] = [
         // Sliding: one row before the window fills, one a chunk deep, one
         // past the window with four chunks to scan.
         (&[5, 300, 1500], 1024, 1024, None, None),
@@ -92,6 +92,10 @@ fn decode_attention_matches_an_f64_oracle_past_the_window_and_the_chunk() {
         (&[3, 64, 900], 0, 64, Some((0.1, 8.0)), None),
         // One row, exactly one full chunk.
         (&[255], 0, 1024, Some((0.1, 8192.0)), None),
+        // Full attention deeper than one chunk a block: 2,049, 2,304 and
+        // 5,000 positions are 9, 9 and 20 chunks over eight blocks, the
+        // first two with a one-position and a whole last chunk.
+        (&[2048, 2303, 4999], 0, 1024, Some((0.1, 512.0)), None),
         // Ring caches: one row not yet round the ring, two that are, one of
         // them with its window straddling the ring's end.
         (&[700, 3000, 5000], 1024, 1024, None, Some(2048)),
@@ -231,6 +235,9 @@ fn decode_attention_matches_an_f64_oracle_past_the_window_and_the_chunk() {
             stream.clone_htod(&rel_bias).unwrap(),
         );
         let mut out = stream.alloc_zeros::<u16>(rows * heads * dim).unwrap();
+        let mut part = stream
+            .alloc_zeros::<f32>(rows * heads * DEC_ATTN_PARTS * (dim + 2))
+            .unwrap();
         kernels
             .attn(
                 &stream,
@@ -240,6 +247,7 @@ fn decode_attention_matches_an_f64_oracle_past_the_window_and_the_chunk() {
                 &d_q_clip,
                 &d_rel_clip,
                 &d_rel_bias,
+                &mut part,
                 &mut out,
                 o,
                 heads,

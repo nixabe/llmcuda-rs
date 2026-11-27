@@ -1775,6 +1775,9 @@ impl DecodeGemm {
 /// then the key, value, attention-output and feed-forward carries.
 pub const DEC_ROW_POINTERS: usize = 6;
 
+/// The most blocks one (head, row) of decode attention is split over.
+pub const DEC_ATTN_PARTS: usize = 8;
+
 /// The fused decode glue (`device-kernels/src/inkling_decode.rs`): what a
 /// layer does between its GEMMs when every row is the next position of its
 /// own sequence. Each launch covers all rows; a row's own state is reached
@@ -1783,6 +1786,7 @@ pub struct InklingDecodeKernels {
     inputs: CudaFunction,
     kv: CudaFunction,
     attn: CudaFunction,
+    attn_merge: CudaFunction,
     ffn_in: CudaFunction,
     ffn_out: CudaFunction,
     gate: CudaFunction,
@@ -1857,6 +1861,7 @@ impl InklingDecodeKernels {
             inputs: m.load_function("ink_dec_inputs")?,
             kv: m.load_function("ink_dec_kv")?,
             attn: m.load_function("ink_dec_attn")?,
+            attn_merge: m.load_function("ink_dec_attn_merge")?,
             ffn_in: m.load_function("ink_dec_ffn_in")?,
             ffn_out: m.load_function("ink_dec_ffn_out")?,
             gate: m.load_function("ink_dec_gate")?,
@@ -2138,6 +2143,7 @@ impl InklingDecodeKernels {
         q_clip: &CudaSlice<f32>,
         rel_clip: &CudaSlice<f32>,
         rel_bias: &CudaSlice<f32>,
+        part: &mut CudaSlice<f32>,
         out: &mut CudaSlice<u16>,
         o: ProjOffsets,
         heads: usize,
@@ -2163,6 +2169,14 @@ impl InklingDecodeKernels {
         need("dec attn rel_clip", rel_clip.len(), heads * n_rel)?;
         need("dec attn rel_bias", rel_bias.len(), extent * n_rel)?;
         need("dec attn out", out.len(), rows * heads * dim)?;
+        // A block a 256-position chunk of a sliding window; a full layer's
+        // span has no bound, so its blocks take every eighth chunk each.
+        let nz = if window > 0 {
+            window.div_ceil(256).min(DEC_ATTN_PARTS)
+        } else {
+            DEC_ATTN_PARTS
+        };
+        need("dec attn part", part.len(), rows * heads * nz * (dim + 2))?;
         let (kv, d, nr, w, e) = (
             kv_heads as i32,
             dim as i32,
@@ -2178,12 +2192,11 @@ impl InklingDecodeKernels {
             .arg(q_clip)
             .arg(rel_clip)
             .arg(rel_bias)
-            .arg(&mut *out)
+            .arg(&mut *part)
             .arg(&o.ldo)
             .arg(&o.q)
             .arg(&o.rel)
             .arg(&o.sink)
-            .arg(&o.gate)
             .arg(&kv)
             .arg(&d)
             .arg(&nr)
@@ -2195,7 +2208,18 @@ impl InklingDecodeKernels {
             .arg(&floor)
             .arg(&mask);
         // SAFETY: lengths checked; caches reached through the pointer table.
-        unsafe { b.launch(cfg((heads, rows, 1), 256, 0)) }?;
+        unsafe { b.launch(cfg((heads, rows, nz), 256, 0)) }?;
+        let nz = nz as i32;
+        let mut b = stream.launch_builder(&self.attn_merge);
+        b.arg(&*part)
+            .arg(proj)
+            .arg(&mut *out)
+            .arg(&o.ldo)
+            .arg(&o.gate)
+            .arg(&d)
+            .arg(&nz);
+        // SAFETY: part was just written for this grid; out length-checked.
+        unsafe { b.launch(cfg((heads, rows, 1), dim as u32, 0)) }?;
         Ok(())
     }
 

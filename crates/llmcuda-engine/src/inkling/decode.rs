@@ -17,7 +17,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use llmcuda_cuda::kernels::hgemm::{HalfWeight, bf16_half_exponent};
 use llmcuda_cuda::kernels::inkling::{
-    ControlWeights, DEC_ROW_POINTERS, DG_BLOCK_ROWS, DG_MAX_ROWS, ProjOffsets,
+    ControlWeights, DEC_ATTN_PARTS, DEC_ROW_POINTERS, DG_BLOCK_ROWS, DG_MAX_ROWS, ProjOffsets,
 };
 use llmcuda_gguf::GgmlType;
 use llmcuda_model::ModelConfig;
@@ -287,6 +287,8 @@ pub struct InklingDecode {
     inputs_h: CudaSlice<u16>,
     proj: CudaSlice<f32>,
     gated_h: CudaSlice<u16>,
+    /// Decode attention's partials, `[rows][heads][parts][dim + 2]`.
+    attn_part: CudaSlice<f32>,
     o_raw: CudaSlice<f32>,
     ffn_inp: CudaSlice<f32>,
     x_work: CudaSlice<f32>,
@@ -351,6 +353,7 @@ impl InklingDecode {
             inputs_h: hf(3 * rows * n)?,
             proj: f(rows * ldo)?,
             gated_h: hf(rows * heads * dim)?,
+            attn_part: f(rows * heads * DEC_ATTN_PARTS * (dim + 2))?,
             o_raw: f(rows * n)?,
             ffn_inp: f(rows * n)?,
             x_work: f(rows * n)?,
@@ -585,6 +588,7 @@ impl InklingDecode {
             &layer.q_clip,
             &layer.rel_clip,
             &layer.rel_bias,
+            &mut self.attn_part,
             &mut self.gated_h,
             d.offsets,
             heads,

@@ -577,18 +577,26 @@ pub unsafe fn ink_dec_kv(
     }
 }
 
-/// One query head of one row, start to finish: the query and
-/// relative-position clips (with the logarithmic position scale when
-/// `alpha >= 0`), attention over the row's cache with the bias computed per
-/// distance and a zero-logit sink, and the output gate. The result is
-/// binary16, `[rows][heads][dim]`.
+/// One query head of one row over a share of the row's cache: the query
+/// and relative-position clips (with the logarithmic position scale when
+/// `alpha >= 0`) and attention with the bias computed per distance, as an
+/// unnormalized partial for `ink_dec_attn_merge`:
+/// `part[row][head][z] = [max logit, sum exp(logit - max), dim sums of
+/// exp(logit - max) * value]`.
 ///
-/// grid: (heads, rows), 256 threads.
+/// Block z of a (head, row) takes the 256-position chunks z, z + Z, z + 2Z
+/// .. of the visible span, Z = gridDim.z, and one with no chunk writes the
+/// empty partial (lowest max, zero sums). A chunk is a serial chain of
+/// loads and barriers, so one block walking a 1,024-row window was four of
+/// them in a row on one SM while the rest of the card idled: 90 us a
+/// launch at three rows, and barely more than at one.
+///
+/// grid: (heads, rows, Z), 256 threads.
 ///
 /// # Safety
-/// As `ink_attn` and `ink_clip`; `proj` rows hold the query, relative,
-/// sink and gate projections at their offsets; dim is a multiple of 4 and
-/// at most 128, n_rel <= 32.
+/// As `ink_attn` and `ink_clip`; `proj` rows hold the query and relative
+/// projections at their offsets; dim is a multiple of 4 and at most 128,
+/// n_rel <= 32; part is `[rows][heads][Z][dim + 2]`.
 #[kernel]
 pub unsafe fn ink_dec_attn(
     proj: *const f32,
@@ -597,12 +605,11 @@ pub unsafe fn ink_dec_attn(
     q_clip: *const f32,
     rel_clip: *const f32,
     rel_bias: *const f32,
-    out: *mut u16,
+    part: *mut f32,
     ldo: i32,
     q_off: i32,
     rel_off: i32,
     sink_off: i32,
-    gate_off: i32,
     kv_heads: i32,
     dim: i32,
     n_rel: i32,
@@ -624,12 +631,27 @@ pub unsafe fn ink_dec_attn(
     let h = thread::blockIdx_x() as usize;
     let t = thread::blockIdx_y() as usize;
     let heads = thread::gridDim_x() as usize;
+    let z = thread::blockIdx_z() as usize;
+    let nz = thread::gridDim_z() as usize;
     let d = dim as usize;
     let kv = h / (heads / kv_heads as usize);
     let stride = kv_heads as usize * d;
     unsafe {
         let row = proj.add(t * ldo as usize);
         let p = *pos.add(t);
+        let lo = if window > 0 && p + 1 > window {
+            p + 1 - window
+        } else {
+            0
+        };
+        let result = part.add(((t * heads + h) * nz + z) * (d + 2));
+        let first = lo + 256 * z as i32;
+        if first > p {
+            if (tid as usize) < d + 2 {
+                *result.add(tid as usize) = if tid == 0 { LOWEST } else { 0.0 };
+            }
+            return;
+        }
         let tau = if alpha >= 0.0 {
             1.0 + alpha * (((p + 1) as f32) / floor).max(1.0).ln()
         } else {
@@ -654,8 +676,8 @@ pub unsafe fn ink_dec_attn(
             R[tid as usize] = rv * ((rel_bound / (r_norm + 1e-6)).min(1.0) * tau);
         }
         if tid == 0 {
-            RUN[0] = 0.0;
-            RUN[1] = 1.0;
+            RUN[0] = LOWEST;
+            RUN[1] = 0.0;
         }
         thread::sync_threads();
 
@@ -663,12 +685,7 @@ pub unsafe fn ink_dec_attn(
         let scale = 1.0 / (dim as f32).sqrt();
         let k_cache = *ptrs.add(t * 6 + P_K_CACHE) as *const u16;
         let v_cache = *ptrs.add(t * 6 + P_V_CACHE) as *const u16;
-        let lo = if window > 0 && p + 1 > window {
-            p + 1 - window
-        } else {
-            0
-        };
-        let mut j0 = lo;
+        let mut j0 = first;
         while j0 <= p {
             let j = j0 + tid;
             let mut s = LOWEST;
@@ -751,13 +768,65 @@ pub unsafe fn ink_dec_attn(
                 RUN[1] = RUN[1] * rescale + chunk_sum;
             }
             thread::sync_threads();
-            j0 += 256;
+            j0 += 256 * nz as i32;
         }
         if (tid as usize) < d {
-            let g = *row.add(gate_off as usize + h * d + tid as usize);
-            let v = ACC[tid as usize] / RUN[1] / (1.0 + (-g).exp());
-            *out.add((t * heads + h) * d + tid as usize) = f2h(v);
+            *result.add(2 + tid as usize) = ACC[tid as usize];
         }
+        if tid < 2 {
+            *result.add(tid as usize) = RUN[tid as usize];
+        }
+    }
+}
+
+/// The partials of `ink_dec_attn` joined: the zero-logit sink (weight one
+/// at logit zero, already folded into the partials' logits), the softmax
+/// normalization and the output gate. Partials are added in z order. The
+/// result is binary16, `[rows][heads][dim]`.
+///
+/// grid: (heads, rows), `dim` threads.
+///
+/// # Safety
+/// part is `[rows][heads][nz][dim + 2]`; `proj` rows hold the gate
+/// projection at its offset; out is `[rows][heads][dim]`.
+#[kernel]
+pub unsafe fn ink_dec_attn_merge(
+    part: *const f32,
+    proj: *const f32,
+    out: *mut u16,
+    ldo: i32,
+    gate_off: i32,
+    dim: i32,
+    nz: i32,
+) {
+    let tid = thread::threadIdx_x() as usize;
+    let h = thread::blockIdx_x() as usize;
+    let t = thread::blockIdx_y() as usize;
+    let heads = thread::gridDim_x() as usize;
+    let d = dim as usize;
+    if tid >= d {
+        return;
+    }
+    unsafe {
+        let base = part.add((t * heads + h) * nz as usize * (d + 2));
+        let mut top = 0.0f32;
+        let mut z = 0usize;
+        while z < nz as usize {
+            top = top.max(*base.add(z * (d + 2)));
+            z += 1;
+        }
+        let mut total = (-top).exp();
+        let mut acc = 0.0f32;
+        let mut z = 0usize;
+        while z < nz as usize {
+            let b = base.add(z * (d + 2));
+            let w = (*b - top).exp();
+            total = (*b.add(1)).mul_add(w, total);
+            acc = (*b.add(2 + tid)).mul_add(w, acc);
+            z += 1;
+        }
+        let g = *proj.add(t * ldo as usize + gate_off as usize + h * d + tid);
+        *out.add((t * heads + h) * d + tid) = f2h(acc / total / (1.0 + (-g).exp()));
     }
 }
 

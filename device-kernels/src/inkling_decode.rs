@@ -685,40 +685,67 @@ pub unsafe fn ink_dec_attn(
         let scale = 1.0 / (dim as f32).sqrt();
         let k_cache = *ptrs.add(t * 6 + P_K_CACHE) as *const u16;
         let v_cache = *ptrs.add(t * 6 + P_V_CACHE) as *const u16;
+        // A lane keeps four channels of the query and one feature of the
+        // relative vector in registers.
+        let lane = (tid & 31) as usize;
+        let wp = tid >> 5;
+        let q4i = lane * 4;
+        let mut q0 = 0.0f32;
+        let mut q1 = 0.0f32;
+        let mut q2 = 0.0f32;
+        let mut q3 = 0.0f32;
+        if q4i < d {
+            q0 = Q[q4i];
+            q1 = Q[q4i + 1];
+            q2 = Q[q4i + 2];
+            q3 = Q[q4i + 3];
+        }
+        let rl = if (lane as i32) < n_rel { R[lane] } else { 0.0 };
         let mut j0 = first;
         while j0 <= p {
-            let j = j0 + tid;
-            let mut s = LOWEST;
-            if j <= p {
-                // Four binary16 a load, two running sums: the loads of a
-                // key row are what this loop waits on, and a thread taking
-                // them one element at a time measured 100 us a launch.
-                let kr = k_cache.add((j & mask) as usize * stride + kv * d);
-                let mut a0 = 0.0f32;
-                let mut a1 = 0.0f32;
-                let mut i = 0usize;
-                while i < d {
-                    let w = *(kr.add(i) as *const u64);
-                    a0 = Q[i].mul_add(h2f(w as u16), a0);
-                    a1 = Q[i + 1].mul_add(h2f((w >> 16) as u16), a1);
-                    a0 = Q[i + 2].mul_add(h2f((w >> 32) as u16), a0);
-                    a1 = Q[i + 3].mul_add(h2f((w >> 48) as u16), a1);
-                    i += 4;
-                }
-                let dot = a0 + a1;
-                let dist = p - j;
-                let mut bias = 0.0f32;
-                if dist < extent {
-                    let b = rel_bias.add(dist as usize * n_rel as usize);
-                    let mut i = 0usize;
-                    while i < n_rel as usize {
-                        bias = (*b.add(i)).mul_add(R[i], bias);
-                        i += 1;
+            // Logits. Warp w takes the keys j = w mod 8 of the chunk, a
+            // lane four channels of each: one 8-byte load a lane a key, the
+            // lane's share of the bias beside it, and the warp's sum by
+            // shuffle. A thread a key walking all 128 channels read the
+            // query back from shared memory once a channel, and it is the
+            // load pipeline this kernel waits on.
+            let mut warp_max = LOWEST;
+            let mut i = 0i32;
+            while i < 32 {
+                let jj = wp + 8 * i;
+                let j = j0 + jj;
+                let mut s = LOWEST;
+                if j <= p {
+                    let mut v = 0.0f32;
+                    if q4i < d {
+                        let w = *(k_cache.add((j & mask) as usize * stride + kv * d + q4i) as *const u64);
+                        let mut a0 = q0 * h2f(w as u16);
+                        let mut a1 = q1 * h2f((w >> 16) as u16);
+                        a0 = q2.mul_add(h2f((w >> 32) as u16), a0);
+                        a1 = q3.mul_add(h2f((w >> 48) as u16), a1);
+                        v = (a0 + a1) * scale;
                     }
+                    let dist = p - j;
+                    if dist < extent && (lane as i32) < n_rel {
+                        v = (*rel_bias.add(dist as usize * n_rel as usize + lane)).mul_add(rl, v);
+                    }
+                    let mut off = 16;
+                    while off > 0 {
+                        v += warp::shuffle_xor_f32_sync(u32::MAX, v, off);
+                        off >>= 1;
+                    }
+                    s = v - sink;
                 }
-                s = dot * scale + (bias - sink);
+                if lane == 0 {
+                    P[jj as usize] = s;
+                }
+                warp_max = warp_max.max(s);
+                i += 1;
             }
-            let chunk_max = block_max_256(s);
+            let chunk_max = block_max_256(warp_max);
+            let j = j0 + tid;
+            let s = P[tid as usize];
+
             let old = RUN[0];
             let top = old.max(chunk_max);
             let rescale = (old - top).exp();

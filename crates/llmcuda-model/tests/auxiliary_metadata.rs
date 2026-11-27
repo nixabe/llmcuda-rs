@@ -1,5 +1,5 @@
 use llmcuda_gguf::{GgufArray as A, GgufFile, GgufValue as V};
-use llmcuda_model::{DFlashConfig, ModelConfig, VisionConfig};
+use llmcuda_model::{DFlashConfig, InklingVisionConfig, ModelConfig, VisionConfig};
 
 fn file(values: &[(&str, V)]) -> GgufFile {
     fn text(out: &mut Vec<u8>, s: &str) {
@@ -254,4 +254,99 @@ fn installed_auxiliary_files_match_metadata_derived_schemas() {
     llmcuda_model::dflash::DFlashWeightSchema::new(&c)
         .resolve(&c, &f)
         .unwrap();
+}
+
+fn inkling_vision(c: InklingVisionConfig) -> Vec<(&'static str, V)> {
+    let mut v = vec![
+        ("general.architecture", V::String("clip".into())),
+        ("clip.vision.projector_type", V::String("inkling2v".into())),
+        ("clip.vision.attention.layer_norm_epsilon", V::F32(c.ln_eps)),
+        (
+            "clip.vision.image_mean",
+            V::Array(A::F32(c.image_mean.to_vec())),
+        ),
+        (
+            "clip.vision.image_std",
+            V::Array(A::F32(c.image_std.to_vec())),
+        ),
+    ];
+    for (k, n) in [
+        ("clip.vision.block_count", c.num_layers),
+        ("clip.vision.embedding_length", c.hidden_size),
+        ("clip.vision.attention.head_count", c.num_heads),
+        ("clip.vision.feed_forward_length", c.ffn_size),
+        ("clip.vision.image_size", c.image_size),
+        ("clip.vision.patch_size", c.patch_size),
+        ("clip.vision.spatial_merge_size", c.spatial_merge),
+        ("clip.vision.projection_dim", c.projection_dim),
+    ] {
+        v.push((k, V::U32(n)));
+    }
+    v
+}
+/// A target whose embedding width is the Inkling 2 Mini projector's; nothing
+/// else about the target is consulted.
+fn inkling_target() -> ModelConfig {
+    ModelConfig {
+        hidden_size: InklingVisionConfig::inkling2_mini().projection_dim,
+        ..ModelConfig::qwen3_6_35b_a3b()
+    }
+}
+#[test]
+fn inkling_vision_geometry_tracks_metadata_instead_of_the_preset() {
+    let target = inkling_target();
+    let mut c = InklingVisionConfig::inkling2_mini();
+    c.num_layers = 3;
+    c.hidden_size = 256;
+    c.num_heads = 8;
+    c.ffn_size = 512;
+    c.image_size = 224;
+    c.patch_size = 8;
+    c.ln_eps = 1e-6;
+    c.image_mean = [0.4, 0.3, 0.2];
+    c.image_std = [0.2, 0.3, 0.4];
+    assert_eq!(
+        InklingVisionConfig::from_gguf(&file(&inkling_vision(c)), &target).unwrap(),
+        c
+    );
+}
+#[test]
+fn inkling_vision_rejects_incompatible_or_malformed_metadata() {
+    let target = inkling_target();
+    for (key, value) in [
+        (
+            "clip.vision.projector_type",
+            V::String("qwen3vl_merger".into()),
+        ),
+        ("general.architecture", V::String("inkling2_loop".into())),
+        ("clip.vision.projection_dim", V::U32(2048)),
+        ("clip.vision.attention.head_count", V::U32(0)),
+        // 1024 / 512 = 2 per head: not two halves of adjacent pairs.
+        ("clip.vision.attention.head_count", V::U32(512)),
+        ("clip.vision.patch_size", V::U32(17)),
+        ("clip.vision.spatial_merge_size", V::U32(3)),
+        ("clip.vision.image_std", V::Array(A::F32(vec![0.0; 3]))),
+        (
+            "clip.vision.image_mean",
+            V::Array(A::F32(vec![f32::NAN; 3])),
+        ),
+        ("clip.vision.attention.layer_norm_epsilon", V::F32(0.0)),
+    ] {
+        let mut v = inkling_vision(InklingVisionConfig::inkling2_mini());
+        replace(&mut v, key, value);
+        assert!(
+            InklingVisionConfig::from_gguf(&file(&v), &target).is_err(),
+            "{key}"
+        );
+    }
+}
+#[test]
+fn the_two_vision_loaders_refuse_each_others_files() {
+    // The Qwen tower keeps its projector type under `clip.projector_type`,
+    // this one under `clip.vision.projector_type`; neither loader may read
+    // the other's file as its own.
+    let qwen = file(&vision(VisionConfig::qwen3_6_35b_a3b()));
+    assert!(InklingVisionConfig::from_gguf(&qwen, &ModelConfig::qwen3_6_35b_a3b()).is_err());
+    let inkling = file(&inkling_vision(InklingVisionConfig::inkling2_mini()));
+    assert!(VisionConfig::from_gguf(&inkling, &inkling_target()).is_err());
 }

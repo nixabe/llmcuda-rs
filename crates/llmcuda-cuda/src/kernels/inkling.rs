@@ -1172,13 +1172,6 @@ __device__ __forceinline__ unsigned dg_bf16x2(unsigned v, float scale) {
     return (unsigned)l | ((unsigned)h << 16);
 }
 
-// One E2M1 nibble (sign in bit 3) to the fp16 bits of its doubled value.
-__device__ __forceinline__ unsigned dg_fp4(unsigned nib) {
-    const unsigned m = nib & 7u;
-    const unsigned v = m < 2u ? m * 0x3C00u : (((15u + (m >> 1)) << 10) | ((m & 1u) << 9));
-    return v | ((nib & 8u) << 12);
-}
-
 // An unsigned E4M3 sub-block scale, halved, as fp16 bits in both halves.
 __device__ __forceinline__ unsigned dg_ue4m3x2(unsigned b) {
     const unsigned e = (b >> 3) & 15u, man = b & 7u;
@@ -1188,6 +1181,46 @@ __device__ __forceinline__ unsigned dg_ue4m3x2(unsigned b) {
     unsigned v = e ? (((e + 7u) << 10) | (man << 7)) : (unsigned)sub;
     v = (b == 0u || b == 0x7Fu) ? 0u : v;
     return v | (v << 16);
+}
+
+__device__ __forceinline__ unsigned dg_prmt(unsigned a, unsigned b, unsigned c) {
+    unsigned v;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v) : "r"(a), "r"(b), "r"(c));
+    return v;
+}
+
+// Four NVFP4 bytes (eight E2M1 nibbles, sign in bit 3) to four fp16 pairs,
+// each times the sub-block scale `sc`; pair i is byte i, low nibble in the
+// low half. No table in memory: the launch is bound by its load pipeline,
+// and a shared-memory table cost a load a byte (bench_inkling_dg: 272 to
+// 362 GB/s of gate/up weights without it), where the arithmetic is free.
+//
+// prmt.b32 is an eight-entry byte table in two registers, indexed by the
+// low three bits of each control nibble; a control nibble with its top bit
+// set yields the *sign* of the selected byte replicated instead. Every
+// entry here is under 0x80, so that is zero. One permute over the nibbles
+// as stored therefore gives 64 + 2|v| for the positive elements and zero
+// for the negative ones; a second over the nibbles with their sign bits
+// flipped gives 64 - 2|v| for the negative ones and zero for the rest. The
+// OR is 64 + 2v, an unsigned byte, and from there it is dg_q8x2's splice:
+// under 0x64 the byte reads 1024 + 64 + 2v exactly, less 1088 is 2v, and
+// the multiply by the (halved) scale is exact too, the product of a
+// two-bit and a four-bit significand.
+__device__ __forceinline__ void dg_nv4(unsigned* h, unsigned d, unsigned sc) {
+    const unsigned dn = d ^ 0x88888888u;
+    const unsigned u0 = dg_prmt(0x43424140u, 0x4C484644u, d & 0xFFFFu) |
+                        dg_prmt(0x3D3E3F40u, 0x34383A3Cu, dn & 0xFFFFu);
+    const unsigned u1 = dg_prmt(0x43424140u, 0x4C484644u, d >> 16) |
+                        dg_prmt(0x3D3E3F40u, 0x34383A3Cu, dn >> 16);
+    h[0] = dg_prmt(u0, 0x64646464u, 0x5150u);
+    h[1] = dg_prmt(u0, 0x64646464u, 0x5352u);
+    h[2] = dg_prmt(u1, 0x64646464u, 0x5150u);
+    h[3] = dg_prmt(u1, 0x64646464u, 0x5352u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        asm("sub.rn.f16x2 %0, %0, %1;" : "+r"(h[i]) : "r"(0x64406440u));
+        asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(h[i]) : "r"(sc));
+    }
 }
 
 __device__ __forceinline__ float dg_situ(float gate, float up, float beta, float lb) {
@@ -1202,7 +1235,8 @@ __device__ __forceinline__ float dg_situ(float gate, float up, float beta, float
 // accumulate.
 //
 // No shared-memory staging. A block owns sixteen weight rows; each of its
-// eight warps contracts one eighth of K for them with one m16n8k8 fragment
+// warps (blockDim.x / 32 of them, at most eight) contracts an equal share
+// of K for them with one m16n8k8 fragment
 // set, and the partial sums are added in warp order at the end. A lane
 // builds its two A registers (rows g and g + 8, k pair t) straight from the
 // stored weights and reads its B register (token g, k pair t) straight from
@@ -1216,11 +1250,12 @@ __device__ __forceinline__ float dg_situ(float gate, float up, float beta, float
 //
 // FMT 0: split Q8_0 (`w` int8 [rows][K], `ws` fp16 [rows][K/32]).
 // FMT 1: bf16 [rows][K], staged at `wscale`.
-// FMT 2: NVFP4 as stored. A byte holds elements b and b + 8 of its
+// FMT 2: NVFP4, tile-major (nv4_tile_major; whole tiles, so every row of
+//   a block exists). A byte holds elements b and b + 8 of its
 //   sub-block, so the contraction walks k in *byte order*: the activations
 //   must be laid out the same way (pair p of a sub-block holds elements p
-//   and p + 8), which the kernels that write them do when asked. One table
-//   load turns a byte into the fp16 pair.
+//   and p + 8), which the kernels that write them do when asked. dg_nv4
+//   turns four bytes into four fp16 pairs in registers.
 //
 // MODE 0, dense: columns are rows 0..ntok of the activation plane that
 //   weight rows [0, b1), [b1, b2), [b2, ..) read (planes 0, 1, 2, `K`
@@ -1240,15 +1275,9 @@ __device__ __forceinline__ void dg_gemm(
     long long wstride, long long wsstride, int topk, int nv_out,
     float alpha, float wscale, float beta, float lb
 ) {
-    __shared__ unsigned lut[256];
     __shared__ float part[8][32][4];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int g = lane >> 2, t = lane & 3;
-    if (FMT == 2) {
-        lut[tid] = dg_fp4(tid & 15u) | (dg_fp4(tid >> 4) << 16);
-        __syncthreads();
-    }
-
     const unsigned short* xcol = nullptr;
     int row_a, row_b;
     if (MODE == 0) {
@@ -1288,10 +1317,24 @@ __device__ __forceinline__ void dg_gemm(
     // near 250 GB/s of weights; staging the wide loads through shared
     // memory to keep the natural order was slower still (bench_inkling_dg).
     const int chunks = K >> 6;
-    const int share = (chunks + 7) / 8;
+    const int nw = blockDim.x >> 5;
+    const int share = (chunks + nw - 1) / nw;
     const int ch0 = warp * share, ch1 = min(ch0 + share, chunks);
     for (int ch = ch0; ch < ch1; ++ch) {
         unsigned a[2][8];
+        if (FMT == 2) {
+            // Tile-major (nv4_tile_major): this lane's sub-block t of rows
+            // g and its partner is one record, and its two scale bytes
+            // another, both in the tile's 576 bytes for this chunk.
+            const unsigned char* tb = w + ((long long)blockIdx.x * chunks + ch) * 576;
+            const uint4 tv = *(const uint4*)(tb + lane * 16);
+            const unsigned ts = *(const unsigned short*)(tb + 512 + lane * 2);
+            const unsigned sa = dg_ue4m3x2(ts & 0xFFu), sb = dg_ue4m3x2(ts >> 8);
+            dg_nv4(a[0], tv.x, sa);
+            dg_nv4(a[0] + 4, tv.y, sa);
+            dg_nv4(a[1], tv.z, sb);
+            dg_nv4(a[1] + 4, tv.w, sb);
+        } else {
 #pragma unroll
         for (int hb = 0; hb < 2; ++hb) {
             const int row = hb ? row_b : row_a;
@@ -1312,7 +1355,7 @@ __device__ __forceinline__ void dg_gemm(
                     h[5] = dg_q8x2(q.z >> 16, sc);
                     h[6] = dg_q8x2(q.w, sc);
                     h[7] = dg_q8x2(q.w >> 16, sc);
-                } else if (FMT == 1) {
+                } else {
                     const uint4* p = (const uint4*)(w + ((long long)row * K + ch * 64 + t * 16) * 2);
                     const uint4 v0 = p[0], v1 = p[1];
                     h[0] = dg_bf16x2(v0.x, wscale);
@@ -1323,23 +1366,9 @@ __device__ __forceinline__ void dg_gemm(
                     h[5] = dg_bf16x2(v1.y, wscale);
                     h[6] = dg_bf16x2(v1.z, wscale);
                     h[7] = dg_bf16x2(v1.w, wscale);
-                } else {
-                    // Sub-block t of this row's block: its scale byte and
-                    // its eight bytes, each byte one fp16 pair in byte order.
-                    const unsigned char* blk = w + ((long long)row * chunks + ch) * 36;
-                    const unsigned sc = dg_ue4m3x2(blk[t]);
-                    const unsigned d0 = *(const unsigned*)(blk + 4 + t * 8);
-                    const unsigned d1 = *(const unsigned*)(blk + 8 + t * 8);
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        h[i] = lut[(d0 >> (8 * i)) & 255u];
-                        h[4 + i] = lut[(d1 >> (8 * i)) & 255u];
-                    }
-#pragma unroll
-                    for (int i = 0; i < 8; ++i)
-                        asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(h[i]) : "r"(sc));
                 }
             }
+        }
         }
         uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
         if (xcol) {
@@ -1364,8 +1393,10 @@ __device__ __forceinline__ void dg_gemm(
     if (warp != 0) return;
 #pragma unroll
     for (int wv = 1; wv < 8; ++wv)
+        if (wv < nw) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) c[i] += part[wv][lane][i];
+            for (int i = 0; i < 4; ++i) c[i] += part[wv][lane][i];
+        }
 
     // c[0], c[1]: row_a at token columns 2t, 2t + 1; c[2], c[3]: row_b.
     if (MODE == 0) {
@@ -1536,7 +1567,13 @@ impl DecodeGemm {
             .arg(&beta)
             .arg(&lb);
         // SAFETY: every caller length-checks its operands against the grid.
-        unsafe { b.launch(cfg((grid.0, grid.1, 1), 256, 0)) }?;
+        // About four and a half 64-element chunks a warp: fewer and the
+        // block's fixed work (its barrier, the partial sums) shows, more and
+        // a warp is bound by the latency of its own loads. Measured on the
+        // down projection, K 1,152: 308 GB/s at eight warps, 339 at four,
+        // 292 at two; K 2,304 is best at eight (bench_inkling_dg).
+        let warps = ((k as u32 / 64 * 2 + 4) / 9).clamp(1, 8);
+        unsafe { b.launch(cfg((grid.0, grid.1, 1), 32 * warps, 0)) }?;
         Ok(())
     }
 
@@ -1637,7 +1674,7 @@ impl DecodeGemm {
         need("dg gate_up ids", ids.len(), pairs)?;
         need("dg gate_up x", x.len(), pairs.div_ceil(topk) * k)?;
         need("dg gate_up out", out.len(), pairs * rows / 2)?;
-        self.check_stack(&w, stack, rows, k)?;
+        self.check_stack(&w, stack, rows, k, rows / 2)?;
         let (format, alpha, wscale, wstride, wsstride) = dg_format(&w, rows, k);
         let (ptr, _guard) = out.device_ptr_mut(stream);
         self.launch(
@@ -1689,7 +1726,7 @@ impl DecodeGemm {
         need("dg down weights", pair_w.len(), pairs)?;
         need("dg down x", x.len(), pairs * k)?;
         need("dg down out", out.len(), pairs * rows)?;
-        self.check_stack(&w, stack, rows, k)?;
+        self.check_stack(&w, stack, rows, k, 8)?;
         let (format, alpha, wscale, wstride, wsstride) = dg_format(&w, rows, k);
         let (ptr, _guard) = out.device_ptr_mut(stream);
         self.launch(
@@ -1715,6 +1752,7 @@ impl DecodeGemm {
         stack: usize,
         rows: usize,
         k: usize,
+        partner: usize,
     ) -> Result<(), InklingError> {
         match w {
             HalfWeight::Q8_0 { q, scales } => {
@@ -1724,10 +1762,20 @@ impl DecodeGemm {
             HalfWeight::Bf16 { bytes, .. } => {
                 need("dg expert bf16 weights", bytes.len(), stack * rows * k * 2)
             }
-            HalfWeight::Nvfp4 { bytes, .. } => {
+            HalfWeight::Nvfp4 {
+                bytes,
+                partner: packed,
+                ..
+            } => {
                 if !k.is_multiple_of(64) {
                     return Err(InklingError::Shape(
                         "NVFP4 rows are whole 64-element blocks",
+                    ));
+                }
+                // The kernel reads tiles, and its tiles are this launch's.
+                if *packed != partner || !super::hgemm::nv4_tiles_fit(rows, partner) {
+                    return Err(InklingError::Shape(
+                        "the decode GEMM reads NVFP4 tile-major, in whole tiles of its own pairing",
                     ));
                 }
                 need(
@@ -1744,6 +1792,9 @@ impl DecodeGemm {
 /// then the key, value, attention-output and feed-forward carries.
 pub const DEC_ROW_POINTERS: usize = 6;
 
+/// The most blocks one (head, row) of decode attention is split over.
+pub const DEC_ATTN_PARTS: usize = 8;
+
 /// The fused decode glue (`device-kernels/src/inkling_decode.rs`): what a
 /// layer does between its GEMMs when every row is the next position of its
 /// own sequence. Each launch covers all rows; a row's own state is reached
@@ -1752,6 +1803,8 @@ pub struct InklingDecodeKernels {
     inputs: CudaFunction,
     kv: CudaFunction,
     attn: CudaFunction,
+    attn_merge: CudaFunction,
+    commit: CudaFunction,
     ffn_in: CudaFunction,
     ffn_out: CudaFunction,
     gate: CudaFunction,
@@ -1826,6 +1879,8 @@ impl InklingDecodeKernels {
             inputs: m.load_function("ink_dec_inputs")?,
             kv: m.load_function("ink_dec_kv")?,
             attn: m.load_function("ink_dec_attn")?,
+            attn_merge: m.load_function("ink_dec_attn_merge")?,
+            commit: m.load_function("ink_dec_commit")?,
             ffn_in: m.load_function("ink_dec_ffn_in")?,
             ffn_out: m.load_function("ink_dec_ffn_out")?,
             gate: m.load_function("ink_dec_gate")?,
@@ -1927,6 +1982,11 @@ impl InklingDecodeKernels {
     ) -> Result<(), InklingError> {
         if c.rank == 0 || c.rank > 64 || ctrls == 0 {
             return Err(InklingError::Shape("controller rank must be 1..=64"));
+        }
+        if !n.is_multiple_of(2) {
+            return Err(InklingError::Shape(
+                "decode control reads its rows two floats a load",
+            ));
         }
         let n_norms = norms.len() / n;
         if n_norms == 0 {
@@ -2058,9 +2118,11 @@ impl InklingDecodeKernels {
         clip: f32,
         eps: f32,
         ring: Option<usize>,
+        window: Option<&DecodeWindow<'_>>,
         rows: usize,
     ) -> Result<(), InklingError> {
         let mask = row_mask(ring)?;
+        let (null, save, width) = window_args(window, rows)?;
         if !dim.is_multiple_of(32) || dim > 128 {
             return Err(InklingError::Shape(
                 "decode kv: head width must be 32..=128 in warps",
@@ -2088,6 +2150,11 @@ impl InklingDecodeKernels {
             .arg(&clip)
             .arg(&eps)
             .arg(&mask);
+        match window {
+            Some(w) => b.arg(w.offsets),
+            None => b.arg(&null),
+        };
+        b.arg(&save).arg(&width);
         // SAFETY: lengths checked; the pointer table is the caller's promise
         // that each row's caches and carries are live and large enough.
         unsafe { b.launch(cfg((2 * kv_heads, rows, 1), dim as u32, 0)) }?;
@@ -2107,6 +2174,7 @@ impl InklingDecodeKernels {
         q_clip: &CudaSlice<f32>,
         rel_clip: &CudaSlice<f32>,
         rel_bias: &CudaSlice<f32>,
+        part: &mut CudaSlice<f32>,
         out: &mut CudaSlice<u16>,
         o: ProjOffsets,
         heads: usize,
@@ -2132,6 +2200,14 @@ impl InklingDecodeKernels {
         need("dec attn rel_clip", rel_clip.len(), heads * n_rel)?;
         need("dec attn rel_bias", rel_bias.len(), extent * n_rel)?;
         need("dec attn out", out.len(), rows * heads * dim)?;
+        // A block a 256-position chunk of a sliding window; a full layer's
+        // span has no bound, so its blocks take every eighth chunk each.
+        let nz = if window > 0 {
+            window.div_ceil(256).min(DEC_ATTN_PARTS)
+        } else {
+            DEC_ATTN_PARTS
+        };
+        need("dec attn part", part.len(), rows * heads * nz * (dim + 2))?;
         let (kv, d, nr, w, e) = (
             kv_heads as i32,
             dim as i32,
@@ -2147,12 +2223,11 @@ impl InklingDecodeKernels {
             .arg(q_clip)
             .arg(rel_clip)
             .arg(rel_bias)
-            .arg(&mut *out)
+            .arg(&mut *part)
             .arg(&o.ldo)
             .arg(&o.q)
             .arg(&o.rel)
             .arg(&o.sink)
-            .arg(&o.gate)
             .arg(&kv)
             .arg(&d)
             .arg(&nr)
@@ -2164,7 +2239,18 @@ impl InklingDecodeKernels {
             .arg(&floor)
             .arg(&mask);
         // SAFETY: lengths checked; caches reached through the pointer table.
-        unsafe { b.launch(cfg((heads, rows, 1), 256, 0)) }?;
+        unsafe { b.launch(cfg((heads, rows, nz), 256, 0)) }?;
+        let nz = nz as i32;
+        let mut b = stream.launch_builder(&self.attn_merge);
+        b.arg(&*part)
+            .arg(proj)
+            .arg(&mut *out)
+            .arg(&o.ldo)
+            .arg(&o.gate)
+            .arg(&d)
+            .arg(&nz);
+        // SAFETY: part was just written for this grid; out length-checked.
+        unsafe { b.launch(cfg((heads, rows, 1), dim as u32, 0)) }?;
         Ok(())
     }
 
@@ -2196,8 +2282,11 @@ impl InklingDecodeKernels {
         taps: usize,
         byte_order: bool,
         eps: f32,
+        window: Option<&DecodeWindow<'_>>,
         rows: usize,
     ) -> Result<(), InklingError> {
+        let (null, save, width) = window_args(window, rows)?;
+        let save_off = window.map_or(0, |w| 2 * w.kv as i32);
         if states + usize::from(opens) + 1 > MIX_MAX_STATES {
             return Err(InklingError::Shape("decode ffn: too many residual blocks"));
         }
@@ -2248,6 +2337,11 @@ impl InklingDecodeKernels {
             b.arg(v);
         }
         b.arg(&eps);
+        match window {
+            Some(w) => b.arg(w.offsets),
+            None => b.arg(&null),
+        };
+        b.arg(&save).arg(&width).arg(&save_off);
         // SAFETY: lengths checked; carries reached through the pointer table.
         unsafe { b.launch(cfg((rows, 1, 1), 256, REDUCE_SHARED)) }?;
         Ok(())
@@ -2267,8 +2361,11 @@ impl InklingDecodeKernels {
         n: usize,
         topk: usize,
         taps: usize,
+        window: Option<&DecodeWindow<'_>>,
         rows: usize,
     ) -> Result<(), InklingError> {
+        let (null, save, width) = window_args(window, rows)?;
+        let save_off = window.map_or(0, |w| (2 * w.kv + n) as i32);
         need("dec out partial", partial.len(), rows * topk * n)?;
         need("dec out ffn_inp", ffn_inp.len(), rows * n)?;
         need("dec out conv", conv_w.len(), n * taps)?;
@@ -2284,8 +2381,76 @@ impl InklingDecodeKernels {
             .arg(&n_i)
             .arg(&k)
             .arg(&t);
+        match window {
+            Some(w) => b.arg(w.offsets),
+            None => b.arg(&null),
+        };
+        b.arg(&save).arg(&width).arg(&save_off);
         // SAFETY: lengths checked; carries reached through the pointer table.
         unsafe { b.launch(cfg((n.div_ceil(256), rows, 1), 256, 0)) }?;
         Ok(())
+    }
+
+    /// After a step with windows: advance every slot's carries by the rows
+    /// each window keeps. `ptrs` is the step's `[slots][rows][6]` table,
+    /// `save` its `[slots][rows][2 * (kv + n)]` saved inputs, and `keep[t]`
+    /// the rows kept from row `t` on when `t` opens a window, else zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit(
+        &self,
+        stream: &Arc<CudaStream>,
+        ptrs: &CudaSlice<u64>,
+        save: &CudaSlice<f32>,
+        keep: &CudaSlice<i32>,
+        kv: usize,
+        n: usize,
+        taps: usize,
+        slots: usize,
+        rows: usize,
+    ) -> Result<(), InklingError> {
+        need(
+            "dec commit ptrs",
+            ptrs.len(),
+            slots * rows * DEC_ROW_POINTERS,
+        )?;
+        need("dec commit save", save.len(), slots * rows * 2 * (kv + n))?;
+        need("dec commit keep", keep.len(), rows)?;
+        let (kv_i, n_i, t) = (kv as i32, n as i32, taps as i32);
+        let mut b = stream.launch_builder(&self.commit);
+        b.arg(ptrs).arg(save).arg(keep).arg(&kv_i).arg(&n_i).arg(&t);
+        // SAFETY: lengths checked; carries reached through the pointer table.
+        unsafe { b.launch(cfg((slots, rows, 1), 256, 0)) }?;
+        Ok(())
+    }
+}
+
+/// A decode step that holds windows: consecutive positions of one
+/// sequence, verified together.
+#[derive(Clone, Copy)]
+pub struct DecodeWindow<'a> {
+    /// `[rows]`: how many rows before each belong to the same sequence.
+    pub offsets: &'a CudaSlice<i32>,
+    /// Device address of this layer application's `[rows][width]` plane of
+    /// saved convolution inputs.
+    pub save: u64,
+    /// Floats a row saves: its key, value, attention-output and
+    /// feed-forward inputs, `2 * (kv + n)`.
+    pub width: usize,
+    /// The key (and value) width.
+    pub kv: usize,
+}
+
+/// A window's kernel arguments: a null for the absent table, the save
+/// plane's address, and its row width.
+fn window_args(
+    window: Option<&DecodeWindow<'_>>,
+    rows: usize,
+) -> Result<(u64, u64, i32), InklingError> {
+    match window {
+        Some(w) => {
+            need("dec window offsets", w.offsets.len(), rows)?;
+            Ok((0, w.save, w.width as i32))
+        }
+        None => Ok((0, 0, 0)),
     }
 }

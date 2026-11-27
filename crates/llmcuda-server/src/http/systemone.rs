@@ -251,8 +251,12 @@ pub(crate) fn media(
         encoding.get_ids().to_vec(),
         images,
         |vision, image| {
+            let config = vision
+                .config
+                .qwen()
+                .ok_or("the decision endpoint needs a qwen3vl_merger projector")?;
             preprocess_hf(
-                &vision.config,
+                config,
                 &image.rgb,
                 image.width,
                 image.height,
@@ -587,7 +591,9 @@ mod tests {
         let tok = crate::tokenizer::from_gguf(std::path::Path::new(&path)).expect("tokenizer");
         let id = |s: &str| tok.token_to_id(s).expect("vision token") as i32;
         let vision = VisionServing {
-            config: llmcuda_model::VisionConfig::qwen3_6_35b_a3b(),
+            config: crate::http::vision::VisionTower::Qwen(
+                llmcuda_model::VisionConfig::qwen3_6_35b_a3b(),
+            ),
             max_tokens: 1024,
             image_pad: id(IMAGE_PAD) as u32,
         };

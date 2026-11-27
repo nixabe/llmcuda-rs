@@ -120,6 +120,7 @@ fn grid_1d(n: usize) -> LaunchConfig {
 pub struct VisionKernels {
     layer_norm: CudaFunction,
     gelu: CudaFunction,
+    gelu_erf: CudaFunction,
     rope_qk: CudaFunction,
     softmax_rows: CudaFunction,
     add_f16: CudaFunction,
@@ -140,6 +141,7 @@ impl VisionKernels {
         Ok(Self {
             layer_norm: r("vision_layer_norm")?,
             gelu: r("vision_gelu")?,
+            gelu_erf: r("vision_gelu_erf")?,
             rope_qk: r("vision_rope_qk")?,
             softmax_rows: r("vision_softmax_rows")?,
             add_f16: r("vision_add_f16")?,
@@ -209,6 +211,34 @@ impl VisionKernels {
         }
         let n_ll = n as i64;
         let mut b = stream.launch_builder(&self.gelu);
+        b.arg(x).arg(&n_ll);
+        // SAFETY: the guard `i >= n` bounds every access; `x` holds at
+        // least `n` halves.
+        unsafe { b.launch(grid_1d(n)) }?;
+        Ok(())
+    }
+
+    /// In-place exact GELU, `x / 2 * (1 + erf(x / sqrt 2))`, over the first
+    /// `n` elements: the `inkling2v` tower's activation, where the tanh
+    /// form is `qwen3vl_merger`'s.
+    pub fn gelu_erf(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &mut CudaSlice<f16>,
+        n: usize,
+    ) -> Result<(), VisionError> {
+        if x.len() < n {
+            return Err(VisionError::WrongLength {
+                name: "gelu_erf x",
+                expected: n,
+                got: x.len(),
+            });
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let n_ll = n as i64;
+        let mut b = stream.launch_builder(&self.gelu_erf);
         b.arg(x).arg(&n_ll);
         // SAFETY: the guard `i >= n` bounds every access; `x` holds at
         // least `n` halves.

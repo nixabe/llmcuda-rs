@@ -12,6 +12,16 @@
 //! attention-output and feed-forward carries. A cache holds position `j` at
 //! row `j & mask`: a ring of `mask + 1` rows on a sliding layer, every
 //! position (`mask = i32::MAX`) on a full one.
+//!
+//! **Windows.** A step may hold several consecutive positions of one
+//! sequence, to verify drafted tokens: `woff[t]` is how many rows before
+//! row `t` belong to the same sequence. The only state rows share is a
+//! convolution's carry, so the three kernels that read one take a tap from
+//! an earlier row of the step where that is what the carry would have held
+//! by then - the same values in the same order as a step a row - and, since
+//! how many rows are kept is decided after the step, leave the carry alone
+//! and save each row's raw input for `ink_dec_commit`. `woff` and `save`
+//! are both null on an ordinary step.
 
 use crate::common::{block_reduce_sum, f2h, h2f};
 use crate::inkling::{block_max_256, block_sum_256};
@@ -34,6 +44,17 @@ fn byte_order(i: usize) -> usize {
     (i & !15) + ((i & 7) << 1) + ((i & 15) >> 3)
 }
 
+/// Two adjacent floats in one load. These kernels wait on their load
+/// pipeline, not on arithmetic, and an element a load is twice the loads.
+///
+/// # Safety
+/// p is 8-byte aligned and covers two floats.
+#[device]
+unsafe fn pair(p: *const f32) -> (f32, f32) {
+    let w = unsafe { *(p as *const u64) };
+    (f32::from_bits(w as u32), f32::from_bits((w >> 32) as u32))
+}
+
 /// One channel's one-row step of a short convolution with a residual, and
 /// its carry advanced: `(x + sum_i carry[i] * w[i] + x * w[carry]) * norm`
 /// before any input-dependent taps.
@@ -41,7 +62,7 @@ fn byte_order(i: usize) -> usize {
 /// # Safety
 /// carry covers `taps - 1` floats owned by this thread and w `taps`.
 #[device]
-unsafe fn conv_row(x: f32, w: *const f32, carry: *mut f32, taps: i32) -> f32 {
+unsafe fn conv_row(x: f32, w: *const f32, carry: *const f32, taps: i32) -> f32 {
     let n = (taps - 1) as usize;
     unsafe {
         let mut sum = 0.0f32;
@@ -72,7 +93,8 @@ unsafe fn carry_push(x: f32, carry: *mut f32, taps: i32) {
 }
 
 /// Depth mixing of one row over `states` stacked planes plus `cur`, for
-/// `n_queries` queries, into `out[q]` planes. As `ink_mix`.
+/// `n_queries` queries, into `out[q]` planes. `ink_mix`'s values, its sums
+/// taken a warp a state: the block is at least `32 * (states + 1)` threads.
 ///
 /// # Safety
 /// Every thread of the block calls this together; stack holds `states`
@@ -97,53 +119,58 @@ unsafe fn mix_row(
     let tid = thread::threadIdx_x() as i32;
     let step = thread::blockDim_x() as i32;
     let total = states + 1;
+    let (warp_id, lane) = (tid >> 5, tid & 31);
     unsafe {
         let base = row * n as usize;
-        let mut s = 0;
-        while s < total {
-            let src = if s < states {
-                stack.add((s as i64 * plane) as usize + base)
+        // A warp a state: its sum of squares and its product with every
+        // query in one walk of the row, reduced by shuffle. Taking each of
+        // the up to forty sums as a pass of the block with a barrier of its
+        // own was most of this kernel's time.
+        if warp_id < total {
+            let src = if warp_id < states {
+                stack.add((warp_id as i64 * plane) as usize + base)
             } else {
                 cur.add(base)
             };
-            let mut partial = 0.0f32;
-            let mut i = tid;
-            while i < n {
-                let v = *src.add(i as usize);
-                partial = v.mul_add(v, partial);
-                i += step;
-            }
-            let sum = block_reduce_sum(partial);
-            if tid == 0 {
-                INV[s as usize] = 1.0 / (sum / n as f32 + 1e-6).sqrt();
-            }
-            s += 1;
-        }
-        let scale = 1.0 / (n as f32).sqrt();
-        let mut q = 0;
-        while q < n_queries {
-            let query = queries.add(q as usize * n as usize);
-            let mut s = 0;
-            while s < total {
-                let src = if s < states {
-                    stack.add((s as i64 * plane) as usize + base)
-                } else {
-                    cur.add(base)
-                };
-                let mut partial = 0.0f32;
-                let mut i = tid;
-                while i < n {
-                    partial = (*src.add(i as usize)).mul_add(*query.add(i as usize), partial);
-                    i += step;
+            let nn = n as usize;
+            let (mut sq, mut d0, mut d1, mut d2, mut d3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            let mut i = lane as usize;
+            while i < nn {
+                let v = *src.add(i);
+                sq = v.mul_add(v, sq);
+                d0 = v.mul_add(*queries.add(i), d0);
+                if n_queries > 1 {
+                    d1 = v.mul_add(*queries.add(nn + i), d1);
                 }
-                let sum = block_reduce_sum(partial);
-                if tid == 0 {
-                    COEF[q as usize * MIX_STATES + s as usize] = sum * INV[s as usize] * scale;
+                if n_queries > 2 {
+                    d2 = v.mul_add(*queries.add(2 * nn + i), d2);
                 }
-                s += 1;
+                if n_queries > 3 {
+                    d3 = v.mul_add(*queries.add(3 * nn + i), d3);
+                }
+                i += 32;
             }
-            q += 1;
+            let mut offset = 16u32;
+            while offset > 0 {
+                sq += warp::shuffle_xor_f32_sync(u32::MAX, sq, offset);
+                d0 += warp::shuffle_xor_f32_sync(u32::MAX, d0, offset);
+                d1 += warp::shuffle_xor_f32_sync(u32::MAX, d1, offset);
+                d2 += warp::shuffle_xor_f32_sync(u32::MAX, d2, offset);
+                d3 += warp::shuffle_xor_f32_sync(u32::MAX, d3, offset);
+                offset >>= 1;
+            }
+            if lane == 0 {
+                let s = warp_id as usize;
+                let inv = 1.0 / (sq / n as f32 + 1e-6).sqrt();
+                let scale = inv / (n as f32).sqrt();
+                INV[s] = inv;
+                COEF[s] = d0 * scale;
+                COEF[MIX_STATES + s] = d1 * scale;
+                COEF[2 * MIX_STATES + s] = d2 * scale;
+                COEF[3 * MIX_STATES + s] = d3 * scale;
+            }
         }
+        thread::sync_threads();
         if tid == 0 {
             let mut q = 0usize;
             while q < n_queries as usize {
@@ -365,7 +392,7 @@ pub unsafe fn ink_dec_inputs(
 ///
 /// # Safety
 /// x and msg are `[ctrls][rows][n]`; inv `[rows][ctrls][2]`; down
-/// `[ctrls][rank][2n]`; gate `[rows][ctrls][rank]`.
+/// `[ctrls][rank][2n]`; gate `[rows][ctrls][rank]`; n is even.
 #[kernel]
 pub unsafe fn ink_dec_gate(
     x: *const f32,
@@ -390,16 +417,22 @@ pub unsafe fn ink_dec_gate(
         let inv_x = *inv.add(y * 2);
         let inv_m = *inv.add(y * 2 + 1);
         let row = down.add((j * rank as usize + r) * 2 * nu);
+        // A thread takes pairs 2 * tid, 2 * tid + 2 * step, ..: n is even,
+        // so a pair is on one side of the [x, msg] seam.
         let mut acc = 0.0f32;
-        let mut i = tid;
+        let mut i = 2 * tid;
         while i < 2 * n {
-            let v = if i < n {
-                *x.add(at + i as usize) * inv_x
+            let (v0, v1, s) = if i < n {
+                let (a, b) = pair(x.add(at + i as usize));
+                (a, b, inv_x)
             } else {
-                *msg.add(at + (i - n) as usize) * inv_m
+                let (a, b) = pair(msg.add(at + (i - n) as usize));
+                (a, b, inv_m)
             };
-            acc = (*row.add(i as usize)).mul_add(v, acc);
-            i += step;
+            let (r0, r1) = pair(row.add(i as usize));
+            acc = r0.mul_add(v0 * s, acc);
+            acc = r1.mul_add(v1 * s, acc);
+            i += 2 * step;
         }
         let sum = block_reduce_sum(acc);
         if tid == 0 {
@@ -446,10 +479,19 @@ pub unsafe fn ink_dec_ctrl(
             let mut g = 0.0f32;
             let mut f = 0.0f32;
             let mut k = 0usize;
-            while k < ru {
+            while ru & 1 == 0 && k + 1 < ru {
+                let (g0, g1) = pair(gr.add(k));
+                let (f0, f1) = pair(fr.add(k));
+                let (a0, a1) = (GATE[k], GATE[k + 1]);
+                g = g0.mul_add(a0, g);
+                f = f0.mul_add(a0, f);
+                g = g1.mul_add(a1, g);
+                f = f1.mul_add(a1, f);
+                k += 2;
+            }
+            if k < ru {
                 g = (*gr.add(k)).mul_add(GATE[k], g);
                 f = (*fr.add(k)).mul_add(GATE[k], f);
-                k += 1;
             }
             let at = (j * rows + t) * nu + i;
             let a = *x.add(at);
@@ -518,6 +560,9 @@ pub unsafe fn ink_dec_kv(
     clip: f32,
     eps: f32,
     mask: i32,
+    woff: *const i32,
+    save: *mut f32,
+    save_width: i32,
 ) {
     static mut RED: SharedArray<f32, 4> = SharedArray::UNINIT;
     let tid = thread::threadIdx_x() as usize;
@@ -535,20 +580,61 @@ pub unsafe fn ink_dec_kv(
         };
         let x = *row.add(off as usize + c);
         let carry = (*ptrs.add(t * 6 + P_K_CARRY + which) as *mut f32).add(c * (taps as usize - 1));
-        let mut sum = conv_row(x, weight.add(c * taps as usize), carry, taps);
+        let r = if woff.is_null() { 0 } else { *woff.add(t) as usize };
+        let n = taps as usize - 1;
+        let w = weight.add(c * taps as usize);
         let mut span = taps;
-        if tap_off >= 0 {
-            let tap = row.add(tap_off as usize + head * taps as usize);
-            sum += x * *tap;
-            let mut lag = 1;
-            while lag < taps {
-                sum += *carry.add((taps - 1 - lag) as usize) * *tap.add(lag as usize);
-                lag += 1;
+        let mut sum;
+        if r == 0 {
+            sum = conv_row(x, w, carry, taps);
+            if tap_off >= 0 {
+                let tap = row.add(tap_off as usize + head * taps as usize);
+                sum += x * *tap;
+                let mut lag = 1;
+                while lag < taps {
+                    sum += *carry.add((taps - 1 - lag) as usize) * *tap.add(lag as usize);
+                    lag += 1;
+                }
+                span = 2 * taps;
             }
-            span = 2 * taps;
+        } else {
+            // Carry element i as a step a row would find it: the carry
+            // shifted by the r rows before this one, their inputs behind it.
+            sum = 0.0;
+            let mut i = 0usize;
+            while i < n {
+                let held = if i + r < n {
+                    *carry.add(i + r)
+                } else {
+                    *proj.add((t + i - n) * ldo as usize + off as usize + c)
+                };
+                sum += held * *w.add(i);
+                i += 1;
+            }
+            sum = sum + x * *w.add(n);
+            if tap_off >= 0 {
+                let tap = row.add(tap_off as usize + head * taps as usize);
+                sum += x * *tap;
+                let mut lag = 1usize;
+                while lag <= n {
+                    let i = n - lag;
+                    let held = if i + r < n {
+                        *carry.add(i + r)
+                    } else {
+                        *proj.add((t + i - n) * ldo as usize + off as usize + c)
+                    };
+                    sum += held * *tap.add(lag);
+                    lag += 1;
+                }
+                span = 2 * taps;
+            }
         }
         let v = (x + sum) / ((span + 1) as f32).sqrt();
-        carry_push(x, carry, taps);
+        if save.is_null() {
+            carry_push(x, carry, taps);
+        } else {
+            *save.add(t * save_width as usize + which * kv_heads as usize * dim + c) = x;
+        }
 
         let mut sq = v * v;
         let mut off = 16;
@@ -577,18 +663,26 @@ pub unsafe fn ink_dec_kv(
     }
 }
 
-/// One query head of one row, start to finish: the query and
-/// relative-position clips (with the logarithmic position scale when
-/// `alpha >= 0`), attention over the row's cache with the bias computed per
-/// distance and a zero-logit sink, and the output gate. The result is
-/// binary16, `[rows][heads][dim]`.
+/// One query head of one row over a share of the row's cache: the query
+/// and relative-position clips (with the logarithmic position scale when
+/// `alpha >= 0`) and attention with the bias computed per distance, as an
+/// unnormalized partial for `ink_dec_attn_merge`:
+/// `part[row][head][z] = [max logit, sum exp(logit - max), dim sums of
+/// exp(logit - max) * value]`.
 ///
-/// grid: (heads, rows), 256 threads.
+/// Block z of a (head, row) takes the 256-position chunks z, z + Z, z + 2Z
+/// .. of the visible span, Z = gridDim.z, and one with no chunk writes the
+/// empty partial (lowest max, zero sums). A chunk is a serial chain of
+/// loads and barriers, so one block walking a 1,024-row window was four of
+/// them in a row on one SM while the rest of the card idled: 90 us a
+/// launch at three rows, and barely more than at one.
+///
+/// grid: (heads, rows, Z), 256 threads.
 ///
 /// # Safety
-/// As `ink_attn` and `ink_clip`; `proj` rows hold the query, relative,
-/// sink and gate projections at their offsets; dim is a multiple of 4 and
-/// at most 128, n_rel <= 32.
+/// As `ink_attn` and `ink_clip`; `proj` rows hold the query and relative
+/// projections at their offsets; dim is a multiple of 4 and at most 128,
+/// n_rel <= 32; part is `[rows][heads][Z][dim + 2]`.
 #[kernel]
 pub unsafe fn ink_dec_attn(
     proj: *const f32,
@@ -597,12 +691,11 @@ pub unsafe fn ink_dec_attn(
     q_clip: *const f32,
     rel_clip: *const f32,
     rel_bias: *const f32,
-    out: *mut u16,
+    part: *mut f32,
     ldo: i32,
     q_off: i32,
     rel_off: i32,
     sink_off: i32,
-    gate_off: i32,
     kv_heads: i32,
     dim: i32,
     n_rel: i32,
@@ -624,12 +717,27 @@ pub unsafe fn ink_dec_attn(
     let h = thread::blockIdx_x() as usize;
     let t = thread::blockIdx_y() as usize;
     let heads = thread::gridDim_x() as usize;
+    let z = thread::blockIdx_z() as usize;
+    let nz = thread::gridDim_z() as usize;
     let d = dim as usize;
     let kv = h / (heads / kv_heads as usize);
     let stride = kv_heads as usize * d;
     unsafe {
         let row = proj.add(t * ldo as usize);
         let p = *pos.add(t);
+        let lo = if window > 0 && p + 1 > window {
+            p + 1 - window
+        } else {
+            0
+        };
+        let result = part.add(((t * heads + h) * nz + z) * (d + 2));
+        let first = lo + 256 * z as i32;
+        if first > p {
+            if (tid as usize) < d + 2 {
+                *result.add(tid as usize) = if tid == 0 { LOWEST } else { 0.0 };
+            }
+            return;
+        }
         let tau = if alpha >= 0.0 {
             1.0 + alpha * (((p + 1) as f32) / floor).max(1.0).ln()
         } else {
@@ -654,8 +762,8 @@ pub unsafe fn ink_dec_attn(
             R[tid as usize] = rv * ((rel_bound / (r_norm + 1e-6)).min(1.0) * tau);
         }
         if tid == 0 {
-            RUN[0] = 0.0;
-            RUN[1] = 1.0;
+            RUN[0] = LOWEST;
+            RUN[1] = 0.0;
         }
         thread::sync_threads();
 
@@ -663,45 +771,67 @@ pub unsafe fn ink_dec_attn(
         let scale = 1.0 / (dim as f32).sqrt();
         let k_cache = *ptrs.add(t * 6 + P_K_CACHE) as *const u16;
         let v_cache = *ptrs.add(t * 6 + P_V_CACHE) as *const u16;
-        let lo = if window > 0 && p + 1 > window {
-            p + 1 - window
-        } else {
-            0
-        };
-        let mut j0 = lo;
+        // A lane keeps four channels of the query and one feature of the
+        // relative vector in registers.
+        let lane = (tid & 31) as usize;
+        let wp = tid >> 5;
+        let q4i = lane * 4;
+        let mut q0 = 0.0f32;
+        let mut q1 = 0.0f32;
+        let mut q2 = 0.0f32;
+        let mut q3 = 0.0f32;
+        if q4i < d {
+            q0 = Q[q4i];
+            q1 = Q[q4i + 1];
+            q2 = Q[q4i + 2];
+            q3 = Q[q4i + 3];
+        }
+        let rl = if (lane as i32) < n_rel { R[lane] } else { 0.0 };
+        let mut j0 = first;
         while j0 <= p {
-            let j = j0 + tid;
-            let mut s = LOWEST;
-            if j <= p {
-                // Four binary16 a load, two running sums: the loads of a
-                // key row are what this loop waits on, and a thread taking
-                // them one element at a time measured 100 us a launch.
-                let kr = k_cache.add((j & mask) as usize * stride + kv * d);
-                let mut a0 = 0.0f32;
-                let mut a1 = 0.0f32;
-                let mut i = 0usize;
-                while i < d {
-                    let w = *(kr.add(i) as *const u64);
-                    a0 = Q[i].mul_add(h2f(w as u16), a0);
-                    a1 = Q[i + 1].mul_add(h2f((w >> 16) as u16), a1);
-                    a0 = Q[i + 2].mul_add(h2f((w >> 32) as u16), a0);
-                    a1 = Q[i + 3].mul_add(h2f((w >> 48) as u16), a1);
-                    i += 4;
-                }
-                let dot = a0 + a1;
-                let dist = p - j;
-                let mut bias = 0.0f32;
-                if dist < extent {
-                    let b = rel_bias.add(dist as usize * n_rel as usize);
-                    let mut i = 0usize;
-                    while i < n_rel as usize {
-                        bias = (*b.add(i)).mul_add(R[i], bias);
-                        i += 1;
+            // Logits. Warp w takes the keys j = w mod 8 of the chunk, a
+            // lane four channels of each: one 8-byte load a lane a key, the
+            // lane's share of the bias beside it, and the warp's sum by
+            // shuffle. A thread a key walking all 128 channels read the
+            // query back from shared memory once a channel, and it is the
+            // load pipeline this kernel waits on.
+            let mut warp_max = LOWEST;
+            let mut i = 0i32;
+            while i < 32 {
+                let jj = wp + 8 * i;
+                let j = j0 + jj;
+                let mut s = LOWEST;
+                if j <= p {
+                    let mut v = 0.0f32;
+                    if q4i < d {
+                        let w = *(k_cache.add((j & mask) as usize * stride + kv * d + q4i) as *const u64);
+                        let mut a0 = q0 * h2f(w as u16);
+                        let mut a1 = q1 * h2f((w >> 16) as u16);
+                        a0 = q2.mul_add(h2f((w >> 32) as u16), a0);
+                        a1 = q3.mul_add(h2f((w >> 48) as u16), a1);
+                        v = (a0 + a1) * scale;
                     }
+                    let dist = p - j;
+                    if dist < extent && (lane as i32) < n_rel {
+                        v = (*rel_bias.add(dist as usize * n_rel as usize + lane)).mul_add(rl, v);
+                    }
+                    let mut off = 16;
+                    while off > 0 {
+                        v += warp::shuffle_xor_f32_sync(u32::MAX, v, off);
+                        off >>= 1;
+                    }
+                    s = v - sink;
                 }
-                s = dot * scale + (bias - sink);
+                if lane == 0 {
+                    P[jj as usize] = s;
+                }
+                warp_max = warp_max.max(s);
+                i += 1;
             }
-            let chunk_max = block_max_256(s);
+            let chunk_max = block_max_256(warp_max);
+            let j = j0 + tid;
+            let s = P[tid as usize];
+
             let old = RUN[0];
             let top = old.max(chunk_max);
             let rescale = (old - top).exp();
@@ -751,13 +881,65 @@ pub unsafe fn ink_dec_attn(
                 RUN[1] = RUN[1] * rescale + chunk_sum;
             }
             thread::sync_threads();
-            j0 += 256;
+            j0 += 256 * nz as i32;
         }
         if (tid as usize) < d {
-            let g = *row.add(gate_off as usize + h * d + tid as usize);
-            let v = ACC[tid as usize] / RUN[1] / (1.0 + (-g).exp());
-            *out.add((t * heads + h) * d + tid as usize) = f2h(v);
+            *result.add(2 + tid as usize) = ACC[tid as usize];
         }
+        if tid < 2 {
+            *result.add(tid as usize) = RUN[tid as usize];
+        }
+    }
+}
+
+/// The partials of `ink_dec_attn` joined: the zero-logit sink (weight one
+/// at logit zero, already folded into the partials' logits), the softmax
+/// normalization and the output gate. Partials are added in z order. The
+/// result is binary16, `[rows][heads][dim]`.
+///
+/// grid: (heads, rows), `dim` threads.
+///
+/// # Safety
+/// part is `[rows][heads][nz][dim + 2]`; `proj` rows hold the gate
+/// projection at its offset; out is `[rows][heads][dim]`.
+#[kernel]
+pub unsafe fn ink_dec_attn_merge(
+    part: *const f32,
+    proj: *const f32,
+    out: *mut u16,
+    ldo: i32,
+    gate_off: i32,
+    dim: i32,
+    nz: i32,
+) {
+    let tid = thread::threadIdx_x() as usize;
+    let h = thread::blockIdx_x() as usize;
+    let t = thread::blockIdx_y() as usize;
+    let heads = thread::gridDim_x() as usize;
+    let d = dim as usize;
+    if tid >= d {
+        return;
+    }
+    unsafe {
+        let base = part.add((t * heads + h) * nz as usize * (d + 2));
+        let mut top = 0.0f32;
+        let mut z = 0usize;
+        while z < nz as usize {
+            top = top.max(*base.add(z * (d + 2)));
+            z += 1;
+        }
+        let mut total = (-top).exp();
+        let mut acc = 0.0f32;
+        let mut z = 0usize;
+        while z < nz as usize {
+            let b = base.add(z * (d + 2));
+            let w = (*b - top).exp();
+            total = (*b.add(1)).mul_add(w, total);
+            acc = (*b.add(2 + tid)).mul_add(w, acc);
+            z += 1;
+        }
+        let g = *proj.add(t * ldo as usize + gate_off as usize + h * d + tid);
+        *out.add((t * heads + h) * d + tid) = f2h(acc / total / (1.0 + (-g).exp()));
     }
 }
 
@@ -793,6 +975,10 @@ pub unsafe fn ink_dec_ffn_in(
     taps: i32,
     nv: i32,
     eps: f32,
+    woff: *const i32,
+    save: *mut f32,
+    save_width: i32,
+    save_off: i32,
 ) {
     let tid = thread::threadIdx_x() as i32;
     let step = thread::blockDim_x() as i32;
@@ -803,13 +989,36 @@ pub unsafe fn ink_dec_ffn_in(
     unsafe {
         let carry = *ptrs.add(t * 6 + P_ATTN_CARRY) as *mut f32;
         let norm = 1.0 / ((taps + 1) as f32).sqrt();
+        let r = if woff.is_null() { 0 } else { *woff.add(t) as usize };
+        let held = (taps - 1) as usize;
         let mut i = tid;
         while i < n {
             let iu = i as usize;
             let x = *o_raw.add(t * nu + iu);
             let c = carry.add(iu * (taps as usize - 1));
-            let a = (x + conv_row(x, conv_w.add(iu * taps as usize), c, taps)) * norm;
-            carry_push(x, c, taps);
+            let w = conv_w.add(iu * taps as usize);
+            let conv = if r == 0 {
+                conv_row(x, w, c, taps)
+            } else {
+                let mut sum = 0.0f32;
+                let mut k = 0usize;
+                while k < held {
+                    let v = if k + r < held {
+                        *c.add(k + r)
+                    } else {
+                        *o_raw.add((t + k - held) * nu + iu)
+                    };
+                    sum += v * *w.add(k);
+                    k += 1;
+                }
+                sum + x * *w.add(held)
+            };
+            let a = (x + conv) * norm;
+            if save.is_null() {
+                carry_push(x, c, taps);
+            } else {
+                *save.add(t * save_width as usize + save_off as usize + iu) = x;
+            }
             let inp = *input.add(t * nu + iu);
             if opens != 0 {
                 *stack.add((states as i64 * plane) as usize + t * nu + iu) = inp;
@@ -855,6 +1064,15 @@ pub unsafe fn ink_dec_router(x: *const f32, router: *const f32, logits: *mut f32
         let xr = x.add(t * nu);
         let mut acc = 0.0f32;
         let mut i = first;
+        if (first | nu) & 1 == 0 {
+            while i + 1 < last {
+                let (w0, w1) = pair(wr.add(i));
+                let (x0, x1) = pair(xr.add(i));
+                acc = w0.mul_add(x0, acc);
+                acc = w1.mul_add(x1, acc);
+                i += 2;
+            }
+        }
         while i < last {
             acc = (*wr.add(i)).mul_add(*xr.add(i), acc);
             i += 1;
@@ -981,6 +1199,10 @@ pub unsafe fn ink_dec_ffn_out(
     n: i32,
     topk: i32,
     taps: i32,
+    woff: *const i32,
+    save: *mut f32,
+    save_width: i32,
+    save_off: i32,
 ) {
     let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
     let t = thread::blockIdx_y() as usize;
@@ -996,9 +1218,95 @@ pub unsafe fn ink_dec_ffn_out(
             j += 1;
         }
         let carry = (*ptrs.add(t * 6 + P_FFN_CARRY) as *mut f32).add(i * (taps as usize - 1));
-        let v = (x + conv_row(x, conv_w.add(i * taps as usize), carry, taps))
-            / ((taps + 1) as f32).sqrt();
-        carry_push(x, carry, taps);
+        let r = if woff.is_null() { 0 } else { *woff.add(t) as usize };
+        let w = conv_w.add(i * taps as usize);
+        let conv = if r == 0 {
+            conv_row(x, w, carry, taps)
+        } else {
+            // An earlier row's input is its own sum of the same pairs.
+            let held = (taps - 1) as usize;
+            let mut sum = 0.0f32;
+            let mut k = 0usize;
+            while k < held {
+                let value = if k + r < held {
+                    *carry.add(k + r)
+                } else {
+                    let row = t + k - held;
+                    let mut earlier = 0.0f32;
+                    let mut j = 0usize;
+                    while j < topk as usize {
+                        earlier += *partial.add((row * topk as usize + j) * nu + i);
+                        j += 1;
+                    }
+                    earlier
+                };
+                sum += value * *w.add(k);
+                k += 1;
+            }
+            sum + x * *w.add(held)
+        };
+        let v = (x + conv) / ((taps + 1) as f32).sqrt();
+        if save.is_null() {
+            carry_push(x, carry, taps);
+        } else {
+            *save.add(t * save_width as usize + save_off as usize + i) = x;
+        }
         *h.add(t * nu + i) = *ffn_inp.add(t * nu + i) + v;
+    }
+}
+
+/// The carries of a window's sequence advanced by the rows that were kept:
+/// each of a slot's four carries takes the saved inputs of rows
+/// `t .. t + keep[t]` in order, as that many steps a row would have pushed
+/// them. Rows with `keep[t] == 0` are not the first of a window, or are of
+/// a sequence that keeps nothing.
+///
+/// grid: (slots, rows), 256 threads. `ptrs` is `[slots][rows][6]` and
+/// `save` `[slots][rows][width]`, a row's fields being its key, value,
+/// attention-output and feed-forward inputs (`kv`, `kv`, `n`, `n` wide).
+///
+/// # Safety
+/// The tables cover the grid; `keep[t]` rows from `t` are one sequence's.
+#[kernel]
+pub unsafe fn ink_dec_commit(
+    ptrs: *const u64,
+    save: *const f32,
+    keep: *const i32,
+    kv: i32,
+    n: i32,
+    taps: i32,
+) {
+    let tid = thread::threadIdx_x() as usize;
+    let step = thread::blockDim_x() as usize;
+    let slot = thread::blockIdx_x() as usize;
+    let t = thread::blockIdx_y() as usize;
+    let rows = thread::gridDim_y() as usize;
+    let width = 2 * (kv + n) as usize;
+    unsafe {
+        let kept = *keep.add(t) as usize;
+        if kept == 0 {
+            return;
+        }
+        let table = ptrs.add((slot * rows + t) * 6 + P_K_CARRY);
+        let mut c = tid;
+        while c < width {
+            // Which carry this channel is in, and where in it.
+            let (field, at) = if c < kv as usize {
+                (0usize, c)
+            } else if c < 2 * kv as usize {
+                (1usize, c - kv as usize)
+            } else if c < (2 * kv + n) as usize {
+                (2usize, c - 2 * kv as usize)
+            } else {
+                (3usize, c - (2 * kv + n) as usize)
+            };
+            let carry = (*table.add(field) as *mut f32).add(at * (taps as usize - 1));
+            let mut j = 0usize;
+            while j < kept {
+                carry_push(*save.add((slot * rows + t + j) * width + c), carry, taps);
+                j += 1;
+            }
+            c += step;
+        }
     }
 }

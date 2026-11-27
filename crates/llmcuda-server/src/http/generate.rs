@@ -300,6 +300,11 @@ pub(crate) struct Generation {
     /// Set for a model that frames its reply in typed blocks; then the
     /// block tokens open and close the reasoning span, and are not text.
     blocks: Option<super::BlockMarkup>,
+    /// Tools were offered to a block model: its tool call blocks are
+    /// parsed rather than passed through as text.
+    block_tools: bool,
+    /// Where the block router is inside a reply.
+    block: BlockState,
     reasoning_open: bool,
     trim_spans: bool,
     /// Set at the start of each span; cleared once that span has emitted
@@ -315,6 +320,45 @@ pub(crate) struct Generation {
     /// Chunks the tool parser produced beyond the one being returned now.
     queued: VecDeque<Chunk>,
     tool_calls: usize,
+}
+
+/// Where a block model's reply is, for the tool call block.
+enum BlockState {
+    /// In a thinking or text block, or between blocks.
+    Content,
+    /// After a block header, before its content type: a function name, if
+    /// the block turns out to be a tool call.
+    Header(String),
+    /// In a tool call's JSON body.
+    ToolBody { name: String, body: String },
+}
+
+impl BlockState {
+    /// What an unfinished tool call had produced, as the text it was.
+    fn take_raw(&mut self) -> Option<String> {
+        match std::mem::replace(self, Self::Content) {
+            Self::ToolBody { name, body } => Some(name + &body),
+            Self::Header(_) | Self::Content => None,
+        }
+    }
+}
+
+/// A tool call block's body: `{"name": NAME, "args": {..}}`. The name is
+/// the JSON's, as in llama.cpp's parser (common/parsers/inkling.cpp), not
+/// the one the header repeats.
+fn parse_block_call(body: &str) -> Option<ParsedToolCall> {
+    let serde_json::Value::Object(mut call) = serde_json::from_str(body.trim()).ok()? else {
+        return None;
+    };
+    let serde_json::Value::String(name) = call.remove("name")? else {
+        return None;
+    };
+    let arguments = match call.remove("args") {
+        Some(serde_json::Value::Object(arguments)) => arguments,
+        None => serde_json::Map::new(),
+        Some(_) => return None,
+    };
+    Some(ParsedToolCall { name, arguments })
 }
 
 impl Generation {
@@ -334,13 +378,24 @@ impl Generation {
                 "this is a decision model: it generates no text; use /v1/systemone",
             ));
         }
-        if state.block_markup.is_some() && spec.tool_parser.is_some() {
-            return Err(ApiError::bad_request(
-                dialect,
-                "tool calls are not supported for this model yet: its replies are parsed for \
-                 thinking and text blocks only",
-            ));
-        }
+        // A block model writes a tool call as a block of its own, which the
+        // block router reads; the text scanner and the grammar built for
+        // `<tool_call>` markup have nothing to find in its output.
+        let mut spec = spec;
+        let block_tools = match state.block_markup {
+            Some(blocks) if spec.tool_parser.is_some() => {
+                if blocks.invoke.is_none() {
+                    return Err(ApiError::bad_request(
+                        dialect,
+                        "this model's vocabulary has no tool call block",
+                    ));
+                }
+                spec.tool_parser = None;
+                spec.constraint = None;
+                true
+            }
+            _ => false,
+        };
         if spec.max_tokens == 0 {
             return Err(ApiError::bad_request(
                 dialect,
@@ -423,6 +478,8 @@ impl Generation {
             pending: String::new(),
             think_close: state.think_close_token,
             blocks: state.block_markup,
+            block_tools,
+            block: BlockState::Content,
             // A block-framed reply says which span it is in; nothing is
             // open until it does.
             reasoning_open: state.block_markup.is_none()
@@ -552,6 +609,11 @@ impl Generation {
                         EngineFinish::Eos => Finish::EndOfTurn,
                         EngineFinish::Length => Finish::Length,
                     });
+                    // A tool call cut short is not a call: what there is of
+                    // it goes out as the text it was.
+                    if let Some(raw) = self.block.take_raw() {
+                        self.pending.push_str(&raw);
+                    }
                     let tail = std::mem::take(&mut self.pending);
                     return Ok(self.chunk(tail));
                 }
@@ -578,21 +640,65 @@ impl Generation {
 
             // A block token is markup: it ends the span in progress, and a
             // content-type token says which span the next text belongs to.
-            if let Some(blocks) = self.blocks
-                && [blocks.header, blocks.thinking, blocks.text, blocks.end].contains(&token)
-            {
-                let tail = std::mem::take(&mut self.pending);
-                let flushed = self.chunk(tail);
-                if token == blocks.thinking {
-                    self.reasoning_open = true;
-                } else if token == blocks.text {
-                    self.reasoning_open = false;
+            if let Some(blocks) = self.blocks {
+                if [blocks.header, blocks.thinking, blocks.text, blocks.end].contains(&token) {
+                    // The end of a tool call's body: the call, or its text
+                    // back if it is not one.
+                    if token == blocks.end
+                        && let BlockState::ToolBody { name, body } =
+                            std::mem::replace(&mut self.block, BlockState::Content)
+                    {
+                        match parse_block_call(&body) {
+                            Some(call) => {
+                                self.tool_calls += 1;
+                                return Ok(Some(Chunk::ToolCall(call)));
+                            }
+                            None => {
+                                self.pending.push_str(&name);
+                                self.pending.push_str(&body);
+                            }
+                        }
+                    }
+                    // A header's own text is a function name, and markup
+                    // either way: nothing of it belongs to a span.
+                    self.block = if token == blocks.header && self.block_tools {
+                        BlockState::Header(String::new())
+                    } else {
+                        BlockState::Content
+                    };
+                    let tail = std::mem::take(&mut self.pending);
+                    let flushed = self.chunk(tail);
+                    if token == blocks.thinking {
+                        self.reasoning_open = true;
+                    } else if token == blocks.text {
+                        self.reasoning_open = false;
+                    }
+                    self.trim_span_start = self.trim_spans;
+                    if flushed.is_some() {
+                        return Ok(flushed);
+                    }
+                    continue;
                 }
-                self.trim_span_start = self.trim_spans;
-                if flushed.is_some() {
-                    return Ok(flushed);
+                if self.block_tools && Some(token) == blocks.invoke {
+                    let name = match std::mem::replace(&mut self.block, BlockState::Content) {
+                        BlockState::Header(name) => name,
+                        _ => String::new(),
+                    };
+                    self.block = BlockState::ToolBody {
+                        name,
+                        body: String::new(),
+                    };
+                    continue;
                 }
-                continue;
+                // Inside a header or a call's body the text is held apart
+                // from the spans, where no stop sequence can cut it.
+                match &mut self.block {
+                    BlockState::Header(text) | BlockState::ToolBody { body: text, .. } => {
+                        text.push_str(&self.detokenizer.push(token as u32));
+                        continue;
+                    }
+                    BlockState::Content => {}
+                }
             }
 
             // The reasoning span closes on its special token, or on explicit
@@ -704,6 +810,34 @@ impl Generation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool call block's body is the call's JSON; the name is the JSON's
+    /// and the arguments its `args` object. Anything else is not a call,
+    /// and the router hands it back as text.
+    #[test]
+    fn a_tool_call_block_parses_to_its_name_and_arguments() {
+        let call = parse_block_call(r#" {"name":"get_weather","args":{"city":"Paris","n":2}} "#)
+            .expect("a call");
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments_json(), r#"{"city":"Paris","n":2}"#);
+        assert_eq!(
+            parse_block_call(r#"{"name":"now"}"#)
+                .expect("no args")
+                .arguments
+                .len(),
+            0
+        );
+        for not_a_call in [
+            r#"{"name":"f","args":[1]}"#,
+            r#"{"args":{}}"#,
+            r#"{"name":7,"args":{}}"#,
+            r#"{"name":"f","args":{"#,
+            "[]",
+            "",
+        ] {
+            assert!(parse_block_call(not_a_call).is_none(), "{not_a_call}");
+        }
+    }
 
     #[test]
     fn a_partial_stop_sequence_is_held_back() {

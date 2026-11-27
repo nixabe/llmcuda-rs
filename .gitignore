@@ -26,3 +26,4 @@
 # Optional native reference tools built beside their sources.
 /tools/oracle/capture
 /tools/oracle/bench_decode
+/tools/oracle/capture_inkling2v

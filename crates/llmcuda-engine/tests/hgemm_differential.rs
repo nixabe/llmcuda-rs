@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaStream};
 use llmcuda_cuda::device::{DeviceInfo, driver_available};
-use llmcuda_cuda::kernels::hgemm::{HalfWeight, HgemmKernels, HgemmPlan, bf16_half_exponent};
+use llmcuda_cuda::kernels::hgemm::{
+    HalfWeight, HgemmKernels, HgemmPlan, bf16_half_exponent, nv4_tile_major, nv4_tiles_fit,
+};
 use llmcuda_cuda::kernels::mma::MmaKernels;
 use llmcuda_kernels::f16::round_through_f16;
 use llmcuda_kernels::quant::quantize_q8_0;
@@ -223,6 +225,7 @@ fn run_case(
             let w = HalfWeight::Nvfp4 {
                 bytes: &dev,
                 scale: NVFP4_SCALE,
+                partner: 0,
             };
             hg.gemm_with_plan(
                 stream,
@@ -417,6 +420,7 @@ fn grouped_gemm_contracts_each_tile_with_its_owner() {
                     let w = HalfWeight::Nvfp4 {
                         bytes: &dev,
                         scale: 1.0,
+                        partner: 0,
                     };
                     hg.gemm_grouped(
                         &stream,
@@ -431,6 +435,52 @@ fn grouped_gemm_contracts_each_tile_with_its_owner() {
                         wide,
                     )
                     .unwrap();
+                    // A stack of whole tiles, as stored and tile-major
+                    // under both pairings the decode GEMM uses: a
+                    // different address for every byte, the same bits out.
+                    let rows = 288usize;
+                    let (bytes, _) = nvfp4_weights(stack * rows, k, 94);
+                    let per = rows * k / 64 * 36;
+                    let seed = rng.vec_f32(tokens * rows, -1.0, 1.0);
+                    let run = |bytes: &[u8], partner: usize| {
+                        let dev = stream.clone_htod(bytes).unwrap();
+                        let mut out = stream.clone_htod(&seed).unwrap();
+                        hg.gemm_grouped(
+                            &stream,
+                            HalfWeight::Nvfp4 {
+                                bytes: &dev,
+                                scale: 1.0,
+                                partner,
+                            },
+                            stack,
+                            &d_owners,
+                            Some(&d_factors),
+                            &xh,
+                            &mut out,
+                            rows,
+                            k,
+                            wide,
+                        )
+                        .unwrap();
+                        stream.clone_dtoh(&out).unwrap()
+                    };
+                    let stored = run(&bytes, 0);
+                    assert!(stored.iter().zip(&seed).any(|(a, b)| a != b));
+                    for partner in [8, rows / 2] {
+                        assert!(nv4_tiles_fit(rows, partner));
+                        let mut packed = vec![0u8; bytes.len()];
+                        for (src, dst) in bytes.chunks_exact(per).zip(packed.chunks_exact_mut(per))
+                        {
+                            nv4_tile_major(src, dst, rows, k, partner);
+                        }
+                        let got = run(&packed, partner);
+                        assert!(
+                            got.iter()
+                                .zip(&stored)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "tile-major NVFP4 (partner {partner}, wide {wide}) is not the stored rows' bits"
+                        );
+                    }
                     (vals, true)
                 }
             };
@@ -512,6 +562,8 @@ fn decode_gemm_matches_its_rounding_contract() {
         bytes: Option<cudarc::driver::CudaSlice<u8>>,
         exponent: i32,
         deq: Vec<f32>,
+        /// NVFP4: 0 as stored, else tile-major with this partner distance.
+        partner: usize,
     }
     let stage = |format: &Format, n: usize, k: usize, seed: u64| -> Staged {
         match format {
@@ -527,6 +579,7 @@ fn decode_gemm_matches_its_rounding_contract() {
                     bytes: None,
                     exponent: 0,
                     deq,
+                    partner: 0,
                 }
             }
             Format::Bf16 => {
@@ -537,6 +590,7 @@ fn decode_gemm_matches_its_rounding_contract() {
                     q: None,
                     bytes: Some(stream.clone_htod(&bytes).unwrap()),
                     exponent,
+                    partner: 0,
                     deq: vals
                         .iter()
                         .map(|&v| round_through_f16(v * scale) / scale)
@@ -550,6 +604,7 @@ fn decode_gemm_matches_its_rounding_contract() {
                     bytes: Some(stream.clone_htod(&bytes).unwrap()),
                     exponent: 0,
                     deq: vals,
+                    partner: 0,
                 }
             }
         }
@@ -567,6 +622,7 @@ fn decode_gemm_matches_its_rounding_contract() {
             Format::Nvfp4 => HalfWeight::Nvfp4 {
                 bytes: s.bytes.as_ref().unwrap(),
                 scale: 1.0,
+                partner: s.partner,
             },
         }
     }
@@ -643,8 +699,23 @@ fn decode_gemm_matches_its_rounding_contract() {
         ("nvfp4", Format::Nvfp4),
     ] {
         let nv = matches!(format, Format::Nvfp4);
-        let gate_up = stage(&format, stack * 2 * ff, n, 11);
-        let down = stage(&format, stack * n, ff, 13);
+        let mut gate_up = stage(&format, stack * 2 * ff, n, 11);
+        let mut down = stage(&format, stack * n, ff, 13);
+        // The decode GEMM reads NVFP4 experts tile-major, each projection
+        // under its own pairing.
+        if nv {
+            for (staged, rows, k, partner) in [(&mut gate_up, 2 * ff, n, ff), (&mut down, n, ff, 8)]
+            {
+                let stored = stream.clone_dtoh(staged.bytes.as_ref().unwrap()).unwrap();
+                let per = rows * k / 64 * 36;
+                let mut packed = vec![0u8; stored.len()];
+                for (src, dst) in stored.chunks_exact(per).zip(packed.chunks_exact_mut(per)) {
+                    nv4_tile_major(src, dst, rows, k, partner);
+                }
+                staged.bytes = Some(stream.clone_htod(&packed).unwrap());
+                staged.partner = partner;
+            }
+        }
         let scale_of = |e: usize| if nv { f64::from(factors[e]) } else { 1.0 };
         // Small activations keep the gates off SiTU's flat ends.
         let x = rng.vec_f32(tokens * n, -0.3, 0.3);

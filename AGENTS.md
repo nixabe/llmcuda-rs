@@ -119,7 +119,7 @@ it runs.
 | `llmcuda-model` | Qwen3.6 config, VRAM and bandwidth budgets | `llmcuda-gguf` |
 | `llmcuda-cache` | Two-group pager, radix prefix tree, snapshot retention | `llmcuda-model` |
 | `llmcuda-sched` | Chunked prefill, decode priority, admission control | `llmcuda-model`, `llmcuda-cache` |
-| `llmcuda-kernels` | CPU reference kernels, differential harness | `llmcuda-model` |
+| `llmcuda-kernels` | CPU reference kernels, differential harness | `llmcuda-gguf`, `llmcuda-model` |
 | `llmcuda-grammar` | Tool-call grammar, vocabulary mask for constrained decoding | — |
 | `llmcuda-cuda` | Driver API, streams, graphs, device probe | — |
 | `llmcuda-engine` | Worker, cache-aware router, orchestration | all of the above |

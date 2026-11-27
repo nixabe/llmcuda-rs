@@ -57,7 +57,7 @@ pub const TARGET_ARCH: &str = "compute_75";
 /// `k2_combine_residual`, `k2_values`, `k2_gate`, `k2_norm`, the three
 /// `k2_dispatch_*` passes, `moe_align_count`, `argmax_partial`,
 /// `argmax_final`, `hg_splitk_reduce`, `dense_ffn_add_residual`,
-/// `mtp_concat_eh`, `dflash_tap`, `hg_to_half`, `vision_gelu`,
+/// `mtp_concat_eh`, `dflash_tap`, `hg_to_half`, `vision_gelu`, `vision_gelu_erf`,
 /// `vision_add_f16`, `vision_half_to_float`, `attn_kv_append`,
 /// `dense_swiglu_narrow`, `dec_add_owner_rows`, `dec_span_mean`,
 /// `dec_attention_combine`, `dec_layer_norm`, `k2_rotary_apply`,
@@ -77,7 +77,7 @@ pub const TARGET_ARCH: &str = "compute_75";
 /// `ink_embed`, `ink_linear`, `ink_mix`, `ink_ctrl_pair`, `ink_ctrl_apply`,
 /// `ink_conv`, `ink_clip`, `ink_rms_groups`, `ink_rel_table`, `ink_attn`,
 /// `ink_gather_half`, `ink_situ_half`, `ink_moe_combine`, `ink_softcap`,
-/// `ink_dec_inputs`, `ink_dec_kv`, `ink_dec_attn`, `ink_dec_ffn_in`,
+/// `ink_dec_inputs`, `ink_dec_kv`, `ink_dec_attn`, `ink_dec_attn_merge`, `ink_dec_commit`, `ink_dec_ffn_in`,
 /// `ink_dec_ffn_out`, `ink_dec_gate`, `ink_dec_ctrl`, `ink_dec_norm`,
 /// `ink_dec_router` and `ink_dec_route`.
 /// No kernel exists in both languages.

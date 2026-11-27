@@ -50,11 +50,22 @@ fn run(args: &[String]) -> Result<()> {
     let token = |i: usize| (((i as u64 * 2_654_435_761) >> 7) % (vocab as u64 - 1000)) as i32;
 
     for &n in &widths {
-        let mut prefill = Vec::new();
+        // One pass per distinct chunk length, reused: a pass owns its
+        // workspace, and one per chunk would not fit at depth.
+        let mut prefill: Vec<(usize, InklingPass)> = Vec::new();
+        let mut plan = Vec::new();
         let mut at = 0;
         while at < pp {
             let rows = chunk.min(pp - at);
-            prefill.push((rows, InklingPass::new(&model, &stream, n * rows)?));
+            let index = match prefill.iter().position(|(have, _)| *have == rows) {
+                Some(index) => index,
+                None => {
+                    let pass = InklingPass::with_logit_rows(&model, &stream, n * rows, n)?;
+                    prefill.push((rows, pass));
+                    prefill.len() - 1
+                }
+            };
+            plan.push(index);
             at += rows;
         }
         let mut decode = InklingDecode::new(&model, &stream, n)?;
@@ -88,7 +99,8 @@ fn run(args: &[String]) -> Result<()> {
             stream.synchronize()?;
             let t0 = Instant::now();
             let mut at = 0;
-            for (rows, pass) in &mut prefill {
+            for &index in &plan {
+                let (rows, pass) = &mut prefill[index];
                 let tokens: Vec<i32> = (0..n)
                     .flat_map(|s| (0..*rows).map(move |i| token(s * 7919 + at + i)))
                     .collect();

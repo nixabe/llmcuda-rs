@@ -21,6 +21,7 @@ pub mod config;
 pub mod dflash;
 pub mod gguf;
 pub mod inkling;
+pub mod inkling_vision;
 mod metadata;
 pub mod verify;
 pub mod vision;
@@ -32,6 +33,7 @@ pub use config::{
 };
 pub use dflash::DFlashConfig;
 pub use inkling::InklingConfig;
+pub use inkling_vision::InklingVisionConfig;
 pub use vision::VisionConfig;
 pub use weights::{Directory, Role, Section, TensorSpec, WeightError, WeightSchema};
 

@@ -8,11 +8,11 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+llmcuda-gguf.workspace = true
 llmcuda-model.workspace = true
 half.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 tracing.workspace = true
-llmcuda-gguf.workspace = true
 llmcuda-log.workspace = true

@@ -313,6 +313,34 @@ mod tests {
 
     /// Token ids llama.cpp ae6a7ad2c produced for the same text (the
     /// `api.tokens` of the capture `inkling_reference.rs` uses).
+    /// An image's block is four tokens: the header, the content type, the
+    /// placeholder the server expands, and the end. A placeholder that
+    /// tokenized as text would leave the image out of the prompt silently.
+    #[test]
+    fn inkling_image_block_is_four_tokens() {
+        let path = std::env::var_os("LLMCUDA_INKLING_MODEL").map_or_else(
+            || {
+                PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf"
+                ))
+            },
+            PathBuf::from,
+        );
+        if !path.exists() {
+            eprintln!("SKIPPED: no Inkling model at {}", path.display());
+            return;
+        }
+        let tokenizer = from_gguf(&path).unwrap();
+        let ids = tokenizer
+            .encode(
+                "<|message_user|><|content_image|><|unused_200054|><|end_message|>",
+                false,
+            )
+            .unwrap();
+        assert_eq!(ids.get_ids(), &[200000, 200005, 200054, 200010]);
+    }
+
     #[test]
     fn inkling_tokenizer_matches_llama_cpp_on_the_capture_prompt() {
         let path = std::env::var_os("LLMCUDA_INKLING_MODEL").map_or_else(

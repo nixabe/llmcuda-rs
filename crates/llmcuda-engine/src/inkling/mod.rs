@@ -24,7 +24,9 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DriverError};
-use llmcuda_cuda::kernels::hgemm::{HalfWeight, HgemmError, HgemmKernels, bf16_half_exponent};
+use llmcuda_cuda::kernels::hgemm::{
+    HalfWeight, HgemmError, HgemmKernels, bf16_half_exponent, nv4_tile_major, nv4_tiles_fit,
+};
 use llmcuda_cuda::kernels::inkling::{InkDispatch, InklingError, InklingKernels};
 use llmcuda_cuda::kernels::k2::K2Kernels;
 use llmcuda_cuda::kernels::layer_ops::{GateShape, LayerOpsError, LayerOpsKernels};
@@ -37,6 +39,8 @@ use crate::viewslice::subslice;
 
 mod decode;
 pub(crate) mod serve;
+mod snapshot;
+pub mod vision;
 
 pub use decode::InklingDecode;
 
@@ -108,9 +112,11 @@ impl Matrix {
 
 /// One layer's experts for one projection: `[experts][rows][k]`.
 enum ExpertStack {
+    /// Tile-major (`nv4_tile_major`), partners `partner` rows apart.
     Nvfp4 {
         bytes: CudaSlice<u8>,
         scales: Option<CudaSlice<f32>>,
+        partner: usize,
     },
     Dense(Dense),
 }
@@ -190,6 +196,8 @@ struct Loader<'a> {
     file: &'a GgufFile,
     mma: MmaKernels,
     bytes: usize,
+    /// Host staging for a repacked expert stack, reused across tensors.
+    repack: Vec<u8>,
 }
 
 impl<'a> Loader<'a> {
@@ -306,7 +314,17 @@ impl<'a> Loader<'a> {
         })
     }
 
-    fn experts(&mut self, name: &str, experts: usize, rows: usize, k: usize) -> Res<Experts> {
+    /// One layer's experts for one projection. NVFP4 is repacked for the
+    /// decode GEMM, whose lanes pair row `g` with row `g + partner`; the
+    /// prefill GEMM reads the same bytes through the same map.
+    fn experts(
+        &mut self,
+        name: &str,
+        experts: usize,
+        rows: usize,
+        k: usize,
+        partner: usize,
+    ) -> Res<Experts> {
         let (ty, bytes, n) = self.info(name)?;
         if n != experts * rows * k {
             return Err(bad(format!(
@@ -315,9 +333,32 @@ impl<'a> Loader<'a> {
         }
         let w = if ty == GgmlType::Nvfp4 {
             self.bytes += bytes.len();
+            if !k.is_multiple_of(64) || !nv4_tiles_fit(rows, partner) {
+                return Err(bad(format!(
+                    "{name}: {rows} x {k} is not whole NVFP4 tiles"
+                )));
+            }
+            let per = rows * k / 64 * 36;
+            if bytes.len() != experts * per {
+                return Err(bad(format!("{name}: {} bytes of NVFP4", bytes.len())));
+            }
+            self.repack.clear();
+            self.repack.resize(bytes.len(), 0);
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+            let share = experts.div_ceil(threads) * per;
+            std::thread::scope(|scope| {
+                for (src, dst) in bytes.chunks(share).zip(self.repack.chunks_mut(share)) {
+                    scope.spawn(move || {
+                        for (src, dst) in src.chunks_exact(per).zip(dst.chunks_exact_mut(per)) {
+                            nv4_tile_major(src, dst, rows, k, partner);
+                        }
+                    });
+                }
+            });
             ExpertStack::Nvfp4 {
-                bytes: self.stream.clone_htod(bytes)?,
+                bytes: self.stream.clone_htod(&self.repack)?,
                 scales: self.optional_floats(&name.replace(".weight", ".scale"), experts)?,
+                partner,
             }
         } else {
             ExpertStack::Dense(self.dense_from(name, ty, bytes, n)?)
@@ -348,6 +389,7 @@ impl InklingModel {
             file,
             mma: MmaKernels::new(ctx)?,
             bytes: 0,
+            repack: Vec::new(),
         };
 
         let mut layers = Vec::with_capacity(config.num_layers as usize);
@@ -427,8 +469,8 @@ impl InklingModel {
                     Some(b) => b,
                     None => stream.alloc_zeros::<f32>(experts)?,
                 },
-                gate_up: l.experts(&name("ffn_gate_up_exps.weight"), experts, 2 * ff, n)?,
-                down: l.experts(&name("ffn_down_exps.weight"), experts, n, ff)?,
+                gate_up: l.experts(&name("ffn_gate_up_exps.weight"), experts, 2 * ff, n, ff)?,
+                down: l.experts(&name("ffn_down_exps.weight"), experts, n, ff, 8)?,
                 looped,
                 decode: decode::DecodeLayer::load(&mut l, i, &config)?,
             });
@@ -536,6 +578,9 @@ impl InklingState {
     /// two (position `j` at row `j % ring`), instead of `capacity` rows —
     /// which at this model's 40 sliding applications of 48 is most of a
     /// long sequence's memory. Results are the same bits.
+    ///
+    /// The ring's size depends on `max_pass_rows` alone, not on `capacity`:
+    /// sequences of any two lengths can share a decode step.
     pub fn bounded(
         stream: &Arc<CudaStream>,
         model: &InklingModel,
@@ -561,10 +606,12 @@ impl InklingState {
         let mut slots = Vec::with_capacity(model.slots());
         for slot in 0..model.slots() {
             let sliding = model.k.is_sliding(model.k.slot_layer(layers, slot as u32));
+            // A ring whatever the capacity, even where `capacity` rows would
+            // be fewer: a decode step takes one row mask for all its rows,
+            // so every sequence that may share a step holds the same ring.
             let ring = max_pass_rows
                 .filter(|_| sliding)
-                .map(|pass| (model.k.sliding_window as usize + pass).next_power_of_two())
-                .filter(|ring| *ring < capacity);
+                .map(|pass| (model.k.sliding_window as usize + pass).next_power_of_two());
             let rows = ring.unwrap_or(capacity);
             slots.push(SlotState {
                 ring,
@@ -765,6 +812,20 @@ unsafe fn rows_of<T>(
     unsafe { subslice(stream, base, row0 * width, rows * width) }
 }
 
+/// Rows of a pass whose inputs are given: `rows` rows of `from`, starting
+/// at its row `first`, in place of the pass's rows from `at`.
+#[derive(Clone, Copy)]
+pub struct GivenRows<'a> {
+    /// The first row of the pass these replace.
+    pub at: usize,
+    /// `[..][hidden]` fp32 rows.
+    pub from: &'a CudaSlice<f32>,
+    /// The first row of `from` to take.
+    pub first: usize,
+    /// How many.
+    pub rows: usize,
+}
+
 impl InklingPass {
     /// Allocate for passes of exactly `rows` rows.
     pub fn new(model: &Arc<InklingModel>, stream: &Arc<CudaStream>, rows: usize) -> Res<Self> {
@@ -947,9 +1008,18 @@ impl InklingPass {
         experts: usize,
     ) -> Res {
         let (w, scales) = match &e.w {
-            ExpertStack::Nvfp4 { bytes, scales } => {
-                (HalfWeight::Nvfp4 { bytes, scale: 1.0 }, scales.as_ref())
-            }
+            ExpertStack::Nvfp4 {
+                bytes,
+                scales,
+                partner,
+            } => (
+                HalfWeight::Nvfp4 {
+                    bytes,
+                    scale: 1.0,
+                    partner: *partner,
+                },
+                scales.as_ref(),
+            ),
             ExpertStack::Dense(Dense::Q8 { q, scales }) => (HalfWeight::Q8_0 { q, scales }, None),
             ExpertStack::Dense(Dense::Bf16 { bytes, exponent }) => (
                 HalfWeight::Bf16 {
@@ -1591,6 +1661,22 @@ impl InklingPass {
         stream: &Arc<CudaStream>,
         segments: &mut [Segment<'_>],
         tokens: &[i32],
+        tap: Option<&mut dyn FnMut(usize, Vec<f32>)>,
+    ) -> Res {
+        self.run_with_rows(stream, segments, tokens, &[], tap)
+    }
+
+    /// [`Self::run`], with some rows' inputs given rather than looked up:
+    /// an image's rows from the vision tower stand where its placeholder
+    /// tokens are. They enter as the model's input directly, past the token
+    /// embedding's norm, as llama.cpp feeds an embedding batch
+    /// (`src/models/inkling2.cpp`: `tok_norm` only `if (ubatch.token)`).
+    pub fn run_with_rows(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        segments: &mut [Segment<'_>],
+        tokens: &[i32],
+        given: &[GivenRows<'_>],
         mut tap: Option<&mut dyn FnMut(usize, Vec<f32>)>,
     ) -> Res {
         let model = self.model.clone();
@@ -1640,6 +1726,14 @@ impl InklingPass {
             n,
             eps,
         )?;
+        for g in given {
+            if g.at + g.rows > rows || (g.first + g.rows) * n > g.from.len() {
+                return Err(bad("given rows fall outside the pass or their source"));
+            }
+            let src = g.from.slice(g.first * n..(g.first + g.rows) * n);
+            let mut dst = self.h.slice_mut(g.at * n..(g.at + g.rows) * n);
+            stream.memcpy_dtod(&src, &mut dst)?;
+        }
 
         let layers = c.num_layers as usize;
         let (start, end) = (kc.loop_start as usize, kc.loop_end as usize);

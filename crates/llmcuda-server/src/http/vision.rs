@@ -20,7 +20,7 @@ use std::hash::{Hash, Hasher};
 
 use llmcuda_engine::image::{ImagePlacement, SequenceImage};
 use llmcuda_kernels::vision::{PreprocessedImage, preprocess_bounded, smart_resize_bounded};
-use llmcuda_model::VisionConfig;
+use llmcuda_model::{InklingVisionConfig, VisionConfig};
 
 use super::error::{ApiError, Dialect};
 
@@ -37,13 +37,51 @@ pub(crate) const VISION_END: &str = "<|vision_end|>";
 /// this bounds a small upload from decompressing into gigabytes of RGB.
 const MAX_DECODED_PIXELS: u64 = 8192 * 8192;
 
+/// The placeholder an `inkling2v` image renders as, and the token the
+/// template puts before it: `<|content_image|><|unused_200054|>`.
+pub(crate) const INKLING_IMAGE_PAD: &str = "<|unused_200054|>";
+pub(crate) const INKLING_IMAGE_BLOCK: &str = "<|content_image|>";
+
+/// Which vision tower the projector file holds: its geometry, and with it
+/// how an image is sized and laid out.
+#[derive(Debug, Clone)]
+pub enum VisionTower {
+    /// `qwen3vl_merger`.
+    Qwen(VisionConfig),
+    /// `inkling2v`.
+    Inkling(InklingVisionConfig),
+}
+
+impl VisionTower {
+    /// Patches along one edge of the cell that becomes one token.
+    fn spatial_merge(&self) -> u32 {
+        match self {
+            Self::Qwen(config) => config.spatial_merge,
+            Self::Inkling(config) => config.spatial_merge,
+        }
+    }
+
+    /// Patches that become one token.
+    pub fn merge_factor(&self) -> u32 {
+        self.spatial_merge() * self.spatial_merge()
+    }
+
+    /// The `qwen3vl_merger` geometry, for the paths only that tower has.
+    pub(crate) fn qwen(&self) -> Option<&VisionConfig> {
+        match self {
+            Self::Qwen(config) => Some(config),
+            Self::Inkling(_) => None,
+        }
+    }
+}
+
 /// What `--mmproj` and `--image-max-tokens` configure, before the tokenizer
 /// exists.
 #[derive(Debug, Clone)]
 pub struct VisionServingConfig {
     /// The vision tower's geometry — patch size, merge factor, pixel
     /// normalization.
-    pub config: VisionConfig,
+    pub config: VisionTower,
     /// The most language-model tokens one image may occupy; larger images
     /// are resized down to fit.
     pub max_tokens: u32,
@@ -53,7 +91,7 @@ pub struct VisionServingConfig {
 /// expansion matches on.
 #[derive(Debug)]
 pub(crate) struct VisionServing {
-    pub(crate) config: VisionConfig,
+    pub(crate) config: VisionTower,
     pub(crate) max_tokens: u32,
     pub(crate) image_pad: u32,
 }
@@ -151,13 +189,30 @@ pub(crate) fn expand_images(
     images: &[DecodedImage],
 ) -> Result<(Vec<u32>, Vec<SequenceImage>), ApiError> {
     expand_images_with(vision, dialect, tokens, images, |vision, image| {
-        Ok(preprocess_bounded(
-            &vision.config,
-            &image.rgb,
-            image.width,
-            image.height,
-            vision.max_tokens,
-        ))
+        match &vision.config {
+            VisionTower::Qwen(config) => Ok(preprocess_bounded(
+                config,
+                &image.rgb,
+                image.width,
+                image.height,
+                vision.max_tokens,
+            )),
+            // Raster patches under the same type: the Inkling runtime knows
+            // what its own tower was given.
+            VisionTower::Inkling(config) => llmcuda_kernels::inkling_vision::preprocess(
+                config,
+                &image.rgb,
+                image.width,
+                image.height,
+                vision.max_tokens,
+            )
+            .map(|pre| PreprocessedImage {
+                patches: pre.patches,
+                grid_h: pre.grid_h,
+                grid_w: pre.grid_w,
+            })
+            .map_err(|e| e.to_string()),
+        }
     })
 }
 
@@ -199,7 +254,7 @@ pub(crate) fn expand_images_with(
         let preprocessed = preprocess(vision, image)
             .map_err(|e| ApiError::bad_request(dialect, format!("image {next}: {e}")))?;
         next += 1;
-        let merge = vision.config.spatial_merge;
+        let merge = vision.config.spatial_merge();
         let placement = ImagePlacement {
             start: expanded.len(),
             grid_h: preprocessed.grid_h / merge,
@@ -212,11 +267,18 @@ pub(crate) fn expand_images_with(
             image: preprocessed,
         });
     }
-    debug_assert_eq!(
-        next,
-        images.len(),
-        "every folded image inserted its own marker"
-    );
+    // An image whose placeholder never reached the token stream would be
+    // left out of the prompt without a word: the template did not render
+    // it, or rendered it as something the tokenizer split.
+    if next != images.len() {
+        return Err(ApiError::internal(
+            dialect,
+            format!(
+                "the rendered prompt holds {next} image placeholders for {} images",
+                images.len()
+            ),
+        ));
+    }
     Ok((expanded, sequence_images))
 }
 
@@ -235,15 +297,24 @@ pub(crate) fn expanded_token_count(
         return Err(vision_disabled(dialect));
     };
     let mut count = token_count;
-    for image in images {
-        let (width, height) =
-            smart_resize_bounded(&vision.config, image.width, image.height, vision.max_tokens);
-        let patch = vision.config.patch_size;
+    for (index, image) in images.iter().enumerate() {
         // The single rendered pad becomes one pad per merged patch.
-        count += vision
-            .config
-            .output_tokens(height / patch, width / patch)
-            .saturating_sub(1) as usize;
+        let tokens = match &vision.config {
+            VisionTower::Qwen(config) => {
+                let (width, height) =
+                    smart_resize_bounded(config, image.width, image.height, vision.max_tokens);
+                let patch = config.patch_size;
+                config.output_tokens(height / patch, width / patch) as usize
+            }
+            VisionTower::Inkling(config) => llmcuda_kernels::inkling_vision::token_count(
+                config,
+                image.width,
+                image.height,
+                vision.max_tokens,
+            )
+            .map_err(|e| ApiError::bad_request(dialect, format!("image {index}: {e}")))?,
+        };
+        count += tokens.saturating_sub(1);
     }
     Ok(count)
 }
@@ -254,7 +325,7 @@ mod tests {
 
     fn serving() -> VisionServing {
         VisionServing {
-            config: VisionConfig::qwen3_6_35b_a3b(),
+            config: VisionTower::Qwen(VisionConfig::qwen3_6_35b_a3b()),
             max_tokens: 1024,
             image_pad: 7,
         }

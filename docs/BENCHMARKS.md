@@ -496,42 +496,74 @@ A looped MoE: 24 layers of weights run as 48 layer applications, 128 experts
 top-8 with NVFP4 expert weights, attention with a relative-position bias and
 a zero-logit sink. **Nothing here is comparable to the standing table** —
 another model, on GPU 0 of a one-card host, through the engine's forward
-alone (`bench_inkling`), not the server. `Inkling-2-Mini-UD-Q4_K_XL.gguf`
-(16.9 GiB resident), against llama.cpp build 12688 (`ae6a7ad2c`):
+alone (`bench_inkling`), not the server, against llama.cpp build 12688
+(`ae6a7ad2c`):
 
 ```sh
-llama-batched-bench -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
-  -ngl 99 -sm none -fa on -b 2048 -ub 2048 -ctk f16 -ctv f16 -c 16384 \
-  -npp <ctx> -ntg 64 -npl 1,3
-bench_inkling <ctx> 64 1,3
+llama-batched-bench -m <file> -ngl 99 -sm none -fa on -b <ub> -ub <ub> \
+  -ctk f16 -ctv f16 -c <3 x (ctx + 64) + 256> -npp <ctx> -ntg 64 -npl 3,1,3,1,3
+LLMCUDA_BENCH_CHUNK=2048 bench_inkling <ctx> 64 1,3
 ```
 
+**`<ub>` is llama.cpp's best for the depth, and for this model that is
+small.** Swept on `UD-Q4_K_XL` at 128 to 4,096: at 512 tokens the whole
+prompt in one batch is its fastest (942 tok/s at N=3 against 835 at
+`-ub 512`); at 2K and 8K `-ub 512` is (677 and 557 tok/s, against 598 and 355
+at `-ub 4096`, and 615 and 518 at `-ub 256`). The rows below use those:
+one batch at 512, `-ub 512` deeper. Its first row of each process is a cold
+start and is dropped. The engine prefills in passes of 2,048 rows a
+sequence, the widest a server builds.
+
 Three interleaved pairs, tok/s as the range over them (decode is the
-aggregate over the N sequences):
+aggregate over the N sequences). `Inkling-2-Mini-UD-Q4_K_XL.gguf` (16.9 GiB
+resident):
 
 | cell | llmcuda-rs | llama.cpp | margin |
 | :--- | ---: | ---: | ---: |
-| prefill 512, N=1 | 1,246–1,274 | 799–812 | **+53% to +59%** |
-| prefill 512, N=3 | 1,732–1,754 | 942–963 | **+80% to +86%** |
-| prefill 2K, N=1 | 1,722–1,729 | 583–595 | **+189% to +197%** |
-| prefill 2K, N=3 | 1,862–1,872 | 592–599 | **+211% to +216%** |
-| decode after 512, N=1 | 56.2–56.4 | 39.6–40.7 | **+38% to +42%** |
-| decode after 512, N=3 | 101.7–102.4 | 88.2–90.6 | **+12% to +16%** |
-| decode after 2K, N=1 | 52.0–52.1 | 38.0–38.9 | **+34% to +37%** |
-| decode after 2K, N=3 | 94.9–95.1 | 81.5–82.4 | **+15% to +17%** |
+| prefill 512, N=1 | 1,305–1,349 | 819–828 | **+58% to +65%** |
+| prefill 512, N=3 | 1,789–1,828 | 942–950 | **+88% to +94%** |
+| prefill 2K, N=1 | 1,762–1,777 | 674–675 | **+161% to +164%** |
+| prefill 2K, N=3 | 1,910–1,915 | 677–679 | **+181% to +183%** |
+| prefill 8K, N=1 | 1,673–1,677 | 555–556 | **+201% to +202%** |
+| prefill 8K, N=3 | 1,798–1,804 | 556–557 | **+223% to +224%** |
+| decode after 512, N=1 | 68.4–68.9 | 40.3–41.0 | **+67% to +71%** |
+| decode after 512, N=3 | 136.4–137.6 | 88.5–89.5 | **+52% to +56%** |
+| decode after 2K, N=1 | 67.6–67.9 | 39.1–39.2 | **+72% to +74%** |
+| decode after 2K, N=3 | 132.3–132.7 | 83.8–84.1 | **+57% to +58%** |
+| decode after 8K, N=1 | 64.8–64.8 | 38.0–38.6 | **+68% to +70%** |
+| decode after 8K, N=3 | 123.6–124.3 | 79.6–80.2 | **+54% to +56%** |
 
-What the table does not say:
+`Inkling-2-Mini-UD-Q8_K_XL.gguf` (bf16 dense matrices, bf16 experts in the
+last four layers; 22.3 GiB resident):
+
+| cell | llmcuda-rs | llama.cpp | margin |
+| :--- | ---: | ---: | ---: |
+| prefill 512, N=1 | 1,310–1,336 | 629–642 | **+104% to +112%** |
+| prefill 512, N=3 | 1,796–1,834 | 772–780 | **+130% to +138%** |
+| prefill 2K, N=1 | 1,768–1,774 | 536–541 | **+227% to +231%** |
+| prefill 2K, N=3 | 1,904–1,911 | 538–542 | **+251% to +255%** |
+| prefill 8K, N=1 | 1,671–1,679 | 457–459 | **+264% to +267%** |
+| prefill 8K, N=3 | 1,787–1,794 | 457–458 | **+290% to +292%** |
+| decode after 512, N=1 | 58.4–58.7 | 21.8–27.2 | **+115% to +169%** |
+| decode after 512, N=3 | 119.5–120.2 | 53.1–62.5 | **+91% to +126%** |
+| decode after 2K, N=1 | 57.8–58.0 | 26.4–33.0 | **+75% to +119%** |
+| decode after 2K, N=3 | 115.9–116.2 | 59.8–61.3 | **+89% to +94%** |
+| decode after 8K, N=1 | 55.8–55.8 | 26.5–32.7 | **+70% to +110%** |
+| decode after 8K, N=3 | 109.5–109.6 | 57.9–58.2 | **+88% to +89%** |
+
+What the tables do not say:
 
 - **Decode is not like for like at the edges.** The engine's step ends at the
   soft-capped logits; `llama-batched-bench` also samples. llama.cpp does not
   take its flash-attention path for this model (the bias goes in through the
   mask), so `-fa on` is inert here.
-- **`-ub 2048` is the whole prompt** at both depths; nothing deeper than 2K
-  and no `-ub 4096` cell has been measured, on either side.
-- **Q8_K_XL has no pair.** That file (bf16 dense matrices, bf16 experts in
-  the last four layers; 22.3 GiB resident) passes the same gates and ran
-  once at 512: prefill 1,270 / 1,767 tok/s and decode 49.4 / 93.6 tok/s at
-  N=1 / N=3. llama.cpp was not timed on it.
+- **Nothing deeper than 8K has been measured**, on either side, and
+  llama.cpp's `-ub` was swept on `UD-Q4_K_XL` only: on `UD-Q8_K_XL` one
+  run each put `-ub 512` ahead at 8K (459 against 322 at `-ub 4096`), and
+  at 2K one `-ub 2048` run read 520 where the `-ub 512` pairs read 537–541.
+- **llama.cpp's decode on `UD-Q8_K_XL` is unsteady** (21.8 to 27.2 tok/s
+  across pairs at N=1 after 512, 26.4 to 33.0 after 2K); the margin there
+  is a range, not a number.
 - **Forward only.** The model is served, but nothing here went through the
   server: no scheduler, sampling or HTTP in either column.
 
@@ -545,12 +577,15 @@ the twelve positions. llama.cpp against the CPU reference does the same.
 Until the first such flip the engine's decode and prefill paths agree to
 1e-7 in cosine.
 
-Where a decode step goes at N=1 after 512 tokens (17.7 ms; CUDA events, ms):
-expert gate/up 3.5, attention projections 2.5, expert down 2.1, attention
-1.8, feed-forward input 1.6, attention inputs 1.3, loop controllers 1.9,
-routing 1.0, output projection 0.9, head 0.9, loop messages 0.8. The four
-contractions are 9 ms of it at 325–485 GB/s of stored weights against the
-card's 672.
+Where a decode step goes at N=3 after 2K tokens on `UD-Q4_K_XL` (22.6 ms
+unprofiled; CUDA events with a sync at every stage, ms): expert gate/up
+6.5, expert down 3.3, attention 2.7, attention projections 2.6, loop
+controllers 2.1, feed-forward input 1.25, routing 1.0, attention inputs
+1.0, output projection 0.9, head 0.9, loop messages 0.8. At N=1 everything
+but the experts is nearly the same and the experts are a third: they are
+what a second and third sequence cost. The expert contractions run at
+477–533 GB/s of stored weights against the card's 672, the Q8_0
+projection pack at 485.
 
 ## Serving concurrent sessions
 
@@ -1416,6 +1451,21 @@ both operands agree, and a GEMM's output columns can be permuted freely.
   `b` and `b + 8` of its sub-block, so contracting in *byte order* makes one
   table load a ready fp16 pair, and the activations are written in that
   order by the kernel that produces them.
+- **Lay the weights out as the lanes read them.** NVFP4 as stored is rows
+  of 36-byte blocks, four scale bytes and four 8-byte sub-blocks, so a lane
+  took three loads a row from sixteen row streams, none wider than four
+  bytes (a sub-block starts four bytes past a multiple of eight). The
+  expert stacks are repacked at load, tile-major (`nv4_tile_major`): for
+  each 64-element chunk of a sixteen-row tile, a 16-byte record per lane —
+  its sub-block of row `g` and of the partner row — then a 2-byte record of
+  the two scales. One wide and one narrow load a lane a chunk, and a warp
+  reads one contiguous stream. Gate/up of eight experts 65.6 → 44.8 us
+  (364 → 533 GB/s), down 35.2 → 25.0 (340 → 477). Same bytes, same sums:
+  the prefill GEMM reads the stack through the same map, bit for bit
+  (`hgemm_differential`). What the ablations say the old layout cost: the
+  separate scale *byte* load alone was 8 us of gate/up's 51 with the
+  decode arithmetic removed, and that arithmetic another 8 — neither the
+  load count nor the ALU is free here.
 - **Prefill attention (`ink_attn_mma`).** One warp a (head, sixteen query
   rows), nothing in shared memory: queries in registers for the whole scan,
   the head dimension contracted with lane quarter `t` owning dims
@@ -1439,6 +1489,15 @@ blocks they measured 1.2–1.8 ms a launch. On grids of their own — a block a
 gate row, a thread a channel, a block per eight experts — the same work is
 40 us. Split by what streams weights, not by what belongs to the layer.
 
+What stays a block a row should not pay a barrier a sum. The depth mix
+needs, for each of up to eight states, a sum of squares and a product with
+each query: taken as passes of the whole block, that is up to forty
+reductions with a barrier each over a row a warp could walk alone. A warp
+a state, every sum of that state in one walk, reduced by shuffle, is one
+barrier: N=3 decode 127.7–128.8 → 132.3–132.7 tok/s (three interleaved
+pairs, `bench_inkling 2048 64 1,3`). The earlier one-pass attempt (WHY
+NOT) kept the sums in a local array; these are registers.
+
 The same reasoning sizes prefill. The fp32 router read both operands from
 global memory for every product, one thread a (row, expert); eight rows a
 block from a shared tile, each thread reading its weight row once for the
@@ -1460,6 +1519,7 @@ Each row gives the decisive measurement and why it lost.
 | --- | --- |
 | `inkling2_loop` decode GEMM: eight warps a 16-row tile, operands still loaded a pair at a time | `bench_inkling_dg`, GPU 0: 82.0 us for the 8,608 × 2,304 Q8_0 pack against 87.2 with one warp a tile, NVFP4 gate/up **184.6** against 210.5. The bound is load instructions, which more warps do not remove; the permuted wide-load order is 43.5 and 87.8 (WHY). |
 | `inkling2_loop` decode GEMM: wide loads staged through a per-warp shared tile to keep the natural `k` order | **85.8 us** Q8_0, **221.5 / 117.4 us** NVFP4 gate/up and down, against 82.0 / 184.6 / 84.6 unstaged: the store, the barrier and the reload cost more than the loads saved. Permuting `k` gets the wide loads with no staging. |
+| `inkling2_loop` NVFP4 decode loads shared across a lane group by warp shuffle: lanes `t` 0 and 2 load 16 bytes for two sub-blocks, lane 1 the four scales, three shuffles hand them round | `bench_inkling_dg`, three interleaved pairs, on a split data/scale layout: gate/up **65.6–65.7 us** and down 34.1, against 65.5–65.7 and 35.1–35.2 as stored — three loads a row-chunk in place of twelve bought nothing, where the same split layout with one 8-byte and one 1-byte load a lane read 59.3 and 31.1. A shuffle costs what the load it replaces does. The tile-major records (WHY) are 44.8 and 25.0. |
 | `inkling2_loop` depth mix in one pass, forty running sums in a local array | The mix-and-norm stage **28 → 40 us** a launch (CUDA events, N=1 decode). The array lives in local memory, and a pass a sum over 2,304 elements was never the cost: a row's block is one SM, and that is the bound. |
 | A contiguous span of the row per thread in the `inkling2_loop` per-row kernels | Controller stage **42 → 60 us**. Every `blockDim`-th element is already coalesced across a warp; a contiguous span per thread makes each warp load touch 32 lines. |
 | Scaling the routed down projection once per 32-element block | `moe_expert_down_mma` converts and scales its int32 pair after every `m8n8k16`, though a Q8_0 scale and an activation scale both span two; accumulating both steps first halves the `I2F`s, as `mma_q8_0_proj_split` and llama.cpp's `mmq` do. `bench_moe_mma` at 8,192 tokens: 22.7 and 21.3 ms against 22.3, inside the bench's own spread. Model, six pairs (GPU 0, one sequence): **1.001–1.004×** at 2,048 tokens, **1.004–1.008×** at 6,138, with last-token logits moving 1.52 and 0.24 max-abs on the synthetic prompt (argmax unchanged), and `int8_forward`'s cosine against the fp32 path 0.999733 against 0.999809 with per-step scaling. Scored against llama.cpp's last-token logits on real text it is `1 − cos` 8.90e-4 against 8.14e-4 at 2,048 tokens and 1.69e-3 against 1.82e-3 at 512: nearer once, farther once. Under 1% for a rounding change nothing shows to be the more accurate one; the kernel is not bound by this loop. Not shipped. |

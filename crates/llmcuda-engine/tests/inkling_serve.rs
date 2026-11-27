@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 
 use llmcuda_cache::CacheConfig;
 use llmcuda_cuda::device::driver_available;
-use llmcuda_engine::{Engine, RouterConfig, SamplingParams, ServingConfig};
+use llmcuda_engine::{
+    Engine, RouterConfig, SamplingParams, ServingConfig, SnapshotArenaSize, Speculation,
+};
 use llmcuda_model::ModelConfig;
 use llmcuda_sched::SchedulerConfig;
 use llmcuda_sched::request::{NewRequest, RequestId};
@@ -23,19 +25,57 @@ use llmcuda_sched::request::{NewRequest, RequestId};
 const OUTPUT: u32 = 6;
 
 fn place(engine: &mut Engine, id: u64, prompt: &[i32], sampling: SamplingParams) {
+    place_for(engine, id, prompt, sampling, OUTPUT);
+}
+
+/// Place a request; the prefix tokens it resumes from.
+fn place_for(
+    engine: &mut Engine,
+    id: u64,
+    prompt: &[i32],
+    sampling: SamplingParams,
+    output: u32,
+) -> u32 {
     engine
         .place_tokens(
             NewRequest {
                 id: RequestId(id),
                 prompt_tokens: prompt.len() as u32,
-                max_output_tokens: OUTPUT,
+                max_output_tokens: output,
             },
             prompt.to_vec(),
             Vec::new(),
             sampling,
             None,
         )
-        .unwrap_or_else(|failure| panic!("request {id} was not placed: {failure}"));
+        .unwrap_or_else(|failure| panic!("request {id} was not placed: {failure}"))
+        .reusable_prefix_tokens
+}
+
+/// One card serving this model with `arena` snapshot slots.
+fn engine_with(model: &ModelConfig, arena: SnapshotArenaSize) -> Engine {
+    let cache = CacheConfig::with_defaults(model.clone()).expect("cache configuration");
+    let block = cache.attention_block_size();
+    let sched = SchedulerConfig::with_defaults(4096, block, 3).expect("scheduler configuration");
+    let engine = Engine::new(
+        &[0],
+        cache,
+        sched,
+        16_384 / block,
+        3,
+        RouterConfig::balanced(),
+    );
+    engine
+        .bind_devices(
+            &inkling_common::model_path(),
+            model.clone(),
+            ServingConfig {
+                snapshot_slots: arena,
+                ..ServingConfig::new(2048)
+            },
+        )
+        .unwrap_or_else(|(worker, failure)| panic!("{worker} failed to bind: {failure}"));
+    engine
 }
 
 /// Step until every request in `ids` has completed; tokens by request.
@@ -47,7 +87,6 @@ fn run(engine: &Engine, ids: &[u64]) -> BTreeMap<u64, Vec<i32>> {
         steps += 1;
         assert!(steps < 200, "the requests did not complete");
         for (_, step) in engine.step_devices().expect("the step runs") {
-            assert!(step.retained.is_empty(), "this runtime keeps no snapshots");
             for (id, token) in step.generated {
                 generated
                     .get_mut(&id.0)
@@ -86,7 +125,12 @@ fn requests_prefill_decode_and_complete_through_the_engine() {
         .bind_devices(
             &inkling_common::model_path(),
             model.clone(),
-            ServingConfig::new(256),
+            // Nothing here reaches a retention boundary; the default arena
+            // would pin gigabytes of host memory for nothing.
+            ServingConfig {
+                snapshot_slots: SnapshotArenaSize::NONE,
+                ..ServingConfig::new(256)
+            },
         )
         .unwrap_or_else(|(worker, failure)| panic!("{worker} failed to bind: {failure}"));
 
@@ -125,6 +169,43 @@ fn requests_prefill_decode_and_complete_through_the_engine() {
         );
     }
 
+    // A request reserved for far more positions than the others decodes
+    // beside them: its caches and theirs are the same rings.
+    place(&mut engine, 8, &capture, SamplingParams::GREEDY);
+    place_for(&mut engine, 9, &other, SamplingParams::GREEDY, 6000);
+    let mixed = {
+        let mut generated: BTreeMap<u64, Vec<i32>> = BTreeMap::new();
+        let mut done = false;
+        let mut steps = 0;
+        while !done {
+            steps += 1;
+            assert!(steps < 100, "request 8 did not complete");
+            for (_, step) in engine
+                .step_devices()
+                .expect("a long and a short request step together")
+            {
+                for (id, token) in step.generated {
+                    generated.entry(id.0).or_default().push(token);
+                }
+                done |= step.completed.iter().any(|id| id.0 == 8);
+            }
+        }
+        generated
+    };
+    assert_eq!(
+        mixed[&8], together[&1],
+        "a long neighbour changed a sequence's tokens"
+    );
+    assert_eq!(
+        mixed[&9][..OUTPUT as usize],
+        together[&3][..],
+        "a long reservation changed its own tokens"
+    );
+    assert!(
+        engine.cancel(RequestId(9)),
+        "the long request was not resident"
+    );
+
     // The same prompt again, alone: places freed, and the same tokens.
     place(&mut engine, 4, &capture, SamplingParams::GREEDY);
     let alone = run(&engine, &[4]);
@@ -148,4 +229,388 @@ fn requests_prefill_decode_and_complete_through_the_engine() {
     println!("sampled: {drawn:?}");
     assert_eq!(drawn[&5], drawn[&6], "one seed drew two sequences");
     assert_ne!(drawn[&5], drawn[&7], "two seeds drew one sequence");
+}
+
+/// A prefix served once is not prefilled again, and resuming from its
+/// snapshot changes no token.
+///
+/// Every prompt is run cold first, on an engine with no snapshot arena,
+/// then on one that retains. The retention interval is 2,048 positions:
+///
+/// - a 2,300-token prompt leaves a snapshot at 2,048, taken mid-prefill;
+/// - a prompt sharing its first 2,100 tokens resumes at 2,048 and prefills
+///   the rest;
+/// - the first 2,048 tokens alone are a whole-prompt resume: nothing to
+///   prefill, and the first token is the one the snapshot recorded;
+/// - a 2,040-token prompt crosses 2,048 while decoding and leaves a
+///   snapshot there; that prompt plus its own first eight tokens then
+///   resumes with nothing to prefill, and continues with the ninth.
+#[test]
+fn a_served_prefix_is_resumed_and_changes_no_token() {
+    let Some((file, _)) = inkling_common::model_and_golden() else {
+        return;
+    };
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver present");
+        return;
+    }
+    let model = ModelConfig::from_gguf(&file).expect("the configuration reads");
+    drop(file);
+    let token = |seed: usize, i: usize| {
+        ((seed * 104_729 + i * 7919 + 1234) % (model.vocab_size as usize - 1000)) as i32
+    };
+    let long: Vec<i32> = (0..2300).map(|i| token(1, i)).collect();
+    let mut sibling = long[..2100].to_vec();
+    sibling.extend((0..150).map(|i| token(2, i)));
+    let whole = long[..2048].to_vec();
+    let short: Vec<i32> = (0..2040).map(|i| token(3, i)).collect();
+    const LONG_OUTPUT: u32 = 12;
+
+    let mut cold = engine_with(&model, SnapshotArenaSize::NONE);
+    let mut cold_run = |id: u64, prompt: &[i32]| {
+        assert_eq!(
+            place_for(&mut cold, id, prompt, SamplingParams::GREEDY, LONG_OUTPUT),
+            0
+        );
+        run(&cold, &[id])[&id].clone()
+    };
+    let want_long = cold_run(1, &long);
+    let want_sibling = cold_run(2, &sibling);
+    let want_whole = cold_run(3, &whole);
+    let want_short = cold_run(4, &short);
+    assert_eq!(
+        want_short.len(),
+        LONG_OUTPUT as usize,
+        "the short prompt stopped early"
+    );
+    let mut continued = short.clone();
+    continued.extend(&want_short[..8]);
+    let want_continued = cold_run(5, &continued);
+    assert_eq!(
+        want_continued[0], want_short[8],
+        "the model disagrees with itself cold"
+    );
+    drop(cold_run);
+    drop(cold);
+
+    let mut warm = engine_with(&model, SnapshotArenaSize::dense(4));
+    let mut warm_run = |id: u64, prompt: &[i32], resumed: u32| {
+        let got = place_for(&mut warm, id, prompt, SamplingParams::GREEDY, LONG_OUTPUT);
+        assert_eq!(got, resumed, "request {id} resumed from the wrong place");
+        run(&warm, &[id])[&id].clone()
+    };
+    // The engine takes a step's snapshots before the step is returned, so
+    // what shows a boundary was retained is the next request resuming there.
+    assert_eq!(warm_run(11, &long, 0), want_long);
+    assert_eq!(
+        warm_run(12, &sibling, 2048),
+        want_sibling,
+        "resuming mid-prompt changed the tokens"
+    );
+    assert_eq!(
+        warm_run(13, &whole, 2048),
+        want_whole,
+        "resuming a whole prompt changed the tokens"
+    );
+    assert_eq!(warm_run(14, &short, 0), want_short);
+    assert_eq!(
+        warm_run(15, &continued, 2048),
+        want_continued,
+        "resuming a decode-time snapshot changed the tokens"
+    );
+    println!(
+        "resumed at 2048 mid-prompt, whole-prompt and from a decode-time snapshot: tokens unchanged"
+    );
+}
+
+/// What one configuration generated, and how many steps it took.
+struct Served {
+    outputs: Vec<Vec<i32>>,
+    steps: usize,
+    multi_token_steps: usize,
+}
+
+/// Serve `prompts` together, greedy, to `tokens` tokens each. End-of-turn
+/// is an ordinary token here, so both runs are the same length.
+fn serve(
+    model: &ModelConfig,
+    speculation: Speculation,
+    drafts: u32,
+    prompts: &[Vec<i32>],
+    tokens: usize,
+) -> Served {
+    use llmcuda_engine::worker::{Worker, WorkerId};
+    let cache = CacheConfig::with_defaults(model.clone()).expect("cache configuration");
+    let block = cache.attention_block_size();
+    let scheduler = SchedulerConfig::new(
+        4096,
+        block,
+        prompts.len() as u32,
+        llmcuda_sched::config::DEFAULT_WATERMARK_FRACTION,
+        drafts,
+    )
+    .expect("scheduler configuration");
+    let mut worker = Worker::new(
+        WorkerId(0),
+        0,
+        cache,
+        scheduler,
+        16_384 / block,
+        prompts.len() as u32,
+    );
+    worker
+        .bind_device_for_benchmark(
+            &inkling_common::model_path(),
+            model.clone(),
+            ServingConfig {
+                speculation,
+                snapshot_slots: SnapshotArenaSize::NONE,
+                ..ServingConfig::new(256)
+            },
+        )
+        .expect("the worker binds");
+    for (index, prompt) in prompts.iter().enumerate() {
+        worker
+            .admit_tokens(
+                NewRequest {
+                    id: RequestId(index as u64 + 1),
+                    prompt_tokens: prompt.len() as u32,
+                    max_output_tokens: tokens as u32 + 16,
+                },
+                prompt.clone(),
+                Vec::new(),
+                SamplingParams::GREEDY,
+                None,
+            )
+            .expect("the request is admitted");
+    }
+    let mut served = Served {
+        outputs: vec![Vec::new(); prompts.len()],
+        steps: 0,
+        multi_token_steps: 0,
+    };
+    while served.outputs.iter().any(|output| output.len() < tokens) {
+        assert!(served.steps < 64 * prompts.len() + 64, "no progress");
+        let step = worker.step_device().expect("the step runs");
+        let mut emitted = vec![0usize; prompts.len()];
+        for (id, token) in &step.generated {
+            served.outputs[id.0 as usize - 1].push(*token);
+            emitted[id.0 as usize - 1] += 1;
+        }
+        served.multi_token_steps += usize::from(emitted.iter().any(|count| *count > 1));
+        served.steps += 1;
+    }
+    served
+}
+
+/// Speculation changes how many steps a request takes and nothing else.
+///
+/// Two requests served together, with each n-gram drafter and without: a
+/// prompt that repeats a four-token cycle, whose continuation a drafter
+/// can guess, and a structureless one. Every drafter must emit the tokens
+/// plain decoding emits, and must have accepted something - a step that
+/// emits more than one token for a request - or it has tested nothing.
+#[test]
+fn speculation_emits_the_tokens_plain_decoding_does() {
+    let Some((file, _)) = inkling_common::model_and_golden() else {
+        return;
+    };
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver present");
+        return;
+    }
+    let model = ModelConfig::from_gguf(&file).expect("the configuration reads");
+    drop(file);
+    const TOKENS: usize = 48;
+    let cycle = [791i32, 1131, 1721, 2217];
+    let periodic: Vec<i32> = cycle.iter().copied().cycle().take(96).collect();
+    let random: Vec<i32> = (0..40usize)
+        .map(|i| ((i * 7919 + 4321) % (model.vocab_size as usize - 1000)) as i32)
+        .collect();
+    let prompts = vec![periodic, random];
+
+    let plain = serve(&model, Speculation::None, 0, &prompts, TOKENS);
+    assert_eq!(
+        plain.multi_token_steps, 0,
+        "plain decoding emitted two tokens in a step"
+    );
+    println!(
+        "plain: {} steps; the periodic prompt continues {:?}",
+        plain.steps,
+        &plain.outputs[0][..8]
+    );
+    for (name, speculation, drafts) in [
+        ("ngram", Speculation::Ngram { min: 2, max: 4 }, 3),
+        ("ngram-simple", Speculation::NgramSimple { size_n: 3 }, 3),
+        (
+            "ngram-mod",
+            Speculation::NgramMod {
+                n_match: 3,
+                n_min: 2,
+            },
+            3,
+        ),
+        (
+            "ngram-map-k",
+            Speculation::NgramMapK {
+                size_n: 3,
+                min_hits: 1,
+            },
+            2,
+        ),
+        (
+            "ngram-map-k4v",
+            Speculation::NgramMapK4v {
+                size_n: 3,
+                min_hits: 1,
+            },
+            2,
+        ),
+    ] {
+        let spec = serve(&model, speculation, drafts, &prompts, TOKENS);
+        println!(
+            "{name}: {} steps ({} plain), {} of them emitting more than one token",
+            spec.steps, plain.steps, spec.multi_token_steps
+        );
+        for (request, (got, want)) in spec.outputs.iter().zip(&plain.outputs).enumerate() {
+            assert_eq!(
+                got[..TOKENS],
+                want[..TOKENS],
+                "{name} changed request {request}'s tokens"
+            );
+        }
+        assert!(spec.multi_token_steps > 0, "{name} accepted nothing");
+        assert!(
+            spec.steps <= plain.steps,
+            "{name} took more steps than plain decoding"
+        );
+    }
+}
+
+/// An image's rows stand in the prompt where its placeholder tokens are.
+///
+/// One prompt ending in a 2x3-token image span, served with two different
+/// images and with the first again: the same image gives the same tokens,
+/// another image gives others (the rows are read, not the placeholders),
+/// and an image request beside a text one does not disturb it. What the
+/// rows should *be* is the tower's test (`inkling_vision.rs`); what the
+/// model says about a picture was checked against llama-server by hand.
+#[test]
+fn an_images_rows_stand_in_the_prompt() {
+    use llmcuda_engine::image::{ImagePlacement, SequenceImage};
+    use llmcuda_kernels::inkling_vision::preprocess;
+    use llmcuda_kernels::vision::PreprocessedImage;
+    use llmcuda_model::InklingVisionConfig;
+
+    let Some((file, golden)) = inkling_common::model_and_golden() else {
+        return;
+    };
+    let mmproj = std::env::var_os("LLMCUDA_INKLING_MMPROJ")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| inkling_common::model_path().with_file_name("mmproj-F16.gguf"));
+    if !mmproj.exists() {
+        println!("SKIPPED: {} is not on this host", mmproj.display());
+        return;
+    }
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver present");
+        return;
+    }
+    let model = ModelConfig::from_gguf(&file).expect("the configuration reads");
+    drop(file);
+    let cache = CacheConfig::with_defaults(model.clone()).expect("cache configuration");
+    let block = cache.attention_block_size();
+    let sched = SchedulerConfig::with_defaults(4096, block, 3).expect("scheduler configuration");
+    let mut engine = Engine::new(
+        &[0],
+        cache,
+        sched,
+        16_384 / block,
+        3,
+        RouterConfig::balanced(),
+    );
+    engine
+        .bind_devices(
+            &inkling_common::model_path(),
+            model.clone(),
+            ServingConfig {
+                snapshot_slots: SnapshotArenaSize::NONE,
+                mmproj: Some(mmproj),
+                max_image_patches: 256,
+                ..ServingConfig::new(256)
+            },
+        )
+        .unwrap_or_else(|(worker, failure)| panic!("{worker} failed to bind: {failure}"));
+
+    let tower = InklingVisionConfig::inkling2_mini();
+    // 120x80 pixels: 6x4 patches, 3x2 tokens.
+    let picture = |seed: u32| {
+        // Seed 1 is flat red; seed 2 is black and white bars.
+        let rgb: Vec<u8> = (0..120 * 80usize)
+            .flat_map(|i| match seed {
+                1 => [230u8, 20, 20],
+                _ => [if (i % 120) / 20 % 2 == 0 { 255 } else { 0 }; 3],
+            })
+            .collect();
+        let pre = preprocess(&tower, &rgb, 120, 80, tower.max_image_tokens).expect("preprocess");
+        PreprocessedImage {
+            patches: pre.patches,
+            grid_h: pre.grid_h,
+            grid_w: pre.grid_w,
+        }
+    };
+    let text = golden.tokens().to_vec();
+    // The text, then the placeholder token six times: the prompt ends on
+    // the image, so what follows is the image's to decide.
+    let mut prompt = text.clone();
+    let start = prompt.len();
+    prompt.extend([200_054; 6]);
+    let mut serve = |id: u64, seed: u32, beside: bool| {
+        let image = picture(seed);
+        let placement = ImagePlacement {
+            start,
+            grid_h: image.grid_h / 2,
+            grid_w: image.grid_w / 2,
+            content_hash: u64::from(seed),
+        };
+        engine
+            .place_tokens(
+                NewRequest {
+                    id: RequestId(id),
+                    prompt_tokens: prompt.len() as u32,
+                    max_output_tokens: OUTPUT,
+                },
+                prompt.clone(),
+                vec![SequenceImage { placement, image }],
+                SamplingParams::GREEDY,
+                None,
+            )
+            .unwrap_or_else(|failure| panic!("request {id} was not placed: {failure}"));
+        let mut ids = vec![id];
+        if beside {
+            place(&mut engine, id + 100, &text, SamplingParams::GREEDY);
+            ids.push(id + 100);
+        }
+        run(&engine, &ids)
+    };
+    let first = serve(1, 1, true);
+    let again = serve(2, 1, false);
+    let other = serve(3, 2, false);
+    println!(
+        "image 1: {:?}; image 2: {:?}; text beside: {:?}",
+        first[&1], other[&3], first[&101]
+    );
+    assert_eq!(first[&1], again[&2], "one image, one prompt, two answers");
+    assert_ne!(first[&1], other[&3], "another image changed nothing");
+    let want_first = golden
+        .logits()
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap()
+        .0 as i32;
+    assert_eq!(
+        first[&101][0], want_first,
+        "an image request disturbed its text neighbour"
+    );
 }

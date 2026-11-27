@@ -17,7 +17,8 @@ use std::sync::Arc;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use llmcuda_cuda::kernels::hgemm::{HalfWeight, bf16_half_exponent};
 use llmcuda_cuda::kernels::inkling::{
-    ControlWeights, DEC_ROW_POINTERS, DG_BLOCK_ROWS, DG_MAX_ROWS, ProjOffsets,
+    ControlWeights, DEC_ATTN_PARTS, DEC_ROW_POINTERS, DG_BLOCK_ROWS, DG_MAX_ROWS, DecodeWindow,
+    ProjOffsets,
 };
 use llmcuda_gguf::GgmlType;
 use llmcuda_model::ModelConfig;
@@ -243,9 +244,18 @@ fn control(c: &ControlF32, rank: usize) -> ControlWeights<'_> {
 
 fn stack_of(e: &super::Experts) -> (HalfWeight<'_>, Option<&CudaSlice<f32>>) {
     match &e.w {
-        ExpertStack::Nvfp4 { bytes, scales } => {
-            (HalfWeight::Nvfp4 { bytes, scale: 1.0 }, scales.as_ref())
-        }
+        ExpertStack::Nvfp4 {
+            bytes,
+            scales,
+            partner,
+        } => (
+            HalfWeight::Nvfp4 {
+                bytes,
+                scale: 1.0,
+                partner: *partner,
+            },
+            scales.as_ref(),
+        ),
         ExpertStack::Dense(dense) => (dense_half(dense), None),
     }
 }
@@ -287,6 +297,8 @@ pub struct InklingDecode {
     inputs_h: CudaSlice<u16>,
     proj: CudaSlice<f32>,
     gated_h: CudaSlice<u16>,
+    /// Decode attention's partials, `[rows][heads][parts][dim + 2]`.
+    attn_part: CudaSlice<f32>,
     o_raw: CudaSlice<f32>,
     ffn_inp: CudaSlice<f32>,
     x_work: CudaSlice<f32>,
@@ -302,11 +314,46 @@ pub struct InklingDecode {
     final_norm: CudaSlice<f32>,
     final_h: CudaSlice<u16>,
     head_logits: CudaSlice<f32>,
+    /// Present on a step built for windows ([`Self::with_windows`]).
+    windows: Option<Windows>,
+}
+
+/// What a step that verifies drafted tokens keeps beside an ordinary one's.
+struct Windows {
+    /// `[rows]`: rows before each that are the same sequence's.
+    host_offsets: Vec<i32>,
+    offsets: CudaSlice<i32>,
+    /// Every slot's saved convolution inputs, `[slots][rows][width]`.
+    save: CudaSlice<f32>,
+    width: usize,
+    host_keep: Vec<i32>,
+    keep: CudaSlice<i32>,
+    /// Rows of each sequence in the step in flight; empty when none is.
+    lens: Vec<usize>,
 }
 
 impl InklingDecode {
     /// Allocate for steps of exactly `rows` sequences.
     pub fn new(model: &Arc<InklingModel>, stream: &Arc<CudaStream>, rows: usize) -> Res<Self> {
+        Self::build(model, stream, rows, false)
+    }
+
+    /// Allocate for steps of exactly `rows` rows that may be several
+    /// consecutive positions of one sequence ([`Self::step_windows`]).
+    pub fn with_windows(
+        model: &Arc<InklingModel>,
+        stream: &Arc<CudaStream>,
+        rows: usize,
+    ) -> Res<Self> {
+        Self::build(model, stream, rows, true)
+    }
+
+    fn build(
+        model: &Arc<InklingModel>,
+        stream: &Arc<CudaStream>,
+        rows: usize,
+        windows: bool,
+    ) -> Res<Self> {
         if rows == 0 || rows > DG_MAX_ROWS {
             return Err(bad(format!("a decode step takes 1..={DG_MAX_ROWS} rows")));
         }
@@ -351,6 +398,7 @@ impl InklingDecode {
             inputs_h: hf(3 * rows * n)?,
             proj: f(rows * ldo)?,
             gated_h: hf(rows * heads * dim)?,
+            attn_part: f(rows * heads * DEC_ATTN_PARTS * (dim + 2))?,
             o_raw: f(rows * n)?,
             ffn_inp: f(rows * n)?,
             x_work: f(rows * n)?,
@@ -366,6 +414,20 @@ impl InklingDecode {
             final_norm: f(rows * n)?,
             final_h: hf(rows * n)?,
             head_logits: f(rows * c.vocab_size as usize)?,
+            windows: if windows {
+                let width = 2 * (model.kv_width() + n);
+                Some(Windows {
+                    host_offsets: vec![0; rows],
+                    offsets: stream.alloc_zeros::<i32>(rows)?,
+                    save: f(slots * rows * width)?,
+                    width,
+                    host_keep: vec![0; rows],
+                    keep: stream.alloc_zeros::<i32>(rows)?,
+                    lens: Vec::with_capacity(rows),
+                })
+            } else {
+                None
+            },
         })
     }
 
@@ -569,6 +631,7 @@ impl InklingDecode {
             f32::from_bits(kc.qk_clip_bits),
             eps,
             self.rings[slot],
+            Self::window(self.windows.as_ref(), stream, slot, rows, model.kv_width()).as_ref(),
             rows,
         )?;
         self.mark(stream, "keys and values")?;
@@ -585,6 +648,7 @@ impl InklingDecode {
             &layer.q_clip,
             &layer.rel_clip,
             &layer.rel_bias,
+            &mut self.attn_part,
             &mut self.gated_h,
             d.offsets,
             heads,
@@ -646,6 +710,7 @@ impl InklingDecode {
             taps,
             gate_up_nv,
             eps,
+            Self::window(self.windows.as_ref(), stream, slot, rows, model.kv_width()).as_ref(),
             rows,
         )?;
         self.mark(stream, "ffn input: conv, mix, norm")?;
@@ -731,6 +796,7 @@ impl InklingDecode {
             n,
             topk,
             taps,
+            Self::window(self.windows.as_ref(), stream, slot, rows, model.kv_width()).as_ref(),
             rows,
         )?;
         self.mark(stream, "layer tail")?;
@@ -745,44 +811,176 @@ impl InklingDecode {
         states: &mut [&mut InklingState],
         tokens: &[i32],
     ) -> Res {
+        if let Some(w) = self.windows.as_mut() {
+            w.lens.clear();
+        }
+        self.run(stream, states, None, tokens)?;
+        for state in states.iter_mut() {
+            state.position += 1;
+        }
+        Ok(())
+    }
+
+    /// Run `lens[i]` consecutive positions of sequence `i` in one step:
+    /// its next token and the tokens drafted after it, `tokens` holding
+    /// them sequence by sequence. Every row is computed as a step of its
+    /// own would compute it. No sequence advances until [`Self::commit`]
+    /// says how many of its rows are kept; keys and values the rows wrote
+    /// past that are overwritten before anything reads them.
+    pub fn step_windows(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [&mut InklingState],
+        lens: &[usize],
+        tokens: &[i32],
+    ) -> Res {
+        if self.windows.is_none() {
+            return Err(bad("this step was not built for windows"));
+        }
+        if lens.len() != states.len() || lens.contains(&0) {
+            return Err(bad("a window holds at least one row of its sequence"));
+        }
+        self.run(stream, states, Some(lens), tokens)?;
+        let w = self.windows.as_mut().expect("checked above");
+        w.lens.clear();
+        w.lens.extend_from_slice(lens);
+        Ok(())
+    }
+
+    /// After [`Self::step_windows`]: sequence `i` keeps its first `keep[i]`
+    /// rows (at least one) and advances by that many positions.
+    pub fn commit(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [&mut InklingState],
+        keep: &[usize],
+    ) -> Res {
+        let model = self.model.clone();
+        let rows = self.rows;
+        let Some(w) = self.windows.as_mut() else {
+            return Err(bad("this step was not built for windows"));
+        };
+        if w.lens.is_empty() || keep.len() != w.lens.len() || states.len() != w.lens.len() {
+            return Err(bad(
+                "commit follows a step of windows, one count a sequence",
+            ));
+        }
+        w.host_keep.fill(0);
+        let mut row = 0;
+        for (kept, len) in keep.iter().zip(&w.lens) {
+            if *kept == 0 || kept > len {
+                return Err(bad("a window keeps between one and all of its rows"));
+            }
+            w.host_keep[row] = *kept as i32;
+            row += len;
+        }
+        stream.memcpy_htod(&w.host_keep, &mut w.keep)?;
+        model.dec.commit(
+            stream,
+            &self.ptrs,
+            &w.save,
+            &w.keep,
+            model.kv_width(),
+            model.config.hidden_size as usize,
+            model.k.conv_taps as usize,
+            model.slots(),
+            rows,
+        )?;
+        for (state, kept) in states.iter_mut().zip(keep) {
+            state.position += kept;
+        }
+        w.lens.clear();
+        Ok(())
+    }
+
+    /// The window arguments of one layer application's kernels, when the
+    /// step in flight holds windows.
+    fn window<'a>(
+        windows: Option<&'a Windows>,
+        stream: &Arc<CudaStream>,
+        slot: usize,
+        rows: usize,
+        kv: usize,
+    ) -> Option<DecodeWindow<'a>> {
+        let w = windows.filter(|w| !w.lens.is_empty())?;
+        let plane = (slot * rows * w.width * size_of::<f32>()) as u64;
+        Some(DecodeWindow {
+            offsets: &w.offsets,
+            save: w.save.device_ptr(stream).0 + plane,
+            width: w.width,
+            kv,
+        })
+    }
+
+    /// One step over `self.rows` rows: a row a sequence, or with `lens` that
+    /// many consecutive rows of each. Positions are left where they were.
+    fn run(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [&mut InklingState],
+        lens: Option<&[usize]>,
+        tokens: &[i32],
+    ) -> Res {
         let model = self.model.clone();
         let c = &model.config;
         let kc = &model.k;
         let n = c.hidden_size as usize;
         let rows = self.rows;
         let plane = rows * n;
-        if tokens.len() != rows || states.len() != rows {
-            return Err(bad(format!("the step advances exactly {rows} sequences")));
+        let total: usize = lens.map_or(states.len(), |lens| lens.iter().sum());
+        if tokens.len() != rows || total != rows {
+            return Err(bad(format!("the step holds exactly {rows} rows")));
         }
         if tokens.iter().any(|t| *t < 0 || *t as u32 >= c.vocab_size) {
             return Err(bad("a token id is outside the vocabulary"));
         }
         let slots = model.slots();
-        for (row, state) in states.iter().enumerate() {
-            if state.position + 1 > state.capacity {
+        let mut row = 0;
+        for (index, state) in states.iter().enumerate() {
+            let len = lens.map_or(1, |lens| lens[index]);
+            if state.position + len > state.capacity {
                 return Err(bad("a sequence would outgrow its cache"));
             }
-            self.host_pos[row] = state.position as i32;
-            for (slot, s) in state.slots.iter().enumerate() {
-                // One launch covers every row, so the rows must agree on
-                // where a position lives.
-                if row == 0 {
-                    self.rings[slot] = s.ring;
-                } else if self.rings[slot] != s.ring {
-                    return Err(bad(
-                        "sequences in one step were built with different ring caches",
-                    ));
+            if len > state.max_pass_rows {
+                return Err(bad(
+                    "a window is wider than the sequence's ring caches allow",
+                ));
+            }
+            for offset in 0..len {
+                self.host_pos[row] = (state.position + offset) as i32;
+                if let Some(w) = self.windows.as_mut() {
+                    w.host_offsets[row] = offset as i32;
                 }
-                let at = (slot * rows + row) * DEC_ROW_POINTERS;
-                self.host_ptrs[at] = s.k.device_ptr(stream).0;
-                self.host_ptrs[at + 1] = s.v.device_ptr(stream).0;
-                self.host_ptrs[at + 2] = s.k_carry.device_ptr(stream).0;
-                self.host_ptrs[at + 3] = s.v_carry.device_ptr(stream).0;
-                self.host_ptrs[at + 4] = s.attn_carry.device_ptr(stream).0;
-                self.host_ptrs[at + 5] = s.ffn_carry.device_ptr(stream).0;
+                for (slot, s) in state.slots.iter().enumerate() {
+                    // One launch covers every row, so the rows must agree on
+                    // where a position lives.
+                    if row == 0 {
+                        self.rings[slot] = s.ring;
+                    } else if self.rings[slot] != s.ring {
+                        return Err(bad(
+                            "sequences in one step were built with different ring caches",
+                        ));
+                    }
+                    let at = (slot * rows + row) * DEC_ROW_POINTERS;
+                    self.host_ptrs[at] = s.k.device_ptr(stream).0;
+                    self.host_ptrs[at + 1] = s.v.device_ptr(stream).0;
+                    self.host_ptrs[at + 2] = s.k_carry.device_ptr(stream).0;
+                    self.host_ptrs[at + 3] = s.v_carry.device_ptr(stream).0;
+                    self.host_ptrs[at + 4] = s.attn_carry.device_ptr(stream).0;
+                    self.host_ptrs[at + 5] = s.ffn_carry.device_ptr(stream).0;
+                }
+                row += 1;
             }
         }
         debug_assert_eq!(self.host_ptrs.len(), slots * rows * DEC_ROW_POINTERS);
+        if let Some(w) = self.windows.as_mut() {
+            // Marks the step in flight as one of windows for `layer`.
+            w.lens.clear();
+            if let Some(lens) = lens {
+                w.lens.extend_from_slice(lens);
+                stream.memcpy_htod(&w.host_offsets, &mut w.offsets)?;
+            }
+        }
         if let Some(p) = self.profile.as_mut() {
             p.restart(stream)?;
         }
@@ -887,9 +1085,6 @@ impl InklingDecode {
             eps,
         )?;
         self.mark(stream, "output mix and norm")?;
-        for state in states.iter_mut() {
-            state.position += 1;
-        }
         Ok(())
     }
 

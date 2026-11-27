@@ -790,7 +790,36 @@ format is contracted from its stored bytes, converted to binary16 exactly.
   routes them to reasoning and answer by block token. The template has no
   thinking switch, only an effort level: thinking off renders effort 0,
   which shortens the thinking block rather than removing it.
-- **Not yet**: prefix snapshots (every request prefills its whole prompt),
-  tool calls (a request with tools is answered 400), images
-  (`mmproj-F16.gguf`), and speculative decoding.
+- **Tool calls**: the template declares the tools in a block of its own
+  and the model answers with one block a call,
+  `<|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>`,
+  which the server's block router turns into a tool call (several in one
+  turn are several blocks). The name is the JSON's, as in llama.cpp's
+  parser. The body is **not grammar-constrained**: a body that is not that
+  JSON goes out as text. `tool_choice` `required` and a named function are
+  refused, as for the other models.
+- **Prefix cache**: a sequence leaves a snapshot every 2,048 positions,
+  in the engine's own arena and prefix tree, and a request whose prompt
+  begins with a retained prefix resumes there. What a later row can still
+  read is all a snapshot holds: the full slots' keys and values for the
+  interval (64 MiB at 2,048 positions, chained to the snapshot before),
+  and as fixed-size state the sliding slots' last 1,024 rows and every
+  slot's convolution carries (196 MiB). Rows are stored by position, so a
+  resume does not depend on the ring size of the sequence that left it.
+- **Speculation**: the five n-gram drafters (`--spec-type ngram`,
+  `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`); the
+  trained drafters are Qwen's and are refused. A sequence's next token and
+  its drafts are verified as consecutive positions in one *decode* step,
+  which computes each row as a step of its own would, to the bit, so what
+  is accepted is what plain decoding emits. A step holds eight rows:
+  drafts are cut, longest first, until every sequence's window fits.
+- **Images**: `--mmproj mmproj-F16.gguf` loads the `inkling2v` tower
+  (patch 20, 23 blocks, class token, layer scale, exact GELU, 2D rotary
+  positions, a 2x2 merge and a bias-free projector to the model's width).
+  An image is padded to whole 40-pixel cells, never resized below 4096
+  tokens' worth, and encoded at admission. The template renders it as a
+  block of its own, `<|message_user|><|content_image|>…<|end_message|>`,
+  holding one placeholder the server expands to a token a row; in prefill
+  the tower's rows stand where those tokens are, past the token
+  embedding's norm, as llama.cpp feeds them.
 

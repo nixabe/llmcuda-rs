@@ -496,42 +496,73 @@ A looped MoE: 24 layers of weights run as 48 layer applications, 128 experts
 top-8 with NVFP4 expert weights, attention with a relative-position bias and
 a zero-logit sink. **Nothing here is comparable to the standing table** —
 another model, on GPU 0 of a one-card host, through the engine's forward
-alone (`bench_inkling`), not the server. `Inkling-2-Mini-UD-Q4_K_XL.gguf`
-(16.9 GiB resident), against llama.cpp build 12688 (`ae6a7ad2c`):
+alone (`bench_inkling`), not the server, against llama.cpp build 12688
+(`ae6a7ad2c`):
 
 ```sh
-llama-batched-bench -m Inkling-2-Mini-UD-Q4_K_XL.gguf \
-  -ngl 99 -sm none -fa on -b 2048 -ub 2048 -ctk f16 -ctv f16 -c 16384 \
-  -npp <ctx> -ntg 64 -npl 1,3
-bench_inkling <ctx> 64 1,3
+llama-batched-bench -m <file> -ngl 99 -sm none -fa on -b <ub> -ub <ub> \
+  -ctk f16 -ctv f16 -c <3 x (ctx + 64) + 256> -npp <ctx> -ntg 64 -npl 3,1,3,1,3
+LLMCUDA_BENCH_CHUNK=2048 bench_inkling <ctx> 64 1,3
 ```
 
+**`<ub>` is llama.cpp's best for the depth, and for this model that is
+small.** Swept on `UD-Q4_K_XL` at 128 to 4,096: at 512 tokens the whole
+prompt in one batch is its fastest (942 tok/s at N=3 against 835 at
+`-ub 512`); at 2K and 8K `-ub 512` is (677 and 557 tok/s, against 598 and 355
+at `-ub 4096`, and 615 and 518 at `-ub 256`). The rows below use those:
+one batch at 512, `-ub 512` deeper. Its first row of each process is a cold
+start and is dropped. The engine prefills in passes of 2,048 rows a
+sequence, the widest a server builds.
+
 Three interleaved pairs, tok/s as the range over them (decode is the
-aggregate over the N sequences):
+aggregate over the N sequences). `Inkling-2-Mini-UD-Q4_K_XL.gguf` (16.9 GiB
+resident):
 
 | cell | llmcuda-rs | llama.cpp | margin |
 | :--- | ---: | ---: | ---: |
 | prefill 512, N=1 | 1,246–1,274 | 799–812 | **+53% to +59%** |
 | prefill 512, N=3 | 1,732–1,754 | 942–963 | **+80% to +86%** |
-| prefill 2K, N=1 | 1,722–1,729 | 583–595 | **+189% to +197%** |
-| prefill 2K, N=3 | 1,862–1,872 | 592–599 | **+211% to +216%** |
+| prefill 2K, N=1 | 1,714–1,728 | 673–674 | **+154% to +157%** |
+| prefill 2K, N=3 | 1,862–1,873 | 677–678 | **+175% to +176%** |
+| prefill 8K, N=1 | 1,629–1,630 | 556–557 | **+192% to +193%** |
+| prefill 8K, N=3 | 1,758–1,763 | 557–558 | **+215% to +217%** |
 | decode after 512, N=1 | 56.2–56.4 | 39.6–40.7 | **+38% to +42%** |
 | decode after 512, N=3 | 101.7–102.4 | 88.2–90.6 | **+12% to +16%** |
-| decode after 2K, N=1 | 52.0–52.1 | 38.0–38.9 | **+34% to +37%** |
-| decode after 2K, N=3 | 94.9–95.1 | 81.5–82.4 | **+15% to +17%** |
+| decode after 2K, N=1 | 51.9–52.2 | 39.0–39.1 | **+33% to +34%** |
+| decode after 2K, N=3 | 95.1–95.2 | 83.8–84.2 | **+13% to +14%** |
+| decode after 8K, N=1 | 46.1–46.2 | 38.4–38.5 | **+20% to +20%** |
+| decode after 8K, N=3 | 86.1–86.5 | 79.8–80.1 | **+7% to +8%** |
 
-What the table does not say:
+`Inkling-2-Mini-UD-Q8_K_XL.gguf` (bf16 dense matrices, bf16 experts in the
+last four layers; 22.3 GiB resident):
+
+| cell | llmcuda-rs | llama.cpp | margin |
+| :--- | ---: | ---: | ---: |
+| prefill 512, N=1 | 1,251–1,255 | 632–634 | **+97% to +98%** |
+| prefill 512, N=3 | 1,739–1,742 | 772–773 | **+125% to +126%** |
+| prefill 2K, N=1 | 1,719–1,725 | 537–539 | **+219% to +221%** |
+| prefill 2K, N=3 | 1,861–1,864 | 539–541 | **+244% to +246%** |
+| prefill 8K, N=1 | 1,632–1,633 | 458–459 | **+256% to +257%** |
+| prefill 8K, N=3 | 1,752–1,752 | 459–459 | **+282% to +282%** |
+| decode after 512, N=1 | 49.1–49.2 | 24.4–27.3 | **+80% to +102%** |
+| decode after 512, N=3 | 92.8–92.9 | 61.4–62.2 | **+49% to +51%** |
+| decode after 2K, N=1 | 45.9–45.9 | 26.6–27.5 | **+67% to +73%** |
+| decode after 2K, N=3 | 86.9–87.0 | 60.4–60.7 | **+43% to +44%** |
+| decode after 8K, N=1 | 41.4–41.4 | 19.5–26.9 | **+54% to +112%** |
+| decode after 8K, N=3 | 79.5–79.6 | 57.8–57.9 | **+37% to +38%** |
+
+What the tables do not say:
 
 - **Decode is not like for like at the edges.** The engine's step ends at the
   soft-capped logits; `llama-batched-bench` also samples. llama.cpp does not
   take its flash-attention path for this model (the bias goes in through the
   mask), so `-fa on` is inert here.
-- **`-ub 2048` is the whole prompt** at both depths; nothing deeper than 2K
-  and no `-ub 4096` cell has been measured, on either side.
-- **Q8_K_XL has no pair.** That file (bf16 dense matrices, bf16 experts in
-  the last four layers; 22.3 GiB resident) passes the same gates and ran
-  once at 512: prefill 1,270 / 1,767 tok/s and decode 49.4 / 93.6 tok/s at
-  N=1 / N=3. llama.cpp was not timed on it.
+- **Nothing deeper than 8K has been measured**, on either side, and
+  llama.cpp's `-ub` was swept on `UD-Q4_K_XL` only: on `UD-Q8_K_XL` one
+  run each put `-ub 512` ahead at 8K (459 against 322 at `-ub 4096`), and
+  at 2K one `-ub 2048` run read 520 where the `-ub 512` pairs read 537–541.
+- **llama.cpp's N=1 decode on `UD-Q8_K_XL` is unsteady** (19.5 to 26.9
+  tok/s across pairs at 8K); the margin there is a range, not a number.
 - **Forward only.** The model is served, but nothing here went through the
   server: no scheduler, sampling or HTTP in either column.
 

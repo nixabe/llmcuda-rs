@@ -53,6 +53,9 @@ pub enum GgmlType {
     Q6K = 14,
     /// Brain float 16: truncated fp32 mantissa. Block size 1.
     Bf16 = 30,
+    /// NVFP4: 64-element blocks of 4-bit E2M1 values, with one unsigned
+    /// E4M3 scale byte per 16-element sub-block (ggml's `block_nvfp4`).
+    Nvfp4 = 40,
 }
 
 impl GgmlType {
@@ -62,6 +65,7 @@ impl GgmlType {
             Self::F32 | Self::F16 | Self::Bf16 => 1,
             Self::Q4_0 | Self::Q8_0 => 32,
             Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            Self::Nvfp4 => 64,
         }
     }
 
@@ -76,6 +80,7 @@ impl GgmlType {
             Self::Q4K => 144,
             Self::Q5K => 176,
             Self::Q6K => 210,
+            Self::Nvfp4 => 36,
         }
     }
 
@@ -90,6 +95,7 @@ impl GgmlType {
             Self::Q5K => "q5_K",
             Self::Q6K => "q6_K",
             Self::Bf16 => "bf16",
+            Self::Nvfp4 => "nvfp4",
         }
     }
 
@@ -126,6 +132,7 @@ impl TryFrom<i32> for GgmlType {
             13 => Ok(Self::Q5K),
             14 => Ok(Self::Q6K),
             30 => Ok(Self::Bf16),
+            40 => Ok(Self::Nvfp4),
             other => Err(GgufError::UnsupportedGgmlType(other)),
         }
     }
@@ -143,6 +150,8 @@ mod tests {
         assert_eq!(GgmlType::F16.type_size(), 2);
         assert_eq!(GgmlType::Bf16.block_size(), 1);
         assert_eq!(GgmlType::Bf16.type_size(), 2);
+        assert_eq!(GgmlType::Nvfp4.block_size(), 64);
+        assert_eq!(GgmlType::Nvfp4.type_size(), 36);
         assert_eq!(GgmlType::Q4_0.block_size(), 32);
         assert_eq!(GgmlType::Q4_0.type_size(), 18);
         assert_eq!(GgmlType::Q8_0.block_size(), 32);
@@ -173,6 +182,7 @@ mod tests {
             (13, GgmlType::Q5K),
             (14, GgmlType::Q6K),
             (30, GgmlType::Bf16),
+            (40, GgmlType::Nvfp4),
         ] {
             assert_eq!(GgmlType::try_from(id).unwrap(), ty);
         }

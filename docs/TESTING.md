@@ -337,6 +337,55 @@ PyTorch kernel ported here (torchvision itself was not available to confirm
 it takes the uint8 path). PIL and that kernel differ by at most 2 levels on
 0.35% of values over random images, 1.3% at worst on noise.
 
+## The looped architecture (`inkling2_loop`)
+
+Inkling 2 Mini has its own forward, so it has its own gates. Nothing above
+applies to it except the kernels it shares (`hgemm`).
+
+| Test | What it asserts | Needs |
+| --- | --- | --- |
+| `llmcuda-kernels` `quant` unit tests (`nvfp4_*`) | NVFP4 dequantization: the E2M1 table, the unsigned-E4M3 scale, the byte-to-element layout | nothing |
+| `llmcuda-engine/tests/inkling_reference.rs` | The CPU reference (`llmcuda_kernels::inkling`) against a llama.cpp capture at all 48 layer applications, the final norm and the logits; prints how many tokens llama.cpp routes to a different expert set at each | the model and its capture; SKIPS without them |
+| `llmcuda-engine/tests/hgemm_differential.rs` (`nvfp4`, `grouped`, `decode_gemm_*`) | The prefill GEMM's NVFP4 format and grouped launch, and the decode GEMM in all three formats and three shapes, against the rounding contract | a device |
+| `llmcuda-engine/tests/inkling_attention.rs` | Prefill attention — scalar, tensor-core with a bias table, tensor-core computing the bias — against an f64 oracle over full and sliding windows, ragged tiles and a mid-cache start, the last two bit-identical to each other; the tiled fp32 projection bit-identical to the plain one; the prefill clip with the logarithmic position scale at positions either side of its floor | a device |
+| `llmcuda-engine/tests/inkling_forward.rs` | The device forward against the capture at every layer application; every cut of the prompt into passes, token by token included, and a two-sequence batch, bit-identical to one pass; the decode path against the prefill path position by position with the experts both route to; a prefill handing over to decode; three sequences decoded together bit-identical to one | a device, the model and its capture |
+| `llmcuda-engine/tests/inkling_decode_kernels.rs` | Each fused decode kernel against a host oracle at shapes the capture never reaches: attention past the sliding window, over caches longer than one 256-key scan chunk, with the position scale on and a bias table shorter than the reach, rows at different depths in one launch; keys and values fed a row at a time through the carried convolution with static and input-dependent taps; attention inputs in all five layer shapes (no, one or three mixing queries, with and without loop controllers); the feed-forward glue over three steps — residual with and without a new block, mix, controller, norm in both layouts, routing (ids exact), and the layer tail | a device |
+| `llmcuda-engine/tests/inkling_serve.rs` | Requests placed through `Engine::place_tokens` on this architecture's runtime: the first token comes with the last prompt row and is llama.cpp's argmax for the capture prompt; two copies of a prompt served with a stranger of another length generate the same tokens, and the same again served alone; every request stops at its output cap and frees its place; a sampling seed is one sequence of tokens and another seed another | a device, the model and its capture |
+| `llmcuda-server` `tokenizer` tests (`inkling_*`) | The `inkling2` pre-tokenizer yields llama.cpp's ids on the capture prompt | the model; SKIPS without it |
+
+`LLMCUDA_INKLING_MODEL` and `LLMCUDA_INKLING_GOLDEN` select the file and its
+capture (defaults: `models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf`
+and `.golden/inkling2-mini-q4-golden.bin`). A capture is made with
+`tools/oracle/capture` and the filters `l_out-.*,result_norm,ffn_moe_topk-.*`,
+from that exact file. Both files have been run; `LLMCUDA_INK_REFERENCE=1`
+runs the forward test on the plain reference kernels.
+
+**The end-to-end floors are loose on purpose, and the tight gates are the
+kernel tests.** The router's sigmoid top-8 has near-ties: any two
+implementations — llama.cpp and the CPU reference, the reference and the
+device, the device's prefill and decode paths — send a few of a prompt's
+(token, layer application) pairs to a different eighth expert, and a layer
+output then reads 0.998–0.9999 where it would read 1 − 1e-7. A wrong
+operator reads 0.3–0.8. The decode-path check therefore asserts tight
+agreement up to the first position whose routing differs and a floor after
+it, and prints the applications that differ.
+
+**Not gated:** the prefill glue kernels other than `ink_clip` (`ink_mix`,
+`ink_conv`, `ink_ctrl_*`, `ink_rel_table`, the dispatch and SiTU kernels)
+have no kernel-level differential test of their own; they are exercised
+through `inkling_forward` against the capture, twelve positions deep. The
+HTTP path has no automated test for this model: block routing, the
+template and the refusals were checked by hand against a running server.
+
+**Against `llama-server`, by hand, once.** Six greedy chat prompts through
+both servers on `UD-Q4_K_XL` (`temperature` 0, 400 tokens): the prompt
+token counts are equal on all six, so tokenizer and template agree. One
+reply is identical through thinking and answer; the other five agree for
+their first 200–420 characters and then continue differently — equally
+sensible text, three of them reaching the same answer. That is the routing
+near-tie again, compounding over a few dozen greedy steps; neither server
+is the reference for where the other one turns.
+
 ## Serving acceptance status
 
 Stated plainly, because a gap you know about is manageable and one you assume

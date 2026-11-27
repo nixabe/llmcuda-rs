@@ -21,6 +21,7 @@ pub mod dequant;
 pub mod gdn;
 pub mod gdn_chunked;
 pub mod hgemm;
+pub mod inkling;
 pub mod k2_gemm;
 pub mod k2_rope;
 pub mod layer_ops;
@@ -72,8 +73,14 @@ pub const TARGET_ARCH: &str = "compute_75";
 /// `attn_decode_rope_append_batch`, `vision_layer_norm`, `hg_q8_to_half_w`,
 /// `dec_lexical`, `dec_question_fields`, `dec_features`, `fwd_embed_quant`,
 /// `k2_rotary_append`, `k2_rotary_append_kv8`, `mma_quantize_rows_q8`,
-/// `mma_repack_q8_0` and `mma_repack_q8_0_h`. No kernel exists in both
-/// languages.
+/// `mma_repack_q8_0`, `mma_repack_q8_0_h`, and the `inkling2_loop` family:
+/// `ink_embed`, `ink_linear`, `ink_mix`, `ink_ctrl_pair`, `ink_ctrl_apply`,
+/// `ink_conv`, `ink_clip`, `ink_rms_groups`, `ink_rel_table`, `ink_attn`,
+/// `ink_gather_half`, `ink_situ_half`, `ink_moe_combine`, `ink_softcap`,
+/// `ink_dec_inputs`, `ink_dec_kv`, `ink_dec_attn`, `ink_dec_ffn_in`,
+/// `ink_dec_ffn_out`, `ink_dec_gate`, `ink_dec_ctrl`, `ink_dec_norm`,
+/// `ink_dec_router` and `ink_dec_route`.
+/// No kernel exists in both languages.
 ///
 /// The PTX is built with implicit multiply-add fusion off
 /// (`CUDA_OXIDE_NO_FMA`): a kernel fuses where its source says `mul_add` and
@@ -99,6 +106,8 @@ pub const RUST_KERNELS_SRC: &str = concat!(
     include_str!("../../../../device-kernels/src/gdn.rs"),
     include_str!("../../../../device-kernels/src/gemm.rs"),
     include_str!("../../../../device-kernels/src/glue.rs"),
+    include_str!("../../../../device-kernels/src/inkling.rs"),
+    include_str!("../../../../device-kernels/src/inkling_decode.rs"),
     include_str!("../../../../device-kernels/src/k2.rs"),
     include_str!("../../../../device-kernels/src/layer_ops.rs"),
     include_str!("../../../../device-kernels/src/moe.rs"),

@@ -22,6 +22,8 @@ mod dense;
 mod gdn;
 mod gemm;
 mod glue;
+mod inkling;
+mod inkling_decode;
 mod k2;
 mod layer_ops;
 mod moe;

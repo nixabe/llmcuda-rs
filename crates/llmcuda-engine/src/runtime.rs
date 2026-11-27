@@ -163,6 +163,8 @@ pub enum RuntimeError {
     ImagePlacement(String),
     /// A decision request is malformed, or the decision head failed.
     Decision(String),
+    /// The `inkling2_loop` runtime refused a request or its forward failed.
+    Inkling(String),
 }
 
 impl core::fmt::Display for RuntimeError {
@@ -177,6 +179,7 @@ impl core::fmt::Display for RuntimeError {
             Self::Decision(e) => write!(f, "decision: {e}"),
             Self::Gguf(e) => write!(f, "GGUF error: {e}"),
             Self::Schema(e) => write!(f, "model schema mismatch: {e}"),
+            Self::Inkling(e) => write!(f, "inkling2_loop: {e}"),
             Self::Load(e) => write!(f, "weight load failed: {e}"),
             Self::Forward(e) => write!(f, "forward pass failed: {e}"),
             Self::State(e) => write!(f, "sequence state failed: {e}"),
@@ -445,7 +448,7 @@ impl RuntimeSequence {
 /// The device kernel's verdict for an unconstrained sequence; this is the
 /// host copy, for a row the grammar has just masked. Non-finite logits lose
 /// to everything, which is exactly how a masked-out token should behave.
-fn argmax(logits: &[f32]) -> i32 {
+pub(crate) fn argmax(logits: &[f32]) -> i32 {
     let mut best = 0usize;
     let mut best_logit = f32::NEG_INFINITY;
     for (index, &logit) in logits.iter().enumerate() {
@@ -655,6 +658,9 @@ impl DeviceRuntimeHandle {
         config: ModelConfig,
         runtime: RuntimeConfig,
     ) -> Result<Self, RuntimeError> {
+        if config.inkling.is_some() {
+            return Self::spawn_inkling(device_ordinal, model_path, config, runtime);
+        }
         let (commands, receiver) = sync_channel::<RuntimeCommand>(1);
         let (ready_tx, ready_rx) = sync_channel::<Result<SnapshotSlots, RuntimeError>>(0);
         let thread = std::thread::Builder::new()
@@ -721,6 +727,80 @@ impl DeviceRuntimeHandle {
     }
 
     /// How much room this device's pinned snapshot arena has left.
+    /// [`Self::spawn`] for `inkling2_loop`: the same thread, channel and
+    /// commands over [`crate::inkling::serve::InklingRuntime`]. That runtime
+    /// keeps no snapshots, so a resume, a decision and a snapshot request
+    /// are answered with an error rather than run.
+    fn spawn_inkling(
+        device_ordinal: usize,
+        model_path: PathBuf,
+        config: ModelConfig,
+        runtime: RuntimeConfig,
+    ) -> Result<Self, RuntimeError> {
+        use crate::inkling::serve::InklingRuntime;
+        let refuse =
+            |what: &str| RuntimeError::Inkling(format!("inkling2_loop does not serve {what}"));
+        let (commands, receiver) = sync_channel::<RuntimeCommand>(1);
+        let (ready_tx, ready_rx) = sync_channel::<Result<SnapshotSlots, RuntimeError>>(0);
+        let thread = std::thread::Builder::new()
+            .name(format!("llmcuda-gpu-{device_ordinal}"))
+            .spawn(move || {
+                let mut runtime =
+                    match InklingRuntime::load(device_ordinal, &model_path, config, runtime) {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                            return;
+                        }
+                    };
+                if ready_tx.send(Ok(runtime.slots())).is_err() {
+                    return;
+                }
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        RuntimeCommand::Admit {
+                            req,
+                            prompt,
+                            images,
+                            snapshot,
+                            sampling,
+                            constraint,
+                            decision,
+                            reply,
+                        } => {
+                            let result = if decision.is_some() {
+                                Err(refuse("decision requests"))
+                            } else if snapshot.is_some() {
+                                Err(refuse("resuming from a snapshot"))
+                            } else {
+                                runtime.admit(req, prompt, !images.is_empty(), sampling, constraint)
+                            };
+                            let _ = reply.send(result);
+                        }
+                        RuntimeCommand::Remove { id, reply } => {
+                            let _ = reply.send(runtime.remove(id));
+                        }
+                        RuntimeCommand::Execute { batch, reply } => {
+                            let _ = reply.send(runtime.execute(batch));
+                        }
+                        RuntimeCommand::Snapshot { reply, .. } => {
+                            let _ = reply.send(Err(refuse("snapshots")));
+                        }
+                        RuntimeCommand::Stop => break,
+                    }
+                }
+            })
+            .map_err(|_| RuntimeError::RuntimeStopped)?;
+        let slots = ready_rx
+            .recv()
+            .map_err(|_| RuntimeError::RuntimeStopped)??;
+        Ok(Self {
+            commands,
+            thread: Some(thread),
+            slots,
+        })
+    }
+
     pub fn snapshot_slots(&self) -> &SnapshotSlots {
         &self.slots
     }

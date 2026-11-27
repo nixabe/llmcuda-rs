@@ -89,9 +89,38 @@ fn bf16_weights(rows: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
     (bytes, vals)
 }
 
+/// NVFP4 bytes for `rows x k` weights and the values they store. Scale bytes
+/// cover the subnormal exponent, the two encodings of zero and a set sign
+/// bit; nibbles cover all sixteen codes.
+fn nvfp4_weights(rows: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+    let mut rng = Xorshift64Star::new(seed);
+    let mut bytes = Vec::with_capacity(rows * k / 64 * 36);
+    for block in 0..rows * k / 64 {
+        for sub in 0..4 {
+            let pick = (rng.next_f32_range(0.0, 1.0) * 97.0) as usize;
+            let byte = match (block + sub) % 29 {
+                0 => 0u8,
+                1 => 0x7F,
+                2 => 0x80 | ((pick % 80) as u8 + 8),
+                _ => (pick % 88) as u8,
+            };
+            bytes.push(byte);
+        }
+        for _ in 0..32 {
+            bytes.push((rng.next_f32_range(0.0, 1.0) * 255.99) as u8);
+        }
+    }
+    let vals = llmcuda_kernels::quant::dequantize_row_nvfp4(&bytes).unwrap();
+    (bytes, vals)
+}
+
+/// The per-matrix factor the NVFP4 cases pass, as an expert's scale would be.
+const NVFP4_SCALE: f32 = 0.371;
+
 enum Format {
     Q8_0,
     Bf16,
+    Nvfp4,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -108,6 +137,12 @@ fn run_case(
     accumulate: bool,
     seed: u64,
 ) {
+    // An NVFP4 row is whole 64-element blocks.
+    let k = if matches!(format, Format::Nvfp4) {
+        k.next_multiple_of(64)
+    } else {
+        k
+    };
     let mut rng = Xorshift64Star::new(seed ^ 0x5eed);
     let x = rng.vec_f32(tokens * k, -3.0, 3.0);
     let prior: Vec<f32> = rng.vec_f32(tokens * ldo, -1.0, 1.0);
@@ -179,6 +214,32 @@ fn run_case(
             .unwrap();
             deq
         }
+        Format::Nvfp4 => {
+            // The staged weights are the stored values exactly; the factor
+            // multiplies the fp32 sum.
+            let (bytes, vals) = nvfp4_weights(rows, k, seed);
+            assert!(vals.iter().all(|v| round_through_f16(*v) == *v));
+            let dev = stream.clone_htod(&bytes).unwrap();
+            let w = HalfWeight::Nvfp4 {
+                bytes: &dev,
+                scale: NVFP4_SCALE,
+            };
+            hg.gemm_with_plan(
+                stream,
+                w,
+                &xh,
+                &mut out,
+                Some(&mut workspace),
+                tokens,
+                rows,
+                k,
+                ldo,
+                accumulate,
+                plan,
+            )
+            .unwrap();
+            vals.iter().map(|v| v * NVFP4_SCALE).collect()
+        }
     };
     let got = stream.clone_dtoh(&out).unwrap();
 
@@ -227,6 +288,7 @@ fn run_case(
     let name = match format {
         Format::Q8_0 => "q8_0",
         Format::Bf16 => "bf16",
+        Format::Nvfp4 => "nvfp4",
     };
     println!(
         "{name} {plan:?} tokens {tokens:4} rows {rows:5} k {k:5} ldo {ldo:5} acc \
@@ -260,7 +322,7 @@ fn half_gemm_matches_its_rounding_contract() {
         (513, 384, 768, 384, true),
     ];
     let mut seed = 17;
-    for format in [Format::Q8_0, Format::Bf16] {
+    for format in [Format::Q8_0, Format::Bf16, Format::Nvfp4] {
         for wide in [false, true] {
             let whole = HgemmPlan { wide, splits: 1 };
             for &(tokens, rows, k, ldo, accumulate) in &shapes {
@@ -279,6 +341,407 @@ fn half_gemm_matches_its_rounding_contract() {
                 }
             }
         }
+    }
+}
+
+/// The grouped launch: each 128-token tile against the matrix its owner
+/// names, scaled by that owner's factor; unowned tiles untouched.
+#[test]
+fn grouped_gemm_contracts_each_tile_with_its_owner() {
+    let Some(ctx) = device() else { return };
+    let stream = ctx.default_stream();
+    let mma = MmaKernels::new(&ctx).expect("int8 kernels compile");
+    let hg = HgemmKernels::new(&ctx).expect("fp16 GEMM kernels compile");
+    let (stack, rows, k) = (5usize, 130usize, 192usize);
+    let owners: Vec<i32> = vec![3, -1, 0, 4, 3, -1, 1];
+    let tiles = owners.len();
+    let tokens = tiles * 128;
+    let factors: Vec<f32> = (0..stack).map(|e| 0.25 + e as f32 * 0.31).collect();
+    let d_owners = stream.clone_htod(&owners).unwrap();
+    let d_factors = stream.clone_htod(&factors).unwrap();
+    let mut rng = Xorshift64Star::new(0xface);
+    let x = rng.vec_f32(tokens * k, -3.0, 3.0);
+    let xd = stream.clone_htod(&x).unwrap();
+    let mut xh = stream.alloc_zeros::<u16>(tokens * k).unwrap();
+    hg.to_half(&stream, &xd, &mut xh, tokens * k).unwrap();
+    for (name, format) in [
+        ("q8_0", Format::Q8_0),
+        ("bf16", Format::Bf16),
+        ("nvfp4", Format::Nvfp4),
+    ] {
+        for wide in [false, true] {
+            let prior = rng.vec_f32(tokens * rows, -1.0, 1.0);
+            let mut out = stream.clone_htod(&prior).unwrap();
+            // What each output is compared with: the staged weight, and the
+            // factor the launch applies on top.
+            let (deq, scaled) = match format {
+                Format::Q8_0 => {
+                    let (bytes, deq) = q8_0_weights(stack * rows, k, 91);
+                    let src = stream.clone_htod(&bytes).unwrap();
+                    let mut wq = stream.alloc_zeros::<i8>(stack * rows * k).unwrap();
+                    let mut ws = stream.alloc_zeros::<u16>(stack * rows * k / 32).unwrap();
+                    mma.repack_q8_0_half(&stream, &src, &mut wq, &mut ws, stack * rows * k)
+                        .unwrap();
+                    let w = HalfWeight::Q8_0 {
+                        q: &wq,
+                        scales: &ws,
+                    };
+                    hg.gemm_grouped(
+                        &stream, w, stack, &d_owners, None, &xh, &mut out, rows, k, wide,
+                    )
+                    .unwrap();
+                    (deq, false)
+                }
+                Format::Bf16 => {
+                    let (bytes, vals) = bf16_weights(stack * rows, k, 92);
+                    let exponent = bf16_half_exponent(&bytes);
+                    let scale = 2f32.powi(exponent);
+                    let dev = stream.clone_htod(&bytes).unwrap();
+                    let w = HalfWeight::Bf16 {
+                        bytes: &dev,
+                        exponent,
+                    };
+                    hg.gemm_grouped(
+                        &stream, w, stack, &d_owners, None, &xh, &mut out, rows, k, wide,
+                    )
+                    .unwrap();
+                    let deq = vals
+                        .iter()
+                        .map(|&v| round_through_f16(v * scale) / scale)
+                        .collect();
+                    (deq, false)
+                }
+                Format::Nvfp4 => {
+                    let (bytes, vals) = nvfp4_weights(stack * rows, k, 93);
+                    let dev = stream.clone_htod(&bytes).unwrap();
+                    let w = HalfWeight::Nvfp4 {
+                        bytes: &dev,
+                        scale: 1.0,
+                    };
+                    hg.gemm_grouped(
+                        &stream,
+                        w,
+                        stack,
+                        &d_owners,
+                        Some(&d_factors),
+                        &xh,
+                        &mut out,
+                        rows,
+                        k,
+                        wide,
+                    )
+                    .unwrap();
+                    (vals, true)
+                }
+            };
+            let got = stream.clone_dtoh(&out).unwrap();
+            let mut worst = 0.0f64;
+            let mut bound = 0.0f64;
+            for (tile, &owner) in owners.iter().enumerate() {
+                for t in tile * 128..(tile + 1) * 128 {
+                    for r in 0..rows {
+                        let g = got[t * rows + r];
+                        if owner < 0 {
+                            assert_eq!(g.to_bits(), prior[t * rows + r].to_bits());
+                            continue;
+                        }
+                        let e = owner as usize;
+                        let factor = if scaled { f64::from(factors[e]) } else { 1.0 };
+                        let (mut s, mut m) = (0.0f64, 0.0f64);
+                        for i in 0..k {
+                            let p = f64::from(round_through_f16(x[t * k + i]))
+                                * f64::from(deq[(e * rows + r) * k + i]);
+                            s += p;
+                            m += p.abs();
+                        }
+                        worst = worst.max((f64::from(g) - s * factor).abs());
+                        bound = bound.max(2.0 * (k as f64) * m * factor * 2f64.powi(-24) + 1e-6);
+                    }
+                }
+            }
+            println!("grouped {name} wide {wide}: max_abs {worst:.3e} (bound {bound:.3e})");
+            assert!(
+                worst <= bound,
+                "grouped {name}: max_abs {worst} exceeds {bound}"
+            );
+        }
+    }
+}
+
+/// Activations laid out for an NVFP4 contraction: pair `p` of each
+/// 16-element group holds elements `p` and `p + 8`.
+fn byte_order(x: &[f32]) -> Vec<f32> {
+    let mut out = vec![0.0; x.len()];
+    for (g, group) in x.chunks(16).enumerate() {
+        for e in 0..16 {
+            out[g * 16 + ((e & 7) << 1) + (e >> 3)] = group[e];
+        }
+    }
+    out
+}
+
+fn situ(gate: f64, up: f64, beta: f64, lb: f64) -> f64 {
+    beta * (gate / beta).tanh() / (1.0 + (-gate).exp()) * lb * (up / lb).tanh()
+}
+
+/// The decode-shaped GEMM (`DecodeGemm`): dense with three activation
+/// planes, and the expert gate/up and down projections, in every format,
+/// against the same rounding contract as the prefill GEMM.
+#[test]
+fn decode_gemm_matches_its_rounding_contract() {
+    use llmcuda_cuda::kernels::inkling::DecodeGemm;
+    let Some(ctx) = device() else { return };
+    let stream = ctx.default_stream();
+    let mma = MmaKernels::new(&ctx).expect("int8 kernels compile");
+    let hg = HgemmKernels::new(&ctx).expect("fp16 GEMM kernels compile");
+    let dg = DecodeGemm::new(&ctx).expect("decode GEMM compiles");
+    let mut rng = Xorshift64Star::new(0xdec0de);
+    let half = |x: &[f32]| {
+        let d = stream.clone_htod(x).unwrap();
+        let mut h = stream.alloc_zeros::<u16>(x.len()).unwrap();
+        hg.to_half(&stream, &d, &mut h, x.len()).unwrap();
+        h
+    };
+    // The device operands for a `stack x rows x k` weight in a format, and
+    // the values the oracle multiplies with.
+    struct Staged {
+        q: Option<(
+            cudarc::driver::CudaSlice<i8>,
+            cudarc::driver::CudaSlice<u16>,
+        )>,
+        bytes: Option<cudarc::driver::CudaSlice<u8>>,
+        exponent: i32,
+        deq: Vec<f32>,
+    }
+    let stage = |format: &Format, n: usize, k: usize, seed: u64| -> Staged {
+        match format {
+            Format::Q8_0 => {
+                let (bytes, deq) = q8_0_weights(n, k, seed);
+                let src = stream.clone_htod(&bytes).unwrap();
+                let mut wq = stream.alloc_zeros::<i8>(n * k).unwrap();
+                let mut ws = stream.alloc_zeros::<u16>(n * k / 32).unwrap();
+                mma.repack_q8_0_half(&stream, &src, &mut wq, &mut ws, n * k)
+                    .unwrap();
+                Staged {
+                    q: Some((wq, ws)),
+                    bytes: None,
+                    exponent: 0,
+                    deq,
+                }
+            }
+            Format::Bf16 => {
+                let (bytes, vals) = bf16_weights(n, k, seed);
+                let exponent = bf16_half_exponent(&bytes);
+                let scale = 2f32.powi(exponent);
+                Staged {
+                    q: None,
+                    bytes: Some(stream.clone_htod(&bytes).unwrap()),
+                    exponent,
+                    deq: vals
+                        .iter()
+                        .map(|&v| round_through_f16(v * scale) / scale)
+                        .collect(),
+                }
+            }
+            Format::Nvfp4 => {
+                let (bytes, vals) = nvfp4_weights(n, k, seed);
+                Staged {
+                    q: None,
+                    bytes: Some(stream.clone_htod(&bytes).unwrap()),
+                    exponent: 0,
+                    deq: vals,
+                }
+            }
+        }
+    };
+    fn operand<'a>(format: &Format, s: &'a Staged) -> HalfWeight<'a> {
+        match format {
+            Format::Q8_0 => {
+                let (q, scales) = s.q.as_ref().unwrap();
+                HalfWeight::Q8_0 { q, scales }
+            }
+            Format::Bf16 => HalfWeight::Bf16 {
+                bytes: s.bytes.as_ref().unwrap(),
+                exponent: s.exponent,
+            },
+            Format::Nvfp4 => HalfWeight::Nvfp4 {
+                bytes: s.bytes.as_ref().unwrap(),
+                scale: 1.0,
+            },
+        }
+    }
+    let dot = |x: &[f32], w: &[f32]| -> (f64, f64) {
+        x.iter().zip(w).fold((0.0, 0.0), |(s, m), (a, b)| {
+            let p = f64::from(round_through_f16(*a)) * f64::from(*b);
+            (s + p, m + p.abs())
+        })
+    };
+
+    // Dense: weight rows [0, 32), [32, 64), [64, 96) read planes 0, 1, 2.
+    let (rows, k, plane_rows, ldo) = (96usize, 128usize, 8usize, 100usize);
+    for (name, format) in [("q8_0", Format::Q8_0), ("bf16", Format::Bf16)] {
+        let w = stage(&format, rows, k, 7);
+        for tokens in [1usize, 3, 8] {
+            let x = rng.vec_f32(3 * plane_rows * k, -3.0, 3.0);
+            let xh = half(&x);
+            let prior = rng.vec_f32(tokens * ldo, -1.0, 1.0);
+            let mut out = stream.clone_htod(&prior).unwrap();
+            dg.dense(
+                &stream,
+                operand(&format, &w),
+                &xh,
+                &mut out,
+                rows,
+                k,
+                tokens,
+                ldo,
+                plane_rows,
+                32,
+                64,
+            )
+            .unwrap();
+            let got = stream.clone_dtoh(&out).unwrap();
+            let (mut worst, mut bound) = (0.0f64, 0.0f64);
+            for t in 0..tokens {
+                for r in 0..ldo {
+                    if r >= rows {
+                        assert_eq!(got[t * ldo + r].to_bits(), prior[t * ldo + r].to_bits());
+                        continue;
+                    }
+                    let plane = r / 32;
+                    let xr = &x[(plane * plane_rows + t) * k..][..k];
+                    let (s, m) = dot(xr, &w.deq[r * k..][..k]);
+                    worst = worst.max((f64::from(got[t * ldo + r]) - s).abs());
+                    bound = bound.max(2.0 * k as f64 * m * 2f64.powi(-24) + 1e-6);
+                }
+            }
+            println!(
+                "decode dense {name} tokens {tokens}: max_abs {worst:.3e} (bound {bound:.3e})"
+            );
+            assert!(
+                worst <= bound,
+                "decode dense {name}: {worst} exceeds {bound}"
+            );
+        }
+    }
+
+    // Experts: three tokens routed to two experts each, out of five.
+    let (stack, n, ff, topk, tokens) = (5usize, 128usize, 64usize, 2usize, 3usize);
+    let pairs = tokens * topk;
+    let ids: Vec<i32> = vec![4, 0, 2, 2, 1, 4];
+    let factors: Vec<f32> = (0..stack).map(|e| 0.2 + e as f32 * 0.17).collect();
+    let pair_w: Vec<f32> = (0..pairs).map(|p| 0.5 + p as f32 * 0.4).collect();
+    let (d_ids, d_factors, d_pair_w) = (
+        stream.clone_htod(&ids).unwrap(),
+        stream.clone_htod(&factors).unwrap(),
+        stream.clone_htod(&pair_w).unwrap(),
+    );
+    let (beta, lb) = (4.0f32, 25.0f32);
+    for (name, format) in [
+        ("q8_0", Format::Q8_0),
+        ("bf16", Format::Bf16),
+        ("nvfp4", Format::Nvfp4),
+    ] {
+        let nv = matches!(format, Format::Nvfp4);
+        let gate_up = stage(&format, stack * 2 * ff, n, 11);
+        let down = stage(&format, stack * n, ff, 13);
+        let scale_of = |e: usize| if nv { f64::from(factors[e]) } else { 1.0 };
+        // Small activations keep the gates off SiTU's flat ends.
+        let x = rng.vec_f32(tokens * n, -0.3, 0.3);
+        let xh = half(&if nv { byte_order(&x) } else { x.clone() });
+        let mut hidden = stream.alloc_zeros::<u16>(pairs * ff).unwrap();
+        dg.gate_up(
+            &stream,
+            operand(&format, &gate_up),
+            stack,
+            &d_ids,
+            nv.then_some(&d_factors),
+            &xh,
+            &mut hidden,
+            2 * ff,
+            n,
+            pairs,
+            topk,
+            nv,
+            beta,
+            lb,
+        )
+        .unwrap();
+        let got: Vec<f32> = stream
+            .clone_dtoh(&hidden)
+            .unwrap()
+            .iter()
+            .map(|h| half::f16::from_bits(*h).to_f32())
+            .collect();
+        let mut want_hidden = vec![0.0f32; pairs * ff];
+        let mut worst = 0.0f64;
+        for (pair, &e) in ids.iter().enumerate() {
+            let e = e as usize;
+            let xr = &x[(pair / topk) * n..][..n];
+            for i in 0..ff {
+                let (g, _) = dot(xr, &gate_up.deq[(e * 2 * ff + i) * n..][..n]);
+                let (u, _) = dot(xr, &gate_up.deq[(e * 2 * ff + ff + i) * n..][..n]);
+                let v = situ(
+                    g * scale_of(e),
+                    u * scale_of(e),
+                    f64::from(beta),
+                    f64::from(lb),
+                );
+                want_hidden[pair * ff + i] = v as f32;
+                let at = if nv {
+                    (i & !15) + ((i & 7) << 1) + ((i & 15) >> 3)
+                } else {
+                    i
+                };
+                let err = (f64::from(got[pair * ff + at]) - v).abs() / v.abs().max(1e-2);
+                worst = worst.max(err);
+            }
+        }
+        println!("decode gate/up {name}: worst relative error {worst:.3e}");
+        // binary16 output: half an ulp is 2^-11 relative, plus the fp32
+        // sums' own error through SiTU's slope.
+        assert!(worst < 2e-3, "decode gate/up {name}: {worst}");
+
+        // Down, from the oracle's hidden values so the two are separable.
+        let hh = half(&if nv {
+            byte_order(&want_hidden)
+        } else {
+            want_hidden.clone()
+        });
+        let mut out = stream.alloc_zeros::<f32>(pairs * n).unwrap();
+        dg.down(
+            &stream,
+            operand(&format, &down),
+            stack,
+            &d_ids,
+            nv.then_some(&d_factors),
+            &hh,
+            &d_pair_w,
+            &mut out,
+            n,
+            ff,
+            pairs,
+        )
+        .unwrap();
+        let got = stream.clone_dtoh(&out).unwrap();
+        let (mut worst, mut bound) = (0.0f64, 0.0f64);
+        for (pair, &e) in ids.iter().enumerate() {
+            let e = e as usize;
+            let f = scale_of(e) * f64::from(pair_w[pair]);
+            for r in 0..n {
+                let (s, m) = dot(
+                    &want_hidden[pair * ff..][..ff],
+                    &down.deq[(e * n + r) * ff..][..ff],
+                );
+                worst = worst.max((f64::from(got[pair * n + r]) - s * f).abs());
+                bound = bound.max(2.0 * ff as f64 * m * f * 2f64.powi(-24) + 1e-6);
+            }
+        }
+        println!("decode down {name}: max_abs {worst:.3e} (bound {bound:.3e})");
+        assert!(
+            worst <= bound,
+            "decode down {name}: {worst} exceeds {bound}"
+        );
     }
 }
 

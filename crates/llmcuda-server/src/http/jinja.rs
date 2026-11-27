@@ -51,6 +51,10 @@ pub(crate) struct ChatTemplate {
     /// The template writes a tool result under a header that names the
     /// function (Inkling's `<|message_tool|>NAME`).
     names_tool_results: bool,
+    /// The template renders an image from a content part of its own
+    /// (Inkling's `<|content_image|>` block), not from markup inside the
+    /// message's text.
+    image_parts: bool,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -73,6 +77,7 @@ impl ChatTemplate {
         let effort_is_the_switch =
             source.contains("reasoning_effort") && !source.contains("enable_thinking");
         let names_tool_results = source.contains("<|message_tool|>");
+        let image_parts = source.contains(super::vision::INKLING_IMAGE_BLOCK);
         let mut env = Environment::new();
         env.set_unknown_method_callback(python_method);
         // This is a model prompt, not HTML. Minijinja's built-in emits
@@ -95,6 +100,7 @@ impl ChatTemplate {
             env,
             effort_is_the_switch,
             names_tool_results,
+            image_parts,
         }))
     }
 
@@ -124,7 +130,7 @@ impl ChatTemplate {
                  model's own chat template; --no-jinja renders it"
             );
         }
-        let messages = messages(conversation, self.names_tool_results);
+        let messages = messages(conversation, self.names_tool_results, self.image_parts);
         let tools: Vec<&Value> = conversation
             .tools
             .iter()
@@ -292,12 +298,34 @@ fn write_json(value: &Value, sort: bool, item: &str, key: &str, out: &mut String
     }
 }
 
+/// A user or tool message's content for the template: its text, or - for a
+/// template that renders images from content parts - the text cut at each
+/// image into a list of text and image parts, in order. The request's
+/// images were folded into the text as [`super::vision::IMAGE_MARKER`]s, one each.
+fn content_of(text: &str, image_parts: bool) -> Value {
+    use super::vision::IMAGE_MARKER;
+    if !image_parts || !text.contains(IMAGE_MARKER) {
+        return json!(text.trim());
+    }
+    let mut parts = Vec::new();
+    let mut pieces = text.split(IMAGE_MARKER).peekable();
+    while let Some(piece) = pieces.next() {
+        if !piece.trim().is_empty() {
+            parts.push(json!({ "type": "text", "text": piece.trim() }));
+        }
+        if pieces.peek().is_some() {
+            parts.push(json!({ "type": "image" }));
+        }
+    }
+    Value::Array(parts)
+}
+
 /// The conversation as the OpenAI message list a chat template expects.
 ///
 /// `name_results` puts on each tool result the name of the call it
 /// answers, by position in the assistant turn before it: a template whose
 /// tool message header carries the function's name reads it from there.
-fn messages(conversation: &Conversation, name_results: bool) -> Vec<Value> {
+fn messages(conversation: &Conversation, name_results: bool, image_parts: bool) -> Vec<Value> {
     let mut called: Vec<&str> = Vec::new();
     let mut messages = Vec::new();
     if let Some(system) = conversation
@@ -311,7 +339,8 @@ fn messages(conversation: &Conversation, name_results: bool) -> Vec<Value> {
     for turn in &conversation.turns {
         match turn {
             Turn::User(content) => {
-                messages.push(json!({ "role": "user", "content": content.trim() }));
+                messages
+                    .push(json!({ "role": "user", "content": content_of(content, image_parts) }));
             }
             Turn::System(content) => {
                 messages.push(json!({ "role": "system", "content": content.trim() }));
@@ -362,7 +391,7 @@ fn messages(conversation: &Conversation, name_results: bool) -> Vec<Value> {
                     if let (true, Some(name)) = (name_results, called.get(index)) {
                         message.insert("name".to_owned(), json!(name));
                     }
-                    message.insert("content".to_owned(), json!(result.trim()));
+                    message.insert("content".to_owned(), content_of(result, image_parts));
                     messages.push(Value::Object(message));
                 }
             }
@@ -613,6 +642,41 @@ mod tests {
         assert!(rendered.contains("Thinking effort level: 0.9<|end_message|>"));
     }
 
+    /// An image in a user turn reaches the Inkling template as a content
+    /// part, which it renders as a block of its own holding the one
+    /// placeholder token the server expands into the image's rows.
+    #[test]
+    fn inkling_template_renders_an_image_as_its_own_block() {
+        let path = std::env::var_os("LLMCUDA_INKLING_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf")
+            });
+        if !path.exists() {
+            eprintln!("SKIPPED: {} is not on this host", path.display());
+            return;
+        }
+        let source = crate::tokenizer::chat_template_from_gguf(&path)
+            .unwrap()
+            .unwrap();
+        let template = ChatTemplate::compile(source).unwrap();
+        let marker = crate::http::vision::IMAGE_MARKER;
+        let mut conversation = Conversation::default();
+        conversation.turns.push(Turn::User(format!(
+            "what is this?\n{marker}\n{marker}\nand that?"
+        )));
+        let rendered = template.render(&conversation, true).unwrap();
+        println!("{rendered}");
+        assert!(rendered.ends_with(concat!(
+            "<|message_user|><|content_text|>what is this?<|end_message|>",
+            "<|message_user|><|content_image|><|unused_200054|><|end_message|>",
+            "<|message_user|><|content_image|><|unused_200054|><|end_message|>",
+            "<|message_user|><|content_text|>and that?<|end_message|>",
+        )));
+        assert!(!rendered.contains("vision_start"));
+    }
+
     /// An effort level is passed only to a template that has no thinking
     /// switch. A present-but-none level is not "undefined" to a template
     /// that takes `| default(...)` of it: K2's fell through to its
@@ -795,7 +859,7 @@ mod tests {
         for (name, conversation) in fixtures() {
             for thinking in [true, false] {
                 let mut request = json!({
-                    "messages": messages(&conversation, false),
+                    "messages": messages(&conversation, false, false),
                     "chat_template_kwargs": {"enable_thinking": thinking},
                 });
                 if !conversation.tools.is_empty() {

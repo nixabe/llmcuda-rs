@@ -730,8 +730,6 @@ fn main() -> std::process::ExitCode {
         // than at the first request.
         let refusal = if args.no_jinja {
             Some("its chat format is its own template; --no-jinja is unsupported")
-        } else if args.mmproj.is_some() {
-            Some("images are not supported for it yet; drop --mmproj")
         } else if args.slots_per_worker > 8 {
             Some("its decode step advances at most eight sequences; use -s 8 or fewer")
         } else {
@@ -795,7 +793,15 @@ fn main() -> std::process::ExitCode {
         .as_ref()
         .map(|path| {
             let file = llmcuda_gguf::GgufFile::open(path).map_err(|e| e.to_string())?;
-            llmcuda_model::VisionConfig::from_gguf(&file, &model).map_err(|e| e.to_string())
+            if is_inkling {
+                llmcuda_model::InklingVisionConfig::from_gguf(&file, &model)
+                    .map(http::VisionTower::Inkling)
+                    .map_err(|e| e.to_string())
+            } else {
+                llmcuda_model::VisionConfig::from_gguf(&file, &model)
+                    .map(http::VisionTower::Qwen)
+                    .map_err(|e| e.to_string())
+            }
         })
         .transpose()
     {
@@ -1185,7 +1191,7 @@ fn main() -> std::process::ExitCode {
         mmproj: args.mmproj.clone(),
         // The runtime's encode buffers are sized in pre-merge patches; the
         // serving ceiling is in post-merge tokens.
-        max_image_patches: vision_config.map_or(0, |c| {
+        max_image_patches: vision_config.as_ref().map_or(0, |c| {
             args.image_max_tokens as usize * c.merge_factor() as usize
         }),
         decision_max_positions: args.decision_max_tokens as usize,

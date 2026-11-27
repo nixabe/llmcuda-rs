@@ -3,10 +3,12 @@
 //!
 //! It answers the same commands — admit, remove, execute a scheduler step —
 //! and returns the same step record, so the scheduler, the pager and the
-//! engine above it are unchanged. It does less: no prefix snapshots (a step
-//! never retains anything, and a resume is refused), no images, no decision
-//! requests, no speculation. Every token is chosen on the host from a row of
-//! logits, greedy or sampled, grammar applied first.
+//! engine above it are unchanged: prefix snapshots are retained and resumed
+//! as there, images are encoded at admission and their rows stand in the
+//! prompt, and the n-gram drafters are verified in the decode step itself.
+//! It has no decision requests and no trained drafter. Every token is chosen
+//! on the host from a row of logits, greedy or sampled, grammar applied
+//! first.
 //!
 //! Nothing is allocated per step. Prefill passes are prebuilt at every power
 //! of two up to the chunk, so a grant of any length is a handful of exact
@@ -17,14 +19,19 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use llmcuda_gguf::GgufFile;
 use llmcuda_grammar::ToolConstraint;
-use llmcuda_model::{InklingConfig, ModelConfig};
+use llmcuda_kernels::inkling_vision::{InklingVisionWeights, PreprocessedInklingImage};
+use llmcuda_model::{InklingConfig, InklingVisionConfig, ModelConfig};
 use llmcuda_sched::request::{BatchDescription, NewRequest, RequestId};
 use smallvec::SmallVec;
 
-use super::{InklingDecode, InklingModel, InklingPass, InklingRunError, InklingState, Segment};
+use super::vision::InklingVisionForward;
+use super::{
+    GivenRows, InklingDecode, InklingModel, InklingPass, InklingRunError, InklingState, Segment,
+};
+use crate::image::{SequenceImage, validate_placements};
 use crate::runtime::{RuntimeConfig, RuntimeError, RuntimeStep};
 use crate::sampling::{Sampler, SamplingParams};
 use crate::state::{SequenceSnapshot, SnapshotArena, SnapshotSlots, StateError};
@@ -63,6 +70,11 @@ struct Sequence {
     spec: Option<SelfSpeculator>,
     /// The tokens drafted for the step in flight.
     draft: Vec<i32>,
+    /// The prompt's image spans, in order: first position, rows, and the
+    /// first row of `image_rows` that holds them.
+    images: SmallVec<[(usize, usize, usize); 2]>,
+    /// Every image's rows from the vision tower, encoded at admission.
+    image_rows: Option<CudaSlice<f32>>,
 }
 
 impl Sequence {
@@ -174,6 +186,8 @@ pub(crate) struct InklingRuntime {
     window_keep: Vec<usize>,
     /// The tokens each sequence chose in a step of windows, end to end.
     window_chosen: Vec<i32>,
+    /// Present when the server was given a vision projector.
+    vision: Option<InklingVisionForward>,
 }
 
 impl InklingRuntime {
@@ -204,9 +218,6 @@ impl InklingRuntime {
         }
         let spec = runtime.spec.map(SelfSpecFactory::new);
         let drafts = spec.as_ref().map_or(0, SelfSpecFactory::max_draft_tokens);
-        if runtime.mmproj.is_some() {
-            return Err(refuse("images"));
-        }
         // The sliding layers' rings are sized for passes this wide; the
         // pager counted them at that size.
         let max_pass_rows = runtime
@@ -249,6 +260,26 @@ impl InklingRuntime {
                 InklingDecode::new(&model, &stream, width)?
             });
         }
+
+        let vision = match runtime.mmproj.as_deref() {
+            Some(path) => {
+                let failed = |e: String| RuntimeError::Vision(e);
+                let projector = GgufFile::open(path).map_err(|e| failed(e.to_string()))?;
+                let tower = InklingVisionConfig::from_gguf(&projector, &config)
+                    .map_err(|e| failed(e.to_string()))?;
+                let weights = InklingVisionWeights::from_gguf(&projector, &tower)
+                    .map_err(|e| failed(e.to_string()))?;
+                let patches = runtime
+                    .max_image_patches
+                    .next_multiple_of(tower.merge_factor() as usize)
+                    .max(tower.merge_factor() as usize);
+                Some(
+                    InklingVisionForward::new(&ctx, stream.clone(), &tower, &weights, patches)
+                        .map_err(|e| failed(e.to_string()))?,
+                )
+            }
+            None => None,
+        };
 
         let mut eos: SmallVec<[i32; 2]> = SmallVec::new();
         if runtime.stop_on_eos {
@@ -293,6 +324,7 @@ impl InklingRuntime {
             window_lens: Vec::with_capacity(widest),
             window_keep: Vec::with_capacity(widest),
             window_chosen: Vec::with_capacity(widest),
+            vision,
         })
     }
 
@@ -304,13 +336,10 @@ impl InklingRuntime {
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
-        has_images: bool,
+        images: Vec<SequenceImage>,
         sampling: SamplingParams,
         constraint: Option<Box<ToolConstraint>>,
     ) -> Result<(), RuntimeError> {
-        if has_images {
-            return Err(RuntimeError::VisionNotEnabled);
-        }
         if self.sequences.contains_key(&req.id) {
             return Err(RuntimeError::DuplicateRequest(req.id));
         }
@@ -329,6 +358,7 @@ impl InklingRuntime {
                 vocab: self.vocab,
             });
         }
+        let (spans, image_rows) = self.encode_images(&images, prompt.len())?;
         // The whole sequence's cache, reserved for its whole life, and room
         // past its end for the drafts of its last step.
         let drafts = self
@@ -359,9 +389,61 @@ impl InklingRuntime {
                 first_from_snapshot: false,
                 spec: self.spec.as_ref().map(SelfSpecFactory::new_speculator),
                 draft: Vec::with_capacity(drafts),
+                images: spans,
+                image_rows,
             },
         );
         Ok(())
+    }
+
+    /// Encode a request's images into one device buffer, rows in placement
+    /// order, and say where each span sits. The one device allocation a
+    /// request makes, at admission.
+    #[allow(clippy::type_complexity)]
+    fn encode_images(
+        &mut self,
+        images: &[SequenceImage],
+        prompt_len: usize,
+    ) -> Result<(SmallVec<[(usize, usize, usize); 2]>, Option<CudaSlice<f32>>), RuntimeError> {
+        let mut spans = SmallVec::new();
+        if images.is_empty() {
+            return Ok((spans, None));
+        }
+        let vision = self.vision.as_mut().ok_or(RuntimeError::VisionNotEnabled)?;
+        let placements: SmallVec<[_; 2]> = images.iter().map(|i| i.placement).collect();
+        validate_placements(&placements, prompt_len).map_err(RuntimeError::ImagePlacement)?;
+        let merge = vision.config().spatial_merge;
+        let hidden = vision.config().projection_dim as usize;
+        let total: usize = images.iter().map(|i| i.placement.tokens()).sum();
+        let rows = self.stream.alloc_zeros::<f32>(total * hidden)?;
+        let mut row = 0usize;
+        for image in images {
+            let (mh, mw) = (image.image.grid_h / merge, image.image.grid_w / merge);
+            if (image.placement.grid_h, image.placement.grid_w) != (mh, mw) {
+                return Err(RuntimeError::ImagePlacement(format!(
+                    "placement grid {}x{} does not match the preprocessed {mh}x{mw}",
+                    image.placement.grid_h, image.placement.grid_w
+                )));
+            }
+            // The server preprocessed for this tower: raster patches.
+            let pre = PreprocessedInklingImage {
+                patches: image.image.patches.clone(),
+                grid_w: image.image.grid_w,
+                grid_h: image.image.grid_h,
+            };
+            let out = vision
+                .encode(&pre)
+                .map_err(|e| RuntimeError::Vision(e.to_string()))?;
+            let tokens = image.placement.tokens();
+            // SAFETY: both views lie inside their buffers.
+            let src = unsafe { subslice(&self.stream, out, 0, tokens * hidden) };
+            let mut dst = unsafe { subslice(&self.stream, &rows, row * hidden, tokens * hidden) };
+            self.stream.memcpy_dtod(&*src, &mut *dst)?;
+            spans.push((image.placement.start, tokens, row));
+            row += tokens;
+        }
+        self.stream.synchronize()?;
+        Ok((spans, Some(rows)))
     }
 
     /// Admit a request whose prompt begins with the prefix `snapshot`
@@ -370,7 +452,7 @@ impl InklingRuntime {
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
-        has_images: bool,
+        images: Vec<SequenceImage>,
         snapshot: Arc<SequenceSnapshot>,
         sampling: SamplingParams,
         constraint: Option<Box<ToolConstraint>>,
@@ -382,7 +464,7 @@ impl InklingRuntime {
                 prompt: prompt.len(),
             });
         }
-        self.admit(req, prompt, has_images, sampling, constraint)?;
+        self.admit(req, prompt, images, sampling, constraint)?;
         let seq = self
             .sequences
             .get_mut(&req.id)
@@ -717,15 +799,35 @@ impl InklingRuntime {
                     .find(|(rows, _)| *rows <= reach)
                     .expect("the narrowest pass is one row");
                 let rows = *rows;
-                pass.run(
-                    &self.stream,
-                    &mut [Segment {
-                        state: &mut seq.state,
-                        rows,
-                    }],
-                    &seq.prompt[seq.prefilled..seq.prefilled + rows],
-                    None,
-                )?;
+                {
+                    // The image rows this piece covers, in place of their
+                    // placeholder tokens.
+                    let mut given: SmallVec<[GivenRows<'_>; 2]> = SmallVec::new();
+                    if let Some(image_rows) = seq.image_rows.as_ref() {
+                        let (lo, hi) = (seq.prefilled, seq.prefilled + rows);
+                        for &(start, tokens, first) in &seq.images {
+                            let (from, to) = (start.max(lo), (start + tokens).min(hi));
+                            if from < to {
+                                given.push(GivenRows {
+                                    at: from - lo,
+                                    from: image_rows,
+                                    first: first + (from - start),
+                                    rows: to - from,
+                                });
+                            }
+                        }
+                    }
+                    pass.run_with_rows(
+                        &self.stream,
+                        &mut [Segment {
+                            state: &mut seq.state,
+                            rows,
+                        }],
+                        &seq.prompt[seq.prefilled..seq.prefilled + rows],
+                        &given,
+                        None,
+                    )?;
+                }
                 if let Some(spec) = seq.spec.as_mut() {
                     spec.observe_all(&seq.prompt[seq.prefilled..seq.prefilled + rows]);
                 }

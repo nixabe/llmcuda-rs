@@ -486,3 +486,131 @@ fn speculation_emits_the_tokens_plain_decoding_does() {
         );
     }
 }
+
+/// An image's rows stand in the prompt where its placeholder tokens are.
+///
+/// One prompt ending in a 2x3-token image span, served with two different
+/// images and with the first again: the same image gives the same tokens,
+/// another image gives others (the rows are read, not the placeholders),
+/// and an image request beside a text one does not disturb it. What the
+/// rows should *be* is the tower's test (`inkling_vision.rs`); what the
+/// model says about a picture was checked against llama-server by hand.
+#[test]
+fn an_images_rows_stand_in_the_prompt() {
+    use llmcuda_engine::image::{ImagePlacement, SequenceImage};
+    use llmcuda_kernels::inkling_vision::preprocess;
+    use llmcuda_kernels::vision::PreprocessedImage;
+    use llmcuda_model::InklingVisionConfig;
+
+    let Some((file, golden)) = inkling_common::model_and_golden() else {
+        return;
+    };
+    let mmproj = std::env::var_os("LLMCUDA_INKLING_MMPROJ")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| inkling_common::model_path().with_file_name("mmproj-F16.gguf"));
+    if !mmproj.exists() {
+        println!("SKIPPED: {} is not on this host", mmproj.display());
+        return;
+    }
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver present");
+        return;
+    }
+    let model = ModelConfig::from_gguf(&file).expect("the configuration reads");
+    drop(file);
+    let cache = CacheConfig::with_defaults(model.clone()).expect("cache configuration");
+    let block = cache.attention_block_size();
+    let sched = SchedulerConfig::with_defaults(4096, block, 3).expect("scheduler configuration");
+    let mut engine = Engine::new(
+        &[0],
+        cache,
+        sched,
+        16_384 / block,
+        3,
+        RouterConfig::balanced(),
+    );
+    engine
+        .bind_devices(
+            &inkling_common::model_path(),
+            model.clone(),
+            ServingConfig {
+                snapshot_slots: SnapshotArenaSize::NONE,
+                mmproj: Some(mmproj),
+                max_image_patches: 256,
+                ..ServingConfig::new(256)
+            },
+        )
+        .unwrap_or_else(|(worker, failure)| panic!("{worker} failed to bind: {failure}"));
+
+    let tower = InklingVisionConfig::inkling2_mini();
+    // 120x80 pixels: 6x4 patches, 3x2 tokens.
+    let picture = |seed: u32| {
+        // Seed 1 is flat red; seed 2 is black and white bars.
+        let rgb: Vec<u8> = (0..120 * 80usize)
+            .flat_map(|i| match seed {
+                1 => [230u8, 20, 20],
+                _ => [if (i % 120) / 20 % 2 == 0 { 255 } else { 0 }; 3],
+            })
+            .collect();
+        let pre = preprocess(&tower, &rgb, 120, 80, tower.max_image_tokens).expect("preprocess");
+        PreprocessedImage {
+            patches: pre.patches,
+            grid_h: pre.grid_h,
+            grid_w: pre.grid_w,
+        }
+    };
+    let text = golden.tokens().to_vec();
+    // The text, then the placeholder token six times: the prompt ends on
+    // the image, so what follows is the image's to decide.
+    let mut prompt = text.clone();
+    let start = prompt.len();
+    prompt.extend([200_054; 6]);
+    let mut serve = |id: u64, seed: u32, beside: bool| {
+        let image = picture(seed);
+        let placement = ImagePlacement {
+            start,
+            grid_h: image.grid_h / 2,
+            grid_w: image.grid_w / 2,
+            content_hash: u64::from(seed),
+        };
+        engine
+            .place_tokens(
+                NewRequest {
+                    id: RequestId(id),
+                    prompt_tokens: prompt.len() as u32,
+                    max_output_tokens: OUTPUT,
+                },
+                prompt.clone(),
+                vec![SequenceImage { placement, image }],
+                SamplingParams::GREEDY,
+                None,
+            )
+            .unwrap_or_else(|failure| panic!("request {id} was not placed: {failure}"));
+        let mut ids = vec![id];
+        if beside {
+            place(&mut engine, id + 100, &text, SamplingParams::GREEDY);
+            ids.push(id + 100);
+        }
+        run(&engine, &ids)
+    };
+    let first = serve(1, 1, true);
+    let again = serve(2, 1, false);
+    let other = serve(3, 2, false);
+    println!(
+        "image 1: {:?}; image 2: {:?}; text beside: {:?}",
+        first[&1], other[&3], first[&101]
+    );
+    assert_eq!(first[&1], again[&2], "one image, one prompt, two answers");
+    assert_ne!(first[&1], other[&3], "another image changed nothing");
+    let want_first = golden
+        .logits()
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap()
+        .0 as i32;
+    assert_eq!(
+        first[&101][0], want_first,
+        "an image request disturbed its text neighbour"
+    );
+}

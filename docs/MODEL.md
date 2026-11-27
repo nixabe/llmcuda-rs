@@ -813,5 +813,13 @@ format is contracted from its stored bytes, converted to binary16 exactly.
   which computes each row as a step of its own would, to the bit, so what
   is accepted is what plain decoding emits. A step holds eight rows:
   drafts are cut, longest first, until every sequence's window fits.
-- **Not yet**: images (`mmproj-F16.gguf`).
+- **Images**: `--mmproj mmproj-F16.gguf` loads the `inkling2v` tower
+  (patch 20, 23 blocks, class token, layer scale, exact GELU, 2D rotary
+  positions, a 2x2 merge and a bias-free projector to the model's width).
+  An image is padded to whole 40-pixel cells, never resized below 4096
+  tokens' worth, and encoded at admission. The template renders it as a
+  block of its own, `<|message_user|><|content_image|>…<|end_message|>`,
+  holding one placeholder the server expands to a token a row; in prefill
+  the tower's rows stand where those tokens are, past the token
+  embedding's norm, as llama.cpp feeds them.
 

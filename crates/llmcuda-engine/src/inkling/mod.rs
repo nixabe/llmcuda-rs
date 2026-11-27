@@ -772,6 +772,20 @@ unsafe fn rows_of<T>(
     unsafe { subslice(stream, base, row0 * width, rows * width) }
 }
 
+/// Rows of a pass whose inputs are given: `rows` rows of `from`, starting
+/// at its row `first`, in place of the pass's rows from `at`.
+#[derive(Clone, Copy)]
+pub struct GivenRows<'a> {
+    /// The first row of the pass these replace.
+    pub at: usize,
+    /// `[..][hidden]` fp32 rows.
+    pub from: &'a CudaSlice<f32>,
+    /// The first row of `from` to take.
+    pub first: usize,
+    /// How many.
+    pub rows: usize,
+}
+
 impl InklingPass {
     /// Allocate for passes of exactly `rows` rows.
     pub fn new(model: &Arc<InklingModel>, stream: &Arc<CudaStream>, rows: usize) -> Res<Self> {
@@ -1598,6 +1612,22 @@ impl InklingPass {
         stream: &Arc<CudaStream>,
         segments: &mut [Segment<'_>],
         tokens: &[i32],
+        tap: Option<&mut dyn FnMut(usize, Vec<f32>)>,
+    ) -> Res {
+        self.run_with_rows(stream, segments, tokens, &[], tap)
+    }
+
+    /// [`Self::run`], with some rows' inputs given rather than looked up:
+    /// an image's rows from the vision tower stand where its placeholder
+    /// tokens are. They enter as the model's input directly, past the token
+    /// embedding's norm, as llama.cpp feeds an embedding batch
+    /// (`src/models/inkling2.cpp`: `tok_norm` only `if (ubatch.token)`).
+    pub fn run_with_rows(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        segments: &mut [Segment<'_>],
+        tokens: &[i32],
+        given: &[GivenRows<'_>],
         mut tap: Option<&mut dyn FnMut(usize, Vec<f32>)>,
     ) -> Res {
         let model = self.model.clone();
@@ -1647,6 +1677,14 @@ impl InklingPass {
             n,
             eps,
         )?;
+        for g in given {
+            if g.at + g.rows > rows || (g.first + g.rows) * n > g.from.len() {
+                return Err(bad("given rows fall outside the pass or their source"));
+            }
+            let src = g.from.slice(g.first * n..(g.first + g.rows) * n);
+            let mut dst = self.h.slice_mut(g.at * n..(g.at + g.rows) * n);
+            stream.memcpy_dtod(&src, &mut dst)?;
+        }
 
         let layers = c.num_layers as usize;
         let (start, end) = (kc.loop_start as usize, kc.loop_end as usize);

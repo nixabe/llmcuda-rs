@@ -772,15 +772,10 @@ impl DeviceRuntimeHandle {
                                 Err(refuse("decision requests"))
                             } else if let Some(snapshot) = snapshot {
                                 runtime.admit_restored(
-                                    req,
-                                    prompt,
-                                    !images.is_empty(),
-                                    snapshot,
-                                    sampling,
-                                    constraint,
+                                    req, prompt, images, snapshot, sampling, constraint,
                                 )
                             } else {
-                                runtime.admit(req, prompt, !images.is_empty(), sampling, constraint)
+                                runtime.admit(req, prompt, images, sampling, constraint)
                             };
                             let _ = reply.send(result);
                         }

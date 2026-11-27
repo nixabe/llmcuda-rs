@@ -45,7 +45,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 pub use generate::SamplingDefaults;
-pub use vision::VisionServingConfig;
+pub use vision::{VisionServingConfig, VisionTower};
 
 use generate::{ClientEvent, EngineFinish};
 
@@ -453,18 +453,27 @@ pub async fn serve(
     let vision = config
         .vision
         .map(|serving| {
-            for spelling in [vision::VISION_START, vision::VISION_END] {
+            // The tokens an image renders as differ by tower; the pad is
+            // the one that is expanded into the image's rows.
+            let (around, pad) = match &serving.config {
+                vision::VisionTower::Qwen(_) => (
+                    &[vision::VISION_START, vision::VISION_END][..],
+                    vision::IMAGE_PAD,
+                ),
+                vision::VisionTower::Inkling(_) => (
+                    &[vision::INKLING_IMAGE_BLOCK][..],
+                    vision::INKLING_IMAGE_PAD,
+                ),
+            };
+            for spelling in around {
                 if tokenizer.token_to_id(spelling).is_none() {
                     return Err(format!(
                         "--mmproj was given, but the tokenizer has no `{spelling}` token"
                     ));
                 }
             }
-            let image_pad = tokenizer.token_to_id(vision::IMAGE_PAD).ok_or_else(|| {
-                format!(
-                    "--mmproj was given, but the tokenizer has no `{}` token",
-                    vision::IMAGE_PAD
-                )
+            let image_pad = tokenizer.token_to_id(pad).ok_or_else(|| {
+                format!("--mmproj was given, but the tokenizer has no `{pad}` token")
             })?;
             Ok(Arc::new(vision::VisionServing {
                 config: serving.config,

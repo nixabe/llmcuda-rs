@@ -44,7 +44,7 @@ if ".target sm_75\n" not in ptx or any(
         "argmax_partial", "argmax_final", "hg_splitk_reduce", "k2_dispatch_count",
         "k2_dispatch_prefix", "k2_dispatch_gather", "k2_norm", "dense_ffn_add_residual",
         "mtp_concat_eh", "dflash_tap", "moe_align_count",
-        "hg_to_half", "vision_gelu", "vision_add_f16", "vision_half_to_float",
+        "hg_to_half", "vision_gelu", "vision_gelu_erf", "vision_add_f16", "vision_half_to_float",
         "attn_kv_append", "dense_swiglu_narrow", "dec_add_owner_rows", "dec_span_mean",
         "dec_attention_combine", "k2_rotary_apply",
         "attn_flash_decode_combine_k2_batch", "embed_q8_0", "dequantize_q8_0",

@@ -3,6 +3,40 @@
 use crate::common::{f2h, h2f};
 use cuda_device::{SharedArray, device, kernel, ptx_asm, thread, warp};
 
+/// In-place exact GELU: `x / 2 * (1 + erf(x / sqrt 2))`, the activation of
+/// the `inkling2v` tower (ggml's `gelu_erf`).
+///
+/// erf is Abramowitz and Stegun 7.1.26, within 1.5e-7 everywhere: the
+/// result is rounded to binary16, whose spacing at these magnitudes is a
+/// thousand times that.
+///
+/// grid: (ceil(n / block)), any block.
+///
+/// # Safety
+/// x covers `n` halves.
+#[kernel]
+pub unsafe fn vision_gelu_erf(x: *mut u16, n: i64) {
+    let i =
+        thread::blockIdx_x() as i64 * thread::blockDim_x() as i64 + thread::threadIdx_x() as i64;
+    if i >= n {
+        return;
+    }
+    unsafe {
+        let v = h2f(*x.add(i as usize));
+        let z = v * 0.707_106_77_f32;
+        let a = z.abs();
+        let t = 1.0 / (1.0 + 0.327_591_1_f32 * a);
+        let poly = ((((1.061_405_4_f32 * t - 1.453_152_f32) * t + 1.421_413_7_f32) * t
+            - 0.284_496_74_f32)
+            * t
+            + 0.254_829_6_f32)
+            * t;
+        let magnitude = 1.0 - poly * (-a * a).exp();
+        let erf = if z < 0.0 { -magnitude } else { magnitude };
+        *x.add(i as usize) = f2h((0.5 * v) * (1.0 + erf));
+    }
+}
+
 /// GELU in place on fp16 activations: ggml's tanh approximation,
 /// computed in fp32 and rounded back.
 ///

@@ -29,6 +29,7 @@ use crate::runtime::{RuntimeConfig, RuntimeError, RuntimeStep};
 use crate::sampling::{Sampler, SamplingParams};
 use crate::state::{SequenceSnapshot, SnapshotArena, SnapshotSlots, StateError};
 use crate::viewslice::subslice;
+use llmcuda_sched::spec::{SelfSpecFactory, SelfSpeculator};
 
 impl From<InklingRunError> for RuntimeError {
     fn from(error: InklingRunError) -> Self {
@@ -57,6 +58,11 @@ struct Sequence {
     /// Resumed from a snapshot of its whole prompt: the first output token
     /// is the snapshot's, emitted on the first grant.
     first_from_snapshot: bool,
+    /// Proposes tokens from what this sequence has seen, when the server
+    /// speculates.
+    spec: Option<SelfSpeculator>,
+    /// The tokens drafted for the step in flight.
+    draft: Vec<i32>,
 }
 
 impl Sequence {
@@ -159,6 +165,15 @@ pub(crate) struct InklingRuntime {
     arena: SnapshotArena,
     /// Positions between snapshots; zero when the arena holds none.
     retention_interval: usize,
+    /// Present when the server speculates with an n-gram drafter.
+    spec: Option<SelfSpecFactory>,
+    /// The fewest tokens worth drafting.
+    draft_n_min: usize,
+    /// Rows of each sequence in a step of windows, and how many it keeps.
+    window_lens: Vec<usize>,
+    window_keep: Vec<usize>,
+    /// The tokens each sequence chose in a step of windows, end to end.
+    window_chosen: Vec<i32>,
 }
 
 impl InklingRuntime {
@@ -182,9 +197,13 @@ impl InklingRuntime {
                 maximum: super::decode::MAX_DECODE_ROWS,
             });
         }
-        if runtime.spec.is_some() || runtime.mtp_drafts > 0 || runtime.dflash.is_some() {
-            return Err(refuse("speculative decoding"));
+        // The n-gram drafters need nothing of the model. The trained ones
+        // are Qwen's: an MTP head in the file, a DFlash drafter beside it.
+        if runtime.mtp_drafts > 0 || runtime.dflash.is_some() {
+            return Err(refuse("a trained drafter; the n-gram drafters work"));
         }
+        let spec = runtime.spec.map(SelfSpecFactory::new);
+        let drafts = spec.as_ref().map_or(0, SelfSpecFactory::max_draft_tokens);
         if runtime.mmproj.is_some() {
             return Err(refuse("images"));
         }
@@ -215,9 +234,20 @@ impl InklingRuntime {
             }
             width /= 2;
         }
-        let mut decode = Vec::with_capacity(runtime.max_batch);
-        for width in 1..=runtime.max_batch {
-            decode.push(InklingDecode::new(&model, &stream, width)?);
+        // Without drafts a step is a row a sequence. With them it is up to
+        // as many rows as the step holds, whoever they belong to.
+        let widest = if drafts > 0 {
+            super::decode::MAX_DECODE_ROWS
+        } else {
+            runtime.max_batch
+        };
+        let mut decode = Vec::with_capacity(widest);
+        for width in 1..=widest {
+            decode.push(if drafts > 0 {
+                InklingDecode::with_windows(&model, &stream, width)?
+            } else {
+                InklingDecode::new(&model, &stream, width)?
+            });
         }
 
         let mut eos: SmallVec<[i32; 2]> = SmallVec::new();
@@ -258,6 +288,11 @@ impl InklingRuntime {
             max_pass_rows,
             arena,
             retention_interval,
+            spec,
+            draft_n_min: runtime.draft_n_min,
+            window_lens: Vec::with_capacity(widest),
+            window_keep: Vec::with_capacity(widest),
+            window_chosen: Vec::with_capacity(widest),
         })
     }
 
@@ -294,11 +329,16 @@ impl InklingRuntime {
                 vocab: self.vocab,
             });
         }
-        // The whole sequence's cache, reserved for its whole life.
+        // The whole sequence's cache, reserved for its whole life, and room
+        // past its end for the drafts of its last step.
+        let drafts = self
+            .spec
+            .as_ref()
+            .map_or(0, SelfSpecFactory::max_draft_tokens);
         let state = InklingState::bounded(
             &self.stream,
             &self.model,
-            req.full_seq_len() as usize,
+            req.full_seq_len() as usize + drafts,
             self.max_pass_rows,
         )?;
         self.sequences.insert(
@@ -317,6 +357,8 @@ impl InklingRuntime {
                 last_snapshot_own: false,
                 retention_disabled: false,
                 first_from_snapshot: false,
+                spec: self.spec.as_ref().map(SelfSpecFactory::new_speculator),
+                draft: Vec::with_capacity(drafts),
             },
         );
         Ok(())
@@ -351,6 +393,9 @@ impl InklingRuntime {
         }
         seq.prefilled = prefix;
         seq.last_snapshot_position = prefix;
+        if let Some(spec) = seq.spec.as_mut() {
+            spec.observe_all(&seq.prompt[..prefix]);
+        }
         if prefix == seq.prompt.len() {
             seq.next_token = snapshot.next_token();
             seq.first_from_snapshot = true;
@@ -397,7 +442,150 @@ impl InklingRuntime {
             generated.push((id, token));
             seq.emitted += 1;
             seq.next_token = Some(token);
+            if let Some(spec) = seq.spec.as_mut() {
+                spec.observe(token);
+            }
         }
+    }
+
+    /// Draft for every sequence of the step, and whether any drafted.
+    ///
+    /// A draft is cut to what the sequence may still emit, to the rows left
+    /// before its next retention boundary (a window may land on one, never
+    /// cross it), and dropped when shorter than `draft_n_min`. Then the
+    /// longest drafts give up tokens until the step's rows fit.
+    fn draft(&mut self) -> bool {
+        let widest = self.decode.len();
+        let mut rows = self.stepping.len();
+        for (_, seq) in &mut self.stepping {
+            seq.draft.clear();
+            let Some(spec) = seq.spec.as_mut() else {
+                continue;
+            };
+            spec.propose_into(&mut seq.draft);
+            let mut room = (seq.max_output - seq.emitted).saturating_sub(1) as usize;
+            if self.retention_interval > 0 && !seq.retention_disabled {
+                let position = seq.state.position();
+                let to_boundary = self.retention_interval - position % self.retention_interval;
+                room = room.min(to_boundary - 1);
+            }
+            seq.draft.truncate(room);
+            if seq.draft.len() < self.draft_n_min {
+                seq.draft.clear();
+            }
+            rows += seq.draft.len();
+        }
+        while rows > widest {
+            let longest = self
+                .stepping
+                .iter_mut()
+                .map(|(_, seq)| &mut seq.draft)
+                .max_by_key(|draft| draft.len())
+                .expect("a step has sequences");
+            longest.pop();
+            rows -= 1;
+        }
+        rows > self.stepping.len()
+    }
+
+    /// One step over `self.stepping` with at least one draft: every
+    /// sequence's next token and its drafts as a window, and from each
+    /// window the tokens the model itself chooses, for as long as they are
+    /// the drafted ones.
+    fn step_windows(
+        &mut self,
+        generated: &mut SmallVec<[(RequestId, i32); 16]>,
+        stopped: &mut SmallVec<[RequestId; 3]>,
+        retained: &mut Retained,
+    ) -> Result<(), RuntimeError> {
+        self.window_lens.clear();
+        self.step_tokens.clear();
+        for (_, seq) in &self.stepping {
+            self.window_lens.push(1 + seq.draft.len());
+            self.step_tokens
+                .push(seq.next_token.expect("a stepping sequence has a token"));
+            self.step_tokens.extend(&seq.draft);
+        }
+        let rows = self.step_tokens.len();
+        let decode = &mut self.decode[rows - 1];
+        {
+            let mut states: SmallVec<[&mut InklingState; 8]> = self
+                .stepping
+                .iter_mut()
+                .map(|(_, s)| &mut s.state)
+                .collect();
+            decode.step_windows(
+                &self.stream,
+                &mut states,
+                &self.window_lens,
+                &self.step_tokens,
+            )?;
+        }
+        decode.logits(&self.stream)?;
+
+        // Row j of a window is the model after the next token and j
+        // drafts. Its choice is emitted; the row after it stands only if
+        // that choice is the draft it was computed from.
+        self.window_keep.clear();
+        self.window_chosen.clear();
+        let mut row = 0;
+        for (_, seq) in &mut self.stepping {
+            let len = 1 + seq.draft.len();
+            let mut kept = 0;
+            for j in 0..len {
+                let token = Self::choose_from(
+                    &self.stream,
+                    decode.head_logits(),
+                    row + j,
+                    &mut self.host_logits,
+                    &mut self.scratch,
+                    seq,
+                )?;
+                self.window_chosen.push(token);
+                kept += 1;
+                if j + 1 == len || token != seq.draft[j] || self.eos.contains(&token) {
+                    break;
+                }
+            }
+            if let Some(spec) = seq.spec.as_mut()
+                && !seq.draft.is_empty()
+            {
+                spec.accept(kept - 1);
+            }
+            self.window_keep.push(kept);
+            row += len;
+        }
+        {
+            let mut states: SmallVec<[&mut InklingState; 8]> = self
+                .stepping
+                .iter_mut()
+                .map(|(_, s)| &mut s.state)
+                .collect();
+            decode.commit(&self.stream, &mut states, &self.window_keep)?;
+        }
+        let mut at = 0;
+        for ((id, seq), kept) in self.stepping.iter_mut().zip(&self.window_keep) {
+            let chosen = &self.window_chosen[at..at + kept];
+            at += kept;
+            let last = *chosen.last().expect("a window keeps a row");
+            if seq.at_boundary(self.retention_interval) {
+                let record = seq.sampler.is_none();
+                if let Some(snapshot) = seq.retain(
+                    &self.stream,
+                    &self.model,
+                    &self.arena,
+                    self.retention_interval,
+                    last,
+                    record,
+                )? {
+                    retained.push((*id, snapshot));
+                }
+            }
+            for token in chosen {
+                Self::emit(&self.eos, *id, *token, seq, generated, stopped);
+            }
+        }
+        Ok(())
     }
 
     /// One decode step over `self.stepping`, and a token chosen for each.
@@ -416,6 +604,9 @@ impl InklingRuntime {
                 requested: width,
                 maximum: self.decode.len(),
             });
+        }
+        if self.draft() {
+            return self.step_windows(generated, stopped, retained);
         }
         let decode = &mut self.decode[width - 1];
         {
@@ -535,6 +726,9 @@ impl InklingRuntime {
                     &seq.prompt[seq.prefilled..seq.prefilled + rows],
                     None,
                 )?;
+                if let Some(spec) = seq.spec.as_mut() {
+                    spec.observe_all(&seq.prompt[seq.prefilled..seq.prefilled + rows]);
+                }
                 seq.prefilled += rows;
                 left -= rows;
                 // The prompt's last row yields the first output token; a

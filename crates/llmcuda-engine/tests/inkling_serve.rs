@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 
 use llmcuda_cache::CacheConfig;
 use llmcuda_cuda::device::driver_available;
-use llmcuda_engine::{Engine, RouterConfig, SamplingParams, ServingConfig, SnapshotArenaSize};
+use llmcuda_engine::{
+    Engine, RouterConfig, SamplingParams, ServingConfig, SnapshotArenaSize, Speculation,
+};
 use llmcuda_model::ModelConfig;
 use llmcuda_sched::SchedulerConfig;
 use llmcuda_sched::request::{NewRequest, RequestId};
@@ -319,4 +321,168 @@ fn a_served_prefix_is_resumed_and_changes_no_token() {
     println!(
         "resumed at 2048 mid-prompt, whole-prompt and from a decode-time snapshot: tokens unchanged"
     );
+}
+
+/// What one configuration generated, and how many steps it took.
+struct Served {
+    outputs: Vec<Vec<i32>>,
+    steps: usize,
+    multi_token_steps: usize,
+}
+
+/// Serve `prompts` together, greedy, to `tokens` tokens each. End-of-turn
+/// is an ordinary token here, so both runs are the same length.
+fn serve(
+    model: &ModelConfig,
+    speculation: Speculation,
+    drafts: u32,
+    prompts: &[Vec<i32>],
+    tokens: usize,
+) -> Served {
+    use llmcuda_engine::worker::{Worker, WorkerId};
+    let cache = CacheConfig::with_defaults(model.clone()).expect("cache configuration");
+    let block = cache.attention_block_size();
+    let scheduler = SchedulerConfig::new(
+        4096,
+        block,
+        prompts.len() as u32,
+        llmcuda_sched::config::DEFAULT_WATERMARK_FRACTION,
+        drafts,
+    )
+    .expect("scheduler configuration");
+    let mut worker = Worker::new(
+        WorkerId(0),
+        0,
+        cache,
+        scheduler,
+        16_384 / block,
+        prompts.len() as u32,
+    );
+    worker
+        .bind_device_for_benchmark(
+            &inkling_common::model_path(),
+            model.clone(),
+            ServingConfig {
+                speculation,
+                snapshot_slots: SnapshotArenaSize::NONE,
+                ..ServingConfig::new(256)
+            },
+        )
+        .expect("the worker binds");
+    for (index, prompt) in prompts.iter().enumerate() {
+        worker
+            .admit_tokens(
+                NewRequest {
+                    id: RequestId(index as u64 + 1),
+                    prompt_tokens: prompt.len() as u32,
+                    max_output_tokens: tokens as u32 + 16,
+                },
+                prompt.clone(),
+                Vec::new(),
+                SamplingParams::GREEDY,
+                None,
+            )
+            .expect("the request is admitted");
+    }
+    let mut served = Served {
+        outputs: vec![Vec::new(); prompts.len()],
+        steps: 0,
+        multi_token_steps: 0,
+    };
+    while served.outputs.iter().any(|output| output.len() < tokens) {
+        assert!(served.steps < 64 * prompts.len() + 64, "no progress");
+        let step = worker.step_device().expect("the step runs");
+        let mut emitted = vec![0usize; prompts.len()];
+        for (id, token) in &step.generated {
+            served.outputs[id.0 as usize - 1].push(*token);
+            emitted[id.0 as usize - 1] += 1;
+        }
+        served.multi_token_steps += usize::from(emitted.iter().any(|count| *count > 1));
+        served.steps += 1;
+    }
+    served
+}
+
+/// Speculation changes how many steps a request takes and nothing else.
+///
+/// Two requests served together, with each n-gram drafter and without: a
+/// prompt that repeats a four-token cycle, whose continuation a drafter
+/// can guess, and a structureless one. Every drafter must emit the tokens
+/// plain decoding emits, and must have accepted something - a step that
+/// emits more than one token for a request - or it has tested nothing.
+#[test]
+fn speculation_emits_the_tokens_plain_decoding_does() {
+    let Some((file, _)) = inkling_common::model_and_golden() else {
+        return;
+    };
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver present");
+        return;
+    }
+    let model = ModelConfig::from_gguf(&file).expect("the configuration reads");
+    drop(file);
+    const TOKENS: usize = 48;
+    let cycle = [791i32, 1131, 1721, 2217];
+    let periodic: Vec<i32> = cycle.iter().copied().cycle().take(96).collect();
+    let random: Vec<i32> = (0..40usize)
+        .map(|i| ((i * 7919 + 4321) % (model.vocab_size as usize - 1000)) as i32)
+        .collect();
+    let prompts = vec![periodic, random];
+
+    let plain = serve(&model, Speculation::None, 0, &prompts, TOKENS);
+    assert_eq!(
+        plain.multi_token_steps, 0,
+        "plain decoding emitted two tokens in a step"
+    );
+    println!(
+        "plain: {} steps; the periodic prompt continues {:?}",
+        plain.steps,
+        &plain.outputs[0][..8]
+    );
+    for (name, speculation, drafts) in [
+        ("ngram", Speculation::Ngram { min: 2, max: 4 }, 3),
+        ("ngram-simple", Speculation::NgramSimple { size_n: 3 }, 3),
+        (
+            "ngram-mod",
+            Speculation::NgramMod {
+                n_match: 3,
+                n_min: 2,
+            },
+            3,
+        ),
+        (
+            "ngram-map-k",
+            Speculation::NgramMapK {
+                size_n: 3,
+                min_hits: 1,
+            },
+            2,
+        ),
+        (
+            "ngram-map-k4v",
+            Speculation::NgramMapK4v {
+                size_n: 3,
+                min_hits: 1,
+            },
+            2,
+        ),
+    ] {
+        let spec = serve(&model, speculation, drafts, &prompts, TOKENS);
+        println!(
+            "{name}: {} steps ({} plain), {} of them emitting more than one token",
+            spec.steps, plain.steps, spec.multi_token_steps
+        );
+        for (request, (got, want)) in spec.outputs.iter().zip(&plain.outputs).enumerate() {
+            assert_eq!(
+                got[..TOKENS],
+                want[..TOKENS],
+                "{name} changed request {request}'s tokens"
+            );
+        }
+        assert!(spec.multi_token_steps > 0, "{name} accepted nothing");
+        assert!(
+            spec.steps <= plain.steps,
+            "{name} took more steps than plain decoding"
+        );
+    }
 }

@@ -30,7 +30,7 @@ inferred from tensor shapes.
 | [Qwen3.8-27B](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) | `qwen35` | Dense sibling |
 | [K2-Horizon-MoVA-36B-A4B](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B-GGUF) | `k2-horizon` | Q4_K_M and Q6_K; see [MODEL.md](docs/MODEL.md#k2-horizon) |
 | [Clef-Flash](https://huggingface.co/ggml-org/Clef-Flash-GGUF) | `clef` | Decision model, served on `/v1/systemone` only |
-| [Inkling 2 Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `inkling2_loop` | `UD-Q4_K_XL` and `UD-Q8_K_XL`. Text chat with thinking, tool calls and the prefix cache, on every endpoint; no images yet — see [MODEL.md](docs/MODEL.md#inkling-2-mini) |
+| [Inkling 2 Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `inkling2_loop` | `UD-Q4_K_XL` and `UD-Q8_K_XL`. Text chat with thinking, tool calls, the prefix cache and n-gram speculation, on every endpoint; no images yet — see [MODEL.md](docs/MODEL.md#inkling-2-mini) |
 
 ## Why one process
 

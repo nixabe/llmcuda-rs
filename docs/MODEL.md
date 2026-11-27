@@ -806,5 +806,12 @@ format is contracted from its stored bytes, converted to binary16 exactly.
   and as fixed-size state the sliding slots' last 1,024 rows and every
   slot's convolution carries (196 MiB). Rows are stored by position, so a
   resume does not depend on the ring size of the sequence that left it.
-- **Not yet**: images (`mmproj-F16.gguf`) and speculative decoding.
+- **Speculation**: the five n-gram drafters (`--spec-type ngram`,
+  `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`); the
+  trained drafters are Qwen's and are refused. A sequence's next token and
+  its drafts are verified as consecutive positions in one *decode* step,
+  which computes each row as a step of its own would, to the bit, so what
+  is accepted is what plain decoding emits. A step holds eight rows:
+  drafts are cut, longest first, until every sequence's window fits.
+- **Not yet**: images (`mmproj-F16.gguf`).
 

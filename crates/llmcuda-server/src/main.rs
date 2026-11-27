@@ -754,8 +754,11 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    if is_inkling && speculation != Speculation::None {
-        error!("speculation      FAIL — inkling2_loop has no drafter path; pass --spec-type none");
+    if is_inkling && matches!(speculation, Speculation::Mtp | Speculation::DFlash) {
+        error!(
+            "speculation      FAIL — inkling2_loop has no trained drafter; the n-gram types \
+             work (--spec-type ngram, ngram-simple, ngram-mod, ngram-map-k, ngram-map-k4v)"
+        );
         return std::process::ExitCode::FAILURE;
     }
 

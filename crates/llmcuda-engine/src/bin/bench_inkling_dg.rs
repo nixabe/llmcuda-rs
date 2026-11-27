@@ -110,6 +110,7 @@ fn run() -> Result<()> {
             HalfWeight::Nvfp4 {
                 bytes: &d_gu,
                 scale: 1.0,
+                partner: ff,
             },
             experts,
             &d_ids,
@@ -138,6 +139,7 @@ fn run() -> Result<()> {
             HalfWeight::Nvfp4 {
                 bytes: &d_dn,
                 scale: 1.0,
+                partner: 8,
             },
             experts,
             &d_ids,

@@ -285,12 +285,29 @@ __device__ __forceinline__ void hg_gemm(
                         rsv[i] = hg_ldg16(ws + (long long)n * kblocks + kb);
                     }
                 } else if (FMT == 2) {
-                    const unsigned char* blk = w + ((long long)n * (K >> 6) + (k0 >> 6)) * 36;
                     const int sb = ((k0 >> 4) & 3) + w_sub;
-                    const uint2 q = hg_ldg8(blk + 4 + sb * 8);
-                    rw[i].x = q.x;
-                    rw[i].y = q.y;
-                    rs[i] = blk[sb];
+                    // For NVFP4 `wsstride` is not a stride: it is the row
+                    // distance between tile partners of a tile-major stack
+                    // (nv4_tile_major), zero for rows as ggml stores them.
+                    const int nvp = (int)wsstride;
+                    if (nvp == 0) {
+                        const unsigned char* blk = w + ((long long)n * (K >> 6) + (k0 >> 6)) * 36;
+                        const uint2 q = hg_ldg8(blk + 4 + sb * 8);
+                        rw[i].x = q.x;
+                        rw[i].y = q.y;
+                        rs[i] = blk[sb];
+                    } else {
+                        const int hb = nvp == 8 ? (n >> 3) & 1 : (n >= nvp);
+                        const int r = nvp == 8 ? n : n - hb * nvp;
+                        const int tile = nvp == 8 ? n >> 4 : r >> 3;
+                        const int rec = (r & 7) * 4 + sb;
+                        const unsigned char* tb =
+                            w + ((long long)tile * (K >> 6) + (k0 >> 6)) * 576;
+                        const uint2 q = hg_ldg8(tb + rec * 16 + hb * 8);
+                        rw[i].x = q.x;
+                        rw[i].y = q.y;
+                        rs[i] = tb[512 + rec * 2 + hb];
+                    }
                 } else {
                     rw[i] = hg_ldg16(w + ((long long)n * K + k0 + w_sub * 8) * 2);
                 }
@@ -545,13 +562,63 @@ pub enum HalfWeight<'a> {
         bytes: &'a CudaSlice<u8>,
         exponent: i32,
     },
-    /// NVFP4 `[N][K]` as ggml stores it: `K / 64` blocks of 36 bytes a row.
-    /// The staged weights are the stored values exactly; `scale` (a
-    /// per-matrix factor, such as an expert's) multiplies the fp32 result.
+    /// NVFP4 `[N][K]`: `K / 64` blocks of 36 bytes a row. The staged
+    /// weights are the stored values exactly; `scale` (a per-matrix factor,
+    /// such as an expert's) multiplies the fp32 result.
+    ///
+    /// `partner` is 0 for rows as ggml stores them, or the row distance
+    /// between tile partners of a stack repacked by [`nv4_tile_major`]
+    /// (grouped launches only).
     Nvfp4 {
         bytes: &'a CudaSlice<u8>,
         scale: f32,
+        partner: usize,
     },
+}
+
+/// Whether `rows` rows cut into whole sixteen-row tiles of partners
+/// `partner` apart: `partner` is 8 (a tile is sixteen consecutive rows) or
+/// half the rows (eight rows and the eight `rows / 2` after them).
+pub fn nv4_tiles_fit(rows: usize, partner: usize) -> bool {
+    rows.is_multiple_of(16) && (partner == 8 || partner * 2 == rows)
+}
+
+/// One NVFP4 matrix `[rows][k]`, as ggml stores it, repacked tile-major for
+/// the decode GEMM, into `dst` (the same length).
+///
+/// A tile is sixteen rows: eight rows `g` and their partners `partner`
+/// rows on. For each 64-element chunk of a tile, 576 bytes: thirty-two
+/// 16-byte records, record `g * 4 + t` holding sub-block `t`'s eight data
+/// bytes of row `g` and then of its partner, and after them thirty-two
+/// 2-byte records of the two scale bytes. A decode lane's whole operand
+/// for a chunk is one 16-byte load and one 2-byte load, and a warp walking
+/// chunks reads one contiguous stream, where rows as stored are sixteen
+/// streams of 36-byte blocks, three loads a row: measured 364 against 501
+/// GB/s of gate/up weights (bench_inkling_dg).
+pub fn nv4_tile_major(src: &[u8], dst: &mut [u8], rows: usize, k: usize, partner: usize) {
+    let chunks = k / 64;
+    assert!(k.is_multiple_of(64) && nv4_tiles_fit(rows, partner));
+    assert_eq!(src.len(), rows * chunks * 36);
+    assert_eq!(dst.len(), src.len());
+    for (tile, out) in dst.chunks_exact_mut(chunks * 576).enumerate() {
+        for (c, out) in out.as_chunks_mut::<576>().0.iter_mut().enumerate() {
+            for g in 0..8 {
+                for hb in 0..2 {
+                    let row = if partner == 8 {
+                        tile * 16 + hb * 8 + g
+                    } else {
+                        tile * 8 + g + hb * partner
+                    };
+                    let blk = &src[(row * chunks + c) * 36..][..36];
+                    for t in 0..4 {
+                        let rec = g * 4 + t;
+                        out[rec * 16 + hb * 8..][..8].copy_from_slice(&blk[4 + t * 8..][..8]);
+                        out[512 + rec * 2 + hb] = blk[t];
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// How one launch is shaped: the weight-row tile and the split-K factor.
@@ -1258,13 +1325,19 @@ impl HgemmKernels {
                 )?;
                 (1, exponent, 1.0, n_rows * k * 2, 0)
             }
-            HalfWeight::Nvfp4 { bytes, scale } => {
-                if !k.is_multiple_of(64) {
+            HalfWeight::Nvfp4 {
+                bytes,
+                scale,
+                partner,
+            } => {
+                if !k.is_multiple_of(64) || (partner != 0 && !nv4_tiles_fit(n_rows, partner)) {
                     return Err(HgemmError::RaggedContraction { k });
                 }
                 let per = n_rows * k / 64 * 36;
                 need("grouped gemm nvfp4 weights", bytes.len(), stack * per)?;
-                (2, 0, scale, per, 0)
+                // The kernel reads the partner distance where the Q8_0
+                // entries read a scale stride.
+                (2, 0, scale, per, partner)
             }
         };
         if tiles == 0 || n_rows == 0 {
@@ -1304,5 +1377,53 @@ impl HgemmKernels {
         // tile, and the kernel masks columns past `n_rows`.
         unsafe { b.launch(cfg) }?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tile_major_tests {
+    use super::{nv4_tile_major, nv4_tiles_fit};
+
+    /// Every stored byte lands once, where the kernels' address map reads
+    /// it: record `g * 4 + t` of the tile's chunk, the partner's half
+    /// eight bytes on, scales after the thirty-two records.
+    #[test]
+    fn tile_major_is_a_permutation_the_address_map_inverts() {
+        let (rows, k) = (32usize, 128usize);
+        let chunks = k / 64;
+        // A byte that names its own place: wraps, so compare by position.
+        let src: Vec<u8> = (0..rows * chunks * 36)
+            .map(|i| (i * 7 + i / 251) as u8)
+            .collect();
+        for partner in [8, rows / 2] {
+            assert!(nv4_tiles_fit(rows, partner));
+            let mut dst = vec![0u8; src.len()];
+            nv4_tile_major(&src, &mut dst, rows, k, partner);
+            let mut hist = [[0usize; 256]; 2];
+            for (a, b) in src.iter().zip(&dst) {
+                hist[0][*a as usize] += 1;
+                hist[1][*b as usize] += 1;
+            }
+            assert_eq!(hist[0], hist[1], "partner {partner}: not a permutation");
+            for n in 0..rows {
+                let hb = if partner == 8 {
+                    (n >> 3) & 1
+                } else {
+                    usize::from(n >= partner)
+                };
+                let r = if partner == 8 { n } else { n - hb * partner };
+                let tile = if partner == 8 { n >> 4 } else { r >> 3 };
+                for c in 0..chunks {
+                    let blk = &src[(n * chunks + c) * 36..][..36];
+                    let tb = &dst[(tile * chunks + c) * 576..][..576];
+                    for sb in 0..4 {
+                        let rec = (r & 7) * 4 + sb;
+                        assert_eq!(tb[rec * 16 + hb * 8..][..8], blk[4 + sb * 8..][..8]);
+                        assert_eq!(tb[512 + rec * 2 + hb], blk[sb]);
+                    }
+                }
+            }
+        }
+        assert!(!nv4_tiles_fit(130, 8) && !nv4_tiles_fit(32, 4));
     }
 }

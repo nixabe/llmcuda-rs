@@ -24,7 +24,9 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DriverError};
-use llmcuda_cuda::kernels::hgemm::{HalfWeight, HgemmError, HgemmKernels, bf16_half_exponent};
+use llmcuda_cuda::kernels::hgemm::{
+    HalfWeight, HgemmError, HgemmKernels, bf16_half_exponent, nv4_tile_major, nv4_tiles_fit,
+};
 use llmcuda_cuda::kernels::inkling::{InkDispatch, InklingError, InklingKernels};
 use llmcuda_cuda::kernels::k2::K2Kernels;
 use llmcuda_cuda::kernels::layer_ops::{GateShape, LayerOpsError, LayerOpsKernels};
@@ -110,9 +112,11 @@ impl Matrix {
 
 /// One layer's experts for one projection: `[experts][rows][k]`.
 enum ExpertStack {
+    /// Tile-major (`nv4_tile_major`), partners `partner` rows apart.
     Nvfp4 {
         bytes: CudaSlice<u8>,
         scales: Option<CudaSlice<f32>>,
+        partner: usize,
     },
     Dense(Dense),
 }
@@ -192,6 +196,8 @@ struct Loader<'a> {
     file: &'a GgufFile,
     mma: MmaKernels,
     bytes: usize,
+    /// Host staging for a repacked expert stack, reused across tensors.
+    repack: Vec<u8>,
 }
 
 impl<'a> Loader<'a> {
@@ -308,7 +314,17 @@ impl<'a> Loader<'a> {
         })
     }
 
-    fn experts(&mut self, name: &str, experts: usize, rows: usize, k: usize) -> Res<Experts> {
+    /// One layer's experts for one projection. NVFP4 is repacked for the
+    /// decode GEMM, whose lanes pair row `g` with row `g + partner`; the
+    /// prefill GEMM reads the same bytes through the same map.
+    fn experts(
+        &mut self,
+        name: &str,
+        experts: usize,
+        rows: usize,
+        k: usize,
+        partner: usize,
+    ) -> Res<Experts> {
         let (ty, bytes, n) = self.info(name)?;
         if n != experts * rows * k {
             return Err(bad(format!(
@@ -317,9 +333,32 @@ impl<'a> Loader<'a> {
         }
         let w = if ty == GgmlType::Nvfp4 {
             self.bytes += bytes.len();
+            if !k.is_multiple_of(64) || !nv4_tiles_fit(rows, partner) {
+                return Err(bad(format!(
+                    "{name}: {rows} x {k} is not whole NVFP4 tiles"
+                )));
+            }
+            let per = rows * k / 64 * 36;
+            if bytes.len() != experts * per {
+                return Err(bad(format!("{name}: {} bytes of NVFP4", bytes.len())));
+            }
+            self.repack.clear();
+            self.repack.resize(bytes.len(), 0);
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+            let share = experts.div_ceil(threads) * per;
+            std::thread::scope(|scope| {
+                for (src, dst) in bytes.chunks(share).zip(self.repack.chunks_mut(share)) {
+                    scope.spawn(move || {
+                        for (src, dst) in src.chunks_exact(per).zip(dst.chunks_exact_mut(per)) {
+                            nv4_tile_major(src, dst, rows, k, partner);
+                        }
+                    });
+                }
+            });
             ExpertStack::Nvfp4 {
-                bytes: self.stream.clone_htod(bytes)?,
+                bytes: self.stream.clone_htod(&self.repack)?,
                 scales: self.optional_floats(&name.replace(".weight", ".scale"), experts)?,
+                partner,
             }
         } else {
             ExpertStack::Dense(self.dense_from(name, ty, bytes, n)?)
@@ -350,6 +389,7 @@ impl InklingModel {
             file,
             mma: MmaKernels::new(ctx)?,
             bytes: 0,
+            repack: Vec::new(),
         };
 
         let mut layers = Vec::with_capacity(config.num_layers as usize);
@@ -429,8 +469,8 @@ impl InklingModel {
                     Some(b) => b,
                     None => stream.alloc_zeros::<f32>(experts)?,
                 },
-                gate_up: l.experts(&name("ffn_gate_up_exps.weight"), experts, 2 * ff, n)?,
-                down: l.experts(&name("ffn_down_exps.weight"), experts, n, ff)?,
+                gate_up: l.experts(&name("ffn_gate_up_exps.weight"), experts, 2 * ff, n, ff)?,
+                down: l.experts(&name("ffn_down_exps.weight"), experts, n, ff, 8)?,
                 looped,
                 decode: decode::DecodeLayer::load(&mut l, i, &config)?,
             });
@@ -968,9 +1008,18 @@ impl InklingPass {
         experts: usize,
     ) -> Res {
         let (w, scales) = match &e.w {
-            ExpertStack::Nvfp4 { bytes, scales } => {
-                (HalfWeight::Nvfp4 { bytes, scale: 1.0 }, scales.as_ref())
-            }
+            ExpertStack::Nvfp4 {
+                bytes,
+                scales,
+                partner,
+            } => (
+                HalfWeight::Nvfp4 {
+                    bytes,
+                    scale: 1.0,
+                    partner: *partner,
+                },
+                scales.as_ref(),
+            ),
             ExpertStack::Dense(Dense::Q8 { q, scales }) => (HalfWeight::Q8_0 { q, scales }, None),
             ExpertStack::Dense(Dense::Bf16 { bytes, exponent }) => (
                 HalfWeight::Bf16 {

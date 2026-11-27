@@ -1250,7 +1250,8 @@ __device__ __forceinline__ float dg_situ(float gate, float up, float beta, float
 //
 // FMT 0: split Q8_0 (`w` int8 [rows][K], `ws` fp16 [rows][K/32]).
 // FMT 1: bf16 [rows][K], staged at `wscale`.
-// FMT 2: NVFP4 as stored. A byte holds elements b and b + 8 of its
+// FMT 2: NVFP4, tile-major (nv4_tile_major; whole tiles, so every row of
+//   a block exists). A byte holds elements b and b + 8 of its
 //   sub-block, so the contraction walks k in *byte order*: the activations
 //   must be laid out the same way (pair p of a sub-block holds elements p
 //   and p + 8), which the kernels that write them do when asked. dg_nv4
@@ -1321,6 +1322,19 @@ __device__ __forceinline__ void dg_gemm(
     const int ch0 = warp * share, ch1 = min(ch0 + share, chunks);
     for (int ch = ch0; ch < ch1; ++ch) {
         unsigned a[2][8];
+        if (FMT == 2) {
+            // Tile-major (nv4_tile_major): this lane's sub-block t of rows
+            // g and its partner is one record, and its two scale bytes
+            // another, both in the tile's 576 bytes for this chunk.
+            const unsigned char* tb = w + ((long long)blockIdx.x * chunks + ch) * 576;
+            const uint4 tv = *(const uint4*)(tb + lane * 16);
+            const unsigned ts = *(const unsigned short*)(tb + 512 + lane * 2);
+            const unsigned sa = dg_ue4m3x2(ts & 0xFFu), sb = dg_ue4m3x2(ts >> 8);
+            dg_nv4(a[0], tv.x, sa);
+            dg_nv4(a[0] + 4, tv.y, sa);
+            dg_nv4(a[1], tv.z, sb);
+            dg_nv4(a[1] + 4, tv.w, sb);
+        } else {
 #pragma unroll
         for (int hb = 0; hb < 2; ++hb) {
             const int row = hb ? row_b : row_a;
@@ -1341,7 +1355,7 @@ __device__ __forceinline__ void dg_gemm(
                     h[5] = dg_q8x2(q.z >> 16, sc);
                     h[6] = dg_q8x2(q.w, sc);
                     h[7] = dg_q8x2(q.w >> 16, sc);
-                } else if (FMT == 1) {
+                } else {
                     const uint4* p = (const uint4*)(w + ((long long)row * K + ch * 64 + t * 16) * 2);
                     const uint4 v0 = p[0], v1 = p[1];
                     h[0] = dg_bf16x2(v0.x, wscale);
@@ -1352,17 +1366,9 @@ __device__ __forceinline__ void dg_gemm(
                     h[5] = dg_bf16x2(v1.y, wscale);
                     h[6] = dg_bf16x2(v1.z, wscale);
                     h[7] = dg_bf16x2(v1.w, wscale);
-                } else {
-                    // Sub-block t of this row's block: its scale byte and
-                    // its eight bytes, each byte one fp16 pair in byte order.
-                    const unsigned char* blk = w + ((long long)row * chunks + ch) * 36;
-                    const unsigned sc = dg_ue4m3x2(blk[t]);
-                    const unsigned d0 = *(const unsigned*)(blk + 4 + t * 8);
-                    const unsigned d1 = *(const unsigned*)(blk + 8 + t * 8);
-dg_nv4(h, d0, sc);
-                    dg_nv4(h + 4, d1, sc);
                 }
             }
+        }
         }
         uint4 x0 = make_uint4(0, 0, 0, 0), x1 = x0;
         if (xcol) {
@@ -1668,7 +1674,7 @@ impl DecodeGemm {
         need("dg gate_up ids", ids.len(), pairs)?;
         need("dg gate_up x", x.len(), pairs.div_ceil(topk) * k)?;
         need("dg gate_up out", out.len(), pairs * rows / 2)?;
-        self.check_stack(&w, stack, rows, k)?;
+        self.check_stack(&w, stack, rows, k, rows / 2)?;
         let (format, alpha, wscale, wstride, wsstride) = dg_format(&w, rows, k);
         let (ptr, _guard) = out.device_ptr_mut(stream);
         self.launch(
@@ -1720,7 +1726,7 @@ impl DecodeGemm {
         need("dg down weights", pair_w.len(), pairs)?;
         need("dg down x", x.len(), pairs * k)?;
         need("dg down out", out.len(), pairs * rows)?;
-        self.check_stack(&w, stack, rows, k)?;
+        self.check_stack(&w, stack, rows, k, 8)?;
         let (format, alpha, wscale, wstride, wsstride) = dg_format(&w, rows, k);
         let (ptr, _guard) = out.device_ptr_mut(stream);
         self.launch(
@@ -1746,6 +1752,7 @@ impl DecodeGemm {
         stack: usize,
         rows: usize,
         k: usize,
+        partner: usize,
     ) -> Result<(), InklingError> {
         match w {
             HalfWeight::Q8_0 { q, scales } => {
@@ -1755,10 +1762,20 @@ impl DecodeGemm {
             HalfWeight::Bf16 { bytes, .. } => {
                 need("dg expert bf16 weights", bytes.len(), stack * rows * k * 2)
             }
-            HalfWeight::Nvfp4 { bytes, .. } => {
+            HalfWeight::Nvfp4 {
+                bytes,
+                partner: packed,
+                ..
+            } => {
                 if !k.is_multiple_of(64) {
                     return Err(InklingError::Shape(
                         "NVFP4 rows are whole 64-element blocks",
+                    ));
+                }
+                // The kernel reads tiles, and its tiles are this launch's.
+                if *packed != partner || !super::hgemm::nv4_tiles_fit(rows, partner) {
+                    return Err(InklingError::Shape(
+                        "the decode GEMM reads NVFP4 tile-major, in whole tiles of its own pairing",
                     ));
                 }
                 need(

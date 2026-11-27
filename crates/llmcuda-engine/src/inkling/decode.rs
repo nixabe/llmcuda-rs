@@ -244,9 +244,18 @@ fn control(c: &ControlF32, rank: usize) -> ControlWeights<'_> {
 
 fn stack_of(e: &super::Experts) -> (HalfWeight<'_>, Option<&CudaSlice<f32>>) {
     match &e.w {
-        ExpertStack::Nvfp4 { bytes, scales } => {
-            (HalfWeight::Nvfp4 { bytes, scale: 1.0 }, scales.as_ref())
-        }
+        ExpertStack::Nvfp4 {
+            bytes,
+            scales,
+            partner,
+        } => (
+            HalfWeight::Nvfp4 {
+                bytes,
+                scale: 1.0,
+                partner: *partner,
+            },
+            scales.as_ref(),
+        ),
         ExpertStack::Dense(dense) => (dense_half(dense), None),
     }
 }

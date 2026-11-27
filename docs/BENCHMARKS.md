@@ -520,36 +520,36 @@ resident):
 
 | cell | llmcuda-rs | llama.cpp | margin |
 | :--- | ---: | ---: | ---: |
-| prefill 512, N=1 | 1,246–1,274 | 799–812 | **+53% to +59%** |
-| prefill 512, N=3 | 1,732–1,754 | 942–963 | **+80% to +86%** |
-| prefill 2K, N=1 | 1,714–1,728 | 673–674 | **+154% to +157%** |
-| prefill 2K, N=3 | 1,862–1,873 | 677–678 | **+175% to +176%** |
-| prefill 8K, N=1 | 1,629–1,630 | 556–557 | **+192% to +193%** |
-| prefill 8K, N=3 | 1,758–1,763 | 557–558 | **+215% to +217%** |
-| decode after 512, N=1 | 56.2–56.4 | 39.6–40.7 | **+38% to +42%** |
-| decode after 512, N=3 | 101.7–102.4 | 88.2–90.6 | **+12% to +16%** |
-| decode after 2K, N=1 | 51.9–52.2 | 39.0–39.1 | **+33% to +34%** |
-| decode after 2K, N=3 | 95.1–95.2 | 83.8–84.2 | **+13% to +14%** |
-| decode after 8K, N=1 | 46.1–46.2 | 38.4–38.5 | **+20% to +20%** |
-| decode after 8K, N=3 | 86.1–86.5 | 79.8–80.1 | **+7% to +8%** |
+| prefill 512, N=1 | 1,305–1,349 | 819–828 | **+58% to +65%** |
+| prefill 512, N=3 | 1,789–1,828 | 942–950 | **+88% to +94%** |
+| prefill 2K, N=1 | 1,762–1,777 | 674–675 | **+161% to +164%** |
+| prefill 2K, N=3 | 1,910–1,915 | 677–679 | **+181% to +183%** |
+| prefill 8K, N=1 | 1,673–1,677 | 555–556 | **+201% to +202%** |
+| prefill 8K, N=3 | 1,798–1,804 | 556–557 | **+223% to +224%** |
+| decode after 512, N=1 | 68.4–68.9 | 40.3–41.0 | **+67% to +71%** |
+| decode after 512, N=3 | 136.4–137.6 | 88.5–89.5 | **+52% to +56%** |
+| decode after 2K, N=1 | 67.6–67.9 | 39.1–39.2 | **+72% to +74%** |
+| decode after 2K, N=3 | 132.3–132.7 | 83.8–84.1 | **+57% to +58%** |
+| decode after 8K, N=1 | 64.8–64.8 | 38.0–38.6 | **+68% to +70%** |
+| decode after 8K, N=3 | 123.6–124.3 | 79.6–80.2 | **+54% to +56%** |
 
 `Inkling-2-Mini-UD-Q8_K_XL.gguf` (bf16 dense matrices, bf16 experts in the
 last four layers; 22.3 GiB resident):
 
 | cell | llmcuda-rs | llama.cpp | margin |
 | :--- | ---: | ---: | ---: |
-| prefill 512, N=1 | 1,251–1,255 | 632–634 | **+97% to +98%** |
-| prefill 512, N=3 | 1,739–1,742 | 772–773 | **+125% to +126%** |
-| prefill 2K, N=1 | 1,719–1,725 | 537–539 | **+219% to +221%** |
-| prefill 2K, N=3 | 1,861–1,864 | 539–541 | **+244% to +246%** |
-| prefill 8K, N=1 | 1,632–1,633 | 458–459 | **+256% to +257%** |
-| prefill 8K, N=3 | 1,752–1,752 | 459–459 | **+282% to +282%** |
-| decode after 512, N=1 | 49.1–49.2 | 24.4–27.3 | **+80% to +102%** |
-| decode after 512, N=3 | 92.8–92.9 | 61.4–62.2 | **+49% to +51%** |
-| decode after 2K, N=1 | 45.9–45.9 | 26.6–27.5 | **+67% to +73%** |
-| decode after 2K, N=3 | 86.9–87.0 | 60.4–60.7 | **+43% to +44%** |
-| decode after 8K, N=1 | 41.4–41.4 | 19.5–26.9 | **+54% to +112%** |
-| decode after 8K, N=3 | 79.5–79.6 | 57.8–57.9 | **+37% to +38%** |
+| prefill 512, N=1 | 1,310–1,336 | 629–642 | **+104% to +112%** |
+| prefill 512, N=3 | 1,796–1,834 | 772–780 | **+130% to +138%** |
+| prefill 2K, N=1 | 1,768–1,774 | 536–541 | **+227% to +231%** |
+| prefill 2K, N=3 | 1,904–1,911 | 538–542 | **+251% to +255%** |
+| prefill 8K, N=1 | 1,671–1,679 | 457–459 | **+264% to +267%** |
+| prefill 8K, N=3 | 1,787–1,794 | 457–458 | **+290% to +292%** |
+| decode after 512, N=1 | 58.4–58.7 | 21.8–27.2 | **+115% to +169%** |
+| decode after 512, N=3 | 119.5–120.2 | 53.1–62.5 | **+91% to +126%** |
+| decode after 2K, N=1 | 57.8–58.0 | 26.4–33.0 | **+75% to +119%** |
+| decode after 2K, N=3 | 115.9–116.2 | 59.8–61.3 | **+89% to +94%** |
+| decode after 8K, N=1 | 55.8–55.8 | 26.5–32.7 | **+70% to +110%** |
+| decode after 8K, N=3 | 109.5–109.6 | 57.9–58.2 | **+88% to +89%** |
 
 What the tables do not say:
 
@@ -561,8 +561,9 @@ What the tables do not say:
   llama.cpp's `-ub` was swept on `UD-Q4_K_XL` only: on `UD-Q8_K_XL` one
   run each put `-ub 512` ahead at 8K (459 against 322 at `-ub 4096`), and
   at 2K one `-ub 2048` run read 520 where the `-ub 512` pairs read 537–541.
-- **llama.cpp's N=1 decode on `UD-Q8_K_XL` is unsteady** (19.5 to 26.9
-  tok/s across pairs at 8K); the margin there is a range, not a number.
+- **llama.cpp's decode on `UD-Q8_K_XL` is unsteady** (21.8 to 27.2 tok/s
+  across pairs at N=1 after 512, 26.4 to 33.0 after 2K); the margin there
+  is a range, not a number.
 - **Forward only.** The model is served, but nothing here went through the
   server: no scheduler, sampling or HTTP in either column.
 
@@ -576,12 +577,15 @@ the twelve positions. llama.cpp against the CPU reference does the same.
 Until the first such flip the engine's decode and prefill paths agree to
 1e-7 in cosine.
 
-Where a decode step goes at N=1 after 512 tokens (17.7 ms; CUDA events, ms):
-expert gate/up 3.5, attention projections 2.5, expert down 2.1, attention
-1.8, feed-forward input 1.6, attention inputs 1.3, loop controllers 1.9,
-routing 1.0, output projection 0.9, head 0.9, loop messages 0.8. The four
-contractions are 9 ms of it at 325–485 GB/s of stored weights against the
-card's 672.
+Where a decode step goes at N=3 after 2K tokens on `UD-Q4_K_XL` (22.6 ms
+unprofiled; CUDA events with a sync at every stage, ms): expert gate/up
+6.5, expert down 3.3, attention 2.7, attention projections 2.6, loop
+controllers 2.1, feed-forward input 1.25, routing 1.0, attention inputs
+1.0, output projection 0.9, head 0.9, loop messages 0.8. At N=1 everything
+but the experts is nearly the same and the experts are a third: they are
+what a second and third sequence cost. The expert contractions run at
+477–533 GB/s of stored weights against the card's 672, the Q8_0
+projection pack at 485.
 
 ## Serving concurrent sessions
 

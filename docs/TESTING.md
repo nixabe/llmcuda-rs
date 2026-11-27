@@ -202,6 +202,35 @@ one image. Text-side M-RoPE (`mrope`) is ported from
 that scalar positions collapse to `rope::apply_rope` — the same reduction
 `llmcuda-engine`'s text path depends on.
 
+**Inkling 2 Mini vision tower (`inkling2v`): validated tensor by tensor.**
+The `inkling_vision` reference (pad-and-normalize preprocessing, class
+token, bilinear position grid, 23 blocks with 2D RoPE and LayerScale, 2×2
+merge, bias-free erf-GELU projector) is ported from
+`tools/mtmd/models/inkling2v.cpp` and `tools/mtmd/mtmd-graph.cpp`.
+`tests/inkling_vision_golden.rs` holds it to llama.cpp running the same
+mmproj on the CPU: the token count of 38 image sizes, the preprocessed
+image bit for bit (including the antialiased-bicubic shrink an oversize
+image takes), up to 328 named graph tensors per image, and the final
+embeddings. The captures are binary, written by
+`tools/oracle/capture_inkling2v.cpp` through libmtmd's public API; they are
+never committed, and the tests read `LLMCUDA_INKLING2V_GOLDEN_DIR` (and the
+mmproj from `LLMCUDA_INKLING_MMPROJ`) and skip without them:
+
+```sh
+cd tools/oracle
+LD_LIBRARY_PATH=$HOME/cuda-12.8/lib make capture_inkling2v
+CUDA_VISIBLE_DEVICES="" LD_LIBRARY_PATH=$HOME/cuda-12.8/lib ./capture_inkling2v \
+  <Inkling-2-Mini-*.gguf> <mmproj-F16.gguf> $LLMCUDA_INKLING2V_GOLDEN_DIR 8
+```
+
+Agreement at last check, max-abs: every captured tensor within 4.3e-5 and
+the final embeddings (which span about ±2 to ±5.7) within 3.3e-6, cosine 1
+to fp32 resolution. That is with the reference rounding the normalized
+pixels to F16, as llama.cpp's graph does on the way into the patch
+convolution (`ggml_conv_2d` builds an F16 `im2col`); without that one
+rounding the final embeddings differ by up to 2.2e-3. The measured figures
+per image and the bounds chosen from them are in the test's module docs.
+
 The second preprocessing path, `preprocess_hf` (the Hugging Face
 processor's, which `/v1/systemone` uses), is checked against
 the code it ports, not against llama.cpp: `tests/hf_image_golden.rs`

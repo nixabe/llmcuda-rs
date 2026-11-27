@@ -13,6 +13,7 @@ LLAMA ?= /home/nixabe/llama.cpp
 LLAMA_BUILD ?= $(LLAMA)/build
 OUT   ?= capture
 BENCH_OUT ?= bench_decode
+VISION_OUT ?= capture_inkling2v
 
 $(OUT): capture.cpp
 	g++ -O2 -std=c++17 capture.cpp -o $(OUT) \
@@ -26,7 +27,17 @@ $(BENCH_OUT): bench_decode.cpp
 	    -L$(LLAMA_BUILD)/bin -lllama -lggml-base -lggml \
 	    -Wl,-rpath,$(LLAMA_BUILD)/bin
 
+# The vision-tower capture for Inkling 2 Mini (`inkling2v`). It goes through
+# libmtmd's public API, so it needs that library and its header. libggml pulls
+# in the CUDA backend's shared objects at link time; export
+# LD_LIBRARY_PATH to wherever those live (e.g. ~/cuda-12.8/lib) before `make`.
+$(VISION_OUT): capture_inkling2v.cpp
+	g++ -O2 -std=c++17 -Wno-deprecated-declarations capture_inkling2v.cpp -o $(VISION_OUT) \
+	    -I$(LLAMA)/include -I$(LLAMA)/ggml/include -I$(LLAMA)/tools/mtmd \
+	    -L$(LLAMA_BUILD)/bin -lmtmd -lllama -lggml-base -lggml \
+	    -Wl,-rpath,$(LLAMA_BUILD)/bin
+
 clean:
-	rm -f $(OUT) $(BENCH_OUT)
+	rm -f $(OUT) $(BENCH_OUT) $(VISION_OUT)
 
 .PHONY: clean

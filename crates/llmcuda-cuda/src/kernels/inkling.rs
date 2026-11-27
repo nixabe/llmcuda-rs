@@ -1172,13 +1172,6 @@ __device__ __forceinline__ unsigned dg_bf16x2(unsigned v, float scale) {
     return (unsigned)l | ((unsigned)h << 16);
 }
 
-// One E2M1 nibble (sign in bit 3) to the fp16 bits of its doubled value.
-__device__ __forceinline__ unsigned dg_fp4(unsigned nib) {
-    const unsigned m = nib & 7u;
-    const unsigned v = m < 2u ? m * 0x3C00u : (((15u + (m >> 1)) << 10) | ((m & 1u) << 9));
-    return v | ((nib & 8u) << 12);
-}
-
 // An unsigned E4M3 sub-block scale, halved, as fp16 bits in both halves.
 __device__ __forceinline__ unsigned dg_ue4m3x2(unsigned b) {
     const unsigned e = (b >> 3) & 15u, man = b & 7u;
@@ -1188,6 +1181,46 @@ __device__ __forceinline__ unsigned dg_ue4m3x2(unsigned b) {
     unsigned v = e ? (((e + 7u) << 10) | (man << 7)) : (unsigned)sub;
     v = (b == 0u || b == 0x7Fu) ? 0u : v;
     return v | (v << 16);
+}
+
+__device__ __forceinline__ unsigned dg_prmt(unsigned a, unsigned b, unsigned c) {
+    unsigned v;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v) : "r"(a), "r"(b), "r"(c));
+    return v;
+}
+
+// Four NVFP4 bytes (eight E2M1 nibbles, sign in bit 3) to four fp16 pairs,
+// each times the sub-block scale `sc`; pair i is byte i, low nibble in the
+// low half. No table in memory: the launch is bound by its load pipeline,
+// and a shared-memory table cost a load a byte (bench_inkling_dg: 272 to
+// 362 GB/s of gate/up weights without it), where the arithmetic is free.
+//
+// prmt.b32 is an eight-entry byte table in two registers, indexed by the
+// low three bits of each control nibble; a control nibble with its top bit
+// set yields the *sign* of the selected byte replicated instead. Every
+// entry here is under 0x80, so that is zero. One permute over the nibbles
+// as stored therefore gives 64 + 2|v| for the positive elements and zero
+// for the negative ones; a second over the nibbles with their sign bits
+// flipped gives 64 - 2|v| for the negative ones and zero for the rest. The
+// OR is 64 + 2v, an unsigned byte, and from there it is dg_q8x2's splice:
+// under 0x64 the byte reads 1024 + 64 + 2v exactly, less 1088 is 2v, and
+// the multiply by the (halved) scale is exact too, the product of a
+// two-bit and a four-bit significand.
+__device__ __forceinline__ void dg_nv4(unsigned* h, unsigned d, unsigned sc) {
+    const unsigned dn = d ^ 0x88888888u;
+    const unsigned u0 = dg_prmt(0x43424140u, 0x4C484644u, d & 0xFFFFu) |
+                        dg_prmt(0x3D3E3F40u, 0x34383A3Cu, dn & 0xFFFFu);
+    const unsigned u1 = dg_prmt(0x43424140u, 0x4C484644u, d >> 16) |
+                        dg_prmt(0x3D3E3F40u, 0x34383A3Cu, dn >> 16);
+    h[0] = dg_prmt(u0, 0x64646464u, 0x5150u);
+    h[1] = dg_prmt(u0, 0x64646464u, 0x5352u);
+    h[2] = dg_prmt(u1, 0x64646464u, 0x5150u);
+    h[3] = dg_prmt(u1, 0x64646464u, 0x5352u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        asm("sub.rn.f16x2 %0, %0, %1;" : "+r"(h[i]) : "r"(0x64406440u));
+        asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(h[i]) : "r"(sc));
+    }
 }
 
 __device__ __forceinline__ float dg_situ(float gate, float up, float beta, float lb) {
@@ -1202,7 +1235,8 @@ __device__ __forceinline__ float dg_situ(float gate, float up, float beta, float
 // accumulate.
 //
 // No shared-memory staging. A block owns sixteen weight rows; each of its
-// eight warps contracts one eighth of K for them with one m16n8k8 fragment
+// warps (blockDim.x / 32 of them, at most eight) contracts an equal share
+// of K for them with one m16n8k8 fragment
 // set, and the partial sums are added in warp order at the end. A lane
 // builds its two A registers (rows g and g + 8, k pair t) straight from the
 // stored weights and reads its B register (token g, k pair t) straight from
@@ -1219,8 +1253,8 @@ __device__ __forceinline__ float dg_situ(float gate, float up, float beta, float
 // FMT 2: NVFP4 as stored. A byte holds elements b and b + 8 of its
 //   sub-block, so the contraction walks k in *byte order*: the activations
 //   must be laid out the same way (pair p of a sub-block holds elements p
-//   and p + 8), which the kernels that write them do when asked. One table
-//   load turns a byte into the fp16 pair.
+//   and p + 8), which the kernels that write them do when asked. dg_nv4
+//   turns four bytes into four fp16 pairs in registers.
 //
 // MODE 0, dense: columns are rows 0..ntok of the activation plane that
 //   weight rows [0, b1), [b1, b2), [b2, ..) read (planes 0, 1, 2, `K`
@@ -1240,15 +1274,9 @@ __device__ __forceinline__ void dg_gemm(
     long long wstride, long long wsstride, int topk, int nv_out,
     float alpha, float wscale, float beta, float lb
 ) {
-    __shared__ unsigned lut[256];
     __shared__ float part[8][32][4];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int g = lane >> 2, t = lane & 3;
-    if (FMT == 2) {
-        lut[tid] = dg_fp4(tid & 15u) | (dg_fp4(tid >> 4) << 16);
-        __syncthreads();
-    }
-
     const unsigned short* xcol = nullptr;
     int row_a, row_b;
     if (MODE == 0) {
@@ -1288,7 +1316,8 @@ __device__ __forceinline__ void dg_gemm(
     // near 250 GB/s of weights; staging the wide loads through shared
     // memory to keep the natural order was slower still (bench_inkling_dg).
     const int chunks = K >> 6;
-    const int share = (chunks + 7) / 8;
+    const int nw = blockDim.x >> 5;
+    const int share = (chunks + nw - 1) / nw;
     const int ch0 = warp * share, ch1 = min(ch0 + share, chunks);
     for (int ch = ch0; ch < ch1; ++ch) {
         unsigned a[2][8];
@@ -1330,14 +1359,8 @@ __device__ __forceinline__ void dg_gemm(
                     const unsigned sc = dg_ue4m3x2(blk[t]);
                     const unsigned d0 = *(const unsigned*)(blk + 4 + t * 8);
                     const unsigned d1 = *(const unsigned*)(blk + 8 + t * 8);
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        h[i] = lut[(d0 >> (8 * i)) & 255u];
-                        h[4 + i] = lut[(d1 >> (8 * i)) & 255u];
-                    }
-#pragma unroll
-                    for (int i = 0; i < 8; ++i)
-                        asm("mul.rn.f16x2 %0, %0, %1;" : "+r"(h[i]) : "r"(sc));
+dg_nv4(h, d0, sc);
+                    dg_nv4(h + 4, d1, sc);
                 }
             }
         }
@@ -1364,8 +1387,10 @@ __device__ __forceinline__ void dg_gemm(
     if (warp != 0) return;
 #pragma unroll
     for (int wv = 1; wv < 8; ++wv)
+        if (wv < nw) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) c[i] += part[wv][lane][i];
+            for (int i = 0; i < 4; ++i) c[i] += part[wv][lane][i];
+        }
 
     // c[0], c[1]: row_a at token columns 2t, 2t + 1; c[2], c[3]: row_b.
     if (MODE == 0) {
@@ -1536,7 +1561,13 @@ impl DecodeGemm {
             .arg(&beta)
             .arg(&lb);
         // SAFETY: every caller length-checks its operands against the grid.
-        unsafe { b.launch(cfg((grid.0, grid.1, 1), 256, 0)) }?;
+        // About four and a half 64-element chunks a warp: fewer and the
+        // block's fixed work (its barrier, the partial sums) shows, more and
+        // a warp is bound by the latency of its own loads. Measured on the
+        // down projection, K 1,152: 308 GB/s at eight warps, 339 at four,
+        // 292 at two; K 2,304 is best at eight (bench_inkling_dg).
+        let warps = ((k as u32 / 64 * 2 + 4) / 9).clamp(1, 8);
+        unsafe { b.launch(cfg((grid.0, grid.1, 1), 32 * warps, 0)) }?;
         Ok(())
     }
 

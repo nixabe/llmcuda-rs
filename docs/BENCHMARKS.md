@@ -1485,6 +1485,15 @@ blocks they measured 1.2–1.8 ms a launch. On grids of their own — a block a
 gate row, a thread a channel, a block per eight experts — the same work is
 40 us. Split by what streams weights, not by what belongs to the layer.
 
+What stays a block a row should not pay a barrier a sum. The depth mix
+needs, for each of up to eight states, a sum of squares and a product with
+each query: taken as passes of the whole block, that is up to forty
+reductions with a barrier each over a row a warp could walk alone. A warp
+a state, every sum of that state in one walk, reduced by shuffle, is one
+barrier: N=3 decode 127.7–128.8 → 132.3–132.7 tok/s (three interleaved
+pairs, `bench_inkling 2048 64 1,3`). The earlier one-pass attempt (WHY
+NOT) kept the sums in a local array; these are registers.
+
 The same reasoning sizes prefill. The fp32 router read both operands from
 global memory for every product, one thread a (row, expert); eight rows a
 block from a shared tile, each thread reading its weight row once for the

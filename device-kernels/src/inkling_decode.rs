@@ -93,7 +93,8 @@ unsafe fn carry_push(x: f32, carry: *mut f32, taps: i32) {
 }
 
 /// Depth mixing of one row over `states` stacked planes plus `cur`, for
-/// `n_queries` queries, into `out[q]` planes. As `ink_mix`.
+/// `n_queries` queries, into `out[q]` planes. `ink_mix`'s values, its sums
+/// taken a warp a state: the block is at least `32 * (states + 1)` threads.
 ///
 /// # Safety
 /// Every thread of the block calls this together; stack holds `states`
@@ -118,53 +119,58 @@ unsafe fn mix_row(
     let tid = thread::threadIdx_x() as i32;
     let step = thread::blockDim_x() as i32;
     let total = states + 1;
+    let (warp_id, lane) = (tid >> 5, tid & 31);
     unsafe {
         let base = row * n as usize;
-        let mut s = 0;
-        while s < total {
-            let src = if s < states {
-                stack.add((s as i64 * plane) as usize + base)
+        // A warp a state: its sum of squares and its product with every
+        // query in one walk of the row, reduced by shuffle. Taking each of
+        // the up to forty sums as a pass of the block with a barrier of its
+        // own was most of this kernel's time.
+        if warp_id < total {
+            let src = if warp_id < states {
+                stack.add((warp_id as i64 * plane) as usize + base)
             } else {
                 cur.add(base)
             };
-            let mut partial = 0.0f32;
-            let mut i = tid;
-            while i < n {
-                let v = *src.add(i as usize);
-                partial = v.mul_add(v, partial);
-                i += step;
-            }
-            let sum = block_reduce_sum(partial);
-            if tid == 0 {
-                INV[s as usize] = 1.0 / (sum / n as f32 + 1e-6).sqrt();
-            }
-            s += 1;
-        }
-        let scale = 1.0 / (n as f32).sqrt();
-        let mut q = 0;
-        while q < n_queries {
-            let query = queries.add(q as usize * n as usize);
-            let mut s = 0;
-            while s < total {
-                let src = if s < states {
-                    stack.add((s as i64 * plane) as usize + base)
-                } else {
-                    cur.add(base)
-                };
-                let mut partial = 0.0f32;
-                let mut i = tid;
-                while i < n {
-                    partial = (*src.add(i as usize)).mul_add(*query.add(i as usize), partial);
-                    i += step;
+            let nn = n as usize;
+            let (mut sq, mut d0, mut d1, mut d2, mut d3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            let mut i = lane as usize;
+            while i < nn {
+                let v = *src.add(i);
+                sq = v.mul_add(v, sq);
+                d0 = v.mul_add(*queries.add(i), d0);
+                if n_queries > 1 {
+                    d1 = v.mul_add(*queries.add(nn + i), d1);
                 }
-                let sum = block_reduce_sum(partial);
-                if tid == 0 {
-                    COEF[q as usize * MIX_STATES + s as usize] = sum * INV[s as usize] * scale;
+                if n_queries > 2 {
+                    d2 = v.mul_add(*queries.add(2 * nn + i), d2);
                 }
-                s += 1;
+                if n_queries > 3 {
+                    d3 = v.mul_add(*queries.add(3 * nn + i), d3);
+                }
+                i += 32;
             }
-            q += 1;
+            let mut offset = 16u32;
+            while offset > 0 {
+                sq += warp::shuffle_xor_f32_sync(u32::MAX, sq, offset);
+                d0 += warp::shuffle_xor_f32_sync(u32::MAX, d0, offset);
+                d1 += warp::shuffle_xor_f32_sync(u32::MAX, d1, offset);
+                d2 += warp::shuffle_xor_f32_sync(u32::MAX, d2, offset);
+                d3 += warp::shuffle_xor_f32_sync(u32::MAX, d3, offset);
+                offset >>= 1;
+            }
+            if lane == 0 {
+                let s = warp_id as usize;
+                let inv = 1.0 / (sq / n as f32 + 1e-6).sqrt();
+                let scale = inv / (n as f32).sqrt();
+                INV[s] = inv;
+                COEF[s] = d0 * scale;
+                COEF[MIX_STATES + s] = d1 * scale;
+                COEF[2 * MIX_STATES + s] = d2 * scale;
+                COEF[3 * MIX_STATES + s] = d3 * scale;
+            }
         }
+        thread::sync_threads();
         if tid == 0 {
             let mut q = 0usize;
             while q < n_queries as usize {

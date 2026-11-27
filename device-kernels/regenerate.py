@@ -63,7 +63,7 @@ if ".target sm_75\n" not in ptx or any(
         "ink_embed", "ink_linear", "ink_mix", "ink_ctrl_pair", "ink_ctrl_apply",
         "ink_conv", "ink_clip", "ink_rms_groups", "ink_rel_table", "ink_attn",
         "ink_gather_half", "ink_situ_half", "ink_moe_combine", "ink_softcap",
-        "ink_dec_inputs", "ink_dec_kv", "ink_dec_attn", "ink_dec_attn_merge", "ink_dec_ffn_in", "ink_dec_ffn_out",
+        "ink_dec_inputs", "ink_dec_kv", "ink_dec_attn", "ink_dec_attn_merge", "ink_dec_commit", "ink_dec_ffn_in", "ink_dec_ffn_out",
         "ink_dec_gate", "ink_dec_ctrl", "ink_dec_norm", "ink_dec_router", "ink_dec_route",
     )
 ):

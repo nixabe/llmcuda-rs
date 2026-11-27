@@ -12,6 +12,16 @@
 //! attention-output and feed-forward carries. A cache holds position `j` at
 //! row `j & mask`: a ring of `mask + 1` rows on a sliding layer, every
 //! position (`mask = i32::MAX`) on a full one.
+//!
+//! **Windows.** A step may hold several consecutive positions of one
+//! sequence, to verify drafted tokens: `woff[t]` is how many rows before
+//! row `t` belong to the same sequence. The only state rows share is a
+//! convolution's carry, so the three kernels that read one take a tap from
+//! an earlier row of the step where that is what the carry would have held
+//! by then - the same values in the same order as a step a row - and, since
+//! how many rows are kept is decided after the step, leave the carry alone
+//! and save each row's raw input for `ink_dec_commit`. `woff` and `save`
+//! are both null on an ordinary step.
 
 use crate::common::{block_reduce_sum, f2h, h2f};
 use crate::inkling::{block_max_256, block_sum_256};
@@ -52,7 +62,7 @@ unsafe fn pair(p: *const f32) -> (f32, f32) {
 /// # Safety
 /// carry covers `taps - 1` floats owned by this thread and w `taps`.
 #[device]
-unsafe fn conv_row(x: f32, w: *const f32, carry: *mut f32, taps: i32) -> f32 {
+unsafe fn conv_row(x: f32, w: *const f32, carry: *const f32, taps: i32) -> f32 {
     let n = (taps - 1) as usize;
     unsafe {
         let mut sum = 0.0f32;
@@ -544,6 +554,9 @@ pub unsafe fn ink_dec_kv(
     clip: f32,
     eps: f32,
     mask: i32,
+    woff: *const i32,
+    save: *mut f32,
+    save_width: i32,
 ) {
     static mut RED: SharedArray<f32, 4> = SharedArray::UNINIT;
     let tid = thread::threadIdx_x() as usize;
@@ -561,20 +574,61 @@ pub unsafe fn ink_dec_kv(
         };
         let x = *row.add(off as usize + c);
         let carry = (*ptrs.add(t * 6 + P_K_CARRY + which) as *mut f32).add(c * (taps as usize - 1));
-        let mut sum = conv_row(x, weight.add(c * taps as usize), carry, taps);
+        let r = if woff.is_null() { 0 } else { *woff.add(t) as usize };
+        let n = taps as usize - 1;
+        let w = weight.add(c * taps as usize);
         let mut span = taps;
-        if tap_off >= 0 {
-            let tap = row.add(tap_off as usize + head * taps as usize);
-            sum += x * *tap;
-            let mut lag = 1;
-            while lag < taps {
-                sum += *carry.add((taps - 1 - lag) as usize) * *tap.add(lag as usize);
-                lag += 1;
+        let mut sum;
+        if r == 0 {
+            sum = conv_row(x, w, carry, taps);
+            if tap_off >= 0 {
+                let tap = row.add(tap_off as usize + head * taps as usize);
+                sum += x * *tap;
+                let mut lag = 1;
+                while lag < taps {
+                    sum += *carry.add((taps - 1 - lag) as usize) * *tap.add(lag as usize);
+                    lag += 1;
+                }
+                span = 2 * taps;
             }
-            span = 2 * taps;
+        } else {
+            // Carry element i as a step a row would find it: the carry
+            // shifted by the r rows before this one, their inputs behind it.
+            sum = 0.0;
+            let mut i = 0usize;
+            while i < n {
+                let held = if i + r < n {
+                    *carry.add(i + r)
+                } else {
+                    *proj.add((t + i - n) * ldo as usize + off as usize + c)
+                };
+                sum += held * *w.add(i);
+                i += 1;
+            }
+            sum = sum + x * *w.add(n);
+            if tap_off >= 0 {
+                let tap = row.add(tap_off as usize + head * taps as usize);
+                sum += x * *tap;
+                let mut lag = 1usize;
+                while lag <= n {
+                    let i = n - lag;
+                    let held = if i + r < n {
+                        *carry.add(i + r)
+                    } else {
+                        *proj.add((t + i - n) * ldo as usize + off as usize + c)
+                    };
+                    sum += held * *tap.add(lag);
+                    lag += 1;
+                }
+                span = 2 * taps;
+            }
         }
         let v = (x + sum) / ((span + 1) as f32).sqrt();
-        carry_push(x, carry, taps);
+        if save.is_null() {
+            carry_push(x, carry, taps);
+        } else {
+            *save.add(t * save_width as usize + which * kv_heads as usize * dim + c) = x;
+        }
 
         let mut sq = v * v;
         let mut off = 16;
@@ -915,6 +969,10 @@ pub unsafe fn ink_dec_ffn_in(
     taps: i32,
     nv: i32,
     eps: f32,
+    woff: *const i32,
+    save: *mut f32,
+    save_width: i32,
+    save_off: i32,
 ) {
     let tid = thread::threadIdx_x() as i32;
     let step = thread::blockDim_x() as i32;
@@ -925,13 +983,36 @@ pub unsafe fn ink_dec_ffn_in(
     unsafe {
         let carry = *ptrs.add(t * 6 + P_ATTN_CARRY) as *mut f32;
         let norm = 1.0 / ((taps + 1) as f32).sqrt();
+        let r = if woff.is_null() { 0 } else { *woff.add(t) as usize };
+        let held = (taps - 1) as usize;
         let mut i = tid;
         while i < n {
             let iu = i as usize;
             let x = *o_raw.add(t * nu + iu);
             let c = carry.add(iu * (taps as usize - 1));
-            let a = (x + conv_row(x, conv_w.add(iu * taps as usize), c, taps)) * norm;
-            carry_push(x, c, taps);
+            let w = conv_w.add(iu * taps as usize);
+            let conv = if r == 0 {
+                conv_row(x, w, c, taps)
+            } else {
+                let mut sum = 0.0f32;
+                let mut k = 0usize;
+                while k < held {
+                    let v = if k + r < held {
+                        *c.add(k + r)
+                    } else {
+                        *o_raw.add((t + k - held) * nu + iu)
+                    };
+                    sum += v * *w.add(k);
+                    k += 1;
+                }
+                sum + x * *w.add(held)
+            };
+            let a = (x + conv) * norm;
+            if save.is_null() {
+                carry_push(x, c, taps);
+            } else {
+                *save.add(t * save_width as usize + save_off as usize + iu) = x;
+            }
             let inp = *input.add(t * nu + iu);
             if opens != 0 {
                 *stack.add((states as i64 * plane) as usize + t * nu + iu) = inp;
@@ -1112,6 +1193,10 @@ pub unsafe fn ink_dec_ffn_out(
     n: i32,
     topk: i32,
     taps: i32,
+    woff: *const i32,
+    save: *mut f32,
+    save_width: i32,
+    save_off: i32,
 ) {
     let i = (thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x()) as usize;
     let t = thread::blockIdx_y() as usize;
@@ -1127,9 +1212,95 @@ pub unsafe fn ink_dec_ffn_out(
             j += 1;
         }
         let carry = (*ptrs.add(t * 6 + P_FFN_CARRY) as *mut f32).add(i * (taps as usize - 1));
-        let v = (x + conv_row(x, conv_w.add(i * taps as usize), carry, taps))
-            / ((taps + 1) as f32).sqrt();
-        carry_push(x, carry, taps);
+        let r = if woff.is_null() { 0 } else { *woff.add(t) as usize };
+        let w = conv_w.add(i * taps as usize);
+        let conv = if r == 0 {
+            conv_row(x, w, carry, taps)
+        } else {
+            // An earlier row's input is its own sum of the same pairs.
+            let held = (taps - 1) as usize;
+            let mut sum = 0.0f32;
+            let mut k = 0usize;
+            while k < held {
+                let value = if k + r < held {
+                    *carry.add(k + r)
+                } else {
+                    let row = t + k - held;
+                    let mut earlier = 0.0f32;
+                    let mut j = 0usize;
+                    while j < topk as usize {
+                        earlier += *partial.add((row * topk as usize + j) * nu + i);
+                        j += 1;
+                    }
+                    earlier
+                };
+                sum += value * *w.add(k);
+                k += 1;
+            }
+            sum + x * *w.add(held)
+        };
+        let v = (x + conv) / ((taps + 1) as f32).sqrt();
+        if save.is_null() {
+            carry_push(x, carry, taps);
+        } else {
+            *save.add(t * save_width as usize + save_off as usize + i) = x;
+        }
         *h.add(t * nu + i) = *ffn_inp.add(t * nu + i) + v;
+    }
+}
+
+/// The carries of a window's sequence advanced by the rows that were kept:
+/// each of a slot's four carries takes the saved inputs of rows
+/// `t .. t + keep[t]` in order, as that many steps a row would have pushed
+/// them. Rows with `keep[t] == 0` are not the first of a window, or are of
+/// a sequence that keeps nothing.
+///
+/// grid: (slots, rows), 256 threads. `ptrs` is `[slots][rows][6]` and
+/// `save` `[slots][rows][width]`, a row's fields being its key, value,
+/// attention-output and feed-forward inputs (`kv`, `kv`, `n`, `n` wide).
+///
+/// # Safety
+/// The tables cover the grid; `keep[t]` rows from `t` are one sequence's.
+#[kernel]
+pub unsafe fn ink_dec_commit(
+    ptrs: *const u64,
+    save: *const f32,
+    keep: *const i32,
+    kv: i32,
+    n: i32,
+    taps: i32,
+) {
+    let tid = thread::threadIdx_x() as usize;
+    let step = thread::blockDim_x() as usize;
+    let slot = thread::blockIdx_x() as usize;
+    let t = thread::blockIdx_y() as usize;
+    let rows = thread::gridDim_y() as usize;
+    let width = 2 * (kv + n) as usize;
+    unsafe {
+        let kept = *keep.add(t) as usize;
+        if kept == 0 {
+            return;
+        }
+        let table = ptrs.add((slot * rows + t) * 6 + P_K_CARRY);
+        let mut c = tid;
+        while c < width {
+            // Which carry this channel is in, and where in it.
+            let (field, at) = if c < kv as usize {
+                (0usize, c)
+            } else if c < 2 * kv as usize {
+                (1usize, c - kv as usize)
+            } else if c < (2 * kv + n) as usize {
+                (2usize, c - 2 * kv as usize)
+            } else {
+                (3usize, c - (2 * kv + n) as usize)
+            };
+            let carry = (*table.add(field) as *mut f32).add(at * (taps as usize - 1));
+            let mut j = 0usize;
+            while j < kept {
+                carry_push(*save.add((slot * rows + t + j) * width + c), carry, taps);
+                j += 1;
+            }
+            c += step;
+        }
     }
 }

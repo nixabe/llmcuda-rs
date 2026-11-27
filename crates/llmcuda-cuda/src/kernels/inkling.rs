@@ -1787,6 +1787,7 @@ pub struct InklingDecodeKernels {
     kv: CudaFunction,
     attn: CudaFunction,
     attn_merge: CudaFunction,
+    commit: CudaFunction,
     ffn_in: CudaFunction,
     ffn_out: CudaFunction,
     gate: CudaFunction,
@@ -1862,6 +1863,7 @@ impl InklingDecodeKernels {
             kv: m.load_function("ink_dec_kv")?,
             attn: m.load_function("ink_dec_attn")?,
             attn_merge: m.load_function("ink_dec_attn_merge")?,
+            commit: m.load_function("ink_dec_commit")?,
             ffn_in: m.load_function("ink_dec_ffn_in")?,
             ffn_out: m.load_function("ink_dec_ffn_out")?,
             gate: m.load_function("ink_dec_gate")?,
@@ -2099,9 +2101,11 @@ impl InklingDecodeKernels {
         clip: f32,
         eps: f32,
         ring: Option<usize>,
+        window: Option<&DecodeWindow<'_>>,
         rows: usize,
     ) -> Result<(), InklingError> {
         let mask = row_mask(ring)?;
+        let (null, save, width) = window_args(window, rows)?;
         if !dim.is_multiple_of(32) || dim > 128 {
             return Err(InklingError::Shape(
                 "decode kv: head width must be 32..=128 in warps",
@@ -2129,6 +2133,11 @@ impl InklingDecodeKernels {
             .arg(&clip)
             .arg(&eps)
             .arg(&mask);
+        match window {
+            Some(w) => b.arg(w.offsets),
+            None => b.arg(&null),
+        };
+        b.arg(&save).arg(&width);
         // SAFETY: lengths checked; the pointer table is the caller's promise
         // that each row's caches and carries are live and large enough.
         unsafe { b.launch(cfg((2 * kv_heads, rows, 1), dim as u32, 0)) }?;
@@ -2256,8 +2265,11 @@ impl InklingDecodeKernels {
         taps: usize,
         byte_order: bool,
         eps: f32,
+        window: Option<&DecodeWindow<'_>>,
         rows: usize,
     ) -> Result<(), InklingError> {
+        let (null, save, width) = window_args(window, rows)?;
+        let save_off = window.map_or(0, |w| 2 * w.kv as i32);
         if states + usize::from(opens) + 1 > MIX_MAX_STATES {
             return Err(InklingError::Shape("decode ffn: too many residual blocks"));
         }
@@ -2308,6 +2320,11 @@ impl InklingDecodeKernels {
             b.arg(v);
         }
         b.arg(&eps);
+        match window {
+            Some(w) => b.arg(w.offsets),
+            None => b.arg(&null),
+        };
+        b.arg(&save).arg(&width).arg(&save_off);
         // SAFETY: lengths checked; carries reached through the pointer table.
         unsafe { b.launch(cfg((rows, 1, 1), 256, REDUCE_SHARED)) }?;
         Ok(())
@@ -2327,8 +2344,11 @@ impl InklingDecodeKernels {
         n: usize,
         topk: usize,
         taps: usize,
+        window: Option<&DecodeWindow<'_>>,
         rows: usize,
     ) -> Result<(), InklingError> {
+        let (null, save, width) = window_args(window, rows)?;
+        let save_off = window.map_or(0, |w| (2 * w.kv + n) as i32);
         need("dec out partial", partial.len(), rows * topk * n)?;
         need("dec out ffn_inp", ffn_inp.len(), rows * n)?;
         need("dec out conv", conv_w.len(), n * taps)?;
@@ -2344,8 +2364,76 @@ impl InklingDecodeKernels {
             .arg(&n_i)
             .arg(&k)
             .arg(&t);
+        match window {
+            Some(w) => b.arg(w.offsets),
+            None => b.arg(&null),
+        };
+        b.arg(&save).arg(&width).arg(&save_off);
         // SAFETY: lengths checked; carries reached through the pointer table.
         unsafe { b.launch(cfg((n.div_ceil(256), rows, 1), 256, 0)) }?;
         Ok(())
+    }
+
+    /// After a step with windows: advance every slot's carries by the rows
+    /// each window keeps. `ptrs` is the step's `[slots][rows][6]` table,
+    /// `save` its `[slots][rows][2 * (kv + n)]` saved inputs, and `keep[t]`
+    /// the rows kept from row `t` on when `t` opens a window, else zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit(
+        &self,
+        stream: &Arc<CudaStream>,
+        ptrs: &CudaSlice<u64>,
+        save: &CudaSlice<f32>,
+        keep: &CudaSlice<i32>,
+        kv: usize,
+        n: usize,
+        taps: usize,
+        slots: usize,
+        rows: usize,
+    ) -> Result<(), InklingError> {
+        need(
+            "dec commit ptrs",
+            ptrs.len(),
+            slots * rows * DEC_ROW_POINTERS,
+        )?;
+        need("dec commit save", save.len(), slots * rows * 2 * (kv + n))?;
+        need("dec commit keep", keep.len(), rows)?;
+        let (kv_i, n_i, t) = (kv as i32, n as i32, taps as i32);
+        let mut b = stream.launch_builder(&self.commit);
+        b.arg(ptrs).arg(save).arg(keep).arg(&kv_i).arg(&n_i).arg(&t);
+        // SAFETY: lengths checked; carries reached through the pointer table.
+        unsafe { b.launch(cfg((slots, rows, 1), 256, 0)) }?;
+        Ok(())
+    }
+}
+
+/// A decode step that holds windows: consecutive positions of one
+/// sequence, verified together.
+#[derive(Clone, Copy)]
+pub struct DecodeWindow<'a> {
+    /// `[rows]`: how many rows before each belong to the same sequence.
+    pub offsets: &'a CudaSlice<i32>,
+    /// Device address of this layer application's `[rows][width]` plane of
+    /// saved convolution inputs.
+    pub save: u64,
+    /// Floats a row saves: its key, value, attention-output and
+    /// feed-forward inputs, `2 * (kv + n)`.
+    pub width: usize,
+    /// The key (and value) width.
+    pub kv: usize,
+}
+
+/// A window's kernel arguments: a null for the absent table, the save
+/// plane's address, and its row width.
+fn window_args(
+    window: Option<&DecodeWindow<'_>>,
+    rows: usize,
+) -> Result<(u64, u64, i32), InklingError> {
+    match window {
+        Some(w) => {
+            need("dec window offsets", w.offsets.len(), rows)?;
+            Ok((0, w.save, w.width as i32))
+        }
+        None => Ok((0, 0, 0)),
     }
 }

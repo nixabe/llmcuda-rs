@@ -486,3 +486,123 @@ fn bounded_sliding_caches_change_no_bits() {
     );
     assert!(refused.is_err(), "a pass wider than the ring allowance ran");
 }
+
+/// A step of windows is the same bits as a step a token.
+///
+/// Speculation verifies drafted tokens as consecutive positions of one
+/// sequence in a single decode step, and what it accepts has to be what
+/// plain decoding would have produced, so every row of a window is held to
+/// the row a step of its own gives - not to a tolerance. The cases: a
+/// window of four; a window whose last two rows are thrown away, and the
+/// window after it, which reads carries the commit advanced by two and
+/// keys and values the discarded rows had written over; two sequences of
+/// unequal windows in one step; and an ordinary step after all of it.
+#[test]
+fn a_step_of_windows_is_the_same_bits_as_a_step_a_token() {
+    let Some((file, _)) = inkling_common::model_and_golden() else {
+        return;
+    };
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver present");
+        return;
+    }
+    let ctx = CudaContext::new(0).expect("device 0");
+    let stream = ctx.default_stream();
+    let model = Arc::new(InklingModel::load(&ctx, &stream, &file).expect("the model loads"));
+    let n = model.config().hidden_size as usize;
+    let vocab = model.config().vocab_size as u64;
+    let mut seed = 0x1234_5678_9abc_def1u64;
+    let tokens: Vec<i32> = (0..12)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % vocab) as i32
+        })
+        .collect();
+    let state = || InklingState::bounded(&stream, &model, 64, 8).expect("state");
+
+    // A step a token: the hidden state at every position.
+    let mut alone = state();
+    let mut one = InklingDecode::new(&model, &stream, 1).expect("decode");
+    let want: Vec<Vec<f32>> = tokens
+        .iter()
+        .map(|t| {
+            one.step(&stream, &mut [&mut alone], &[*t]).expect("step");
+            stream.clone_dtoh(one.hidden()).expect("read back")
+        })
+        .collect();
+
+    let mut four = InklingDecode::with_windows(&model, &stream, 4).expect("decode");
+    let same = |what: &str, got: &[f32], positions: &[usize]| {
+        for (row, position) in positions.iter().enumerate() {
+            let differ = got[row * n..(row + 1) * n]
+                .iter()
+                .zip(&want[*position])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differ, 0,
+                "{what}: row {row} (position {position}) differs in {differ} of {n} elements"
+            );
+        }
+    };
+    let mut a = state();
+    four.step_windows(&stream, &mut [&mut a], &[4], &tokens[0..4])
+        .expect("window");
+    same(
+        "a window of four",
+        &stream.clone_dtoh(four.hidden()).expect("read back"),
+        &[0, 1, 2, 3],
+    );
+    // Keep two of the four.
+    four.commit(&stream, &mut [&mut a], &[2]).expect("commit");
+    assert_eq!(a.position(), 2);
+    four.step_windows(&stream, &mut [&mut a], &[4], &tokens[2..6])
+        .expect("window");
+    same(
+        "after keeping two of four",
+        &stream.clone_dtoh(four.hidden()).expect("read back"),
+        &[2, 3, 4, 5],
+    );
+    four.commit(&stream, &mut [&mut a], &[4]).expect("commit");
+    assert_eq!(a.position(), 6);
+
+    // A second sequence beside it, one row against three.
+    let mut b = state();
+    let mut rows = vec![tokens[0]];
+    rows.extend(&tokens[6..9]);
+    four.step_windows(&stream, &mut [&mut b, &mut a], &[1, 3], &rows)
+        .expect("windows");
+    same(
+        "two sequences, one row and three",
+        &stream.clone_dtoh(four.hidden()).expect("read back"),
+        &[0, 6, 7, 8],
+    );
+    four.commit(&stream, &mut [&mut b, &mut a], &[1, 1])
+        .expect("commit");
+    assert_eq!((b.position(), a.position()), (1, 7));
+
+    // And ordinary steps after: on the windowed step's own object, and on
+    // a plain one.
+    let mut two = InklingDecode::with_windows(&model, &stream, 2).expect("decode");
+    two.step(&stream, &mut [&mut b, &mut a], &[tokens[1], tokens[7]])
+        .expect("step");
+    same(
+        "an ordinary step on a step built for windows",
+        &stream.clone_dtoh(two.hidden()).expect("read back"),
+        &[1, 7],
+    );
+    let mut plain = InklingDecode::new(&model, &stream, 2).expect("decode");
+    plain
+        .step(&stream, &mut [&mut b, &mut a], &[tokens[2], tokens[8]])
+        .expect("step");
+    same(
+        "an ordinary step after windows",
+        &stream.clone_dtoh(plain.hidden()).expect("read back"),
+        &[2, 8],
+    );
+    println!(
+        "windows of 4, 4 after keeping 2, and 1 beside 3: every row bit-identical to a step a token"
+    );
+}

@@ -344,7 +344,7 @@ fn decode_keys_and_values_match_the_reference_convolution_step_by_step() {
             kernels
                 .kv(
                     &stream, &d_proj, &d_ptrs, &d_pos, &d_k_conv, &d_v_conv, o, kv_heads, dim,
-                    taps, clip, eps, ring, rows,
+                    taps, clip, eps, ring, None, rows,
                 )
                 .unwrap();
         }
@@ -714,6 +714,7 @@ fn decode_feed_forward_glue_matches_the_reference_step_by_step() {
                     taps,
                     byte_order,
                     eps,
+                    None,
                     rows,
                 )
                 .unwrap();
@@ -768,6 +769,7 @@ fn decode_feed_forward_glue_matches_the_reference_step_by_step() {
                     n,
                     topk,
                     taps,
+                    None,
                     rows,
                 )
                 .unwrap();

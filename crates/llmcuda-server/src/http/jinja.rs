@@ -48,6 +48,9 @@ pub(crate) struct ChatTemplate {
     /// The template has a `reasoning_effort` level and no `enable_thinking`
     /// switch, so "thinking off" has to be said as an effort.
     effort_is_the_switch: bool,
+    /// The template writes a tool result under a header that names the
+    /// function (Inkling's `<|message_tool|>NAME`).
+    names_tool_results: bool,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -69,6 +72,7 @@ impl ChatTemplate {
             .replace("{%- endgeneration -%}", "{{- '' -}}");
         let effort_is_the_switch =
             source.contains("reasoning_effort") && !source.contains("enable_thinking");
+        let names_tool_results = source.contains("<|message_tool|>");
         let mut env = Environment::new();
         env.set_unknown_method_callback(python_method);
         // This is a model prompt, not HTML. Minijinja's built-in emits
@@ -90,6 +94,7 @@ impl ChatTemplate {
         Ok(Arc::new(Self {
             env,
             effort_is_the_switch,
+            names_tool_results,
         }))
     }
 
@@ -119,7 +124,7 @@ impl ChatTemplate {
                  model's own chat template; --no-jinja renders it"
             );
         }
-        let messages = messages(conversation);
+        let messages = messages(conversation, self.names_tool_results);
         let tools: Vec<&Value> = conversation
             .tools
             .iter()
@@ -210,7 +215,30 @@ fn prompt_tojson(
     kwargs: Kwargs,
 ) -> Result<JinjaValue, Error> {
     let indent = indent.or(kwargs.get("indent")?);
+    // Python's json.dumps keywords, as llama.cpp's minja takes them.
+    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
+    let separators: Option<Vec<String>> = kwargs.get("separators")?;
+    let _ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
     kwargs.assert_all_used()?;
+    if sort_keys == Some(true) || separators.is_some() {
+        let (item, key) = match separators.as_deref() {
+            Some([item, key]) => (item.as_str(), key.as_str()),
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    "tojson separators must be (item, key)",
+                ));
+            }
+            None => (", ", ": "),
+        };
+        let value = serde_json::to_value(&value).map_err(|error| {
+            Error::new(ErrorKind::InvalidOperation, "cannot serialize prompt JSON")
+                .with_source(error)
+        })?;
+        let mut out = String::new();
+        write_json(&value, sort_keys == Some(true), item, key, &mut out);
+        return Ok(JinjaValue::from_safe_string(out));
+    }
     let encoded = if let Some(indent) = indent {
         let mut bytes = Vec::new();
         let spaces = " ".repeat(indent);
@@ -228,8 +256,49 @@ fn prompt_tojson(
     })
 }
 
+/// JSON with chosen separators and, when asked, every object's keys in
+/// byte order at every depth: `json.dumps(sort_keys=True, separators=..)`.
+/// Strings are escaped as serde_json escapes them, which leaves non-ASCII
+/// and HTML characters alone.
+fn write_json(value: &Value, sort: bool, item: &str, key: &str, out: &mut String) {
+    match value {
+        Value::Array(items) => {
+            out.push('[');
+            for (index, element) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(item);
+                }
+                write_json(element, sort, item, key, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            if sort {
+                entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            }
+            out.push('{');
+            for (index, (name, element)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    out.push_str(item);
+                }
+                out.push_str(&Value::String(name.clone()).to_string());
+                out.push_str(key);
+                write_json(element, sort, item, key, out);
+            }
+            out.push('}');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
 /// The conversation as the OpenAI message list a chat template expects.
-fn messages(conversation: &Conversation) -> Vec<Value> {
+///
+/// `name_results` puts on each tool result the name of the call it
+/// answers, by position in the assistant turn before it: a template whose
+/// tool message header carries the function's name reads it from there.
+fn messages(conversation: &Conversation, name_results: bool) -> Vec<Value> {
+    let mut called: Vec<&str> = Vec::new();
     let mut messages = Vec::new();
     if let Some(system) = conversation
         .system
@@ -260,6 +329,7 @@ fn messages(conversation: &Conversation) -> Vec<Value> {
                 if !reasoning.trim().is_empty() {
                     message.insert("reasoning_content".to_owned(), json!(reasoning.trim()));
                 }
+                called = tool_calls.iter().map(|call| call.name.as_str()).collect();
                 if !tool_calls.is_empty() {
                     // Arguments as an object, not as the JSON string the wire
                     // carries: the template tests `is mapping` and would
@@ -286,8 +356,14 @@ fn messages(conversation: &Conversation) -> Vec<Value> {
                 messages.push(Value::Object(message));
             }
             Turn::ToolResults(results) => {
-                for result in results {
-                    messages.push(json!({ "role": "tool", "content": result.trim() }));
+                for (index, result) in results.iter().enumerate() {
+                    let mut message = Map::new();
+                    message.insert("role".to_owned(), json!("tool"));
+                    if let (true, Some(name)) = (name_results, called.get(index)) {
+                        message.insert("name".to_owned(), json!(name));
+                    }
+                    message.insert("content".to_owned(), json!(result.trim()));
+                    messages.push(Value::Object(message));
                 }
             }
         }
@@ -458,6 +534,83 @@ mod tests {
             .turns
             .push(Turn::ToolResults(vec!["contents".to_owned()]));
         conversation
+    }
+
+    /// `tojson` takes json.dumps' keywords: an Inkling template declares
+    /// its tools with `sort_keys=true, separators=(",", ":")`, and a render
+    /// that refuses the keywords refuses every request with tools.
+    #[test]
+    fn tojson_takes_pythons_sort_keys_and_separators() {
+        let mut conversation = Conversation::default();
+        conversation.turns.push(Turn::User("x".into()));
+        let render = |source: &str| {
+            ChatTemplate::compile(source.to_owned())
+                .unwrap()
+                .render(&conversation, true)
+                .unwrap()
+        };
+        let value = r#"{"b": [1, {"z": "<é>", "a": null}], "a": {"d": 1.5, "c": true}}"#;
+        assert_eq!(
+            render(&format!(
+                "{{{{ {value} | tojson(sort_keys=true, separators=(',', ':')) }}}}"
+            )),
+            r#"{"a":{"c":true,"d":1.5},"b":[1,{"a":null,"z":"<é>"}]}"#
+        );
+        // Separators alone keep insertion order; sorting alone keeps the
+        // default separators.
+        assert_eq!(
+            render(&format!(
+                "{{{{ {value} | tojson(separators=(',', ':')) }}}}"
+            )),
+            r#"{"b":[1,{"z":"<é>","a":null}],"a":{"d":1.5,"c":true}}"#
+        );
+        assert_eq!(
+            render("{{ {'b': 1, 'a': 2} | tojson(sort_keys=true) }}"),
+            r#"{"a": 2, "b": 1}"#
+        );
+        assert_eq!(
+            render("{{ {'b': 1, 'a': 2} | tojson }}"),
+            r#"{"b": 1, "a": 2}"#
+        );
+    }
+
+    /// The Inkling template from the file itself, with tools, a call and
+    /// its result: the declaration block, the call block and the named
+    /// result header, byte for byte as the template defines them.
+    #[test]
+    fn inkling_template_renders_tools_a_call_and_its_named_result() {
+        let path = std::env::var_os("LLMCUDA_INKLING_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf")
+            });
+        if !path.exists() {
+            eprintln!("SKIPPED: {} is not on this host", path.display());
+            return;
+        }
+        let source = crate::tokenizer::chat_template_from_gguf(&path)
+            .unwrap()
+            .unwrap();
+        let template = ChatTemplate::compile(source).unwrap();
+        let rendered = template.render(&conversation(), true).unwrap();
+        println!("{rendered}");
+        assert!(rendered.starts_with(concat!(
+            "<|message_system|>tool_declare<|content_xml|>",
+            r#"[{"description":"","name":"read","parameters":{"properties":{"filePath":{"type":"string"}},"type":"object"},"type":"function"}]"#,
+            "<|end_message|>",
+            "<|message_system|><|content_text|>be terse<|end_message|>",
+        )));
+        assert!(rendered.contains(concat!(
+            "<|message_model|><|content_thinking|>thinking<|end_message|>",
+            r#"<|message_model|>read<|content_invoke_tool_json|>{"name":"read","args":{"filePath":"a.rs"}}<|end_message|>"#,
+            "<|content_model_end_sampling|>",
+            "<|message_tool|>read<|content_text|>contents<|end_message|>",
+        )));
+        // Thinking off is the template's effort zero.
+        let off = template.render(&conversation(), false).unwrap();
+        assert!(off.contains("Thinking effort level: 0<|end_message|>"));
+        assert!(rendered.contains("Thinking effort level: 0.9<|end_message|>"));
     }
 
     /// An effort level is passed only to a template that has no thinking
@@ -642,7 +795,7 @@ mod tests {
         for (name, conversation) in fixtures() {
             for thinking in [true, false] {
                 let mut request = json!({
-                    "messages": messages(&conversation),
+                    "messages": messages(&conversation, false),
                     "chat_template_kwargs": {"enable_thinking": thinking},
                 });
                 if !conversation.tools.is_empty() {

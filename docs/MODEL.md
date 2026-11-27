@@ -790,7 +790,14 @@ format is contracted from its stored bytes, converted to binary16 exactly.
   routes them to reasoning and answer by block token. The template has no
   thinking switch, only an effort level: thinking off renders effort 0,
   which shortens the thinking block rather than removing it.
+- **Tool calls**: the template declares the tools in a block of its own
+  and the model answers with one block a call,
+  `<|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>`,
+  which the server's block router turns into a tool call (several in one
+  turn are several blocks). The name is the JSON's, as in llama.cpp's
+  parser. The body is **not grammar-constrained**: a body that is not that
+  JSON goes out as text. `tool_choice` `required` and a named function are
+  refused, as for the other models.
 - **Not yet**: prefix snapshots (every request prefills its whole prompt),
-  tool calls (a request with tools is answered 400), images
-  (`mmproj-F16.gguf`), and speculative decoding.
+  images (`mmproj-F16.gguf`), and speculative decoding.
 

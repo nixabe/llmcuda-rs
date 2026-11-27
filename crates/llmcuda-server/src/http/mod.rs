@@ -404,6 +404,9 @@ pub(crate) struct BlockMarkup {
     pub(crate) thinking: i32,
     pub(crate) text: i32,
     pub(crate) end: i32,
+    /// Opens a tool call's JSON body; the block's header carries the
+    /// function's name before it.
+    pub(crate) invoke: Option<i32>,
 }
 
 impl BlockMarkup {
@@ -418,6 +421,7 @@ impl BlockMarkup {
             thinking: id("<|content_thinking|>")?,
             text: id("<|content_text|>")?,
             end: id("<|end_message|>")?,
+            invoke: id("<|content_invoke_tool_json|>"),
         })
     }
 }

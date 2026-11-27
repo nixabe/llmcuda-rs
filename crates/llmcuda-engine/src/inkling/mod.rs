@@ -37,6 +37,7 @@ use crate::viewslice::subslice;
 
 mod decode;
 pub(crate) mod serve;
+mod snapshot;
 
 pub use decode::InklingDecode;
 

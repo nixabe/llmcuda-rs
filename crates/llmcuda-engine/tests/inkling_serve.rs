@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use llmcuda_cache::CacheConfig;
 use llmcuda_cuda::device::driver_available;
-use llmcuda_engine::{Engine, RouterConfig, SamplingParams, ServingConfig};
+use llmcuda_engine::{Engine, RouterConfig, SamplingParams, ServingConfig, SnapshotArenaSize};
 use llmcuda_model::ModelConfig;
 use llmcuda_sched::SchedulerConfig;
 use llmcuda_sched::request::{NewRequest, RequestId};
@@ -23,19 +23,57 @@ use llmcuda_sched::request::{NewRequest, RequestId};
 const OUTPUT: u32 = 6;
 
 fn place(engine: &mut Engine, id: u64, prompt: &[i32], sampling: SamplingParams) {
+    place_for(engine, id, prompt, sampling, OUTPUT);
+}
+
+/// Place a request; the prefix tokens it resumes from.
+fn place_for(
+    engine: &mut Engine,
+    id: u64,
+    prompt: &[i32],
+    sampling: SamplingParams,
+    output: u32,
+) -> u32 {
     engine
         .place_tokens(
             NewRequest {
                 id: RequestId(id),
                 prompt_tokens: prompt.len() as u32,
-                max_output_tokens: OUTPUT,
+                max_output_tokens: output,
             },
             prompt.to_vec(),
             Vec::new(),
             sampling,
             None,
         )
-        .unwrap_or_else(|failure| panic!("request {id} was not placed: {failure}"));
+        .unwrap_or_else(|failure| panic!("request {id} was not placed: {failure}"))
+        .reusable_prefix_tokens
+}
+
+/// One card serving this model with `arena` snapshot slots.
+fn engine_with(model: &ModelConfig, arena: SnapshotArenaSize) -> Engine {
+    let cache = CacheConfig::with_defaults(model.clone()).expect("cache configuration");
+    let block = cache.attention_block_size();
+    let sched = SchedulerConfig::with_defaults(4096, block, 3).expect("scheduler configuration");
+    let engine = Engine::new(
+        &[0],
+        cache,
+        sched,
+        16_384 / block,
+        3,
+        RouterConfig::balanced(),
+    );
+    engine
+        .bind_devices(
+            &inkling_common::model_path(),
+            model.clone(),
+            ServingConfig {
+                snapshot_slots: arena,
+                ..ServingConfig::new(2048)
+            },
+        )
+        .unwrap_or_else(|(worker, failure)| panic!("{worker} failed to bind: {failure}"));
+    engine
 }
 
 /// Step until every request in `ids` has completed; tokens by request.
@@ -47,7 +85,6 @@ fn run(engine: &Engine, ids: &[u64]) -> BTreeMap<u64, Vec<i32>> {
         steps += 1;
         assert!(steps < 200, "the requests did not complete");
         for (_, step) in engine.step_devices().expect("the step runs") {
-            assert!(step.retained.is_empty(), "this runtime keeps no snapshots");
             for (id, token) in step.generated {
                 generated
                     .get_mut(&id.0)
@@ -86,7 +123,12 @@ fn requests_prefill_decode_and_complete_through_the_engine() {
         .bind_devices(
             &inkling_common::model_path(),
             model.clone(),
-            ServingConfig::new(256),
+            // Nothing here reaches a retention boundary; the default arena
+            // would pin gigabytes of host memory for nothing.
+            ServingConfig {
+                snapshot_slots: SnapshotArenaSize::NONE,
+                ..ServingConfig::new(256)
+            },
         )
         .unwrap_or_else(|(worker, failure)| panic!("{worker} failed to bind: {failure}"));
 
@@ -148,4 +190,96 @@ fn requests_prefill_decode_and_complete_through_the_engine() {
     println!("sampled: {drawn:?}");
     assert_eq!(drawn[&5], drawn[&6], "one seed drew two sequences");
     assert_ne!(drawn[&5], drawn[&7], "two seeds drew one sequence");
+}
+
+/// A prefix served once is not prefilled again, and resuming from its
+/// snapshot changes no token.
+///
+/// Every prompt is run cold first, on an engine with no snapshot arena,
+/// then on one that retains. The retention interval is 2,048 positions:
+///
+/// - a 2,300-token prompt leaves a snapshot at 2,048, taken mid-prefill;
+/// - a prompt sharing its first 2,100 tokens resumes at 2,048 and prefills
+///   the rest;
+/// - the first 2,048 tokens alone are a whole-prompt resume: nothing to
+///   prefill, and the first token is the one the snapshot recorded;
+/// - a 2,040-token prompt crosses 2,048 while decoding and leaves a
+///   snapshot there; that prompt plus its own first eight tokens then
+///   resumes with nothing to prefill, and continues with the ninth.
+#[test]
+fn a_served_prefix_is_resumed_and_changes_no_token() {
+    let Some((file, _)) = inkling_common::model_and_golden() else {
+        return;
+    };
+    if !driver_available() {
+        println!("SKIPPED: no CUDA driver present");
+        return;
+    }
+    let model = ModelConfig::from_gguf(&file).expect("the configuration reads");
+    drop(file);
+    let token = |seed: usize, i: usize| {
+        ((seed * 104_729 + i * 7919 + 1234) % (model.vocab_size as usize - 1000)) as i32
+    };
+    let long: Vec<i32> = (0..2300).map(|i| token(1, i)).collect();
+    let mut sibling = long[..2100].to_vec();
+    sibling.extend((0..150).map(|i| token(2, i)));
+    let whole = long[..2048].to_vec();
+    let short: Vec<i32> = (0..2040).map(|i| token(3, i)).collect();
+    const LONG_OUTPUT: u32 = 12;
+
+    let mut cold = engine_with(&model, SnapshotArenaSize::NONE);
+    let mut cold_run = |id: u64, prompt: &[i32]| {
+        assert_eq!(
+            place_for(&mut cold, id, prompt, SamplingParams::GREEDY, LONG_OUTPUT),
+            0
+        );
+        run(&cold, &[id])[&id].clone()
+    };
+    let want_long = cold_run(1, &long);
+    let want_sibling = cold_run(2, &sibling);
+    let want_whole = cold_run(3, &whole);
+    let want_short = cold_run(4, &short);
+    assert_eq!(
+        want_short.len(),
+        LONG_OUTPUT as usize,
+        "the short prompt stopped early"
+    );
+    let mut continued = short.clone();
+    continued.extend(&want_short[..8]);
+    let want_continued = cold_run(5, &continued);
+    assert_eq!(
+        want_continued[0], want_short[8],
+        "the model disagrees with itself cold"
+    );
+    drop(cold_run);
+    drop(cold);
+
+    let mut warm = engine_with(&model, SnapshotArenaSize::dense(4));
+    let mut warm_run = |id: u64, prompt: &[i32], resumed: u32| {
+        let got = place_for(&mut warm, id, prompt, SamplingParams::GREEDY, LONG_OUTPUT);
+        assert_eq!(got, resumed, "request {id} resumed from the wrong place");
+        run(&warm, &[id])[&id].clone()
+    };
+    // The engine takes a step's snapshots before the step is returned, so
+    // what shows a boundary was retained is the next request resuming there.
+    assert_eq!(warm_run(11, &long, 0), want_long);
+    assert_eq!(
+        warm_run(12, &sibling, 2048),
+        want_sibling,
+        "resuming mid-prompt changed the tokens"
+    );
+    assert_eq!(
+        warm_run(13, &whole, 2048),
+        want_whole,
+        "resuming a whole prompt changed the tokens"
+    );
+    assert_eq!(warm_run(14, &short, 0), want_short);
+    assert_eq!(
+        warm_run(15, &continued, 2048),
+        want_continued,
+        "resuming a decode-time snapshot changed the tokens"
+    );
+    println!(
+        "resumed at 2048 mid-prompt, whole-prompt and from a decode-time snapshot: tokens unchanged"
+    );
 }

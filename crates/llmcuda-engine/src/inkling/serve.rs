@@ -27,7 +27,7 @@ use smallvec::SmallVec;
 use super::{InklingDecode, InklingModel, InklingPass, InklingRunError, InklingState, Segment};
 use crate::runtime::{RuntimeConfig, RuntimeError, RuntimeStep};
 use crate::sampling::{Sampler, SamplingParams};
-use crate::state::{SnapshotArena, SnapshotArenaSize, SnapshotSlots};
+use crate::state::{SequenceSnapshot, SnapshotArena, SnapshotSlots, StateError};
 use crate::viewslice::subslice;
 
 impl From<InklingRunError> for RuntimeError {
@@ -46,9 +46,79 @@ struct Sequence {
     max_output: u32,
     sampler: Option<Sampler>,
     constraint: Option<Box<ToolConstraint>>,
+    /// The newest snapshot of this sequence's prefix, taken here or resumed
+    /// from, and the parent of the next one.
+    last_snapshot: Option<Arc<SequenceSnapshot>>,
+    last_snapshot_position: usize,
+    /// Whether this sequence took `last_snapshot` itself.
+    last_snapshot_own: bool,
+    /// Set when the arena ran out: this sequence retains nothing more.
+    retention_disabled: bool,
+    /// Resumed from a snapshot of its whole prompt: the first output token
+    /// is the snapshot's, emitted on the first grant.
+    first_from_snapshot: bool,
 }
 
 impl Sequence {
+    /// Whether a snapshot is due at the position the state has reached.
+    fn at_boundary(&self, interval: usize) -> bool {
+        let position = self.state.position();
+        interval > 0
+            && !self.retention_disabled
+            && position > self.last_snapshot_position
+            && position.is_multiple_of(interval)
+    }
+
+    /// Whether what this sequence picks next is the model's argmax and
+    /// nothing else, so that another request may inherit it.
+    fn picks_the_argmax(&self) -> bool {
+        self.sampler.is_none() && self.constraint.is_none()
+    }
+
+    /// Take a snapshot at the current position, recording `next` as what
+    /// follows it when `record`. An exhausted arena ends this sequence's
+    /// retention and is not an error. As `DeviceRuntime`'s `Retention`: the
+    /// snapshot before gives up its fixed-size state unless it is the
+    /// prompt's last boundary, which a later request is likeliest to want.
+    #[allow(clippy::too_many_arguments)]
+    fn retain(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        model: &InklingModel,
+        arena: &SnapshotArena,
+        interval: usize,
+        next: i32,
+        record: bool,
+    ) -> Result<Option<Arc<SequenceSnapshot>>, RuntimeError> {
+        let snapshot = self
+            .state
+            .snapshot(stream, model, arena, self.last_snapshot.clone());
+        let mut snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(StateError::SnapshotArenaExhausted) => {
+                self.retention_disabled = true;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if record {
+            snapshot.set_next_token(next);
+        }
+        let snapshot = Arc::new(snapshot);
+        if self.last_snapshot_own
+            && let Some(previous) = self.last_snapshot.as_ref()
+        {
+            let prompt_tail = self.prompt.len() / interval * interval;
+            if previous.position() != prompt_tail {
+                previous.yield_state();
+            }
+        }
+        self.last_snapshot_position = snapshot.position();
+        self.last_snapshot = Some(Arc::clone(&snapshot));
+        self.last_snapshot_own = true;
+        Ok(Some(snapshot))
+    }
+
     /// Pick a token from a row of logits, the grammar applied first.
     fn choose(&mut self, logits: &mut [f32], scratch: &mut Vec<(f32, u32)>) -> i32 {
         if let Some(constraint) = self.constraint.as_mut() {
@@ -64,6 +134,9 @@ impl Sequence {
         token
     }
 }
+
+/// Snapshots a step took, by request.
+type Retained = SmallVec<[(RequestId, Arc<SequenceSnapshot>); 8]>;
 
 /// One card's `inkling2_loop` model, prebuilt passes and live sequences.
 pub(crate) struct InklingRuntime {
@@ -83,7 +156,9 @@ pub(crate) struct InklingRuntime {
     eos: SmallVec<[i32; 2]>,
     vocab: u32,
     max_pass_rows: usize,
-    slots: SnapshotSlots,
+    arena: SnapshotArena,
+    /// Positions between snapshots; zero when the arena holds none.
+    retention_interval: usize,
 }
 
 impl InklingRuntime {
@@ -155,9 +230,19 @@ impl InklingRuntime {
                 }
             }
         }
-        // An arena with nothing in it: the engine asks how many snapshots a
-        // worker could take, and the answer here is always none.
-        let slots = SnapshotArena::new(&ctx, &config, 1, SnapshotArenaSize::NONE)?.slots();
+        let arena = SnapshotArena::new(
+            &ctx,
+            &config,
+            runtime.retention_interval.max(1),
+            runtime.snapshot_slots,
+        )?;
+        // A prefill piece ends at every boundary, so a boundary has to be a
+        // pass this runtime can run.
+        let retention_interval = if arena.capacity() == 0 || arena.state_capacity() == 0 {
+            0
+        } else {
+            runtime.retention_interval
+        };
         Ok(Self {
             stream,
             model,
@@ -171,12 +256,13 @@ impl InklingRuntime {
             eos,
             vocab,
             max_pass_rows,
-            slots,
+            arena,
+            retention_interval,
         })
     }
 
     pub(crate) fn slots(&self) -> SnapshotSlots {
-        self.slots.clone()
+        self.arena.slots()
     }
 
     pub(crate) fn admit(
@@ -226,8 +312,50 @@ impl InklingRuntime {
                 max_output: req.max_output_tokens,
                 sampler: (!sampling.is_greedy()).then(|| Sampler::new(sampling)),
                 constraint,
+                last_snapshot: None,
+                last_snapshot_position: 0,
+                last_snapshot_own: false,
+                retention_disabled: false,
+                first_from_snapshot: false,
             },
         );
+        Ok(())
+    }
+
+    /// Admit a request whose prompt begins with the prefix `snapshot`
+    /// holds: the state is restored and prefill continues from there.
+    pub(crate) fn admit_restored(
+        &mut self,
+        req: NewRequest,
+        prompt: Vec<i32>,
+        has_images: bool,
+        snapshot: Arc<SequenceSnapshot>,
+        sampling: SamplingParams,
+        constraint: Option<Box<ToolConstraint>>,
+    ) -> Result<(), RuntimeError> {
+        let prefix = snapshot.position();
+        if prefix > prompt.len() {
+            return Err(RuntimeError::SnapshotPrefix {
+                snapshot: prefix,
+                prompt: prompt.len(),
+            });
+        }
+        self.admit(req, prompt, has_images, sampling, constraint)?;
+        let seq = self
+            .sequences
+            .get_mut(&req.id)
+            .expect("admit inserted the request");
+        if let Err(error) = seq.state.restore(&self.stream, &self.model, &snapshot) {
+            self.sequences.remove(&req.id);
+            return Err(error.into());
+        }
+        seq.prefilled = prefix;
+        seq.last_snapshot_position = prefix;
+        if prefix == seq.prompt.len() {
+            seq.next_token = snapshot.next_token();
+            seq.first_from_snapshot = true;
+        }
+        seq.last_snapshot = Some(snapshot);
         Ok(())
     }
 
@@ -277,6 +405,7 @@ impl InklingRuntime {
         &mut self,
         generated: &mut SmallVec<[(RequestId, i32); 16]>,
         stopped: &mut SmallVec<[RequestId; 3]>,
+        retained: &mut Retained,
     ) -> Result<(), RuntimeError> {
         let width = self.stepping.len();
         if width == 0 {
@@ -307,6 +436,21 @@ impl InklingRuntime {
                 &mut self.scratch,
                 seq,
             )?;
+            // The token just chosen is what follows the prefix the state
+            // now holds.
+            if seq.at_boundary(self.retention_interval) {
+                let record = seq.sampler.is_none();
+                if let Some(snapshot) = seq.retain(
+                    &self.stream,
+                    &self.model,
+                    &self.arena,
+                    self.retention_interval,
+                    token,
+                    record,
+                )? {
+                    retained.push((*id, snapshot));
+                }
+            }
             Self::emit(&self.eos, *id, token, seq, generated, stopped);
         }
         Ok(())
@@ -318,6 +462,7 @@ impl InklingRuntime {
     ) -> Result<RuntimeStep, RuntimeError> {
         let mut generated = SmallVec::new();
         let mut stopped = SmallVec::new();
+        let mut retained: Retained = SmallVec::new();
 
         // Decodes first, all of them in one step.
         self.stepping.clear();
@@ -339,7 +484,7 @@ impl InklingRuntime {
                 }
             }
         }
-        let outcome = self.step_decodes(&mut generated, &mut stopped);
+        let outcome = self.step_decodes(&mut generated, &mut stopped, &mut retained);
         // Back into the map whatever happened, so a failed step leaves
         // every sequence removable.
         for (id, seq) in self.stepping.drain(..) {
@@ -353,11 +498,32 @@ impl InklingRuntime {
                 .get_mut(&item.id)
                 .ok_or(RuntimeError::UnknownRequest(item.id))?;
             let mut left = (item.tokens as usize).min(seq.prompt.len() - seq.prefilled);
+            // A whole-prompt resume has nothing to prefill: its first token
+            // is the one the snapshot recorded.
+            if seq.first_from_snapshot {
+                seq.first_from_snapshot = false;
+                if seq.max_output > 0 {
+                    let token = seq.next_token.ok_or(RuntimeError::SnapshotPrefix {
+                        snapshot: seq.prefilled,
+                        prompt: seq.prompt.len(),
+                    })?;
+                    if let Some(constraint) = seq.constraint.as_mut() {
+                        constraint.observe(token);
+                    }
+                    Self::emit(&self.eos, item.id, token, seq, &mut generated, &mut stopped);
+                }
+            }
             while left > 0 {
+                // A piece ends at a retention boundary, never across one.
+                let reach = match self.retention_interval {
+                    0 => left,
+                    _ if seq.retention_disabled => left,
+                    interval => left.min(interval - seq.prefilled % interval),
+                };
                 let (rows, pass) = self
                     .passes
                     .iter_mut()
-                    .find(|(rows, _)| *rows <= left)
+                    .find(|(rows, _)| *rows <= reach)
                     .expect("the narrowest pass is one row");
                 let rows = *rows;
                 pass.run(
@@ -371,9 +537,18 @@ impl InklingRuntime {
                 )?;
                 seq.prefilled += rows;
                 left -= rows;
-                // The prompt's last row yields the first output token.
-                if seq.prefilled == seq.prompt.len() && seq.max_output > 0 {
-                    pass.logits(&self.stream, rows - 1, 1)?;
+                // The prompt's last row yields the first output token; a
+                // boundary inside the prompt yields the model's own
+                // prediction, recorded so that a request resuming there
+                // with nothing left to prefill knows what follows.
+                let first = seq.prefilled == seq.prompt.len() && seq.max_output > 0;
+                let boundary = seq.at_boundary(self.retention_interval);
+                if !first && !boundary {
+                    continue;
+                }
+                pass.logits(&self.stream, rows - 1, 1)?;
+                let (token, record) = if first {
+                    let record = seq.picks_the_argmax();
                     let token = Self::choose_from(
                         &self.stream,
                         pass.head_logits(),
@@ -382,6 +557,27 @@ impl InklingRuntime {
                         &mut self.scratch,
                         seq,
                     )?;
+                    (token, record)
+                } else {
+                    let vocab = self.host_logits.len();
+                    // SAFETY: the first row of the pass's logits.
+                    let view = unsafe { subslice(&self.stream, pass.head_logits(), 0, vocab) };
+                    self.stream.memcpy_dtoh(&*view, &mut self.host_logits)?;
+                    (crate::runtime::argmax(&self.host_logits), true)
+                };
+                if boundary
+                    && let Some(snapshot) = seq.retain(
+                        &self.stream,
+                        &self.model,
+                        &self.arena,
+                        self.retention_interval,
+                        token,
+                        record,
+                    )?
+                {
+                    retained.push((item.id, snapshot));
+                }
+                if first {
                     Self::emit(&self.eos, item.id, token, seq, &mut generated, &mut stopped);
                 }
             }
@@ -402,7 +598,7 @@ impl InklingRuntime {
             generated,
             completed,
             stopped,
-            retained: SmallVec::new(),
+            retained,
             decisions: SmallVec::new(),
         })
     }

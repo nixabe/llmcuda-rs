@@ -156,9 +156,9 @@ pub struct SequenceState {
     max_seq: usize,
 }
 
-struct HostGdnState {
-    conv: PinnedHostSlice<f32>,
-    recurrent: PinnedHostSlice<f32>,
+pub(crate) struct HostGdnState {
+    pub(crate) conv: PinnedHostSlice<f32>,
+    pub(crate) recurrent: PinnedHostSlice<f32>,
 }
 
 /// One retention interval of attention key/value rows, every layer.
@@ -464,6 +464,27 @@ struct SnapshotLayout {
 
 impl SnapshotLayout {
     fn new(config: &ModelConfig, retention_interval: usize) -> Self {
+        // `inkling2_loop` has no recurrent layers, and two kinds of cache:
+        // a full-attention slot's keys and values grow with the sequence
+        // and are the per-interval half; everything of fixed size is the
+        // per-state half, one entry a layer application - its four
+        // convolution carries and, on a sliding slot, the window of keys
+        // and of values its next rows can still reach (binary16, counted
+        // here in the f32 words the pinned buffer is made of).
+        if let Some(k) = config.inkling.as_ref() {
+            let layers = config.num_layers;
+            let kv = config.attention.kv_heads as usize * config.attention.head_dim as usize;
+            let carry = k.conv_taps as usize - 1;
+            return Self {
+                attention_layers: k.full_slots(layers) as usize,
+                positions: retention_interval,
+                k_row: kv,
+                v_row: kv,
+                gdn_layers: k.slots(layers) as usize,
+                conv_elements: carry * 2 * (kv + config.hidden_size as usize),
+                recurrent_elements: k.sliding_window as usize * kv,
+            };
+        }
         let attention_layers = (0..config.num_layers)
             .filter(|&layer| {
                 config.layer_kind(layer) == llmcuda_model::config::LayerKind::GatedAttention
@@ -658,6 +679,49 @@ impl SnapshotArena {
         self.layout.gdn_bytes()
     }
 
+    /// A snapshot at `position` whose buffers `fill` writes: the interval
+    /// `[start, position)` of every growing cache (`start` is the parent's
+    /// position, or zero) and the fixed-size state. For a sequence type
+    /// other than [`SequenceState`], which captures itself.
+    ///
+    /// `fill` must have its copies complete before it returns.
+    pub(crate) fn capture(
+        &self,
+        position: usize,
+        parent: Option<Arc<SequenceSnapshot>>,
+        fill: impl FnOnce(usize, &mut [HostKvPrefix], &mut [HostGdnState]) -> Result<(), StateError>,
+    ) -> Result<SequenceSnapshot, StateError> {
+        let start = parent.as_ref().map_or(0, |snapshot| snapshot.position);
+        if start > position || position - start > self.layout.positions {
+            return Err(StateError::SnapshotShape);
+        }
+        let mut buffers = self
+            .slots
+            .checkout()
+            .ok_or(StateError::SnapshotArenaExhausted)?;
+        let claim = self
+            .states
+            .take()
+            .ok_or(StateError::SnapshotArenaExhausted)?;
+        {
+            // Nothing else can reach this claim yet; see `snapshot`.
+            let mut held = claim.held.lock().expect("snapshot state poisoned");
+            let host = held.state.as_mut().expect("a fresh claim holds its state");
+            fill(start, &mut buffers.attention, &mut host.gdn)?;
+        }
+        Ok(SequenceSnapshot {
+            position,
+            start,
+            row_words: self.layout.k_row + self.layout.v_row,
+            buffers,
+            state: claim,
+            states: Arc::clone(&self.states),
+            gdn_bytes: self.layout.gdn_bytes(),
+            next_token: None,
+            parent,
+        })
+    }
+
     /// A view of this arena's free-slot count, shareable with the engine
     /// thread.
     ///
@@ -671,6 +735,11 @@ impl SnapshotArena {
         }
     }
 }
+
+/// What [`SequenceSnapshot::read`] calls for each interval: its first
+/// position, its end, and its rows for every growing cache.
+pub(crate) type IntervalVisitor<'a> =
+    dyn FnMut(usize, usize, &[HostKvPrefix]) -> Result<(), StateError> + 'a;
 
 /// A complete resumable prefix, stored in page-locked host memory.
 ///
@@ -694,6 +763,32 @@ pub struct SequenceSnapshot {
 impl SequenceSnapshot {
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// Read this snapshot back: `interval(start, end, rows)` for each
+    /// interval of its chain, oldest first, then `state` on the fixed-size
+    /// half. The state's lock is held throughout, so `state` must have its
+    /// copies complete before it returns - the pinned buffers may be handed
+    /// to another snapshot the moment the lock drops.
+    pub(crate) fn read(
+        &self,
+        interval: &mut IntervalVisitor<'_>,
+        state: impl FnOnce(&[HostGdnState]) -> Result<(), StateError>,
+    ) -> Result<(), StateError> {
+        let held = self.state.held.lock().expect("snapshot state poisoned");
+        let host = held
+            .state
+            .as_ref()
+            .ok_or(StateError::SnapshotStateReleased)?;
+        self.visit_intervals(interval)?;
+        state(&host.gdn)
+    }
+
+    fn visit_intervals(&self, interval: &mut IntervalVisitor<'_>) -> Result<(), StateError> {
+        if let Some(parent) = self.parent.as_deref() {
+            parent.visit_intervals(interval)?;
+        }
+        interval(self.start, self.position, &self.buffers.attention)
     }
 
     /// Target-model prediction produced after computing this exact prefix.

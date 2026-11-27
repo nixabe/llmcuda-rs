@@ -798,6 +798,13 @@ format is contracted from its stored bytes, converted to binary16 exactly.
   parser. The body is **not grammar-constrained**: a body that is not that
   JSON goes out as text. `tool_choice` `required` and a named function are
   refused, as for the other models.
-- **Not yet**: prefix snapshots (every request prefills its whole prompt),
-  images (`mmproj-F16.gguf`), and speculative decoding.
+- **Prefix cache**: a sequence leaves a snapshot every 2,048 positions,
+  in the engine's own arena and prefix tree, and a request whose prompt
+  begins with a retained prefix resumes there. What a later row can still
+  read is all a snapshot holds: the full slots' keys and values for the
+  interval (64 MiB at 2,048 positions, chained to the snapshot before),
+  and as fixed-size state the sliding slots' last 1,024 rows and every
+  slot's convolution carries (196 MiB). Rows are stored by position, so a
+  resume does not depend on the ring size of the sequence that left it.
+- **Not yet**: images (`mmproj-F16.gguf`) and speculative decoding.
 

@@ -770,8 +770,15 @@ impl DeviceRuntimeHandle {
                         } => {
                             let result = if decision.is_some() {
                                 Err(refuse("decision requests"))
-                            } else if snapshot.is_some() {
-                                Err(refuse("resuming from a snapshot"))
+                            } else if let Some(snapshot) = snapshot {
+                                runtime.admit_restored(
+                                    req,
+                                    prompt,
+                                    !images.is_empty(),
+                                    snapshot,
+                                    sampling,
+                                    constraint,
+                                )
                             } else {
                                 runtime.admit(req, prompt, !images.is_empty(), sampling, constraint)
                             };
@@ -784,7 +791,9 @@ impl DeviceRuntimeHandle {
                             let _ = reply.send(runtime.execute(batch));
                         }
                         RuntimeCommand::Snapshot { reply, .. } => {
-                            let _ = reply.send(Err(refuse("snapshots")));
+                            // Nothing in the engine asks for a snapshot
+                            // off a boundary; the runtime retains its own.
+                            let _ = reply.send(Err(refuse("snapshots on request")));
                         }
                         RuntimeCommand::Stop => break,
                     }

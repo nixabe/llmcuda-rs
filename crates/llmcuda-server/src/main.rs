@@ -1100,9 +1100,6 @@ fn main() -> std::process::ExitCode {
         // resume from a prefix (a restored prefix has no final hidden states
         // for the head to read), so an arena would pin host RAM nothing reads.
         _ if decisions => SnapshotArenaSize::NONE,
-        // No prefix snapshots for this architecture yet: its runtime never
-        // retains one.
-        _ if is_inkling => SnapshotArenaSize::NONE,
         Some(size::FULL_COVERAGE) => full_coverage,
         Some(budget) => for_budget(budget),
         // Default to full coverage, bounded by a share of what the host can

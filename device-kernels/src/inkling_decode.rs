@@ -34,6 +34,17 @@ fn byte_order(i: usize) -> usize {
     (i & !15) + ((i & 7) << 1) + ((i & 15) >> 3)
 }
 
+/// Two adjacent floats in one load. These kernels wait on their load
+/// pipeline, not on arithmetic, and an element a load is twice the loads.
+///
+/// # Safety
+/// p is 8-byte aligned and covers two floats.
+#[device]
+unsafe fn pair(p: *const f32) -> (f32, f32) {
+    let w = unsafe { *(p as *const u64) };
+    (f32::from_bits(w as u32), f32::from_bits((w >> 32) as u32))
+}
+
 /// One channel's one-row step of a short convolution with a residual, and
 /// its carry advanced: `(x + sum_i carry[i] * w[i] + x * w[carry]) * norm`
 /// before any input-dependent taps.
@@ -365,7 +376,7 @@ pub unsafe fn ink_dec_inputs(
 ///
 /// # Safety
 /// x and msg are `[ctrls][rows][n]`; inv `[rows][ctrls][2]`; down
-/// `[ctrls][rank][2n]`; gate `[rows][ctrls][rank]`.
+/// `[ctrls][rank][2n]`; gate `[rows][ctrls][rank]`; n is even.
 #[kernel]
 pub unsafe fn ink_dec_gate(
     x: *const f32,
@@ -390,16 +401,22 @@ pub unsafe fn ink_dec_gate(
         let inv_x = *inv.add(y * 2);
         let inv_m = *inv.add(y * 2 + 1);
         let row = down.add((j * rank as usize + r) * 2 * nu);
+        // A thread takes pairs 2 * tid, 2 * tid + 2 * step, ..: n is even,
+        // so a pair is on one side of the [x, msg] seam.
         let mut acc = 0.0f32;
-        let mut i = tid;
+        let mut i = 2 * tid;
         while i < 2 * n {
-            let v = if i < n {
-                *x.add(at + i as usize) * inv_x
+            let (v0, v1, s) = if i < n {
+                let (a, b) = pair(x.add(at + i as usize));
+                (a, b, inv_x)
             } else {
-                *msg.add(at + (i - n) as usize) * inv_m
+                let (a, b) = pair(msg.add(at + (i - n) as usize));
+                (a, b, inv_m)
             };
-            acc = (*row.add(i as usize)).mul_add(v, acc);
-            i += step;
+            let (r0, r1) = pair(row.add(i as usize));
+            acc = r0.mul_add(v0 * s, acc);
+            acc = r1.mul_add(v1 * s, acc);
+            i += 2 * step;
         }
         let sum = block_reduce_sum(acc);
         if tid == 0 {
@@ -446,10 +463,19 @@ pub unsafe fn ink_dec_ctrl(
             let mut g = 0.0f32;
             let mut f = 0.0f32;
             let mut k = 0usize;
-            while k < ru {
+            while ru & 1 == 0 && k + 1 < ru {
+                let (g0, g1) = pair(gr.add(k));
+                let (f0, f1) = pair(fr.add(k));
+                let (a0, a1) = (GATE[k], GATE[k + 1]);
+                g = g0.mul_add(a0, g);
+                f = f0.mul_add(a0, f);
+                g = g1.mul_add(a1, g);
+                f = f1.mul_add(a1, f);
+                k += 2;
+            }
+            if k < ru {
                 g = (*gr.add(k)).mul_add(GATE[k], g);
                 f = (*fr.add(k)).mul_add(GATE[k], f);
-                k += 1;
             }
             let at = (j * rows + t) * nu + i;
             let a = *x.add(at);
@@ -951,6 +977,15 @@ pub unsafe fn ink_dec_router(x: *const f32, router: *const f32, logits: *mut f32
         let xr = x.add(t * nu);
         let mut acc = 0.0f32;
         let mut i = first;
+        if (first | nu) & 1 == 0 {
+            while i + 1 < last {
+                let (w0, w1) = pair(wr.add(i));
+                let (x0, x1) = pair(xr.add(i));
+                acc = w0.mul_add(x0, acc);
+                acc = w1.mul_add(x1, acc);
+                i += 2;
+            }
+        }
         while i < last {
             acc = (*wr.add(i)).mul_add(*xr.add(i), acc);
             i += 1;

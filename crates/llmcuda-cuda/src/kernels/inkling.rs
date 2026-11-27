@@ -1964,6 +1964,11 @@ impl InklingDecodeKernels {
         if c.rank == 0 || c.rank > 64 || ctrls == 0 {
             return Err(InklingError::Shape("controller rank must be 1..=64"));
         }
+        if !n.is_multiple_of(2) {
+            return Err(InklingError::Shape(
+                "decode control reads its rows two floats a load",
+            ));
+        }
         let n_norms = norms.len() / n;
         if n_norms == 0 {
             return Err(InklingError::Shape("decode control: no norm weight"));

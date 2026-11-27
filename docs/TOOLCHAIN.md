@@ -45,41 +45,32 @@ repository, [NVIDIA/cuda-rust `f35d6ccc`](https://github.com/NVIDIA/cuda-rust/tr
   13.2 for Ampere, Ada and Blackwell, 13.3 for Hopper. Nothing in it can be
   built for or run on the deployment cards, so it has never been measured here.
 
-The candidate in [`experiments/cuda-oxide`](../experiments/cuda-oxide) ports
-`layer_ops.rs::{tensor_add, swiglu_mul, sigmoid_gate_mul, rms_norm_rows,
-rms_norm_swiglu_rows, softplus_elementwise, rope_partial}` and
-`attention.rs::attn_rope_partial_neox` to Rust, preserving the raw-pointer
-ABIs and supported input/output aliasing.
-It uses a separate Cargo workspace so compiler experiments do not change the
-engine's nightly or dependency graph. The
-[`bench_rust_add`](../crates/llmcuda-engine/src/bin/bench_rust_add.rs) gate loads
-its PTX through the engine's existing cudarc runtime, compares both compilers
-against `llmcuda_kernels::norm::residual_add`, and measures alternating pairs
-with CUDA events. The opt-in `llmcuda-cuda/rust-kernels` feature embeds the
-generated PTX, so using it requires neither the experimental compiler nor its
-host runtime at engine build or run time. Source changes require regeneration.
-The server and engine expose a forwarding `rust-kernels` feature: build with
-`cargo build --release -p llmcuda-server --features rust-kernels` to enable it.
-`bench_rust_activations` checks softplus, both sigmoid shapes, waypoint outputs,
-guards, aliases and graph replay against
-the existing CPU tolerances before reporting six alternating event pairs.
-`bench_rust_rope` checks both partial rotary APIs, including exact tail bits;
-`bench_rust_norm` checks both normalization ports and their CPU gates.
-The feature is disabled by default and has no runtime switch; see the
-[build instructions](DEVELOPMENT.md#optional-rust-cuda-kernels).
+[`device-kernels`](../device-kernels) holds the Rust source
+of the ported kernels, with the raw-pointer ABIs and supported input/output
+aliasing their launchers in `layer_ops.rs` and `attention.rs` expect. For most
+of them it is the only source: the CUDA C++ was deleted once the port matched
+it bit for bit.
+It uses a separate Cargo workspace so the kernel compiler does not change the
+engine's nightly or dependency graph. The engine embeds the generated PTX and
+loads it through its existing cudarc runtime, so it requires neither
+cuda-oxide nor its host runtime at build or run time. Source changes require
+regeneration.
 
-On GPU 1, the residual matched its CPU oracle bit for bit, including both
-in-place aliases, signed zero, subnormals and ragged tails. All 12 existing
-layer-op differentials passed with the feature enabled. The 19-token Qwen3.6
-forward golden also passed all 40 block gates and selected token 25358.
-These checks do not establish long-context performance.
-[The paired measurements](BENCHMARKS.md#rust-normalization-and-rotary-kernels-need-separate-kernel-and-model-gates)
-show gains for specific kernel shapes and model-level parity at N=3/2K. The default remains NVRTC.
+Which kernels launch from Rust and what a port must show first is in the
+[build instructions](DEVELOPMENT.md#rust-cuda-kernels); there is no runtime
+switch, and no kernel exists in both languages. A Rust kernel is held by its
+CPU-reference differential test and, where a fused CUDA C++ kernel shares its
+arithmetic, by the test that compares the two exactly.
 
-The current host runtime dependency (`cuda-core`/`cuda-bindings` 0.3.1) requires
-CUDA 13.0+ headers. On this host the shell selects CUDA 12.4 even though CUDA
-13.0 is also installed. Select the latter explicitly for the experiment;
-ordinary engine builds continue to use NVRTC as before.
+[The paired measurements](BENCHMARKS.md#rust-kernel-authoring-can-keep-the-existing-launcher)
+show model-level parity. The first normalization ports were faster at narrow
+rows and one ulp away from the fused CUDA C++ paths; the ones in the tree
+reduce in the original's order and are bit-identical.
+
+The compiler's host crates (`cuda-core`/`cuda-bindings`) require a CUDA 13.0+
+toolkit, which the engine does not; the crate's README records how one
+was assembled beside the host's CUDA 12.8. Ordinary engine builds continue to
+use NVRTC for every kernel that is not embedded PTX.
 
 ## Gating results
 

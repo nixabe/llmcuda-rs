@@ -1060,130 +1060,6 @@ LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b5, 5)
 LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b6, 6)
 LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b7, 7)
 LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b8, 8)
-
-// ---------------------------------------------------------------------------
-// Greatest logit, lowest index on a tie: `llmcuda_kernels::gemv::argmax`.
-// ---------------------------------------------------------------------------
-//
-// The sampled token is the only part of a 248,320-entry logit vector anybody
-// sees, and getting it to the host used to mean copying all 993 KiB of the
-// vector and scanning it there. That cost 0.5 ms of a 11.6 ms decode step —
-// 4% of the whole model — to move 993 KiB across PCIe and touch every one of
-// a quarter of a million floats on one CPU core, in order to learn four
-// bytes. Reducing on the device and copying the four bytes is the same
-// answer for about 20 us.
-//
-// Two launches rather than one. A single block reading 993 KiB occupies one
-// SM of seventy-two, and this reduction is bandwidth-bound: the first pass
-// spreads the vector over a full grid, and the second reduces the per-block
-// winners, a vector short enough that one block is no longer the wrong shape.
-//
-// Splitting it that way is only safe because of the tie-break. "Greatest
-// value, lowest index" is associative *and* commutative, so the answer does
-// not depend on how the vector is partitioned or in what order the partitions
-// are merged. That is the same argument `moe_route`'s max and argmax
-// reductions rest on — and the same one its softmax denominator cannot make,
-// which is why that one still reduces through shared memory.
-__device__ __forceinline__ void argmax_merge(float& bv, int& bi, float v, int i) {
-    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
-}
-
-// Reduce one block's per-thread candidate to thread 0.
-//
-// Every thread seeds from element 0 rather than from a -INFINITY sentinel, so
-// a vector that is entirely NaN answers 0 — which is what the scalar
-// reference does, because `NaN > NaN` is false and its running best never
-// moves off index 0. A sentinel would answer "no candidate" instead, and the
-// two would disagree on the one input where disagreement is hardest to spot.
-__device__ __forceinline__ void argmax_reduce_block(float& bv, int& bi) {
-    __shared__ float sv[ARGMAX_THREADS / 32];
-    __shared__ int   si[ARGMAX_THREADS / 32];
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    for (int off = 16; off > 0; off >>= 1) {
-        float ov = __shfl_down_sync(0xffffffff, bv, off);
-        int   oi = __shfl_down_sync(0xffffffff, bi, off);
-        argmax_merge(bv, bi, ov, oi);
-    }
-    if (lane == 0) { sv[warp] = bv; si[warp] = bi; }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        for (int w = 1; w < ARGMAX_THREADS / 32; ++w) {
-            argmax_merge(bv, bi, sv[w], si[w]);
-        }
-    }
-}
-
-extern "C" __global__ void argmax_partial(
-    const float* __restrict__ x,
-    int n,
-    float* __restrict__ pv,
-    int* __restrict__ pi
-) {
-    float bv = x[0];
-    int   bi = 0;
-    for (int i = blockIdx.x * ARGMAX_THREADS + threadIdx.x;
-         i < n;
-         i += gridDim.x * ARGMAX_THREADS) {
-        argmax_merge(bv, bi, x[i], i);
-    }
-    argmax_reduce_block(bv, bi);
-    if (threadIdx.x == 0) { pv[blockIdx.x] = bv; pi[blockIdx.x] = bi; }
-}
-
-extern "C" __global__ void argmax_final(
-    const float* __restrict__ pv,
-    const int* __restrict__ pi,
-    int n,
-    int* __restrict__ out
-) {
-    float bv = pv[0];
-    int   bi = pi[0];
-    for (int i = threadIdx.x; i < n; i += ARGMAX_THREADS) {
-        argmax_merge(bv, bi, pv[i], pi[i]);
-    }
-    argmax_reduce_block(bv, bi);
-    if (threadIdx.x == 0) out[0] = bi;
-}
-
-// Softmax probability of the row's maximum: p = 1 / sum(exp(x - max)).
-// One block per call; two grid-stride passes over the row (max, then the
-// stabilized exp-sum). The 2 MB the second pass rereads is noise next to
-// the GEMM that produced the row.
-extern "C" __global__ void argmax_prob(
-    const float* __restrict__ x,
-    int n,
-    float* __restrict__ out
-) {
-    __shared__ float sv[ARGMAX_THREADS / 32];
-
-    float bv = x[0];
-    int   bi = 0;
-    for (int i = threadIdx.x; i < n; i += ARGMAX_THREADS) {
-        argmax_merge(bv, bi, x[i], i);
-    }
-    argmax_reduce_block(bv, bi);
-    if (threadIdx.x == 0) sv[0] = bv;
-    __syncthreads();
-    const float row_max = sv[0];
-    __syncthreads();
-
-    float acc = 0.0f;
-    for (int i = threadIdx.x; i < n; i += ARGMAX_THREADS) {
-        acc += expf(x[i] - row_max);
-    }
-    // warp then cross-warp sum
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, off);
-    }
-    if ((threadIdx.x & 31) == 0) sv[threadIdx.x >> 5] = acc;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float total = 0.0f;
-        for (int w = 0; w < ARGMAX_THREADS / 32; ++w) total += sv[w];
-        out[0] = 1.0f / total;
-    }
-}
 "#;
 
 /// How a tensor this kernel family reads is stored in the GGUF.
@@ -1578,6 +1454,7 @@ impl LmHeadKernels {
 
         let ptx = compile(LM_HEAD_SRC, "lm_head").map_err(LmHeadError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         // The row tile only serves whole groups of RT adjacent rows; a vocab
         // that is not a multiple of RT would leave the last group partially
         // live, which the kernel does not guard. The real 248,320-entry head
@@ -1671,9 +1548,9 @@ impl LmHeadKernels {
             ],
             bf16_b3_row_tile,
             b3_row_tile,
-            argmax_partial: module.load_function("argmax_partial")?,
-            argmax_final: module.load_function("argmax_final")?,
-            argmax_prob: module.load_function("argmax_prob")?,
+            argmax_partial: rust.load_function("argmax_partial")?,
+            argmax_final: rust.load_function("argmax_final")?,
+            argmax_prob: rust.load_function("argmax_prob")?,
             geometry,
         })
     }

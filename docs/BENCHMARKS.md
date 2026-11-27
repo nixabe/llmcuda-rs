@@ -685,13 +685,17 @@ establish serving throughput ([Current standing](#current-standing)).
 
 ## Rust kernel authoring can keep the existing launcher
 
-The opt-in `llmcuda-cuda/rust-kernels` feature swaps eight kernels for
-cuda-oxide PTX behind the existing cudarc ABI, allocations and graph capture:
-residual add, standalone SwiGLU, sigmoid gating, softplus, standalone RoPE,
-production tiled RoPE, RMSNorm and fused RMSNorm/SwiGLU. Toolchain pin:
-[TOOLCHAIN.md](TOOLCHAIN.md), [`experiments/cuda-oxide`](../experiments/cuda-oxide).
-CUDA C++ stays the default. The dense model and three-card serving were not
-measured.
+The layer ops are moving to Rust a kernel at a time: cuda-oxide PTX behind
+the existing cudarc ABI, allocations and graph capture. A port launches once
+it is bit-identical to its CUDA C++ original and costs the model nothing
+measurable; it does not have to be faster
+([DEVELOPMENT.md](DEVELOPMENT.md#rust-cuda-kernels)). Every layer op launches
+from Rust, with the small MoE, Gated DeltaNet, K2, sampling, embedding,
+vision and decision kernels listed at `RUST_KERNELS_PTX`; the GEMVs, GEMMs,
+flash attention and the chunked Gated DeltaNet scan are CUDA C++. No kernel
+exists in both languages. Toolchain pin:
+[TOOLCHAIN.md](TOOLCHAIN.md), [`device-kernels`](../device-kernels).
+The dense model and three-card serving were not measured.
 
 Kernel tables: twelve alternating CUDA-event pairs on GPU 0 (two processes of
 six), order reversed on odd pairs, 100 graph-captured launches per interval;
@@ -700,30 +704,31 @@ GPU 0, only the switch different, order rotated each round, box quiet; cells
 are round 0 / 1 / 2. Register counts are offline CUDA 12.8
 `ptxas -arch=sm_75`, not the driver's JIT.
 
-All eight ports together, Qwen3.6:
+Every kernel that launches from Rust (84 entry points) against the all-C++
+build, Qwen3.6:
 
-| N=3 | CUDA C++ tok/s | Eight Rust ports tok/s | Rust change across rounds |
-| --- | --- | --- | --- |
-| Decode at 2,048 per sequence, 64 steps after 4 warmup | 218.5 / 219.1 / 219.1 | 219.1 / 219.7 / 219.8 | +0.27% / +0.27% / +0.32% |
-| Decode at 32,768 per sequence, 64 steps after 4 warmup | 165.9 / 166.2 / 166.4 | 166.2 / 160.8 / 166.9 | +0.18% / −3.25% / +0.30% |
-| Prefill, one 2,048-token pass, 5 timed repetitions | 3650.61 / 3680.53 / 3666.40 | 3664.85 / 3673.64 / 3670.55 | +0.39% / −0.19% / +0.11% |
+| N=3 | CUDA C++ tok/s | Rust kernels tok/s |
+| --- | --- | --- |
+| Decode at 2,048 per sequence, 64 steps after 4 warmup | 218.8 / 219.0 / 211.1 | 220.1 / 220.2 / 219.8 |
+| Decode at 32,768 per sequence, 64 steps after 4 warmup | 165.5 / 165.7 / 165.7 | 166.5 / 165.7 / 166.1 |
+| Prefill, one 2,048-token pass, 5 timed repetitions | 3662.25 / 3651.73 / 3652.16 | 3659.99 / 3662.05 / 3656.85 |
 
-The 160.8 cell is one stalled step (latency sd 4.82 ms against 0.09–0.13 in
-every other run; its median step, 18.03 ms, is level with the rest). Prefill
-within-process standard deviations: 11.02–50.81 tok/s C++, 13.19–25.44 Rust.
-Decode at 2K favours the ports by about a quarter of a percent in every
-round; deep decode and prefill are inside run-to-run spread. The kernel gains
-are a small fraction of the pass.
+The 211.1 is one stalled step (p50 13.69 ms against a 14.21 ms mean, latency
+sd 4.28 ms), not a slower build. Decode at 2K is 0.6% higher from Rust in the
+two clean rounds; at 32K it is between level and 0.6% higher. Prefill is
+inside its within-process standard deviation (3.09-24.33 tok/s C++,
+9.64-20.64 Rust). The moves are for one source language, not for speed. The
+dense model, the vision tower, the decision head and K2 are covered at kernel
+level only.
 
 **The compiler revision does not move these numbers.** PTX from cuda-oxide
 0.2.1 (`26754ae5`) and 0.4.0 (`f35d6ccc`) for the same Rust source differs by
 three instructions in the two normalization kernels and four registers in
-standalone RoPE (38 → 42); the other seven register counts are identical. In
-the same three rounds the 0.2.1 artifact measured 219.9 / 219.6 / 219.7
-(decode 2K), 166.3 / 166.4 / 166.5 (decode 32K) and 3664.95 / 3653.32 /
-3671.36 (prefill); residual add, new against old artifact, is within ±2.5% at
-cache-hot sizes and ±0.3% at a million elements and above. The newer
-compiler's loop unrolling leaves these grid-stride loops as they were.
+standalone RoPE (38 → 42); the other seven register counts are identical.
+Residual add, new against old artifact, is within ±2.5% at cache-hot sizes
+and ±0.3% at a million elements and above; the model-level rounds are in
+"Rejected on measurement". The newer compiler's loop unrolling leaves these
+grid-stride loops as they were.
 
 Residual add: NVRTC unrolls the grid-stride loop and cuda-oxide does not
 (36 against 16 registers, no spills). The port is bit-exact, including signed
@@ -766,37 +771,45 @@ Standalone softplus, SwiGLU and layer-ops RoPE are API ports, not production
 hot paths; fused batched-decode rotary/append and multimodal IMRoPE remain
 CUDA C++.
 
-RMSNorm's second reduction is a parallel shuffle over the warp partials,
-removing a block barrier; the changed addition order makes it not
-bit-identical to the C++ kernel. Target-width max-abs errors against CPU were
-**3.099e-6**, **1.192e-6** and **9.537e-7** (hidden, attention-head,
-GDN-head), cosines **1.000000000**, at unchanged tolerances. The 19-token
-golden passes but does not validate deep context. 1,536 rows are one prefill
-chunk:
+RMSNorm, both fused RMSNorm/SwiGLU forms and the four convolution kernels are
+transcriptions that matched the CUDA C++ originals bit for bit before those
+were deleted: the reduction is `block_reduce_sum` operation for operation,
+and the convolution rounds each product before adding it. Twelve alternating
+pairs on GPU 0 through the model's launchers, the last measurement with both
+arms in the tree; 2,048 rows, 65,536 × 128 and 32,768 × 256 are a
+2,048-token chunk, and the convolution is 6,144 channels by 4 taps:
 
-| Kernel | Rows × width | NVRTC us/launch, min–max | Rust us/launch, min–max |
-| --- | ---: | ---: | ---: |
-| RMSNorm | 3 × 2,048 | 2.499–2.540 | 2.444–2.516 |
-| RMSNorm | 96 × 128 | 1.904–1.940 | 1.823–1.858 |
-| RMSNorm | 48 × 256 | 2.002–2.028 | 1.928–2.028 |
-| RMSNorm | 1,536 × 2,048 | 50.688–51.053 | 50.330–50.665 |
-| RMSNorm | 49,152 × 128 | 101.332–103.474 | 100.723–101.846 |
-| RMSNorm | 24,576 × 256 | 103.013–104.492 | 102.108–103.465 |
-| RMSNorm/SwiGLU | 3 × 2,048 | 2.848–3.952 | 3.072–4.251 |
-| RMSNorm/SwiGLU | 96 × 128 | 2.120–2.944 | 1.925–2.645 |
-| RMSNorm/SwiGLU | 48 × 256 | 2.929–3.011 | 2.765–2.798 |
-| RMSNorm/SwiGLU | 1,536 × 2,048 | 93.553–97.751 | 95.126–102.502 |
-| RMSNorm/SwiGLU | 49,152 × 128 | 182.538–182.764 | 182.006–182.310 |
-| RMSNorm/SwiGLU | 24,576 × 256 | 182.564–182.740 | 182.191–182.402 |
+| Kernel | Shape | NVRTC us/launch, min–max | Rust us/launch, min–max | Rust throughput per pair |
+| --- | ---: | ---: | ---: | ---: |
+| RMSNorm | 3 × 2,048 | 2.683–2.855 | 2.702–2.878 | −1.4% to 0.0% |
+| RMSNorm | 96 × 128 | 1.925–1.966 | 1.924–1.945 | −1.0% to +1.8% |
+| RMSNorm | 48 × 256 | 2.215–2.262 | 2.238–2.580 | −13.5% to 0.0% |
+| RMSNorm | 2,048 × 2,048 | 65.926–66.273 | 66.149–66.516 | −0.5% to −0.3% |
+| RMSNorm | 65,536 × 128 | 132.730–134.911 | 135.148–137.834 | −3.4% to −1.7% |
+| RMSNorm | 32,768 × 256 | 133.161–136.829 | 136.456–139.244 | −2.7% to −1.4% |
+| RMSNorm/SwiGLU | 3 × 2,048 | 2.826–2.939 | 3.076–3.195 | −8.6% to −7.6% |
+| RMSNorm/SwiGLU | 96 × 128 | 2.100–2.130 | 2.212–2.232 | −5.5% to −4.0% |
+| RMSNorm/SwiGLU | 48 × 256 | 2.273–2.444 | 2.437–2.591 | −6.7% to −5.3% |
+| RMSNorm/SwiGLU | 2,048 × 2,048 | 123.617–123.884 | 125.291–125.428 | −1.4% to −1.1% |
+| RMSNorm/SwiGLU | 65,536 × 128 | 242.545–242.975 | 243.343–243.643 | −0.3% to −0.2% |
+| RMSNorm/SwiGLU | 32,768 × 256 | 242.836–243.547 | 243.582–244.120 | −0.3% to −0.2% |
+| RMSNorm/SwiGLU to int8 | 96 × 128 | 2.220–2.277 | 2.253–2.363 | −4.7% to +0.1% |
+| RMSNorm/SwiGLU to int8 | 48 × 256 | 2.437–2.471 | 2.437–2.460 | −0.1% to +0.9% |
+| RMSNorm/SwiGLU to int8 | 65,536 × 128 | 194.568–217.794 | 197.412–218.908 | −10.4% to +10.0% |
+| RMSNorm/SwiGLU to int8 | 32,768 × 256 | 197.796–212.250 | 196.308–221.092 | −8.6% to +0.8% |
+| Convolution, one token | 6,144 | 1.845–2.597 | 1.536–2.152 | +18.1% to +24.1% |
+| Convolution, three sequences | 3 × 6,144 | 2.694–2.867 | 2.561–2.724 | +4.5% to +5.8% |
+| Convolution, prefill | 2,048 × 6,144 | 294.892–302.413 | 296.887–304.777 | −1.9% to −0.4% |
+| Cache advance after one token | 6,144 | 1.529–2.092 | 1.497–2.108 | −0.9% to +3.4% |
+| Cache advance after prefill | 6,144 | 1.964–2.027 | 1.992–2.077 | −5.3% to −0.5% |
 
-The wide ranges in two fused rows are a level shift between the two
-processes, not within-pair noise; the per-pair figures below are paired.
-Decode RMSNorm gained **0.6–5.6%** at the hidden and GDN-head widths and
-**−0.9% to +4.9%** at the attention-head width; hidden-width prefill gained
-**0.5–0.9%**. Fused GDN normalization gained **4.8–11.9%** at 96 × 128, about
-0.25 us per GDN layer against a 13.7 ms batch decode step, and **0.2–0.3%** at
-its prefill shape. Generic fused width 2,048 still loses: **6.5–7.9%** at
-three rows and **0.3–4.7%** at 1,536.
+Wide min–max ranges with a narrow per-pair column are level shifts between
+the two processes. The int8 prefill rows are noisy in both arms. The ports
+are not faster: the fused fp32 form gives up 0.1–0.25 us a launch at decode
+sizes and plain RMSNorm 1.4–3.4% at the head-width prefill shapes. The
+one-token convolution gains because its cache shift needs no staging array.
+The attention query/gate split and row positions are data movers and were not
+timed alone.
 
 Production `attn_rope_partial_neox` already reuses frequencies across 16
 tokens. Its Rust port keeps that and, in grids of at most 72 blocks (the SM
@@ -1384,12 +1397,20 @@ Each row gives the decisive measurement and why it lost.
 | Alternating shared K/V buffers in prefill attention | Removes one barrier per 8-key tile; shared memory 13,952 → 22,272 B; all gates passed. Three GPU 1 N=3 pairs: 2K **−0.13 / +0.23 / −0.14%**, 8K **+0.04 / +0.02 / +0.05%**, inside 8K's 9.80–23.47 tok/s within-process SD. Fewer barriers bought no full-prefill throughput. Reverted; above 8K not measured. |
 | Applying two token groups to every Rust tiled RoPE grid | Six alternating GPU 1 pairs: splitting alternate tokens over idle rotary threads gains **51.2–51.6%** at 512 tokens × 2 heads but loses **5.0–5.2%** at 512 × 16, duplicating double-precision frequency work. Use two groups only at most 72 blocks (72 SMs); keep 16-token frequency reuse above that. |
 | Keeping the literal production tiled RoPE port's unused rotary threads | Six alternating GPU 1 pairs, 512-token chunk, 2 key heads: NVRTC **19.437–19.511 us**, Rust **20.400–20.426 us** (**4.5–4.7% lower throughput**). 64 blocks on 72 SMs, and half the rotary threads exit. Using that half is a separately gated layout change, not a benefit of translation. |
+| A parallel second shuffle reduction in Rust RMSNorm | Faster than NVRTC at narrow rows (fused 96 × 128 gained **4.8–11.9%**), but it adds the warp partials in a different order from `block_reduce_sum`, and the fused Gated DeltaNet kernels are compared to these norms with no tolerance. With it active five tests failed by one ulp: the normalized-gate consumer, the chunked-prefill decay check, both `gdn_tail_differential` quantization comparisons and wide repacked verify/rollback. Replaced by a port that reduces in the original's order. A faster reduction has to change every kernel that shares the order at once. |
+| Transcribing the convolution's register staging array and per-tap index into Rust | Bit-identical, but six alternating GPU 0 pairs on a 2,048-token chunk: **282.69 us NVRTC vs 407.78 us Rust (28.1–30.7% lower throughput)**, and the three-sequence step lost **13.7–14.7%**. cuda-oxide keeps the `[f32; 8]` array in local memory and emits a 64-bit multiply per tap where NVRTC does neither. Walking pointers and shifting the cache oldest slot first, with no staging, reads the same values: **296.9–304.8 vs 294.9–302.4 us**. `ld.global.nc` loads through inline PTX were tried first and moved it by about two points. |
+| Letting cuda-oxide fuse multiply-adds in the Rust kernels | Its default passes `-fp-contract=fast` to llc, which turned the convolution's `acc + x * w` into `fma.rn.f32`; the CUDA C++ kernel denies that with `__fadd_rn(acc, __fmul_rn(...))` to stay bit-identical to the scalar reference. Built with `CUDA_OXIDE_NO_FMA=1`; a port writes `mul_add` where NVRTC fuses the original. |
+| Transcribing a strided contraction or a long strided scan into Rust as the plain loop | cuda-oxide issues a load where the source reads it, and a GPU thread executes in order, so a load interleaved with a dependent fused chain waits on it. `gdn_proj_f32` at one token, six alternating pairs of 100 launches: **5.9 us as the plain loop vs 4.3 us NVRTC**; unrolling by four, non-coherent loads (`ld.global.nc`) and NVRTC's exact interleaved pattern as inline PTX each stayed at 5.9; reading eight elements into locals before the chain gave 4.8 and sixteen **4.4**. Same order of fused additions, so still bit-identical. The same change took `dec_final_scores` from 5.6–6.2 to 3.6–4.1 us (NVRTC 3.5–3.9), `argmax_prob` over 248,320 entries from 114–132 to **88 us (NVRTC 100)**, and the gate prelude from 8.8 to 6.4 us (NVRTC 6.6). Write the grouped form. |
+| Moving `k2_dispatch` to Rust | Bit-identical. At one token and 128 experts **11.4 us Rust vs 5.4 us NVRTC**, with or without grouped scans; at 256 tokens the grouped form is faster (76 vs 98 us). The decode size is the one that matters, so it stays CUDA C++. |
+| Scalar loads for the Gated DeltaNet state in the Rust recurrent step | Bit-identical, **14.5 us vs 6.8 us NVRTC** at one sequence and 36.3 vs 19.6 at three: the kernel is bandwidth-bound and NVRTC reads each lane's four columns as one 16-byte vector. With `ld.global.v4.f32` and `st.global.v4.f32` through `ptx_asm!` it is 6.86 vs 6.79 us, and 62.7 vs 64.1 at eight sequences. |
 | Updating cuda-oxide (0.2.1 `26754ae5` → 0.4.0 `f35d6ccc`) to speed up the Rust ports | Same source, both artifacts built with `rust-kernels`, three rotated rounds on GPU 0: N=3 decode **219.9 / 219.6 / 219.7 old vs 219.1 / 219.7 / 219.8 new** at 2K and **166.3 / 166.4 / 166.5 vs 166.2 / 160.8 (one stalled step) / 166.9** at 32K; 2,048-token prefill **3664.95 / 3653.32 / 3671.36 vs 3664.85 / 3673.64 / 3670.55**. The PTX differs by three instructions and four registers in total: the new unroller does not touch grid-stride loops. The update is kept for the supported toolchain (stable Rust 1.99.1, the `NVIDIA/cuda-rust` home), not for speed. `cutile-rs` in the same repository still excludes sm_75 and was not run. |
 | Promoting the optimized eight-port Rust bundle to the default backend | Three alternating Qwen3.6 GPU 1 N=3/2K pairs: **−0.05% to +0.05% decode**, **−0.35% to +0.09% prefill**, despite narrow wins for the fused GDN norm and key RoPE. Query RoPE and generic fused hidden-width normalization still lose narrow gates. `rust-kernels` stays opt-in. |
-| Removing a Rust RMSNorm barrier by repeating the serial warp-partial sum in every warp | Six alternating GPU 1 pairs vs NVRTC: hidden-width RMSNorm loses **11.4–12.7%** at 3 × 2,048 and **9.7–11.2%** at 1,536 × 2,048. Up to 32 repeated dependent additions per warp cost more than the barrier. Use a parallel second shuffle reduction, gated for its changed addition order. |
+| Removing a Rust RMSNorm barrier by repeating the serial warp-partial sum in every warp | Six alternating GPU 1 pairs vs NVRTC: hidden-width RMSNorm loses **11.4–12.7%** at 3 × 2,048 and **9.7–11.2%** at 1,536 × 2,048. Up to 32 repeated dependent additions per warp cost more than the barrier. The barrier stays, with thread 0 adding the warp totals as `block_reduce_sum` does. |
 | Literal `usize` column loops and a rolled warp sum in the Rust normalization port | Six alternating GPU 1 pairs: 24,576 × 256 **100.606–102.575 us NVRTC** vs **104.244–105.007 us Rust** (2.3–3.5% lower throughput); 49,152 × 128 **100.073–100.855** vs **101.102–101.683 us** (0.8–1.1%). Causes: 64-bit column counters where NVRTC uses 32-bit, and an un-unrolled warp-partial loop. Keep 32-bit counters; lower register counts did not predict throughput. |
 | Promoting the literal five-kernel Rust bundle to the default backend | Three alternating Qwen3.6 GPU 1 N=3/2K pairs lose **0.05–0.28% decode** and **0.05–0.38% prefill**; fused width-128 decode normalization loses **3.8–4.4%** kernel throughput. Matching arithmetic and geometry does not make a migration compiler-neutral. The bundle stays behind the disabled-by-default `rust-kernels` switch. |
-| Enabling the plain Rust activation ports by default | Six alternating GPU 1 pairs at 8,388,608 elements: SwiGLU **182.156–182.255 us NVRTC** vs **186.574–186.675 us Rust** (2.3–2.4% lower throughput); per-row sigmoid at width 2,048 **132.924–133.251** vs **142.222–142.510 us** (6.4–6.7%). Three N=3/2K model pairs change sign. Kept behind `rust-kernels`, rejected as default. |
+| The plain grid-stride loop for the Rust activation ports | Six alternating pairs at 8,388,608 elements: SwiGLU **182.2 us NVRTC vs 186.6 us Rust** (2.4% lower throughput); per-row sigmoid at width 2,048 **133.1 vs 142.4 us** (6.5%). SwiGLU reading four elements ahead of the exponentials is 184.2 (1.2%) and faster than NVRTC up to a million elements (4.98 vs 5.82 us at 262,145); groups of eight were worse (34 vs 25 us at a million). The sigmoid's loss was two 64-bit divides per element: carrying the row and column along the walk gives **130.3 vs 132.8 us**. Both launch from Rust in that form. |
+| `k2_route` in Rust | Bit-identical, slower in three forms, six alternating pairs at 256 experts top-8: bounds-checked shared arrays **7.6 us vs 5.6 us NVRTC**; raw shared pointers 6.5; each thread's four selection scores in registers with only the winner in shared memory 6.6–6.9. About 0.1 us per selection round that none of load grouping, register state or dropping the bounds checks touched; the remaining difference is two barriers and a five-step shuffle a round, the same on both sides, so the mechanism is not identified. Stays CUDA C++. |
+| A Rust kernel that calls `erff` (`dec_splitk_reduce`'s GELU, and with it the decision GEMM epilogue) | Not bit-identical, and not fixable in the port: the libdevice the Rust toolchain links (CUDA 13) has a different `erff` from NVRTC 12.8's, which this engine compiles with — the small-argument threshold is `0x3F807B28` against `0x3F8060FE` and the polynomial differs. `exp`, `ln`, `tanh`, `sin`, `cos` and `pow` agree between the two and their ports are exact. Stays CUDA C++ until both compile against one libdevice. |
 | Four-float Rust residual loads/stores with the existing launch grid | Bit-exact. Six GPU 1 pairs vs scalar Rust: 16,384 elements scalar **1.577–1.640 us**, vector **1.798–1.835 us** (8.9–13.9% lower throughput); 8,388,608 elements **180.408–180.593** vs **179.876–180.062 us** (0.20–0.35% higher). The unchanged grid leaves three quarters of its blocks empty at 16K. Rejected. |
 | GDN split projection at row tiles 1 and 2 (`uint4` form, N=3) | 78.4 and 46.4 us per qkv/gate call vs RT=4's 33.9. RT=1 has the most warps and in-flight bytes and is worst: memory-level parallelism does not bind; instruction count per byte does, and it falls with RT. |
 | The output projection at row tile 2 (2,048 rows, 512 warps at RT = 4 — under half a wave) | Bit-identical; **flat at N=1** (23.0 us), **+25% at N=3** (28.2 → 35.2 us). The grid was 0.44 waves deep, yet doubling warps bought nothing: at three tokens the cost is activation instructions per weight byte, which halving RT doubles. Wave fill does not bind a decode-width GEMV here. |

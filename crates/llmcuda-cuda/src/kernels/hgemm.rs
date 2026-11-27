@@ -123,16 +123,6 @@ __device__ __forceinline__ unsigned hg_ldg2(const unsigned short* p) {
     return v;
 }
 
-// fp32 -> fp16, round to nearest even, `n` elements.
-__global__ void hg_to_half(const float* __restrict__ x, unsigned short* __restrict__ y, long long n) {
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        unsigned short h;
-        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(x[i]));
-        y[i] = h;
-    }
-}
-
 // Halves offset of 16-byte chunk `c` (0..3) of row `r` in a [rows][32] fp16
 // tile. XOR-swizzling the chunk by bits 1..2 of the row puts the eight rows
 // one `ldmatrix` phase reads -- and the eight a store phase writes -- on
@@ -360,45 +350,6 @@ __device__ __forceinline__ void hg_gemm(
         hg_gemm<FMT, WN>(w, ws, x, out, part, M, N, K, ldo, accumulate, alpha, wscale, kps); \
     }
 
-// out[m][n] (+)= sum over z = 0, 1, ... of part[z][m][n], in that order, so the
-// result does not depend on which split finished first. Two columns a thread.
-// Split Q8_0 to resident fp16: `w16[i] = half(q[i] * d[i / 32])`, by the same
-// `hg_dequant4` the GEMM stages with, so the two paths read one weight.
-// A thread converts four weights; `n` is a multiple of 32.
-extern "C" __global__ void hg_q8_to_half_w(const signed char* __restrict__ wq,
-                                const unsigned short* __restrict__ ws,
-                                unsigned short* __restrict__ w16, long long n) {
-    long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
-    if (i >= n) return;
-    unsigned q = *(const unsigned*)(wq + i);
-    unsigned sc = ws[i >> 5];
-    unsigned lo, hi;
-    hg_dequant4(q, sc | (sc << 16), lo, hi);
-    *(uint2*)(w16 + i) = make_uint2(lo, hi);
-}
-
-extern "C" __global__ void hg_splitk_reduce(
-    const float* __restrict__ part, float* __restrict__ out,
-    int M, int N, int ldo, int splits, int accumulate) {
-    const long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 2;
-    const long long mn = (long long)M * N;
-    if (i >= mn) return;
-    const long long m = i / N, n = i % N;
-    float2 v = *(const float2*)(part + i);
-    for (int z = 1; z < splits; ++z) {
-        const float2 p = *(const float2*)(part + z * mn + i);
-        v.x += p.x;
-        v.y += p.y;
-    }
-    float2* o = (float2*)(out + m * ldo + n);
-    if (accumulate) {
-        const float2 prior = *o;
-        v.x = prior.x + v.x;
-        v.y = prior.y + v.y;
-    }
-    *o = v;
-}
-
 HG_ENTRY(hg_q8_256, 0, 64, 1)
 HG_ENTRY(hg_q8_128, 0, 32, 2)
 HG_ENTRY(hg_bf16_256, 1, 64, 1)
@@ -599,6 +550,7 @@ impl HgemmKernels {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, HgemmError> {
         let ptx = compile(HGEMM_SRC, "hgemm").map_err(HgemmError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         let sms = ctx.attribute(
             cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
         )? as usize;
@@ -607,9 +559,9 @@ impl HgemmKernels {
             q8_128: module.load_function("hg_q8_128")?,
             bf16_256: module.load_function("hg_bf16_256")?,
             bf16_128: module.load_function("hg_bf16_128")?,
-            to_half: module.load_function("hg_to_half")?,
-            reduce: module.load_function("hg_splitk_reduce")?,
-            q8_to_half_w: module.load_function("hg_q8_to_half_w")?,
+            to_half: rust.load_function("hg_to_half")?,
+            reduce: rust.load_function("hg_splitk_reduce")?,
+            q8_to_half_w: rust.load_function("hg_q8_to_half_w")?,
             sms,
             library: None,
         })

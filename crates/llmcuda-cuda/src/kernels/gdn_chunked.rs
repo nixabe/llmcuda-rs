@@ -185,70 +185,6 @@ const STATE_JLANES: u32 = 32;
 const GDN_CHUNKED_SRC: &str = r#"
 extern "C" {
 
-// Sum across a block of up to 1024 threads. Identical to the recurrent
-// kernel's reduction, and identical for the same reason: warp shuffles then
-// one pass through shared memory. The tree order differs from the reference's
-// sequential sum, which is one of the two sources of disagreement between this
-// kernel and the CPU.
-__device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffff, v, offset);
-    }
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    if (lane == 0) scratch[warp] = v;
-    __syncthreads();
-
-    int n_warps = (blockDim.x + 31) >> 5;
-    float total = 0.0f;
-    if (threadIdx.x == 0) {
-        for (int w = 0; w < n_warps; ++w) total += scratch[w];
-        scratch[0] = total;
-    }
-    __syncthreads();
-    return scratch[0];
-}
-
-// L2-normalize q and k for every (token, query/key head), folding the
-// 1/sqrt(head_dim) output scale into q.
-//
-// Same arithmetic as the recurrent form's normalizer, batched over the
-// sequence: one block per (token, qk head) pair instead of one per qk head.
-// The scale goes on q alone because q appears only in the final dot product
-// and never in the state update.
-//
-// grid: seq_len * qk_heads blocks. block: head_dim threads.
-__global__ void gdn_chunk_normalize_qk(
-    const float* __restrict__ q_in,
-    const float* __restrict__ k_in,
-    float* __restrict__ q_out,
-    float* __restrict__ k_out,
-    int head_dim,
-    float eps,
-    float scale
-) {
-    extern __shared__ float scratch[];
-    long long base = (long long)blockIdx.x * head_dim;
-    int j = threadIdx.x;
-
-    float qv = q_in[base + j];
-    float kv = k_in[base + j];
-
-    float q_sq = block_reduce_sum(qv * qv, scratch);
-    __syncthreads();
-    float k_sq = block_reduce_sum(kv * kv, scratch);
-    __syncthreads();
-
-    // `1/sqrt(sum + eps)`, flash-linear-attention's l2norm — the epsilon is
-    // added under the root. See `super::gdn`'s normalizer for the sources and
-    // for what the form that floors the norm instead costs.
-    //
-    // 1.0f/sqrtf rather than rsqrtf, so that the disagreement with the CPU
-    // reference stays attributable to the reduction order alone.
-    q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;
-    k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));
-}
-
 // Everything between the q/k/v projection and the scan, in one launch.
 //
 // A prefill pass ran this as three: the causal convolution
@@ -655,25 +591,6 @@ __global__ void gdn_scan_prefill(
     }
 }
 
-
-// `exp(log_decay)` for the whole pass, once.
-//
-// `gdn_scan_prefill` takes the exponential in every lane of every warp of a
-// head, on every token: `head_dim / SCAN_COLS` warps computing one scalar the
-// head shares. `gdn_scan_prefill_fold` reads it from here instead. The call
-// is the same `expf` on the same operand, so the decay is the same bits.
-//
-// grid: any. block: any.
-__global__ void gdn_scan_decay(
-    const float* __restrict__ log_decay,
-    float* __restrict__ decay,
-    long long n
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        decay[i] = expf(log_decay[i]);
-    }
-}
 
 // Four per-lane partial sums to four warp totals in six shuffles.
 //
@@ -1546,15 +1463,16 @@ impl GdnChunkedKernels {
 
         let ptx = compile(GDN_CHUNKED_SRC, "gdn_chunked").map_err(GdnChunkedError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
-            normalize: module.load_function("gdn_chunk_normalize_qk")?,
+            normalize: rust.load_function("gdn_chunk_normalize_qk")?,
             gram: module.load_function("gdn_chunk_gram")?,
             inter: module.load_function("gdn_chunk_inter")?,
             solve: module.load_function("gdn_chunk_solve_and_apply")?,
             state_update: module.load_function("gdn_chunk_state_update")?,
             scan: module.load_function("gdn_scan_prefill")?,
             scan_fold: module.load_function("gdn_scan_prefill_fold")?,
-            scan_decay: module.load_function("gdn_scan_decay")?,
+            scan_decay: rust.load_function("gdn_scan_decay")?,
             prelude: module.load_function("gdn_scan_prelude")?,
             fold: true,
             head_dim,
@@ -2369,7 +2287,11 @@ mod tests {
         // kernel must not take one of its own, fast or otherwise.
         let fold = kernel_text("gdn_scan_prefill_fold");
         assert!(!fold.contains("expf("), "the folded scan reads its decay");
-        assert!(kernel_text("gdn_scan_decay").contains("decay[i] = expf(log_decay[i]);"));
+        // `gdn_scan_decay` is Rust; its `exp` is libdevice's, as `expf` is.
+        assert!(
+            crate::kernels::RUST_KERNELS_SRC
+                .contains("*decay.add(i as usize) = (*log_decay.add(i as usize)).exp();")
+        );
         assert!(kernel_text("gdn_scan_prelude").contains("decay_out[ht] = expf(log_decay[ht]);"));
         assert!(!GDN_CHUNKED_SRC.contains("__expf("));
     }
@@ -2449,10 +2371,15 @@ mod tests {
     fn the_scale_is_folded_into_q_only() {
         // Same invariant as the recurrent kernel's: on both, or on neither,
         // and every GDN layer's output is off by 11.3x or its square.
+        // The chunked normalizer is Rust and is the recurrent step's row
+        // function, so the two paths cannot disagree about the scale.
         assert!(
-            GDN_CHUNKED_SRC.contains("q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;")
+            crate::kernels::rust_kernel_source("gdn_chunk_normalize_qk")
+                .contains("normalize_qk_row(")
         );
-        assert!(GDN_CHUNKED_SRC.contains("k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));"));
+        let row = crate::kernels::rust_kernel_source("normalize_qk_row");
+        assert!(row.contains("*q_out.add(at) = qv * (1.0 / (q_sq + eps).sqrt()) * scale;"));
+        assert!(row.contains("*k_out.add(at) = kv * (1.0 / (k_sq + eps).sqrt());"));
     }
 
     #[test]

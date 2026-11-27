@@ -103,12 +103,15 @@ const KEYS_PER_WARP: usize = 4;
 /// `QUERY_TILE` rows is `head_dim` threads exactly.
 const QUERY_TILE: usize = 8;
 
-/// Tokens one rotary block carries. Mirrors `ROPE_TT`.
+/// Tokens one rotary block carries: the tile `attn_rope_partial_neox` walks.
 ///
 /// The rotary frequency depends on the head dimension and nothing else, so a
 /// block per token recomputed a double-precision `pow` for every (token, head,
 /// dimension) triple to get one of 32 distinct values. A band hoists it out.
 const ROPE_TOKENS: u32 = 16;
+
+/// Largest RoPE grid, in blocks, launched on the Rust kernel.
+const RUST_ROPE_MAX_BLOCKS: u32 = 256;
 
 /// Head dimensions one lane reduces over, at most. Mirrors `ATTN_MAXD`.
 ///
@@ -263,66 +266,6 @@ const DECODE_KEY_TILE: usize = 8;
 /// exponential phase gives one key slot to one lane.
 const GQA_KEY_TILE: usize = 8;
 
-/// The q8_0 KV-cache device helpers, verbatim as [`ATTENTION_SRC`] carries
-/// them, for other modules that write the same cache (`k2_rope`'s batched
-/// decode append). A test pins the two copies together.
-pub(crate) const KV_Q8_HELPERS: &str = r#"// q8_0 KV cache (KV_KQ8 / KV_VQ8, set per half by the K2 kernel set).
-// One position's row of n = kv_heads * head_dim elements is n int8 codes
-// followed by n / 32 binary16 scales; block b covers elements
-// [32b, 32b + 32). That is llama.cpp's block_q8_0 arithmetic in a layout
-// whose codes stay 16-byte aligned per head. Every reader sees the binary16
-// rounding of q * d, so the tensor-core and scalar kernels read the same
-// number, and the CPU reference can build it exactly.
-#ifndef KV_KQ8
-#define KV_KQ8 0
-#endif
-#ifndef KV_VQ8
-#define KV_VQ8 0
-#endif
-__device__ __forceinline__ long long kvq8_row_bytes(int n) { return (long long)n + (n >> 4); }
-// Four codes (one little-endian word) times one scale, as two packed binary16
-// pairs. Exact up to one rounding: 0x64XX is 1024 + XX in binary16, so
-// (q ^ 0x80) under that exponent is 1152 + q, subtracting 1152 is exact, and
-// mul.rn rounds the exact product q * d once -- f16(q * d), no I2F.
-__device__ __forceinline__ void kvq8_dequant4(unsigned codes, unsigned short d, unsigned* lo, unsigned* hi) {
-    unsigned x = codes ^ 0x80808080u;
-    unsigned a = __byte_perm(x, 0x64646464u, 0x4140);
-    unsigned b = __byte_perm(x, 0x64646464u, 0x4342);
-    unsigned dd = (unsigned)d | ((unsigned)d << 16);
-    asm("{ sub.rn.f16x2 %0, %2, %4; mul.rn.f16x2 %0, %0, %5;\n"
-        "  sub.rn.f16x2 %1, %3, %4; mul.rn.f16x2 %1, %1, %5; }"
-        : "=&r"(*lo), "=&r"(*hi) : "r"(a), "r"(b), "r"(0x64806480u), "r"(dd));
-}
-// Codes in bytes 0 and 1 of `codes`, each with its own scale: the packed
-// binary16 key pair a tensor-core V operand wants.
-__device__ __forceinline__ unsigned kvq8_dequant2(unsigned codes, unsigned short d0, unsigned short d1) {
-    unsigned a = __byte_perm(codes ^ 0x8080u, 0x64646464u, 0x4140);
-    unsigned dd = (unsigned)d0 | ((unsigned)d1 << 16);
-    unsigned r;
-    asm("{ sub.rn.f16x2 %0, %1, %2; mul.rn.f16x2 %0, %0, %3; }"
-        : "=&r"(r) : "r"(a), "r"(0x64806480u), "r"(dd));
-    return r;
-}
-// llama.cpp's quantize_row_q8_0_ref (ggml-quants.c) for the block whose 32
-// elements this warp's lanes hold, one each: d = amax / 127, q = round(x / d)
-// computed as x * (1 / d), d stored as binary16. fmaxf is exact and
-// commutative, so the butterfly order cannot change amax. Every lane must be
-// live. Returns this lane's code in the low byte; *d_bits gets the scale.
-__device__ __forceinline__ unsigned kvq8_quantize(float x, unsigned short* d_bits) {
-    float amax = fabsf(x);
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
-    }
-    float d = __fdiv_rn(amax, 127.0f);
-    float id = d != 0.0f ? __fdiv_rn(1.0f, d) : 0.0f;
-    unsigned short h;
-    asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(d));
-    *d_bits = h;
-    return (unsigned)(int)roundf(__fmul_rn(x, id)) & 0xffu;
-}
-"#;
-
 /// CUDA C++ baseline exposed for differential CUDA-event benchmarks.
 pub const ATTENTION_SRC: &str = r#"
 extern "C" {
@@ -393,191 +336,6 @@ __device__ __forceinline__ unsigned kvq8_dequant2(unsigned codes, unsigned short
     asm("{ sub.rn.f16x2 %0, %1, %2; mul.rn.f16x2 %0, %0, %3; }"
         : "=&r"(r) : "r"(a), "r"(0x64806480u), "r"(dd));
     return r;
-}
-// llama.cpp's quantize_row_q8_0_ref (ggml-quants.c) for the block whose 32
-// elements this warp's lanes hold, one each: d = amax / 127, q = round(x / d)
-// computed as x * (1 / d), d stored as binary16. fmaxf is exact and
-// commutative, so the butterfly order cannot change amax. Every lane must be
-// live. Returns this lane's code in the low byte; *d_bits gets the scale.
-__device__ __forceinline__ unsigned kvq8_quantize(float x, unsigned short* d_bits) {
-    float amax = fabsf(x);
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
-    }
-    float d = __fdiv_rn(amax, 127.0f);
-    float id = d != 0.0f ? __fdiv_rn(1.0f, d) : 0.0f;
-    unsigned short h;
-    asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(d));
-    *d_bits = h;
-    return (unsigned)(int)roundf(__fmul_rn(x, id)) & 0xffu;
-}
-
-// Deinterleave the packed query/gate tensor.
-//
-// grid: (n_tokens, q_heads). block: head_dim threads.
-//
-// `blk.N.attn_q.weight` emits, per token, [q_h0, gate_h0, q_h1, gate_h1, ...]
-// — a per-head stride of 2*head_dim with the query first. This is confirmed
-// against llama.cpp's src/models/qwen35moe.cpp, which views it with
-// stride = head_dim*2. It is NOT [all queries | all gates]: reading it that
-// way feeds query heads 8..15 the gates of heads 0..7, stays finite, and is a
-// different model.
-__global__ void attn_split_query_gate(
-    const float* __restrict__ packed,
-    float* __restrict__ q,
-    float* __restrict__ gate,
-    int q_heads,
-    int head_dim
-) {
-    long long t = blockIdx.x;
-    int h = blockIdx.y;
-    int d = threadIdx.x;
-
-    long long row = t * (long long)q_heads * 2 * head_dim;
-    long long dst = (t * (long long)q_heads + h) * (long long)head_dim + d;
-
-    q[dst]    = packed[row + (long long)(2 * h)     * head_dim + d];
-    gate[dst] = packed[row + (long long)(2 * h + 1) * head_dim + d];
-}
-
-// Partial rotary position embedding, NEOX (split-half) pairing.
-//
-// grid: (n_tokens, n_heads). block: head_dim threads.
-//
-// Rotates dimensions [0, rope_dim) pairing i with i + rope_dim/2, and copies
-// [rope_dim, head_dim) through. The copy is a real load/store rather than an
-// arithmetic identity so the tail is bit-identical rather than merely close —
-// that is what `Tolerance::exact()` in the differential test checks.
-//
-// The angle is computed in double to match `llmcuda_kernels::rope::apply_rope`,
-// which raises theta_base to a f64 power. Doing it in float diverges visibly
-// at the positions this model actually reaches: at position 262,143 a float
-// angle loses about 5 significant digits.
-// Tokens one rotary block carries.
-//
-// The frequency `theta_base ^ (-2 d / rope_dim)` depends on the head dimension
-// and nothing else, yet a block per token made it a **double-precision `pow`
-// per (token, head, dimension) triple** -- 262,144 of them per pass for the
-// query stream alone, for 32 distinct values. Turing runs fp64 at a
-// thirty-second of fp32, and `pow` is a libdevice call on top of that.
-//
-// A band of tokens computes it once and reuses it, which is bit-identical:
-// the same `pow` of the same arguments, hoisted out of a loop. The angle and
-// its sine and cosine still have to be per token, and still have to be double
-// -- see below.
-#define ROPE_TT 16
-
-__global__ void attn_rope_partial_neox(
-    const float* __restrict__ in,
-    float* __restrict__ out,
-    int n_heads,
-    int head_dim,
-    int rope_dim,
-    const int* __restrict__ pos_offset,
-    float theta_base,
-    int n_tokens
-) {
-    long long t0 = (long long)blockIdx.x * ROPE_TT;
-    int h = blockIdx.y;
-    int d = threadIdx.x;
-
-    int half = rope_dim >> 1;
-
-    if (d >= rope_dim) {
-        for (int u = 0; u < ROPE_TT; ++u) {
-            long long t = t0 + u;
-            if (t >= n_tokens) break;
-            long long base = (t * (long long)n_heads + h) * (long long)head_dim;
-            out[base + d] = in[base + d];
-        }
-        return;
-    }
-    // Dimensions [half, rope_dim) are written by their partner thread d-half.
-    if (d >= half) return;
-
-    // Hoisted: the one quantity in here that does not depend on the token.
-    double freq = pow((double)theta_base, -2.0 * (double)d / (double)rope_dim);
-
-    for (int u = 0; u < ROPE_TT; ++u) {
-        long long t = t0 + u;
-        if (t >= n_tokens) break;
-        long long base = (t * (long long)n_heads + h) * (long long)head_dim;
-
-        double pos = (double)(*pos_offset) + (double)t;
-        double angle = pos * freq;
-        float sin_a = (float)sin(angle);
-        float cos_a = (float)cos(angle);
-
-        float x0 = in[base + d];
-        float x1 = in[base + d + half];
-        out[base + d]        = x0 * cos_a - x1 * sin_a;
-        out[base + d + half] = x0 * sin_a + x1 * cos_a;
-    }
-}
-
-// Interleaved multimodal rotary (IMROPE), the three-component sibling of
-// attn_rope_partial_neox for prefill chunks that overlap an image span.
-//
-// Each token carries (t, h, w) in `mrope_pos[3*token ..]`. Pair d reads
-// component d%3 — h iff d%3==1 and d < h_bound (3*sections[1]), w iff
-// d%3==2 and d < w_bound (3*sections[2]), else t — with the frequency on
-// the *global* pair index, exactly `ggml_mrope_cache_init`'s
-// GGML_ROPE_TYPE_IMROPE branch (reference:
-// `llmcuda_kernels::mrope::apply_imrope`). With all three components equal
-// this computes bit-for-bit what attn_rope_partial_neox computes — the
-// double conversions and the operation order are copied from it — which is
-// asserted by differential test rather than assumed.
-//
-// No ROPE_TT banding: the frequency hoist is per pair as before, but the
-// position is per token anyway and this kernel only ever runs on
-// image-bearing prefill chunks, off the decode path the banding was
-// measured for.
-__global__ void attn_rope_partial_imrope(
-    const float* __restrict__ in,
-    float* __restrict__ out,
-    int n_heads,
-    int head_dim,
-    int rope_dim,
-    const int* __restrict__ mrope_pos,
-    int h_bound,
-    int w_bound,
-    float theta_base,
-    int n_tokens
-) {
-    long long t = blockIdx.x;
-    int h = blockIdx.y;
-    int d = threadIdx.x;
-    if (t >= n_tokens) return;
-
-    int half = rope_dim >> 1;
-    long long base = (t * (long long)n_heads + h) * (long long)head_dim;
-
-    if (d >= rope_dim) {
-        out[base + d] = in[base + d];
-        return;
-    }
-    if (d >= half) return;
-
-    int c = d % 3;
-    int component;
-    if (c == 1 && d < h_bound) {
-        component = mrope_pos[3 * t + 1];
-    } else if (c == 2 && d < w_bound) {
-        component = mrope_pos[3 * t + 2];
-    } else {
-        component = mrope_pos[3 * t];
-    }
-
-    double freq = pow((double)theta_base, -2.0 * (double)d / (double)rope_dim);
-    double angle = (double)component * freq;
-    float sin_a = (float)sin(angle);
-    float cos_a = (float)cos(angle);
-
-    float x0 = in[base + d];
-    float x1 = in[base + d + half];
-    out[base + d]        = x0 * cos_a - x1 * sin_a;
-    out[base + d + half] = x0 * sin_a + x1 * cos_a;
 }
 
 // Causal GQA attention, online-softmax streaming form.
@@ -2094,35 +1852,6 @@ __global__ void attn_flash_decode_split(
     }
 }
 
-// grid: (q_heads,). block: head_dim threads, one per output dimension.
-__global__ void attn_flash_decode_combine(
-    const float* __restrict__ part_acc,
-    const float* __restrict__ part_m,
-    const float* __restrict__ part_l,
-    float* __restrict__ out,
-    int q_heads,
-    int head_dim,
-    int n_splits
-) {
-    int h = blockIdx.x;
-    int d = threadIdx.x;
-
-    // Split 0 always holds at least key 0, so this is never -inf and the
-    // subtraction below never forms inf - inf.
-    float gm = neg_inf();
-    for (int s = 0; s < n_splits; ++s) gm = fmaxf(gm, part_m[s * q_heads + h]);
-
-    float num = 0.0f;
-    float den = 0.0f;
-    for (int s = 0; s < n_splits; ++s) {
-        float ms = part_m[s * q_heads + h];
-        float f = (ms == neg_inf()) ? 0.0f : expf(ms - gm);
-        num += f * part_acc[((long long)s * q_heads + h) * (long long)head_dim + d];
-        den += f * part_l[s * q_heads + h];
-    }
-    out[(long long)h * (long long)head_dim + d] = num / den;
-}
-
 // ---------------------------------------------------------------------------
 // Flash decoding on the tensor cores, with Q split into a fp16 high half and
 // a fp16 residual instead of the single fp16 rounding attn_flash_causal_mma
@@ -2646,96 +2375,6 @@ __global__ void attn_flash_causal_t1(
 }
 
 
-// Append this batch's roped keys and raw values to the cache, at the absolute
-// position the sequence has reached.
-//
-// This was two `cuMemcpyDtoDAsync` calls into `cache.k.slice_mut(at..)` and
-// `cache.v.slice_mut(at..)`, which is the same traffic and one fewer launch.
-// It is a kernel now for one reason: `at` was computed on the host, so the
-// destination was a **host-chosen address**. A CUDA graph records addresses,
-// so a captured decode step would write position `n` forever. Reading the
-// position from device memory is what makes the step replayable, and it is
-// `AGENTS.md` rule 5 besides.
-//
-// Both halves in one launch: they are the same shape and the same stride, and
-// the copies are independent, so splitting them would only cost a launch.
-//
-// grid: (ceil(2 * span / ATTN_APPEND_THREADS),). block: ATTN_APPEND_THREADS.
-// out[i] = position[0] + i, for i < n.
-//
-// A caller that wants to run one query row at a time needs each row's own
-// absolute position as a *device* pointer, because that is the only form the
-// attention kernels take one in (see the note on `key_offset` above: a host
-// position cannot be baked into a captured launch). One thread, `n` of them,
-// off the base the caller already holds.
-__global__ void attn_row_positions(
-    const int* __restrict__ position,
-    int* __restrict__ out,
-    int n
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    out[i] = position[0] + i;
-}
-
-__global__ void attn_kv_append(
-    const float* __restrict__ key,
-    const float* __restrict__ value,
-    unsigned short* __restrict__ k_cache,
-    unsigned short* __restrict__ v_cache,
-    const int* __restrict__ position,
-    int span,
-    int row
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= 2 * span) return;
-    // `span` is `n_tokens * row`; the cache is indexed by *position*, so the
-    // destination base is one row per position and not one span.
-    long long at = (long long)(*position) * (long long)row;
-    if (i < span) {
-        k_cache[at + i] = f2h(key[i]);
-    } else {
-        int j = i - span;
-        v_cache[at + j] = f2h(value[j]);
-    }
-}
-
-// attn_kv_append with either half in q8_0 (`kq8` / `vq8` nonzero). One thread
-// per element as above, so with `row` a multiple of 32 and 256-thread blocks
-// each warp holds exactly one 32-element block of one half of one position:
-// `span` and `2 * span` are multiples of 32, so the early return, the K/V
-// choice and the format choice are all warp-uniform and kvq8_quantize sees
-// all 32 lanes. A binary16 half is written exactly as attn_kv_append does.
-__global__ void attn_kv_append_kv8(
-    const float* __restrict__ key,
-    const float* __restrict__ value,
-    unsigned short* __restrict__ k_cache,
-    unsigned short* __restrict__ v_cache,
-    const int* __restrict__ position,
-    int span,
-    int row,
-    int kq8,
-    int vq8
-) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= 2 * span) return;
-    bool is_k = i < span;
-    int j = is_k ? i : i - span;
-    float x = is_k ? key[j] : value[j];
-    unsigned short* cache = is_k ? k_cache : v_cache;
-    long long pos = (long long)(*position) + j / row;
-    int e = j % row;
-    if (!(is_k ? kq8 : vq8)) {
-        cache[pos * (long long)row + e] = f2h(x);
-        return;
-    }
-    unsigned short d;
-    unsigned code = kvq8_quantize(x, &d);
-    unsigned char* dst = (unsigned char*)cache + pos * kvq8_row_bytes(row);
-    dst[e] = (unsigned char)code;
-    if ((e & 31) == 0) *(unsigned short*)(dst + row + 2 * (e >> 5)) = d;
-}
-
 // The decode step's per-sequence rotary and cache append, batched over the
 // launch: one grid advances every sequence's query and key through
 // `attn_rope_partial_neox`'s arithmetic and appends the roped key and the
@@ -2770,82 +2409,6 @@ __device__ __forceinline__ unsigned long long attn_slot(
     switch (z) {
         case 0: return s0; case 1: return s1; case 2: return s2; case 3: return s3;
         case 4: return s4; case 5: return s5; case 6: return s6; default: return s7;
-    }
-}
-
-__global__ void attn_decode_rope_append_batch(
-    const float* __restrict__ q_in,
-    float* __restrict__ q_out,
-    const float* __restrict__ k_in,
-    float* __restrict__ k_out,
-    const float* __restrict__ v_in,
-    unsigned long long rp0, unsigned long long rp1, unsigned long long rp2, unsigned long long rp3,
-    unsigned long long rp4, unsigned long long rp5, unsigned long long rp6, unsigned long long rp7,
-    unsigned long long ap0, unsigned long long ap1, unsigned long long ap2, unsigned long long ap3,
-    unsigned long long ap4, unsigned long long ap5, unsigned long long ap6, unsigned long long ap7,
-    unsigned long long kc0, unsigned long long kc1, unsigned long long kc2, unsigned long long kc3,
-    unsigned long long kc4, unsigned long long kc5, unsigned long long kc6, unsigned long long kc7,
-    unsigned long long vc0, unsigned long long vc1, unsigned long long vc2, unsigned long long vc3,
-    unsigned long long vc4, unsigned long long vc5, unsigned long long vc6, unsigned long long vc7,
-    int q_heads,
-    int kv_heads,
-    int head_dim,
-    int rope_dim,
-    float theta_base
-) {
-    int seq = blockIdx.y;
-    int h = blockIdx.x;
-    int d = threadIdx.x;
-    const int* rope_pos = (const int*)attn_slot(seq, rp0, rp1, rp2, rp3, rp4, rp5, rp6, rp7);
-
-    bool is_q = h < q_heads;
-    const float* in = is_q ? q_in : k_in;
-    float* out = is_q ? q_out : k_out;
-    int heads = is_q ? q_heads : kv_heads;
-    int hh = is_q ? h : h - q_heads;
-    long long base = ((long long)seq * heads + hh) * (long long)head_dim;
-
-    // The key head's cache row for this sequence's position.
-    unsigned short* k_cache = 0;
-    unsigned short* v_cache = 0;
-    long long at = 0;
-    if (!is_q) {
-        const int* pos = (const int*)attn_slot(seq, ap0, ap1, ap2, ap3, ap4, ap5, ap6, ap7);
-        k_cache = (unsigned short*)attn_slot(seq, kc0, kc1, kc2, kc3, kc4, kc5, kc6, kc7);
-        v_cache = (unsigned short*)attn_slot(seq, vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7);
-        at = (long long)(*pos) * (long long)kv_heads * (long long)head_dim
-           + (long long)hh * (long long)head_dim;
-    }
-
-    int half = rope_dim >> 1;
-    if (d >= rope_dim) {
-        float x = in[base + d];
-        out[base + d] = x;
-        if (!is_q) {
-            k_cache[at + d] = f2h(x);
-            v_cache[at + d] = f2h(v_in[base + d]);
-        }
-        return;
-    }
-    if (d >= half) return;
-
-    double freq = pow((double)theta_base, -2.0 * (double)d / (double)rope_dim);
-    double pos_d = (double)(*rope_pos) + (double)0;
-    double angle = pos_d * freq;
-    float sin_a = (float)sin(angle);
-    float cos_a = (float)cos(angle);
-
-    float x0 = in[base + d];
-    float x1 = in[base + d + half];
-    float y0 = x0 * cos_a - x1 * sin_a;
-    float y1 = x0 * sin_a + x1 * cos_a;
-    out[base + d]        = y0;
-    out[base + d + half] = y1;
-    if (!is_q) {
-        k_cache[at + d]        = f2h(y0);
-        k_cache[at + d + half] = f2h(y1);
-        v_cache[at + d]        = f2h(v_in[base + d]);
-        v_cache[at + d + half] = f2h(v_in[base + d + half]);
     }
 }
 
@@ -3113,37 +2676,6 @@ __global__ void attn_flash_decode_warp_k2_128_batch(
     attn_k2_warp_body<128,4>(q,k,v,part_acc,part_m,part_l,q_heads,kv_heads,head_dim,key_offset,scale,n_splits);
 }
 __global__ void attn_flash_decode_warp_k2_128(const float* __restrict__ q,const unsigned short* __restrict__ k,const unsigned short* __restrict__ v,float* __restrict__ part_acc,float* __restrict__ part_m,float* __restrict__ part_l,int q_heads,int kv_heads,int head_dim,const int* key_offset,float scale,int n_splits){attn_k2_warp_body<128,4>(q,k,v,part_acc,part_m,part_l,q_heads,kv_heads,head_dim,key_offset,scale,n_splits);}
-__global__ void attn_flash_decode_combine_k2_batch(
-    const float* __restrict__ part_acc,
-    const float* __restrict__ part_m,
-    const float* __restrict__ part_l,
-    float* __restrict__ out,
-    int q_heads,
-    int head_dim,
-    int n_splits
-) {
-    int seq=blockIdx.y;
-    part_acc+=(long long)seq*n_splits*q_heads*head_dim;
-    part_m+=(long long)seq*n_splits*q_heads;part_l+=(long long)seq*n_splits*q_heads;
-    out+=(long long)seq*q_heads*head_dim;
-    int h = blockIdx.x;
-    int d = threadIdx.x;
-
-    // Split 0 always holds at least key 0, so this is never -inf and the
-    // subtraction below never forms inf - inf.
-    float gm = neg_inf();
-    for (int s = 0; s < n_splits; ++s) gm = fmaxf(gm, part_m[s * q_heads + h]);
-
-    float num = 0.0f;
-    float den = 0.0f;
-    for (int s = 0; s < n_splits; ++s) {
-        float ms = part_m[s * q_heads + h];
-        float f = (ms == neg_inf()) ? 0.0f : expf(ms - gm);
-        num += f * part_acc[((long long)s * q_heads + h) * (long long)head_dim + d];
-        den += f * part_l[s * q_heads + h];
-    }
-    out[(long long)h * (long long)head_dim + d] = num / den;
-}
 
 }
 "#;
@@ -3349,6 +2881,7 @@ impl AttnDecodeScratch {
 pub struct AttentionKernels {
     split: CudaFunction,
     rope: CudaFunction,
+    rope_small: CudaFunction,
     rope_imrope: CudaFunction,
     flash: CudaFunction,
     flash_gqa: CudaFunction,
@@ -3491,19 +3024,15 @@ impl AttentionKernels {
         };
         let ptx = compile(&source, "attention").map_err(AttentionError::Compile)?;
         let module = ctx.load_module(ptx)?;
-        #[cfg(feature = "rust-kernels")]
-        let migrated = ctx.load_module(cudarc::nvrtc::Ptx::from_src(include_str!(
-            "rust/tensor_add.ptx"
-        )))?;
-        #[cfg(not(feature = "rust-kernels"))]
-        let migrated = &module;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
-            split: module.load_function("attn_split_query_gate")?,
-            rope: migrated.load_function("attn_rope_partial_neox")?,
-            rope_imrope: module.load_function("attn_rope_partial_imrope")?,
+            split: rust.load_function("attn_split_query_gate")?,
+            rope: rust.load_function("attn_rope_partial_neox")?,
+            rope_small: rust.load_function("attn_rope_partial_neox")?,
+            rope_imrope: rust.load_function("attn_rope_partial_imrope")?,
             flash: module.load_function("attn_flash_causal")?,
             flash_gqa: module.load_function("attn_flash_causal_gqa")?,
-            row_positions: module.load_function("attn_row_positions")?,
+            row_positions: rust.load_function("attn_row_positions")?,
             flash_mma: {
                 let f = module.load_function("attn_flash_causal_mma")?;
                 // Ask for the >48 KiB carveout before the first launch. Turing
@@ -3545,7 +3074,7 @@ impl AttentionKernels {
             decode_warp_k2_128_batch: module
                 .load_function("attn_flash_decode_warp_k2_128_batch")?,
             decode_warp_k2_batch: module.load_function("attn_flash_decode_warp_k2_batch")?,
-            decode_combine_k2_batch: module.load_function("attn_flash_decode_combine_k2_batch")?,
+            decode_combine_k2_batch: rust.load_function("attn_flash_decode_combine_k2_batch")?,
             decode_mma_wpo4: {
                 let f = module.load_function("attn_flash_decode_mma_wpo4")?;
                 f.set_attribute(
@@ -3567,11 +3096,11 @@ impl AttentionKernels {
                 )?;
                 f
             },
-            decode_combine: module.load_function("attn_flash_decode_combine")?,
+            decode_combine: rust.load_function("attn_flash_decode_combine")?,
             flash_t1: module.load_function("attn_flash_causal_t1")?,
-            append: module.load_function("attn_kv_append")?,
-            append_kv8: module.load_function("attn_kv_append_kv8")?,
-            rope_append_batch: module.load_function("attn_decode_rope_append_batch")?,
+            append: rust.load_function("attn_kv_append")?,
+            append_kv8: rust.load_function("attn_kv_append_kv8")?,
+            rope_append_batch: rust.load_function("attn_decode_rope_append_batch")?,
             kv,
             q_heads,
             kv_heads,
@@ -4021,7 +3550,16 @@ impl AttentionKernels {
         let head_dim = self.head_dim as i32;
         let rope_dim_i = rope_dim as i32;
         let n_tokens_i = n_tokens as i32;
-        let mut builder = stream.launch_builder(&self.rope);
+        // Small grids go to the Rust kernel: it spreads a token band over the
+        // otherwise idle rotary threads when the grid fits the card's SMs, and
+        // measured faster up to a 192-block key grid. A 512-block query grid
+        // measured 0.6-0.9% slower, so wide grids stay CUDA C++.
+        let kernel = if cfg.grid_dim.0 * cfg.grid_dim.1 <= RUST_ROPE_MAX_BLOCKS {
+            &self.rope_small
+        } else {
+            &self.rope
+        };
+        let mut builder = stream.launch_builder(kernel);
         builder
             .arg(input)
             .arg(out)
@@ -4980,13 +4518,15 @@ mod tests {
 
     #[test]
     fn the_split_kernel_strides_by_two_head_dims() {
-        // Guards the comment above from being "simplified" in the source.
+        // Guards the interleaved layout from being "simplified" in the Rust
+        // kernel: query head h at 2*h, its gate at 2*h + 1.
+        let src = crate::kernels::RUST_KERNELS_SRC;
         assert!(
-            ATTENTION_SRC.contains("packed[row + (long long)(2 * h)     * head_dim + d]"),
+            src.contains("*packed.add((row + 2 * h * head_dim as i64 + d) as usize)"),
             "query slice is no longer read at the interleaved 2*h stride",
         );
         assert!(
-            ATTENTION_SRC.contains("packed[row + (long long)(2 * h + 1) * head_dim + d]"),
+            src.contains("*packed.add((row + (2 * h + 1) * head_dim as i64 + d) as usize)"),
             "gate slice is no longer read at the interleaved 2*h+1 stride",
         );
     }
@@ -5024,16 +4564,21 @@ mod tests {
         // `out[d] = in[d]` is bit-identical. Anything arithmetic — even
         // multiplying by a cos of angle zero — is not, and would fail the
         // exact-equality gate the differential test puts on the tail.
+        let tiled = crate::kernels::rust_kernel_source("attn_rope_partial_neox");
         assert!(
-            ATTENTION_SRC.contains("out[base + d] = in[base + d];"),
+            tiled.contains("*output.add(base + d as usize) = *input.add(base + d as usize);"),
             "the untouched rotary tail is no longer a plain copy",
         );
         // And it is still selected by the same bound, now inside the token
         // band rather than outside it.
         assert!(
-            ATTENTION_SRC.contains("if (d >= rope_dim) {"),
-            "the rotary tail is no longer selected by rope_dim",
+            tiled.contains("if d >= rotated {"),
+            "the rotary tail is no longer selected by the rotated width",
         );
+        let imrope = crate::kernels::rust_kernel_source("attn_rope_partial_imrope");
+        assert!(imrope.contains(
+            "if d >= rope_dim {\n            *out.add(base + d as usize) = *input.add(base + d as usize);"
+        ));
     }
 
     #[test]
@@ -5195,8 +4740,6 @@ mod tests {
         // compile, run, and silently spill.
         assert_eq!(32 * ATTN_MAXD, 256);
         assert!(ATTENTION_SRC.contains("#define ATTN_MAXD 8"));
-        // k2_rope compiles its q8_0 append against this copy.
-        assert!(ATTENTION_SRC.contains(KV_Q8_HELPERS));
         assert!(
             ATTENTION_SRC.contains("float qr[QT][ATTN_MAXD];"),
             "the query tile is no longer a register array",

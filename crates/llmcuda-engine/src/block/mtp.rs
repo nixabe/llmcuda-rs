@@ -42,7 +42,6 @@ use cudarc::driver::{
     PushKernelArg,
 };
 
-use llmcuda_cuda::kernels::compile;
 use llmcuda_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
 use llmcuda_cuda::kernels::lm_head::{
     ARGMAX_BLOCKS, HeadFormat, HeadTensor, LmHeadError, LmHeadGeometry, LmHeadKernels,
@@ -59,66 +58,6 @@ use crate::block::moe::MoeBlockError;
 use crate::weights::DeviceWeights;
 
 const EMBED_THREADS: u32 = 256;
-
-/// `out[t][j] = dequantize(token_embd)[ids[t]][j]`, and
-/// `concat[t][j] = j < hidden ? e_norm[t][j] : h_norm[t][j - hidden]` —
-/// `ggml_concat(.., dim = 0)`, e_norm first. One module because NVRTC
-/// compiles from a string with no include path and no cross-string linking,
-/// same reason `forward.rs`'s `EMBED_SRC` is inline.
-const MTP_GLUE_SRC: &str = r#"
-extern "C" {
-
-__device__ __forceinline__ float load_half_le(const unsigned char* p) {
-    unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
-    float f;
-    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(bits));
-    return f;
-}
-
-// grid: (n_tokens). block: EMBED_THREADS, striding the row.
-__global__ void mtp_embed_q8_0(
-    const unsigned char* __restrict__ table,
-    const int* __restrict__ ids,
-    float* __restrict__ out,
-    int hidden,
-    int n_tokens
-) {
-    int t = blockIdx.x;
-    if (t >= n_tokens) return;
-
-    long long blocks = hidden / 32;
-    const unsigned char* row = table + (long long)ids[t] * blocks * 34;
-    float* dst = out + (long long)t * hidden;
-
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        const unsigned char* blk = row + (long long)(j / 32) * 34;
-        float d = load_half_le(blk);
-        signed char q = (signed char)blk[2 + (j % 32)];
-        dst[j] = d * (float)q;
-    }
-}
-
-// grid: (n_tokens). block: EMBED_THREADS, striding 2*hidden.
-__global__ void mtp_concat_eh(
-    const float* __restrict__ e_norm,
-    const float* __restrict__ h_norm,
-    float* __restrict__ out,
-    int hidden,
-    int n_tokens
-) {
-    int t = blockIdx.x;
-    if (t >= n_tokens) return;
-    const float* e = e_norm + (long long)t * hidden;
-    const float* h = h_norm + (long long)t * hidden;
-    float* dst = out + (long long)t * 2 * hidden;
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        dst[j] = e[j];
-        dst[hidden + j] = h[j];
-    }
-}
-
-}
-"#;
 
 /// Something went wrong building or running the MTP draft head.
 #[derive(Debug)]
@@ -370,10 +309,11 @@ impl MtpBlock {
         let vocab = config.vocab_size as usize;
         let mtp_layer = config.num_layers;
 
-        let ptx = compile(MTP_GLUE_SRC, "mtp_glue").map_err(MtpBlockError::Compile)?;
-        let module = ctx.load_module(ptx)?;
-        let embed_fn = module.load_function("mtp_embed_q8_0")?;
-        let concat_fn = module.load_function("mtp_concat_eh")?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
+            llmcuda_cuda::kernels::RUST_KERNELS_PTX,
+        ))?;
+        let embed_fn = rust.load_function("embed_q8_0")?;
+        let concat_fn = rust.load_function("mtp_concat_eh")?;
         let layer_ops = LayerOpsKernels::new(ctx)?;
 
         let batch_fork = ctx.new_event(None)?;

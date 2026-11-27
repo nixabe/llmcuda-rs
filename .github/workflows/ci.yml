@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `cuda-oxide` is the long-lived kernel migration branch; it is held to
+    # the same checks as main while it is open.
+    branches: [main, cuda-oxide]
   pull_request:
 
 env:

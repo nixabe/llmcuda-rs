@@ -9,7 +9,6 @@ authors.workspace = true
 
 [features]
 default = []
-rust-kernels = ["llmcuda-cuda/rust-kernels"]
 # The optional TensorRT backend and its benches; off by default. See
 # crates/llmcuda-trt for what it needs at build and run time.
 tensorrt = ["dep:llmcuda-trt", "llmcuda-trt/tensorrt"]

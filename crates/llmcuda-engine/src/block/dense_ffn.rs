@@ -242,117 +242,6 @@ pub const DENSE_REPACK_INT8: bool = true;
 const GLUE_SRC: &str = r#"
 extern "C" {
 
-// l_out[t][j] = ffn_out[t][j] + residual[t][j], for live t only.
-//
-// The row is split over `gridDim.y` blocks for the same reason the MoE
-// combine's is: one block per token would put a 20 KiB row on one SM.
-__global__ void dense_ffn_add_residual(
-    const float* __restrict__ ffn_out,
-    const float* __restrict__ residual,
-    const int* __restrict__ valid_tokens,
-    int hidden,
-    float* __restrict__ l_out) {
-    int t = blockIdx.x;
-    if (t >= *valid_tokens) return;
-
-    long long base = (long long)t * hidden;
-    int stride = gridDim.y * blockDim.x;
-    for (int j = blockIdx.y * blockDim.x + threadIdx.x; j < hidden; j += stride) {
-        l_out[base + j] = ffn_out[base + j] + residual[base + j];
-    }
-}
-
-// The post-mixer RMSNorm, emitting both widths in one pass.
-//
-// `LayerOpsKernels::rms_norm` produces `normed`, and the split GEMV then
-// needs it narrowed -- two launches over a 20 KiB row, of which the second is
-// almost entirely the card starting it. This is the first with an extra
-// store: the fp32 output survives because `attn_post_norm-N` is a captured
-// waypoint and the golden reads it, and the fp16 output is what the two
-// projections actually consume.
-//
-// **The body is `rms_norm_rows` verbatim**, `block_reduce_sum` included, and
-// it has to stay that way: a different reduction order here would make the
-// dense block's own norm disagree with every other norm in the model.
-// `the_dense_norm_matches_layer_ops` is what keeps the copy honest.
-__device__ __forceinline__ float dense_block_reduce_sum(float v, float* scratch) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffff, v, offset);
-    }
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    if (lane == 0) scratch[warp] = v;
-    __syncthreads();
-
-    int n_warps = (blockDim.x + 31) >> 5;
-    float total = 0.0f;
-    if (threadIdx.x == 0) {
-        for (int w = 0; w < n_warps; ++w) total += scratch[w];
-        scratch[0] = total;
-    }
-    __syncthreads();
-    return scratch[0];
-}
-
-__global__ void dense_rms_norm_narrow(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    float* __restrict__ out,
-    unsigned short* __restrict__ out_h,
-    int width,
-    float eps
-) {
-    extern __shared__ float scratch[];
-    long long base = (long long)blockIdx.x * width;
-
-    float partial = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float v = x[base + j];
-        partial += v * v;
-    }
-    float sum_sq = dense_block_reduce_sum(partial, scratch);
-
-    float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);
-
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float v = x[base + j] * inv_rms * weight[j];
-        out[base + j] = v;
-        unsigned short h;
-        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v));
-        out_h[base + j] = h;
-    }
-}
-
-// act_h[i] = (half)(silu(gate[i]) * up[i]).
-//
-// `LayerOpsKernels::swiglu` followed by a separate narrowing pass computes
-// the same thing in two launches and a full-width round trip through memory;
-// the down projection only ever reads the narrowed form, so the fp32
-// intermediate has no other reader and does not need to exist.
-//
-// `expf`, not `__expf`. `layer_ops.rs` has a test asserting its own SwiGLU
-// has not drifted to the fast intrinsic, and this has to agree with it byte
-// for byte or the two residencies stop being comparable.
-//
-// This is *not* folded into the up projection's epilogue, which is where it
-// was tried first: that epilogue runs on `lane == 0`, so 17,408 transcendental
-// calls would land on one lane in thirty-two. It measured 0.585 ms a layer at
-// four tokens against 0.560 here -- the launch it saved cost more than it was
-// worth. See docs/BENCHMARKS.md.
-__global__ void dense_swiglu_narrow(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
-    unsigned short* __restrict__ act_h,
-    int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g = gate[i];
-    float a = (g / (1.0f + expf(-g))) * up[i];
-    unsigned short h;
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(a));
-    act_h[i] = h;
-}
-
 }
 
 // ---------------------------------------------------------------------------
@@ -997,6 +886,9 @@ impl DenseFfnBlock {
         let layer_ops = LayerOpsKernels::new(ctx)?;
         let ptx = compile(GLUE_SRC, "dense_ffn_block").map_err(MoeBlockError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
+            llmcuda_cuda::kernels::RUST_KERNELS_PTX,
+        ))?;
         // Exactly one of the two int8 paths is provisioned, by width. The
         // GEMV's scratch is small enough to be unconditional; the tensor-core
         // staging arrays are not.
@@ -1020,8 +912,8 @@ impl DenseFfnBlock {
                     None
                 },
                 kernels,
-                rms_norm_narrow: module.load_function("dense_rms_norm_narrow")?,
-                swiglu_narrow: module.load_function("dense_swiglu_narrow")?,
+                rms_norm_narrow: rust.load_function("dense_rms_norm_narrow")?,
+                swiglu_narrow: rust.load_function("dense_swiglu_narrow")?,
                 gate_out: stream.alloc_zeros::<f32>(n)?,
                 up_out: stream.alloc_zeros::<f32>(n)?,
                 normed_h: stream.alloc_zeros::<u16>(geometry.max_tokens * geometry.hidden)?,
@@ -1039,8 +931,8 @@ impl DenseFfnBlock {
                 tile: module
                     .load_function(&format!("dense_proj_split_t{tile_tokens}_r{rows_per_warp}"))?,
                 rows_per_warp,
-                rms_norm_narrow: module.load_function("dense_rms_norm_narrow")?,
-                swiglu_narrow: module.load_function("dense_swiglu_narrow")?,
+                rms_norm_narrow: rust.load_function("dense_rms_norm_narrow")?,
+                swiglu_narrow: rust.load_function("dense_swiglu_narrow")?,
                 gate_out: stream.alloc_zeros::<f32>(n)?,
                 up_out: stream.alloc_zeros::<f32>(n)?,
                 normed_h: stream.alloc_zeros::<u16>(tokens * geometry.hidden)?,
@@ -1053,7 +945,7 @@ impl DenseFfnBlock {
         };
 
         Ok(Self {
-            add_residual_fn: module.load_function("dense_ffn_add_residual")?,
+            add_residual_fn: rust.load_function("dense_ffn_add_residual")?,
             moe,
             layer_ops,
             buffers,
@@ -1533,8 +1425,11 @@ mod tests {
         // AGENTS.md rule 5: no launch on this path may be bounded by a count
         // the host passed by value.
         assert!(GLUE_SRC.contains("const int* __restrict__ valid_tokens"));
-        assert!(GLUE_SRC.contains("if (t >= *valid_tokens) return;"));
         assert!(!GLUE_SRC.contains("int live_tokens"));
+        // The residual add is Rust; it reads the same device-side count.
+        let add = rust_add_residual();
+        assert!(add.contains("valid_tokens: *const i32,"));
+        assert!(add.contains("if t >= *valid_tokens as i64 {"));
     }
 
     #[test]
@@ -1542,7 +1437,14 @@ mod tests {
         // The dense counterpart of the MoE block's same check: folding the
         // residual into `ffn_out` would still give the right `l_out` and
         // would fail the golden's intermediate waypoint.
-        assert!(GLUE_SRC.contains("l_out[base + j] = ffn_out[base + j] + residual[base + j];"));
+        assert!(
+            rust_add_residual().contains("*l_out.add(at) = *ffn_out.add(at) + *residual.add(at);")
+        );
+    }
+
+    /// `dense_ffn_add_residual`, which has no CUDA C++ twin.
+    fn rust_add_residual() -> &'static str {
+        llmcuda_cuda::kernels::rust_kernel_source("dense_ffn_add_residual")
     }
 
     /// The two copies of the split-layout projection GEMV read the weights
@@ -1619,72 +1521,18 @@ mod tests {
         assert!(crate::block::gdn::GDN_BLOCK_SRC.contains(IDIOM));
     }
 
-    /// The block's own RMSNorm has not drifted from `LayerOpsKernels`'.
-    ///
-    /// `dense_rms_norm_narrow` exists only to add a second store; everything
-    /// else is `rms_norm_rows` verbatim, `block_reduce_sum` included. A
-    /// different summation order here would put this one layer's norm out of
-    /// step with every other norm in the model, by an amount no benchmark
-    /// would show and the `forward_pass` golden might not either.
+    /// The dense norm is the layer ops' norm with a second, narrowed output:
+    /// both take their inverse RMS from one Rust function, so the reduction
+    /// order and the exact division cannot drift between them.
     #[test]
     fn the_dense_norm_matches_layer_ops() {
-        fn between<'a>(src: &'a str, open: &str, close: &str) -> &'a str {
-            let at = src
-                .find(open)
-                .unwrap_or_else(|| panic!("the kernel source no longer has `{open}`"));
-            let end = at
-                + src[at..]
-                    .find(close)
-                    .unwrap_or_else(|| panic!("`{open}` no longer ends at `{close}`"));
-            &src[at..end]
-        }
-        fn tokens(src: &str) -> String {
-            src.split_whitespace().collect::<Vec<_>>().join(" ")
-        }
-
-        // The reduction, token for token. This is the part whose drift
-        // would be silent: a different tree gives a different sum.
-        let dense_reduce = tokens(
-            &between(
-                GLUE_SRC,
-                "__device__ __forceinline__ float dense_block_reduce_sum(",
-                "\n}\n",
-            )
-            .replace("dense_", ""),
-        );
-        let shared_reduce = tokens(between(
-            llmcuda_cuda::kernels::layer_ops::LAYER_OPS_SRC,
-            "__device__ __forceinline__ float block_reduce_sum(",
-            "\n}\n",
-        ));
-        assert_eq!(
-            dense_reduce, shared_reduce,
-            "the dense block's copy of `block_reduce_sum` has drifted",
-        );
-
-        // And the arithmetic around it. The stores are what the copy exists
-        // to change, so they are the only lines not compared.
-        let dense_body = between(GLUE_SRC, "__global__ void dense_rms_norm_narrow(", "\n}\n");
-        let shared_body = between(
-            llmcuda_cuda::kernels::layer_ops::LAYER_OPS_SRC,
-            "__global__ void rms_norm_rows(",
-            "\n}\n",
-        );
-        for line in [
-            "long long base = (long long)blockIdx.x * width;",
-            "for (int j = threadIdx.x; j < width; j += blockDim.x) {",
-            "partial += v * v;",
-            "float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);",
-        ] {
-            assert!(dense_body.contains(line), "the dense norm lost `{line}`");
+        for kernel in ["rms_norm_rows", "dense_rms_norm_narrow"] {
             assert!(
-                shared_body.contains(line),
-                "`rms_norm_rows` moved on: `{line}`"
+                llmcuda_cuda::kernels::rust_kernel_source(kernel)
+                    .contains("inverse_rms(x, width, eps)"),
+                "{kernel} no longer shares the inverse RMS",
             );
         }
-        // `layer_ops.rs` has its own test pinning this; the copy needs the
-        // same one or the two diverge the moment that one is relaxed.
-        assert!(!dense_body.contains("rsqrtf"), "the dense norm took rsqrtf");
     }
 
     #[test]

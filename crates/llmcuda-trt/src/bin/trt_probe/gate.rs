@@ -64,7 +64,7 @@ pub fn bit_diff(a: &[f32], b: &[f32]) -> (usize, Option<usize>) {
 
 /// Operands that stress exactness: signed zero, subnormals, cancellation, a
 /// rounding tie, and |a| >> |b|. The first entries are the edges
-/// `bench_rust_add` gates on.
+/// the residual add is gated on.
 pub fn exact_operands(n: usize, seed: u64, edges: bool) -> (Vec<f32>, Vec<f32>) {
     let mut rng = Xorshift64Star::new(seed);
     let mut a = rng.vec_f32(n, -100.0, 100.0);

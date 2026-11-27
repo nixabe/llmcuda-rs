@@ -33,215 +33,6 @@ use cudarc::driver::{
 };
 use half::f16;
 
-use super::compile;
-
-/// CUDA C++ source for the elementwise and reduction kernels.
-///
-/// Kept as one translation unit so the whole set is one NVRTC invocation.
-const VISION_SRC: &str = r#"
-extern "C" {
-
-// binary16 <-> fp32 by hand: NVRTC compiles from a string with no include
-// path, so cuda_fp16.h is not reachable — same convention as
-// `attention.rs`. Activations are stored binary16 and every kernel
-// computes in fp32.
-__device__ __forceinline__ float h2f(unsigned short h) {
-    float f;
-    asm("{ .reg .f16 a; mov.b16 a, %1; cvt.f32.f16 %0, a; }" : "=f"(f) : "h"(h));
-    return f;
-}
-__device__ __forceinline__ unsigned short f2h(float f) {
-    unsigned short h;
-    asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(f));
-    return h;
-}
-
-__global__ void vision_layer_norm(
-    const unsigned short* __restrict__ x,
-    unsigned short* __restrict__ out,
-    const unsigned short* __restrict__ gamma,
-    const unsigned short* __restrict__ beta,
-    int width,
-    float eps)
-{
-    // One block per row. Two-pass mean/variance in f32.
-    const unsigned short* row = x + (long long)blockIdx.x * width;
-    unsigned short* dst = out + (long long)blockIdx.x * width;
-
-    __shared__ float warp_sums[32];
-    float sum = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        sum += h2f(row[j]);
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        sum += __shfl_down_sync(0xffffffffu, sum, off);
-    }
-    if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = sum;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        int warps = (blockDim.x + 31) >> 5;
-        float v = threadIdx.x < warps ? warp_sums[threadIdx.x] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down_sync(0xffffffffu, v, off);
-        }
-        if (threadIdx.x == 0) warp_sums[0] = v;
-    }
-    __syncthreads();
-    float mean = warp_sums[0] / (float)width;
-    __syncthreads();
-
-    float var = 0.0f;
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float d = h2f(row[j]) - mean;
-        var += d * d;
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        var += __shfl_down_sync(0xffffffffu, var, off);
-    }
-    if ((threadIdx.x & 31) == 0) warp_sums[threadIdx.x >> 5] = var;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        int warps = (blockDim.x + 31) >> 5;
-        float v = threadIdx.x < warps ? warp_sums[threadIdx.x] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down_sync(0xffffffffu, v, off);
-        }
-        if (threadIdx.x == 0) warp_sums[0] = v;
-    }
-    __syncthreads();
-    float inv = rsqrtf(warp_sums[0] / (float)width + eps);
-
-    for (int j = threadIdx.x; j < width; j += blockDim.x) {
-        float g = h2f(gamma[j]);
-        float b = h2f(beta[j]);
-        float centered = (h2f(row[j]) - mean) * inv;
-        dst[j] = f2h(centered * g + b);
-    }
-}
-
-__global__ void vision_gelu(unsigned short* __restrict__ x, long long n)
-{
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    // ggml's tanh approximation, computed in f32.
-    float v = h2f(x[i]);
-    float inner = 0.79788456f * v * (1.0f + 0.044715f * v * v);
-    x[i] = f2h(0.5f * v * (1.0f + tanhf(inner)));
-}
-
-// Rotates the query and key slices of the fused qkv buffer in place.
-// Layout per token: [q 0..hidden | k hidden..2*hidden | v untouched],
-// heads of head_dim within each slice. positions holds (row, col) per
-// token. Pairs (j, j + head_dim/2); pairs below the quarter rotate by the
-// patch row, the rest by the column, each with frequencies restarting at
-// theta^0 — GGML_ROPE_TYPE_VISION with independent sections, see
-// llmcuda_kernels::vision::tower.
-__global__ void vision_rope_qk(
-    unsigned short* __restrict__ qkv,
-    const int* __restrict__ positions,
-    int hidden,
-    int head_dim,
-    float theta_base)
-{
-    int token = blockIdx.x;
-    int slice = blockIdx.y;         // 0 = q, 1 = k
-    int head = blockIdx.z;
-    int j = threadIdx.x;            // pair index, [0, head_dim/2)
-    int half_dim = head_dim >> 1;
-    int quarter = head_dim >> 2;
-    if (j >= half_dim) return;
-
-    unsigned short* base = qkv + (long long)token * 3 * hidden + slice * hidden + head * head_dim;
-    int pos = j < quarter ? positions[2 * token] : positions[2 * token + 1];
-    int k = j < quarter ? j : j - quarter;
-    float freq = powf(theta_base, -(float)k / (float)quarter);
-    float angle = (float)pos * freq;
-    float sin_a, cos_a;
-    sincosf(angle, &sin_a, &cos_a);
-    float x0 = h2f(base[j]);
-    float x1 = h2f(base[j + half_dim]);
-    base[j] = f2h(x0 * cos_a - x1 * sin_a);
-    base[j + half_dim] = f2h(x0 * sin_a + x1 * cos_a);
-}
-
-__global__ void vision_softmax_rows(
-    unsigned short* __restrict__ scores,
-    int row_len)
-{
-    // One block per row, rows are (batch * n) in grid.x.
-    unsigned short* row = scores + (long long)blockIdx.x * row_len;
-    __shared__ float warp_red[32];
-
-    float local_max = -3.4e38f;
-    for (int j = threadIdx.x; j < row_len; j += blockDim.x) {
-        local_max = fmaxf(local_max, h2f(row[j]));
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffu, local_max, off));
-    }
-    if ((threadIdx.x & 31) == 0) warp_red[threadIdx.x >> 5] = local_max;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        int warps = (blockDim.x + 31) >> 5;
-        float v = threadIdx.x < warps ? warp_red[threadIdx.x] : -3.4e38f;
-        for (int off = 16; off > 0; off >>= 1) {
-            v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
-        }
-        if (threadIdx.x == 0) warp_red[0] = v;
-    }
-    __syncthreads();
-    float row_max = warp_red[0];
-    __syncthreads();
-
-    float total = 0.0f;
-    for (int j = threadIdx.x; j < row_len; j += blockDim.x) {
-        float e = expf(h2f(row[j]) - row_max);
-        row[j] = f2h(e);
-        total += e;
-    }
-    for (int off = 16; off > 0; off >>= 1) {
-        total += __shfl_down_sync(0xffffffffu, total, off);
-    }
-    if ((threadIdx.x & 31) == 0) warp_red[threadIdx.x >> 5] = total;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        int warps = (blockDim.x + 31) >> 5;
-        float v = threadIdx.x < warps ? warp_red[threadIdx.x] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down_sync(0xffffffffu, v, off);
-        }
-        if (threadIdx.x == 0) warp_red[0] = v;
-    }
-    __syncthreads();
-    float inv = 1.0f / warp_red[0];
-    for (int j = threadIdx.x; j < row_len; j += blockDim.x) {
-        row[j] = f2h(h2f(row[j]) * inv);
-    }
-}
-
-__global__ void vision_add_f16(
-    unsigned short* __restrict__ a,
-    const unsigned short* __restrict__ b,
-    long long n)
-{
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    a[i] = f2h(h2f(a[i]) + h2f(b[i]));
-}
-
-__global__ void vision_half_to_float(
-    const unsigned short* __restrict__ src,
-    float* __restrict__ dst,
-    long long n)
-{
-    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = h2f(src[i]);
-}
-
-} // extern "C"
-"#;
-
 /// Errors from the vision device ops.
 #[derive(Debug)]
 pub enum VisionError {
@@ -339,20 +130,20 @@ pub struct VisionKernels {
 impl VisionKernels {
     /// Compile and load the kernels on `ctx`, binding GEMMs to `stream`.
     pub fn new(ctx: &Arc<CudaContext>, stream: Arc<CudaStream>) -> Result<Self, VisionError> {
-        let ptx = compile(VISION_SRC, "vision").map_err(VisionError::Build)?;
-        let module = ctx.load_module(ptx).map_err(VisionError::Driver)?;
-        let f = |name: &str| {
-            module
-                .load_function(name)
+        let rust = ctx
+            .load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))
+            .map_err(VisionError::Driver)?;
+        let r = |name: &str| {
+            rust.load_function(name)
                 .map_err(|e| VisionError::Build(format!("{name}: {e}")))
         };
         Ok(Self {
-            layer_norm: f("vision_layer_norm")?,
-            gelu: f("vision_gelu")?,
-            rope_qk: f("vision_rope_qk")?,
-            softmax_rows: f("vision_softmax_rows")?,
-            add_f16: f("vision_add_f16")?,
-            half_to_float: f("vision_half_to_float")?,
+            layer_norm: r("vision_layer_norm")?,
+            gelu: r("vision_gelu")?,
+            rope_qk: r("vision_rope_qk")?,
+            softmax_rows: r("vision_softmax_rows")?,
+            add_f16: r("vision_add_f16")?,
+            half_to_float: r("vision_half_to_float")?,
             blas: CudaBlasLT::new(stream)?,
         })
     }

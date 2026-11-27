@@ -98,7 +98,6 @@ use cudarc::driver::{
 };
 
 use llmcuda_cuda::kernels::attention::AttentionError;
-use llmcuda_cuda::kernels::compile;
 use llmcuda_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
 use llmcuda_cuda::kernels::lm_head::{
     ARGMAX_BLOCKS, HeadFormat, HeadTensor, LmHeadError, LmHeadGeometry, LmHeadKernels,
@@ -212,220 +211,6 @@ pub fn moe_block_size(tokens: usize) -> usize {
 /// The GGUF keys that are not in [`ModelConfig`] and must not be guessed.
 pub(crate) const RMS_EPS_SUFFIX: &str = "attention.layer_norm_rms_epsilon";
 pub(crate) const ROPE_FREQ_BASE_SUFFIX: &str = "rope.freq_base";
-
-const EMBED_SRC: &str = r#"
-extern "C" {
-
-// Reinterpret two little-endian bytes as an IEEE half and widen to float.
-//
-// Copied verbatim from `llmcuda_cuda::kernels::dequant`: NVRTC compiles from a
-// string with no include path, so <cuda_fp16.h> is unreachable.
-__device__ __forceinline__ float load_half_le(const unsigned char* p) {
-    unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
-    float f;
-    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(bits));
-    return f;
-}
-
-// Copy one table row into shared memory before reading it. K2-Horizon's table
-// is mapped host memory (`forward::host_holds`), where every read crosses
-// PCIe, and the gather reads a row byte by byte over dependent loop
-// iterations: one round trip each. Here every thread issues all of its word
-// loads before storing any, so each 4 * blockDim words cost one round trip.
-// A row that is not whole aligned words, or is longer than the stage, is read
-// in place; the condition is uniform across the block.
-#define EMBED_STAGE_WORDS 4096
-__device__ __forceinline__ const unsigned char* embed_stage_row(
-    const unsigned char* row, long long row_bytes, unsigned int* stage
-) {
-    if ((row_bytes & 3) || row_bytes > EMBED_STAGE_WORDS * 4 || ((unsigned long long)row & 3)) {
-        return row;
-    }
-    int words = (int)(row_bytes >> 2);
-    const unsigned int* src = (const unsigned int*)row;
-    for (int base = 0; base < words; base += 4 * (int)blockDim.x) {
-        unsigned int v[4];
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            int w = base + (int)threadIdx.x + k * (int)blockDim.x;
-            if (w < words) v[k] = src[w];
-        }
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            int w = base + (int)threadIdx.x + k * (int)blockDim.x;
-            if (w < words) stage[w] = v[k];
-        }
-    }
-    __syncthreads();
-    return (const unsigned char*)stage;
-}
-
-// out[t][j] = dequantize(token_embd)[ids[t]][j] -- ggml's `get_rows` over a
-// Q8_0 table, which is what `model.input_embed` is.
-//
-// `token_embd.weight` is [hidden, vocab] in ggml order, so token `v`'s row is
-// `hidden` *contiguous* elements at `v * (hidden/32) * 34` bytes. Reading it
-// transposed gathers at stride `vocab` and produces a different model that
-// still generates text; `docs/ORACLE.md` section 6.3 proves the layout
-// bit-exactly against this same table.
-//
-// The arithmetic is `d * q` and nothing else, matching
-// `dequantize_row_q8_0`, so the result is bit-identical to the capture rather
-// than merely close.
-//
-// grid: (max_tokens). block: EMBED_THREADS, striding the row.
-__global__ void fwd_embed_q8_0(
-    const unsigned char* __restrict__ table,
-    const int* __restrict__ ids,
-    float* __restrict__ out,
-    int hidden,
-    int n_tokens
-) {
-    int t = blockIdx.x;
-    if (t >= n_tokens) return;
-
-    long long blocks = hidden / 32;
-    const unsigned char* row = table + (long long)ids[t] * blocks * 34;
-    float* dst = out + (long long)t * hidden;
-
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        const unsigned char* blk = row + (long long)(j / 32) * 34;
-        float d = load_half_le(blk);
-        signed char q = (signed char)blk[2 + (j % 32)];
-        dst[j] = d * (float)q;
-    }
-}
-
-// The same gather over any format the shipped files do *not* use.
-//
-// `fwd_embed_q8_0` above stays a separate, specialized kernel because it is
-// the one both shipped models actually take, it is on the hot path, and it is
-// covered by `forward_pass` and `golden`. This is its fallback sibling: one
-// kernel with a runtime format code, covering Q6_K, Q4_0, Q4_K, Q5_K and F16.
-//
-// A switch per element rather than a kernel per format, because this is a
-// gather and not a GEMV — it runs once per step over `n_tokens` rows, against
-// a decode step that reads tens of gigabytes — and `format` is uniform across
-// every thread in the grid, so the branch is warp-uniform and predictable.
-// Five near-duplicate kernels would be five places to get an unpacking wrong
-// for a path that cannot show up in a profile.
-//
-// Every reconstruction below matches its scalar reference operand for
-// operand. The two affine formats use `mul.rn`/`sub.rn` so the subtraction
-// cannot contract into an FMA, which is what keeps them bit-identical rather
-// than merely close; see `k_affine_value` in `llmcuda_cuda::kernels::lm_head`
-// for the full reasoning.
-#define FWD_EMBED_Q6_K 0
-#define FWD_EMBED_Q4_0 1
-#define FWD_EMBED_Q4_K 2
-#define FWD_EMBED_Q5_K 3
-#define FWD_EMBED_F16  4
-
-__device__ __forceinline__ float fwd_affine(float d1, int code, float m1) {
-    float c = (float)code;
-    float t, r;
-    asm("mul.rn.f32 %0, %1, %2;" : "=f"(t) : "f"(d1), "f"(c));
-    asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(t), "f"(m1));
-    return r;
-}
-
-// `get_scale_min_k4` from `ggml-quants.c`; see the copy in `lm_head.rs` for
-// why the `j >= 4` branch is the dangerous one.
-__device__ __forceinline__ void fwd_scale_min_k4(
-    int j, const unsigned char* q, int* sc, int* m
-) {
-    if (j < 4) {
-        *sc = q[j] & 63;
-        *m  = q[j + 4] & 63;
-    } else {
-        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        *m  = (q[j + 4] >> 4)  | ((q[j]     >> 6) << 4);
-    }
-}
-
-__global__ void fwd_embed_quant(
-    const unsigned char* __restrict__ table,
-    const int* __restrict__ ids,
-    float* __restrict__ out,
-    int hidden,
-    int n_tokens,
-    int format
-) {
-    int t = blockIdx.x;
-    if (t >= n_tokens) return;
-
-    // Serialized bytes per row, by format.
-    long long row_bytes;
-    switch (format) {
-        case FWD_EMBED_Q6_K: row_bytes = (long long)(hidden / 256) * 210; break;
-        case FWD_EMBED_Q4_0: row_bytes = (long long)(hidden / 32)  * 18;  break;
-        case FWD_EMBED_Q4_K: row_bytes = (long long)(hidden / 256) * 144; break;
-        case FWD_EMBED_Q5_K: row_bytes = (long long)(hidden / 256) * 176; break;
-        default:             row_bytes = (long long)hidden * 2;           break;
-    }
-    __shared__ unsigned int stage[EMBED_STAGE_WORDS];
-    const unsigned char* row = embed_stage_row(table + (long long)ids[t] * row_bytes, row_bytes, stage);
-    float* dst = out + (long long)t * hidden;
-
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        float v;
-        if (format == FWD_EMBED_Q6_K) {
-            // Index decomposition is `moe.rs`'s dequant_tile_q6k_impl read
-            // backwards: half r>>7, interleave group (r>>5)&3, lane r&31.
-            const unsigned char* sb = row + (long long)(j >> 8) * 210;
-            int r    = j & 255;
-            int half = r >> 7;
-            int grp  = (r >> 5) & 3;
-            int l    = r & 31;
-            const unsigned char* ql = sb + half * 64 + ((grp & 1) ? l + 32 : l);
-            const unsigned char* qh = sb + 128 + half * 32 + l;
-            const signed char*   sc = (const signed char*)(sb + 192 + half * 8);
-            float d = load_half_le(sb + 208);
-            int lo4 = (grp < 2) ? (*ql & 0xF) : (*ql >> 4);
-            int raw = lo4 | ((((int)*qh >> (2 * grp)) & 3) << 4);
-            v = d * (float)sc[(l >> 4) + 2 * grp] * (float)(raw - 32);
-        } else if (format == FWD_EMBED_Q4_0) {
-            // Byte `k` holds elements `k` and `k + 16` of its block.
-            const unsigned char* blk = row + (long long)(j >> 5) * 18;
-            int r = j & 31;
-            int k = r & 15;
-            float d = load_half_le(blk);
-            unsigned int q = blk[2 + k];
-            int code = (r < 16) ? (int)(q & 0xFu) : (int)(q >> 4);
-            v = (float)(code - 8) * d;
-        } else if (format == FWD_EMBED_F16) {
-            v = load_half_le(row + (long long)j * 2);
-        } else {
-            // Q4_K and Q5_K: four 64-element passes, low nibbles then high.
-            int q5 = (format == FWD_EMBED_Q5_K);
-            int sb_bytes = q5 ? 176 : 144;
-            int qs_off   = q5 ? 48 : 16;
-            const unsigned char* sb = row + (long long)(j >> 8) * sb_bytes;
-            int r   = j & 255;
-            int g   = r >> 6;
-            int sub = (r >> 5) & 1;
-            int l   = r & 31;
-            int js  = 2 * g + sub;
-
-            float d    = load_half_le(sb);
-            float dmin = load_half_le(sb + 2);
-            int sc, m;
-            fwd_scale_min_k4(js, sb + 4, &sc, &m);
-
-            unsigned int byte = sb[qs_off + g * 32 + l];
-            int code = (int)(sub ? (byte >> 4) : (byte & 0xFu));
-            if (q5) {
-                // One `qh` plane reused by all four passes; the *bit* moves.
-                code |= (int)((sb[16 + l] >> js) & 1) << 4;
-            }
-            v = fwd_affine(d * (float)sc, code, dmin * (float)m);
-        }
-        dst[j] = v;
-    }
-}
-
-}
-"#;
 
 /// Something went wrong building or running the forward pass.
 #[derive(Debug)]
@@ -1244,10 +1029,11 @@ impl Forward {
             .get_f32(&rope_key)
             .ok_or(ForwardError::MissingMetadata { key: rope_key })?;
 
-        let ptx = compile(EMBED_SRC, "forward_embed").map_err(ForwardError::Compile)?;
-        let module = ctx.load_module(ptx)?;
-        let embed_q8_0 = module.load_function("fwd_embed_q8_0")?;
-        let embed_quant = module.load_function("fwd_embed_quant")?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
+            llmcuda_cuda::kernels::RUST_KERNELS_PTX,
+        ))?;
+        let embed_q8_0 = rust.load_function("embed_q8_0")?;
+        let embed_quant = rust.load_function("fwd_embed_quant")?;
 
         let layer_ops = LayerOpsKernels::new(ctx)?;
 
@@ -1282,8 +1068,8 @@ impl Forward {
         // The gather has a body per format; bf16 has none, because no file
         // seen so far stores the *embedding* that way and an untested third
         // path is worse than a named refusal.
-        // `fwd_embed_quant`'s format codes, mirroring the `#define`s in
-        // EMBED_SRC. bf16 is the one format with no gather body: no file seen
+        // `fwd_embed_quant`'s format codes, as its Rust source matches on
+        // them. bf16 is the one format with no gather body: no file seen
         // so far stores the *embedding* that way, and an untested path is
         // worse than a refusal that names the format.
         let (embed_fn, embed_code) = match embd_format {
@@ -4387,9 +4173,9 @@ mod tests {
     /// result is bit-identical to `dequantize_*` or the unpacking is wrong. A
     /// tolerance could hide a systematically wrong sub-scale, which is the
     /// failure mode the k-quants actually have. The affine formats stay exact
-    /// only because `fwd_affine` pins the rounding with `mul.rn`/`sub.rn`;
-    /// without that the subtraction contracts into an FMA and this test is
-    /// what fails.
+    /// only because the kernel is built with implicit fusion off and spells
+    /// no `mul_add`; were the subtraction to contract into an FMA, this test
+    /// is what fails.
     ///
     /// The tables are synthetic because no file on this host stores
     /// `token_embd.weight` in any of these formats — that is precisely why
@@ -4429,8 +4215,11 @@ mod tests {
             })
             .collect();
 
-        let ptx = compile(EMBED_SRC, "forward_embed").expect("NVRTC");
-        let module = ctx.load_module(ptx).expect("load module");
+        let module = ctx
+            .load_module(cudarc::nvrtc::Ptx::from_src(
+                llmcuda_cuda::kernels::RUST_KERNELS_PTX,
+            ))
+            .expect("load module");
         let f = module
             .load_function("fwd_embed_quant")
             .expect("the fallback gather entry point");
@@ -4563,30 +4352,37 @@ mod tests {
             llmcuda_cuda::kernels::dequant::BLOCK_Q6_K_BYTES
         );
         assert_eq!(BLOCK_Q6_K_BYTES, QK_K / 2 + QK_K / 4 + QK_K / 16 + 2);
+        // The Q8_0 gather is Rust.
         assert!(
-            EMBED_SRC
-                .contains("const unsigned char* row = table + (long long)ids[t] * blocks * 34;")
+            llmcuda_cuda::kernels::rust_kernel_source("embed_q8_0").contains(
+                "let row = table.add((*ids.add(t as usize) as i64 * blocks * 34) as usize);"
+            )
         );
         // The fallback gather's block strides, spelled as literals in the
         // kernel for the same reason 32 and 34 are.
+        let gather = llmcuda_cuda::kernels::rust_kernel_source("fwd_embed_quant");
         for stride in [
-            "(long long)(hidden / 256) * 210",
-            "(long long)(hidden / 32)  * 18",
-            "(long long)(hidden / 256) * 144",
-            "(long long)(hidden / 256) * 176",
+            "0 => (hidden / 256) as i64 * 210,",
+            "1 => (hidden / 32) as i64 * 18,",
+            "2 => (hidden / 256) as i64 * 144,",
+            "3 => (hidden / 256) as i64 * 176,",
         ] {
-            assert!(EMBED_SRC.contains(stride), "missing row stride: {stride}");
+            assert!(gather.contains(stride), "missing row stride: {stride}");
         }
         // Q6_K reconstructs as (d * scale) * q, with no addition to contract.
         assert!(
-            EMBED_SRC.contains("d * (float)sc[(l >> 4) + 2 * grp] * (float)(raw - 32)"),
+            gather.contains(
+                "d * (*sc.add(((l >> 4) + 2 * grp) as usize) as f32) * (raw - 32) as f32"
+            ),
             "the Q6_K gather reassociated away from (d * scale) * q",
         );
-        // The affine formats pin their rounding, or nvcc contracts the
-        // subtraction into an FMA and the weight stops being bit-identical.
+        // The affine formats are a multiply and a subtract. The Rust PTX is
+        // built with implicit fusion off, so only a `mul_add` could contract
+        // them, and the weight would stop being bit-identical.
+        assert!(gather.contains("(d * sc as f32) * code as f32 - dmin * m as f32"));
         assert!(
-            EMBED_SRC.contains("mul.rn.f32") && EMBED_SRC.contains("sub.rn.f32"),
-            "the affine gather lost its rounding pins and may contract to an FMA",
+            !gather.contains("mul_add"),
+            "the affine gather may contract to an FMA",
         );
     }
 
@@ -4597,8 +4393,9 @@ mod tests {
         // equality rather than a tolerance. Reading the codes as unsigned
         // would flip the sign of about half the table while leaving every
         // magnitude plausible.
-        assert!(EMBED_SRC.contains("dst[j] = d * (float)q;"));
-        assert!(EMBED_SRC.contains("signed char q = (signed char)blk[2 + (j % 32)];"));
+        let embed = llmcuda_cuda::kernels::rust_kernel_source("embed_q8_0");
+        assert!(embed.contains("*dst.add(j as usize) = d * q as f32;"));
+        assert!(embed.contains("let q = *blk.add(2 + (j % 32) as usize) as i8;"));
     }
 
     #[test]
@@ -4606,7 +4403,10 @@ mod tests {
         // AGENTS.md rule 5. The grid is `max_tokens` blocks and the live count
         // is a guard inside the kernel, so the launch shape does not change
         // with the batch and stays replayable from a captured graph.
-        assert!(EMBED_SRC.contains("if (t >= n_tokens) return;"));
+        assert!(
+            llmcuda_cuda::kernels::rust_kernel_source("fwd_embed_quant")
+                .contains("if t >= n_tokens {\n        return;")
+        );
     }
 
     #[test]

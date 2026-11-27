@@ -93,7 +93,6 @@ __device__ __forceinline__ float load_half_le_mma(const unsigned char* p) {
     return f;
 }
 
-
 // d[m][n] = sum_k a[m][k] * b[n][k], int8 operands, int32 accumulate.
 //
 // `a` is [M][K] row-major and `b` is [N][K] row-major -- b is the transpose of
@@ -106,55 +105,10 @@ __device__ __forceinline__ float load_half_le_mma(const unsigned char* p) {
 //
 // K must be a multiple of 16. The caller checks it; a kernel-side check would
 // have to be a branch on a host value in the inner loop.
-// Quantize activations to int8, one scale per 32-element block.
 //
-// This is the operand the model does not already provide. Weights ship as
-// Q8_0 -- int8 with an fp16 scale per 32 elements -- so they feed the MMA
-// directly; activations are fp32 and must be narrowed to match.
-//
-// Symmetric, absmax, round-to-nearest, exactly llama.cpp's `quantize_q8_1`
-// shape minus the sum term this formulation does not need (no zero point, so
-// no correction term). One warp per (row, block): 32 lanes, one element each.
-__global__ void mma_quantize_rows_q8(
-    const float* __restrict__ x,
-    signed char* __restrict__ q,
-    float* __restrict__ scales,
-    int k_dim
-) {
-    // Row on x, contraction block on y -- deliberately, and not the other way
-    // round. grid.y and grid.z are capped at 65,535 while grid.x is capped at
-    // 2^31-1, and `rows` here is the MoE dispatch *slot* count, which is
-    // `max_tokens * top_k` plus padding. Putting it on y capped the model's
-    // context at about 7,168 tokens, with the failure surfacing as a bare
-    // CUDA_ERROR_INVALID_VALUE from the launch.
-    int row   = blockIdx.x;
-    int block = blockIdx.y * blockDim.y + threadIdx.y;
-    int lane  = threadIdx.x;
-    int blocks = k_dim / 32;
-    if (block >= blocks) return;
-
-    long long base = (long long)row * k_dim + block * 32;
-    float v = x[base + lane];
-
-    // Absmax across the warp. `fmaxf` of absolute values, butterfly so every
-    // lane ends with the same scale and none has to broadcast.
-    float a = fabsf(v);
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off));
-
-    // A block of exact zeros has no scale; 1.0 keeps the dequantization
-    // well-defined and every quant is zero anyway.
-    float d = a > 0.0f ? a / 127.0f : 1.0f;
-    float inv = a > 0.0f ? 127.0f / a : 0.0f;
-
-    // rintf, not truncation: truncation biases every magnitude downward and
-    // the bias survives the sum over k, which a symmetric rounding does not.
-    int qi = (int)rintf(v * inv);
-    qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
-
-    q[base + lane] = (signed char)qi;
-    if (lane == 0) scales[(long long)row * blocks + block] = d;
-}
+// The activation operand is quantized by the Rust kernel
+// `mma_quantize_rows_q8`: weights ship as Q8_0 and feed the MMA directly,
+// activations are fp32 and must be narrowed to match.
 
 // out[t][n] = sum_k w[n][k] * x[t][k], with `w` a Q8_0 GGUF tensor and `x`
 // pre-quantized by `mma_quantize_rows_q8`, computed on integer tensor cores.
@@ -273,52 +227,8 @@ __global__ void mma_q8_0_proj(
 // pass afterwards.
 //
 //   quants: int8  [n_rows][k]
-//   scales: fp32  [n_rows][k / 32]   (`mma_repack_q8_0`)
-//   scales: fp16  [n_rows][k / 32]   (`mma_repack_q8_0_h`)
-// Split a Q8_0 tensor into aligned quants and per-32 scales.
-//
-// One warp per 32-element block: each lane moves one quant, lane 0 writes the
-// scale. Run once at load; see `mma_q8_0_proj_split` for why the on-disk
-// layout cannot be read directly at speed.
-//
-// **Which width the scales get is a bandwidth decision, not a numeric one.**
-// Q8_0 stores an fp16 scale per 32 quants, so the fp32 form widens a value
-// that has no more precision to give: 1.125 bytes an element against Q8_0's
-// own 1.0625, which is 5.9% more traffic for nothing. That is noise where the
-// repack covers a shared expert (3.5 MB in a layer of 725) and it is not
-// noise where it covers a 17,408-wide dense FFN -- there the same 5.9% is
-// 1.01 GiB of every decoded token. `_h` keeps the file's own fp16 bits
-// verbatim, so it is neither a requantization nor a rounding.
-__global__ void mma_repack_q8_0(
-    const unsigned char* __restrict__ src,
-    signed char* __restrict__ q,
-    float* __restrict__ scales,
-    long long n_blocks
-) {
-    long long b = (long long)blockIdx.x * blockDim.y + threadIdx.y;
-    if (b >= n_blocks) return;
-    int lane = threadIdx.x;
-    const unsigned char* blk = src + b * 34;
-    q[b * 32 + lane] = (signed char)blk[2 + lane];
-    if (lane == 0) scales[b] = load_half_le_mma(blk);
-}
-
-__global__ void mma_repack_q8_0_h(
-    const unsigned char* __restrict__ src,
-    signed char* __restrict__ q,
-    unsigned short* __restrict__ scales,
-    long long n_blocks
-) {
-    long long b = (long long)blockIdx.x * blockDim.y + threadIdx.y;
-    if (b >= n_blocks) return;
-    int lane = threadIdx.x;
-    const unsigned char* blk = src + b * 34;
-    q[b * 32 + lane] = (signed char)blk[2 + lane];
-    // The two source bytes, moved rather than converted. GGUF is
-    // little-endian and so is the device, so this is the identity on the
-    // value as well as on the bits.
-    if (lane == 0) scales[b] = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
-}
+//   scales: fp32  [n_rows][k / 32]   (`mma_repack_q8_0`, a Rust kernel)
+//   scales: fp16  [n_rows][k / 32]   (`mma_repack_q8_0_h`, a Rust kernel)
 
 // Contraction the block stages per trip, and the padded row stride it stages
 // into.
@@ -744,14 +654,15 @@ impl MmaKernels {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, MmaError> {
         let ptx = compile(MMA_SRC, "mma_int8").map_err(MmaError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {
             gemm: module.load_function("mma_int8_gemm")?,
-            quantize: module.load_function("mma_quantize_rows_q8")?,
+            quantize: rust.load_function("mma_quantize_rows_q8")?,
             proj: module.load_function("mma_q8_0_proj")?,
             proj_split: module.load_function("mma_q8_0_proj_split")?,
             proj_split_h: module.load_function("mma_q8_0_proj_split_h")?,
-            repack: module.load_function("mma_repack_q8_0")?,
-            repack_h: module.load_function("mma_repack_q8_0_h")?,
+            repack: rust.load_function("mma_repack_q8_0")?,
+            repack_h: rust.load_function("mma_repack_q8_0_h")?,
         })
     }
 
@@ -1159,10 +1070,13 @@ mod tests {
         // 2^31-1. With rows on y the model could not exceed about 7,168 tokens
         // and the failure was an unattributed CUDA_ERROR_INVALID_VALUE, which
         // is why this is asserted rather than left to a comment.
-        assert!(MMA_SRC.contains("int row   = blockIdx.x;"));
-        assert!(MMA_SRC.contains("int block = blockIdx.y * blockDim.y + threadIdx.y;"));
+        let quantize = crate::kernels::rust_kernel_source("mma_quantize_rows_q8");
+        assert!(quantize.contains("let row = thread::blockIdx_x() as i64;"));
+        assert!(quantize.contains(
+            "(thread::blockIdx_y() * thread::blockDim_y() + thread::threadIdx_y()) as i32;"
+        ));
         assert!(
-            !MMA_SRC.contains("int row   = blockIdx.y;"),
+            !quantize.contains("let row = thread::blockIdx_y()"),
             "rows on grid.y caps context at 65,535 slots",
         );
     }
@@ -1223,9 +1137,13 @@ mod tests {
         // Truncation biases every magnitude toward zero, and the bias survives
         // the sum over k rather than cancelling — a systematic error in every
         // projection, not a rounding one.
-        assert!(MMA_SRC.contains("rintf(v * inv)"), "must round to nearest");
+        let quantize = crate::kernels::rust_kernel_source("mma_quantize_rows_q8");
         assert!(
-            MMA_SRC.contains("qi < -127 ? -127"),
+            quantize.contains("(v * inv).round_ties_even() as i32"),
+            "must round to nearest"
+        );
+        assert!(
+            quantize.contains("if qi < -127 {"),
             "must clamp symmetrically; -128 has no positive counterpart and \
              would skew the scale",
         );

@@ -18,7 +18,7 @@ pub type Error = Box<dyn std::error::Error>;
 /// cudarc launches only on a `CudaStream` it created.
 #[derive(Clone, Copy)]
 pub struct Kernels {
-    /// The engine's NVRTC `tensor_add`, compiled from `LAYER_OPS_SRC`.
+    /// The engine's `tensor_add`, from its embedded Rust-kernel PTX.
     pub add: CUfunction,
     pub accumulate: CUfunction,
     pub through_workspace: CUfunction,
@@ -54,7 +54,11 @@ __global__ void probe_through_workspace(
 
 fn load(src: &str, name: &str, functions: &[&str]) -> Result<Vec<CUfunction>, Error> {
     let ptx = llmcuda_cuda::kernels::compile(src, name)?;
-    let image = CString::new(ptx.to_src())?;
+    load_ptx(&ptx.to_src(), functions)
+}
+
+fn load_ptx(ptx: &str, functions: &[&str]) -> Result<Vec<CUfunction>, Error> {
+    let image = CString::new(ptx)?;
     // SAFETY: a NUL-terminated PTX image; the module is never unloaded, so
     // its functions stay valid for the process.
     let module = unsafe { result::module::load_data(image.as_ptr() as *const c_void) }?;
@@ -77,11 +81,7 @@ impl Env {
         // until it synchronizes; graph capture (P4) requires this.
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
-        let add = load(
-            llmcuda_cuda::kernels::layer_ops::LAYER_OPS_SRC,
-            "layer_ops",
-            &["tensor_add"],
-        )?;
+        let add = load_ptx(llmcuda_cuda::kernels::RUST_KERNELS_PTX, &["tensor_add"])?;
         let probe = load(
             PROBE_SRC,
             "trt_probe",

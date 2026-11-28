@@ -1,9 +1,8 @@
 //! Just enough ONNX protobuf to hand TensorRT's parser a graph.
 //!
-//! Hand-encoded wire format for the handful of messages U4 and U5 need. The
-//! trunk's emitter (`llmcuda-onnx`) generates its types from `onnx.proto3`;
-//! this exists only so the toolchain probe does not depend on that crate.
-//! Field numbers are from `onnx/onnx.proto3`.
+//! Hand-encoded wire format for the handful of messages U4 and U5 need, so
+//! the probe depends on no protobuf crate. Field numbers are from
+//! `onnx/onnx.proto3`.
 
 /// `TensorProto.DataType`.
 #[derive(Clone, Copy)]

@@ -25,8 +25,7 @@ pub struct Kernels {
 }
 
 /// Probe-only kernels: a side-effecting accumulator reached through a
-/// device pointer table (the shape every real plugin's state access takes),
-/// and a pass through plugin workspace.
+/// device pointer table, and a pass through plugin workspace.
 const PROBE_SRC: &str = r#"
 extern "C" {
 

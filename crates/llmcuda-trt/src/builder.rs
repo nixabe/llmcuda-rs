@@ -402,7 +402,7 @@ impl BuilderConfig<'_> {
     }
 
     /// The design runs every layer and plugin on the caller's stream, so
-    /// this is always set to zero by the engine.
+    /// every builder in this repository sets this to zero.
     pub fn set_max_aux_streams(&self, n: i32) -> Result<()> {
         clear_last_error();
         // SAFETY: live config.

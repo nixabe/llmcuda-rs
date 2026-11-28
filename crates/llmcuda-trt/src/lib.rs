@@ -54,10 +54,3 @@ pub use types::{
     ProfilingVerbosity, Result, TensorLocation, TrtError, header_version, library_version,
     onnx_parser_version,
 };
-
-/// The plugin ABI version serialized into every plan this crate builds.
-#[cfg(feature = "tensorrt")]
-pub const PLUGIN_ABI_VERSION: i32 = ffi::ABI_VERSION;
-
-/// Whether this build links TensorRT.
-pub const ENABLED: bool = cfg!(feature = "tensorrt");

@@ -1,4 +1,4 @@
-//! TensorRT toolchain gate: Phase 0 of the TensorRT trunk plan.
+//! TensorRT toolchain gate.
 //!
 //! ```sh
 //! export TENSORRT_ROOT=/path/to/tensorrt-11 CUDA_ROOT=/path/to/cuda-12

@@ -1,5 +1,5 @@
-//! P6: capability probes. Each answers a question the plan left open by
-//! running it, not by reading documentation. These are recorded, not gated:
+//! P6: capability probes. Each answers a question by running it, not by
+//! reading documentation. These are recorded, not gated:
 //! `Pass` means "yes, demonstrated", `Fail` means "no", with the reason
 //! TensorRT gave.
 
@@ -641,8 +641,8 @@ struct U6Run {
 /// Build the U6 GEMM from `cache_blob` (empty for a fresh cache),
 /// optionally rewriting every non-zero tactic in it to `pin` first, then
 /// run each of [`U6_MS`] on the same leading rows. `exact` builds one
-/// exact-shape profile per row count, as the plan specifies; otherwise one
-/// dynamic profile covers all three.
+/// exact-shape profile per row count; otherwise one dynamic profile covers
+/// all three.
 fn u6_run(
     env: &Env,
     w: &[f16],
@@ -770,8 +770,8 @@ fn u6(env: &Env) -> Result<CheckOutcome, Error> {
         base.layers,
         fmt_cmp(&sanity)
     );
-    // Not the plan's design, but the obvious alternative if exact profiles
-    // fail: one dynamic profile, so one tactic for every row count.
+    // The obvious alternative if exact profiles fail: one dynamic profile,
+    // so one tactic for every row count.
     let dynamic = match u6_run(env, &w, &x, &[], None, false) {
         Ok(r) => format!(
             "one dynamic profile [1, 6144] instead: diffs {:?}, layers {:?}",
@@ -900,7 +900,7 @@ fn u8(env: &Env) -> Result<CheckOutcome, Error> {
     })
 }
 
-/// IAttention, as the plan would use it after a KV layout migration: fp16,
+/// IAttention, as it would be used after a KV layout migration: fp16,
 /// 16 query heads over 2 KV heads, head dim 256, causal from position 0,
 /// padded BHND. Built without `setDecomposable` first — the question — and
 /// with it only if that fails, for context. Compared against the engine's

@@ -20,8 +20,8 @@ use tracing::info;
 use crate::env::{CountingAllocator, Env, Error, Unpooled, free_bytes};
 use crate::plugins::{self, CTX_SEEN, NAMESPACE};
 
-/// Fresh builder objects, configured as the trunk will be: no auxiliary
-/// streams, so everything runs on the stream given to `enqueueV3`.
+/// Fresh builder objects with no auxiliary streams, so everything runs on
+/// the stream given to `enqueueV3`.
 pub fn config<'b>(builder: &'b Builder) -> Result<BuilderConfig<'b>, Error> {
     let config = builder.config()?;
     config.set_max_aux_streams(0)?;
@@ -204,8 +204,7 @@ fn p1(env: &Env) -> Result<CheckOutcome, Error> {
 /// an intervening synchronize, so work TensorRT put on any other stream
 /// would race and show up as wrong output. Then the same network on
 /// subnormal and signed-zero operands, reported but not gated: it says
-/// whether TensorRT's own elementwise kernels flush denormals, which
-/// decides what a native swap may replace in Phase 5.
+/// whether TensorRT's own elementwise kernels flush denormals.
 fn p2(env: &Env) -> Result<CheckOutcome, Error> {
     const N: i64 = (1 << 20) + 3;
     let builder = Builder::new()?;

@@ -6,8 +6,7 @@
 //! - `ProbeCtx`: copies its input and records which CUDA context and stream
 //!   TensorRT ran it in (P1).
 //! - `ProbeAccumulate`: increments a float through a device pointer table
-//!   passed as an INT64 tensor — the state-access shape the trunk's plugins
-//!   use — so graph replays are countable (P4).
+//!   passed as an INT64 tensor, so graph replays are countable (P4).
 //! - `ProbeWorkspace`: routes its data through plugin workspace, so P5's
 //!   allocation count covers workspace carved from the user-managed block.
 

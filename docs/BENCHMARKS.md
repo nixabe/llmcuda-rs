@@ -563,8 +563,8 @@ over the whole prompt in passes of 2,048 rows, decode 64 steps after it,
 At 127K a decode step is 43.0 ms at N=3 and 21.7 at N=1, against 22.2 and
 14.1 after 2K: the difference is the eight full-attention applications
 reading 4.2 GB of keys and values a sequence, at about 550–600 GB/s (by
-subtraction) of the card's
-672 (WHY: "`inkling2_loop`: at depth, decode attention is the bus").
+subtraction) where a bare coalesced read of the same caches streams 606
+(WHY: "`inkling2_loop`: at depth, decode attention is the bus").
 
 What the tables do not say:
 
@@ -1562,8 +1562,12 @@ tok/s:
 | 32K | 55.3–55.5 → 61.6–61.8 | 99.2–99.4 → 108.8–109.0 |
 | 127K | 35.7–35.7 → 46.0–46.1 | 54.7–54.8 → 69.7–69.7 |
 
-What is left at depth is bytes, not instructions: span count (32 to 128)
-and warps a block (1 to 4) move the full layer by under 2%.
+What is left at depth is bytes, not instructions. 672 GB/s is the pin
+rate; a coalesced `uint4` read of the same six caches and nothing else
+streams **606** (the bench's calibration row), the kernel with its
+arithmetic removed 591–593, the kernel 579–581: 95.5% of what the card
+reads. Span count (32 to 128) and warps a block (1 to 4) move the full
+layer by under 2%.
 
 # WHY NOT
 
@@ -1579,6 +1583,7 @@ Each row gives the decisive measurement and why it lost.
 | `inkling2_loop` decode GEMM: wide loads staged through a per-warp shared tile to keep the natural `k` order | **85.8 us** Q8_0, **221.5 / 117.4 us** NVFP4 gate/up and down, against 82.0 / 184.6 / 84.6 unstaged: the store, the barrier and the reload cost more than the loads saved. Permuting `k` gets the wide loads with no staging. |
 | `inkling2_loop` NVFP4 decode loads shared across a lane group by warp shuffle: lanes `t` 0 and 2 load 16 bytes for two sub-blocks, lane 1 the four scales, three shuffles hand them round | `bench_inkling_dg`, three interleaved pairs, on a split data/scale layout: gate/up **65.6–65.7 us** and down 34.1, against 65.5–65.7 and 35.1–35.2 as stored — three loads a row-chunk in place of twelve bought nothing, where the same split layout with one 8-byte and one 1-byte load a lane read 59.3 and 31.1. A shuffle costs what the load it replaces does. The tile-major records (WHY) are 44.8 and 25.0. |
 | `inkling2_loop` decode attention leaving values unread where the probabilities are zero: a probability under 2^-25 of the span's running maximum is zero in both binary16 parts, so eight keys that are that for all three heads contribute nothing and their value rows (half the bytes) need not be loaded — exact | Decode after 126,976 positions at N=3, attention stage by CUDA events: **23.5 ms** a step with the skip against 23.1 without, and 23.5 again with the running maximum started at the sink's logit so that keys far under the sink qualify too. It never fires: on these caches (the bench's pseudo-random prompt) no eight consecutive keys sit 17 logits under their span's maximum for every head. Not measured on real text. |
+| `inkling2_loop` decode attention with a step's key and value loads issued a step ahead (none of them depends on the step before), so the bus works under the MMAs — bit-identical | `bench_inkling_attn 126976`, a full layer: **2.70–2.72 ms** at three rows against 2.69, 960 us at one row against 978. The kernel already reads at 95.5% of a bare coalesced read (606 GB/s) and at 98% of itself with the arithmetic removed; there is no stall for the earlier loads to hide. The one-row gain is 0.15 ms of a 21.7 ms step, under what a model run resolves. Not shipped. |
 | `inkling2_loop` depth mix in one pass, forty running sums in a local array | The mix-and-norm stage **28 → 40 us** a launch (CUDA events, N=1 decode). The array lives in local memory, and a pass a sum over 2,304 elements was never the cost: a row's block is one SM, and that is the bound. |
 | A contiguous span of the row per thread in the `inkling2_loop` per-row kernels | Controller stage **42 → 60 us**. Every `blockDim`-th element is already coalesced across a warp; a contiguous span per thread makes each warp load touch 32 lines. |
 | Scaling the routed down projection once per 32-element block | `moe_expert_down_mma` converts and scales its int32 pair after every `m8n8k16`, though a Q8_0 scale and an activation scale both span two; accumulating both steps first halves the `I2F`s, as `mma_q8_0_proj_split` and llama.cpp's `mmq` do. `bench_moe_mma` at 8,192 tokens: 22.7 and 21.3 ms against 22.3, inside the bench's own spread. Model, six pairs (GPU 0, one sequence): **1.001–1.004×** at 2,048 tokens, **1.004–1.008×** at 6,138, with last-token logits moving 1.52 and 0.24 max-abs on the synthetic prompt (argmax unchanged), and `int8_forward`'s cosine against the fp32 path 0.999733 against 0.999809 with per-step scaling. Scored against llama.cpp's last-token logits on real text it is `1 − cos` 8.90e-4 against 8.14e-4 at 2,048 tokens and 1.69e-3 against 1.82e-3 at 512: nearer once, farther once. Under 1% for a rounding change nothing shows to be the more accurate one; the kernel is not bound by this loop. Not shipped. |

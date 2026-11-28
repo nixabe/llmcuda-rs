@@ -1,17 +1,40 @@
 //! Inkling 2 Mini's decode attention alone, CUDA-event timed over random
 //! caches: one layer's launch for `rows` sequences each `depth` positions
 //! deep, a sliding layer (window 1,024) and a full-attention one, on the
-//! scalar kernel and the tensor-core one. Prints microseconds a launch and,
-//! for the full layer, the cache bytes streamed per second.
+//! scalar kernel and the tensor-core one. Prints microseconds a launch and
+//! the cache bytes streamed per second, under a calibration row: what a
+//! bare coalesced read of the same caches streams.
 //!
 //! `bench_inkling_attn <depth> <rows>`.
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, sys::CUevent_flags};
+use cudarc::driver::{
+    CudaContext, CudaSlice, CudaStream, DevicePtr, PushKernelArg, sys::CUevent_flags,
+};
 use llmcuda_cuda::kernels::inkling::{
     DEC_ATTN_PARTS, DEC_ROW_POINTERS, DecodeAttention, InklingDecodeKernels, ProjOffsets,
 };
 use tracing::{error, info};
+
+/// A coalesced read of a cache and nothing else, as `bench_dense_ffn`'s:
+/// what the card streams, which 672 GB/s (the pin rate) is not.
+const CALIBRATE_SRC: &str = r#"
+extern "C" __global__ void stream_read_u4(
+    const uint4* __restrict__ src,
+    long long n_vec,
+    float* __restrict__ sink
+) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)gridDim.x * blockDim.x;
+    unsigned int acc = 0u;
+    for (; i < n_vec; i += stride) {
+        uint4 v = src[i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    // Never true, and ptxas cannot prove it.
+    if (acc == 0xdeadbeefu && blockIdx.x == 0xffffffu) sink[0] = (float)acc;
+}
+"#;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -93,6 +116,35 @@ fn run(args: &[String]) -> Result<()> {
     );
     let mut out = stream.alloc_zeros::<u16>(rows * heads * dim)?;
     let mut part = stream.alloc_zeros::<f32>(rows * heads * DEC_ATTN_PARTS * (dim + 2))?;
+    {
+        let module = ctx.load_module(llmcuda_cuda::kernels::compile(
+            CALIBRATE_SRC,
+            "inkling attention calibrate",
+        )?)?;
+        let f = module.load_function("stream_read_u4")?;
+        let n = (plane.len() / 8) as i64;
+        let mut sink = stream.alloc_zeros::<f32>(1)?;
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (72 * 8, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let us = time(&ctx, &stream, 20, || {
+            for cache in &caches {
+                let mut b = stream.launch_builder(&f);
+                b.arg(cache).arg(&n).arg(&mut sink);
+                // SAFETY: a grid-stride loop bounded by `n` 16-byte vectors
+                // of a cache that long; `sink` is never written.
+                unsafe { b.launch(cfg) }?;
+            }
+            Ok(())
+        })?;
+        info!(
+            "calibration: a coalesced read of the {} caches streams {:.1} GB/s",
+            caches.len(),
+            (caches.len() * plane.len() * 2) as f64 / us / 1e3
+        );
+    }
     for round in 0..3 {
         for (name, mode) in [
             ("scalar", DecodeAttention::Scalar),

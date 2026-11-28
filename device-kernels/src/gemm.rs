@@ -9,7 +9,8 @@ use cuda_device::{kernel, ptx_asm, thread, warp};
 ///
 /// # Safety
 /// part covers splits * M * N floats; out covers M rows of stride ldo
-/// with N columns used. M * N is even. out is disjoint from part.
+/// with N columns used. M * N is even and below 2^32, so the row and
+/// column are a 32-bit divide. out is disjoint from part.
 #[kernel]
 pub unsafe fn hg_splitk_reduce(
     part: *const f32,
@@ -27,7 +28,8 @@ pub unsafe fn hg_splitk_reduce(
     if i >= mn {
         return;
     }
-    let (m, n) = (i / n_cols as i64, i % n_cols as i64);
+    let m = i as u32 / n_cols as u32;
+    let n = i as u32 - m * n_cols as u32;
     unsafe {
         let mut p = part.add(i as usize);
         let (mut v0, mut v1) = (*p, *p.add(1));
@@ -38,7 +40,7 @@ pub unsafe fn hg_splitk_reduce(
             v1 += *p.add(1);
             z += 1;
         }
-        let o = out.add((m * ldo as i64 + n) as usize);
+        let o = out.add((m as i64 * ldo as i64 + n as i64) as usize);
         if accumulate != 0 {
             v0 = *o + v0;
             v1 = *o.add(1) + v1;

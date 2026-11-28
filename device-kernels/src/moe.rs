@@ -625,7 +625,7 @@ unsafe fn route_token(
 /// `(token, slot)` pair sorted by expert into runs padded to `block_size`
 /// with the sentinel `numel`, the expert owning each bucket (`-1` for an
 /// unused one), and the padded total. One thread per expert counts its
-/// pairs, an in-warp prefix scan turns the padded counts into offsets,
+/// pairs in buckets, an in-warp prefix scan turns those into offsets,
 /// and each thread then writes its own run, so the original order is
 /// kept without an atomic.
 ///
@@ -666,7 +666,7 @@ unsafe fn dispatch_token(
         let mut e = tid;
         while e < num_experts {
             let c = count_equal(topk_ids, numel, e);
-            *cumsum.add(e as usize + 1) = ((c + block_size - 1) / block_size) * block_size;
+            *cumsum.add(e as usize + 1) = (c + block_size - 1) / block_size;
             e += block;
         }
         thread::sync_threads();
@@ -702,7 +702,7 @@ unsafe fn dispatch_token(
                 *cumsum = 0;
             }
             if tid == num_experts - 1 {
-                *num_tokens_post_pad = v;
+                *num_tokens_post_pad = v * block_size;
             }
         } else if tid == 0 {
             *cumsum = 0;
@@ -711,13 +711,14 @@ unsafe fn dispatch_token(
                 *cumsum.add(i as usize + 1) += *cumsum.add(i as usize);
                 i += 1;
             }
-            *num_tokens_post_pad = *cumsum.add(num_experts as usize);
+            *num_tokens_post_pad = *cumsum.add(num_experts as usize) * block_size;
         }
         thread::sync_threads();
 
         let mut e = tid;
         while e < num_experts {
-            let base = *cumsum.add(e as usize);
+            let first = *cumsum.add(e as usize);
+            let base = first * block_size;
             let mut w = 0i32;
             let mut i = 0;
             while i < numel {
@@ -730,8 +731,8 @@ unsafe fn dispatch_token(
                 }
                 i += 1;
             }
-            let last = *cumsum.add(e as usize + 1) / block_size;
-            let mut b = base / block_size;
+            let last = *cumsum.add(e as usize + 1);
+            let mut b = first;
             while b < last && b < expert_capacity {
                 *expert_ids.add(b as usize) = e;
                 b += 1;
@@ -877,7 +878,7 @@ pub unsafe fn moe_route_dispatch_t1(
 /// `(token, slot)` pairs, in order, at its padded offset, and marks the
 /// buckets it owns with how many live pairs each holds.
 ///
-/// Every block recomputes the padded prefix from `counts` (it is 257
+/// Every block recomputes the bucket prefix from `counts` (it is 257
 /// ints). Pairs are scanned a warp-wide chunk at a time: a ballot of the
 /// lanes that hit, and each hit's slot is the running total plus the
 /// population count of the lower lanes, which keeps the original order.
@@ -914,7 +915,7 @@ pub unsafe fn moe_align_block_size(
         let mut i = tid;
         while i < num_experts {
             let c = *counts.add(i as usize);
-            *cumsum.add(i as usize + 1) = ((c + block_size - 1) / block_size) * block_size;
+            *cumsum.add(i as usize + 1) = (c + block_size - 1) / block_size;
             i += block;
         }
         thread::sync_threads();
@@ -926,12 +927,13 @@ pub unsafe fn moe_align_block_size(
                 i += 1;
             }
             if e == 0 {
-                *num_tokens_post_pad = *cumsum.add(num_experts as usize);
+                *num_tokens_post_pad = *cumsum.add(num_experts as usize) * block_size;
             }
         }
         thread::sync_threads();
 
-        let base = *cumsum.add(e as usize);
+        let first = *cumsum.add(e as usize);
+        let base = first * block_size;
         let (lane, warp_i, n_warps) = (tid & 31, tid >> 5, block >> 5);
         let chunks = (numel + 31) >> 5;
         let per_warp = (chunks + n_warps - 1) / n_warps;
@@ -1008,8 +1010,7 @@ pub unsafe fn moe_align_block_size(
             c += 1;
         }
 
-        let first = base / block_size;
-        let last = *cumsum.add(e as usize + 1) / block_size;
+        let last = *cumsum.add(e as usize + 1);
         let count = *counts.add(e as usize);
         let mut b = first + tid;
         while b < last && b < expert_capacity {

@@ -113,10 +113,10 @@ const WARP: u32 = 32;
 /// Largest number of tokens one pass over the weights may serve.
 ///
 /// Each token in the tile costs one fp32 accumulator register per lane and
-/// one extra `float4` activation load per four weight elements. The measured
-/// table in the module docs shows the saving is real but strongly
-/// sublinear — 8 tokens is 2.85x one token's throughput, not 8x, because the
-/// activation traffic scales with the tile while the weight read does not.
+/// one extra `float4` activation load per four weight elements. The saving is
+/// real but strongly sublinear — 8 tokens is 2.85x one token's throughput,
+/// not 8x, because the activation traffic scales with the tile while the
+/// weight read does not.
 ///
 /// Eight is chosen because per-token cost is still improving there
 /// (0.37–0.43 ms/token against 0.47 at five and 0.99 at one) and because the
@@ -431,7 +431,7 @@ LM_HEAD_ENTRY(lm_head_gemv_b8, 8)
 // The row-tiled decode entry points. Only the three-token tile gets them:
 // that is the N=3 batched decode shape, the one place the profile shows the
 // activation-pipe cost (2.22 ms against a 0.92 ms weight-read floor,
-// docs/BENCHMARKS.md 2026-08-20). Row arithmetic and order are identical to
+// docs/BENCHMARKS.md). Row arithmetic and order are identical to
 // the RT=1 instantiations -- only the number of accumulators in flight
 // differs -- so `b3r2`/`b3r4` against three `b1` launches must be
 // bit-identical, and the differential test asserts exactly that.
@@ -689,7 +689,7 @@ LM_HEAD_F16_ENTRY(lm_head_f16_b8, 8)
 // These three are what an ordinary community quant is built from. `Q4_K_M` in
 // particular is a *mixture* — Q4_K for most projections, Q5_K and Q6_K for the
 // ones llama.cpp's heuristics protect — so a file of that name needs all of
-// these bodies plus the Q6_K one above, not any single reader.
+// these bodies plus the Q6_K one below, not any single reader.
 //
 // All three are fallbacks, written the same way as the Q6_K body and for the
 // same reason: their block strides (18, 144 and 176 bytes) do not put a warp's
@@ -941,9 +941,7 @@ LM_HEAD_KAFF_ENTRY(lm_head_q5_k_b8, true, 8)
 // Q6_K — both put their projections and their head at Q8_0 or bf16, and Q6_K
 // appears only in the expert stacks, which `moe.rs` owns. This body exists for
 // the *other* files: the ordinary community quant of either architecture is
-// uniform, so `token_embd.weight` and every projection arrive as Q6_K and the
-// model previously stopped at the first one with "is q6_K, this pass unpacks
-// q8_0".
+// uniform, so `token_embd.weight` and every projection arrive as Q6_K.
 //
 // It is a fallback and is written as one. There is no staging pass, no row
 // tile and no prefetch — a 210-byte superblock stride defeats the alignment
@@ -1101,19 +1099,6 @@ pub enum HeadFormat {
 }
 
 impl HeadFormat {
-    /// Serialized bytes per weight element.
-    pub const fn bytes_per_element(self) -> f64 {
-        match self {
-            Self::Q8_0 => BLOCK_Q8_0_BYTES as f64 / QK8_0 as f64,
-            Self::Bf16 => 2.0,
-            Self::Q6K => BLOCK_Q6_K_BYTES as f64 / QK_K as f64,
-            Self::F16 => 2.0,
-            Self::Q4_0 => BLOCK_Q4_0_BYTES as f64 / QK4_0 as f64,
-            Self::Q4K => BLOCK_Q4_K_BYTES as f64 / QK_K as f64,
-            Self::Q5K => BLOCK_Q5_K_BYTES as f64 / QK_K as f64,
-        }
-    }
-
     /// The format a GGUF type code names, or `None` if this kernel family
     /// does not read it.
     pub const fn from_ggml(name: &str) -> Option<Self> {
@@ -1149,30 +1134,6 @@ impl<'a> HeadTensor<'a> {
             format: HeadFormat::Q8_0,
         }
     }
-
-    /// A bf16 tensor.
-    pub fn bf16(bytes: &'a CudaSlice<u8>) -> Self {
-        Self {
-            bytes,
-            format: HeadFormat::Bf16,
-        }
-    }
-
-    /// A Q6_K tensor — what a uniform community quant stores these as.
-    pub fn q6_k(bytes: &'a CudaSlice<u8>) -> Self {
-        Self {
-            bytes,
-            format: HeadFormat::Q6K,
-        }
-    }
-
-    /// An f16 tensor.
-    pub fn f16(bytes: &'a CudaSlice<u8>) -> Self {
-        Self {
-            bytes,
-            format: HeadFormat::F16,
-        }
-    }
 }
 
 /// The LM head shape this instance is compiled and sized for.
@@ -1203,35 +1164,16 @@ impl LmHeadGeometry {
     /// geometry).
     ///
     /// Qwen3.6's head is Q8_0; Qwen3.8's is bf16, for which the figure is
-    /// `hidden * 2`. Use [`Self::row_bytes_for`] where the format is not
-    /// already known to be Q8_0 — a GB/s number computed with the wrong one
-    /// is off by 1.88x.
+    /// `hidden * 2` — a GB/s number computed with the wrong one is off by
+    /// 1.88x.
     pub const fn row_bytes(&self) -> usize {
         self.hidden / QK8_0 * BLOCK_Q8_0_BYTES
-    }
-
-    /// Serialized bytes per vocabulary row at `format`.
-    pub const fn row_bytes_for(&self, format: HeadFormat) -> usize {
-        match format {
-            HeadFormat::Q8_0 => self.row_bytes(),
-            HeadFormat::Bf16 => self.hidden * 2,
-            HeadFormat::Q6K => self.hidden / QK_K * BLOCK_Q6_K_BYTES,
-            HeadFormat::F16 => self.hidden * 2,
-            HeadFormat::Q4_0 => self.hidden / QK4_0 * BLOCK_Q4_0_BYTES,
-            HeadFormat::Q4K => self.hidden / QK_K * BLOCK_Q4_K_BYTES,
-            HeadFormat::Q5K => self.hidden / QK_K * BLOCK_Q5_K_BYTES,
-        }
     }
 
     /// Serialized bytes of the whole head at Q8_0 (540,344,320 at the real
     /// geometry). See [`Self::row_bytes`].
     pub const fn weight_bytes(&self) -> usize {
         self.vocab * self.row_bytes()
-    }
-
-    /// Serialized bytes of the whole head at `format`.
-    pub const fn weight_bytes_for(&self, format: HeadFormat) -> usize {
-        self.vocab * self.row_bytes_for(format)
     }
 
     /// Weight elements (508,559,360 at the real geometry).
@@ -1409,12 +1351,11 @@ impl LmHeadKernels {
         Self::with_row_tile(ctx, geometry, Some(4))
     }
 
-    /// [`Self::new`] with the three-token row tile chosen explicitly rather
-    /// than from the environment: `None` is the untiled path, `Some(2)` and
-    /// `Some(4)` the compiled row tiles.
+    /// [`Self::new`] with the three-token row tile chosen explicitly: `None`
+    /// is the untiled path, `Some(2)` and `Some(4)` the compiled row tiles.
     ///
     /// Public so the differential test can gate every compiled path in one
-    /// process without mutating the environment under other threads.
+    /// process.
     pub fn with_row_tile(
         ctx: &Arc<CudaContext>,
         geometry: LmHeadGeometry,
@@ -1757,13 +1698,9 @@ impl LmHeadKernels {
                     // would be correct today and silently wrong the moment
                     // that filter grows an arm: the new format would take the
                     // *Q8_0* kernel, which indexes a staging buffer this
-                    // launch may request zero bytes of. That is the shape that
-                    // faulted main in e4d43e0 — `tt` and `narrow` derived by
-                    // rules that disagreed at one width, and a `_` arm picking
-                    // a kernel wanting twice the shared memory it was launched
-                    // with. Spelling the formats out makes adding a
-                    // `HeadFormat` variant a compile error here rather than an
-                    // out-of-bounds read.
+                    // launch may request zero bytes of. Spelling the formats
+                    // out makes adding a `HeadFormat` variant a compile error
+                    // here rather than an out-of-bounds read.
                     let func = match weight.format {
                         HeadFormat::Q8_0 => f,
                         HeadFormat::Bf16 => self
@@ -1822,8 +1759,7 @@ impl LmHeadKernels {
     /// rule 6.
     ///
     /// This is the device half of sampling. It exists so the host reads four
-    /// bytes per step instead of the whole logit vector; see the kernel's own
-    /// comment for what that was costing.
+    /// bytes per step instead of the whole logit vector.
     pub fn argmax(
         &self,
         stream: &Arc<CudaStream>,

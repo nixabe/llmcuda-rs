@@ -105,12 +105,10 @@ const QUERY_TILE: usize = 8;
 /// Tokens one rotary block carries: the tile `attn_rope_partial_neox` walks.
 ///
 /// The rotary frequency depends on the head dimension and nothing else, so a
-/// block per token recomputed a double-precision `pow` for every (token, head,
-/// dimension) triple to get one of 32 distinct values. A band hoists it out.
+/// block per token would recompute a double-precision `pow` for every (token,
+/// head, dimension) triple to get one of 32 distinct values. A band hoists it
+/// out.
 const ROPE_TOKENS: u32 = 16;
-
-/// Largest RoPE grid, in blocks, launched on the Rust kernel.
-const RUST_ROPE_MAX_BLOCKS: u32 = 256;
 
 /// Head dimensions one lane reduces over, at most. Mirrors `ATTN_MAXD`.
 ///
@@ -223,15 +221,15 @@ const K2_STAGED_SHARED_BYTES: usize = (32 * 68 + 128 * 20) * 4;
 /// NOT pure launch geometry: the slice boundaries are the partial layout
 /// and the combine's reduction shape, so the deep-window differential gate
 /// must pass at whatever ships here (72 and 96 both have; 48 and 36 both
-/// failed it at 2.28e-5, docs/BENCHMARKS.md 2026-08-20).
+/// failed it at 2.28e-5, docs/BENCHMARKS.md).
 /// `LLMCUDA_DEC_MMA_SPLITS` overrides at construction. The wave arithmetic,
 /// at 228 registers per thread and 64-thread blocks (4 resident blocks/SM,
 /// 288 block slots on 72 SMs): the N=3 serving shape runs three concurrent
 /// sequence-local calls of `blocks * kv_heads` blocks each. 96 splits at
 /// the batch capture's 48 blocks is 288 — exactly one wave, every block
 /// grid-striding exactly two splits — and measured 151.2/153.2 tok/s
-/// against the prior 72-split/36-block default's 149.5/148.3 at 32K N=3
-/// (two interleaved pairs, idle GPU 1, 2026-08-20).
+/// against 72 splits at 36 blocks' 149.5/148.3 at 32K N=3 (two interleaved
+/// pairs).
 const MMA_DECODE_SPLITS: usize = 96;
 
 /// Largest partial count either decode path can write, used for scratch.
@@ -599,10 +597,6 @@ ATTN_FLASH(attn_flash_causal, ATTN_QT)
 // arithmetic, which would have to accumulate in fp16 and would breach the
 // tolerance the differential tests are gated at.
 //
-// The cache stays fp32; K and V are rounded to fp16 on their way into shared.
-// This kernel therefore changes the arithmetic without changing the cache
-// format, which is a separate (and separately useful) change.
-//
 // ## Fragment layouts, which are the whole risk
 //
 // For `m16n8k8` with `groupID = lane >> 2` and `tig = lane & 3`:
@@ -647,7 +641,7 @@ ATTN_FLASH(attn_flash_causal, ATTN_QT)
 // across the whole compute phase by design, and at head_dim 256 they sit
 // against `o` and `qa` at the register ceiling. Widening the tile spills
 // them to local memory -- 4 octets measured −30% (32K prefill 2,109 vs
-// 2,799), 2 octets −13% (2,424) on 2026-08-20, both rejected. Fewer
+// 2,799), 2 octets −13% (2,424), both rejected. Fewer
 // barriers cannot buy back a spilled prefetch.
 #define MMA_KOCT 1
 #define MMA_KT (8 * MMA_WPH * MMA_KOCT)
@@ -1470,7 +1464,7 @@ __global__ void attn_flash_causal_gqa(
 // ---------------------------------------------------------------------------
 // Flash decoding again, with a warp as the whole split and no shared memory.
 //
-// grid: (DEC_SPLITS, kv_heads). block: one warp.
+// grid: (DEC_WARP_SPLITS, kv_heads). block: one warp.
 //
 // ## Why the kernel below it was not enough
 //
@@ -1485,25 +1479,24 @@ __global__ void attn_flash_causal_gqa(
 //
 // At 128 B/cycle the shared traffic is ~1,152 cycles against ~1,224 for the
 // DRAM it is meant to be hiding behind. The staging *is* the bottleneck. Two
-// cheaper explanations were measured and rejected first: `DEC_SPLITS` at 144,
+// cheaper explanations were measured and rejected first: a split count of 144,
 // 288, 432 and 576 gives 1.453, 1.453, 1.466, 1.477 ms, so it is not block
 // parallelism; and the tile already keeps ~24 KiB in flight per SM against the
 // ~4 KiB Little's law asks for, so it is not memory-level parallelism.
 //
-// That splits sweep says more than it was first credited with. It varies the
-// resident warps 3.5x at *fixed* total work and moves the time 1.7%, which
+// That splits sweep varies the resident warps 3.5x at *fixed* total work and
+// moves the time 1.7%, which
 // rules out a latency bound as surely as it rules out a parallelism one: more
 // warps would hide more latency. Invariance to parallelism at fixed work is
 // the signature of a saturated per-SM resource, and the sector amplification
-// documented at the `wpl == 4` branch below is one. The datum sat here for
-// some time labelled "no effect" because nothing yet explained it.
+// documented at the `wpl == 4` branch below is one.
 //
 // ## The shape
 //
 // A lane holds `head_dim/32` **consecutive** dimensions, so the 32 lanes of one
 // warp cover a whole key and can load it as one coalesced run straight from
-// global -- though only if the load is written as a single wide access, which
-// for a long time it was not; see the `wpl == 4` branch below.
+// global -- though only if the load is written as a single wide access; see
+// the `wpl == 4` branch below.
 // The warp then owns *every* query head of its KV head, reusing that key
 // `gqa` times out of registers. K and V are read exactly once each, by exactly
 // one warp, and shared memory disappears along with every barrier.
@@ -1856,7 +1849,7 @@ __global__ void attn_flash_decode_split(
 // a fp16 residual instead of the single fp16 rounding attn_flash_causal_mma
 // accepts under MMA_GATE.
 //
-// grid: (DEC_SPLITS, kv_heads), same as attn_flash_decode_warp/_split. block:
+// grid: (splits, kv_heads), same as attn_flash_decode_warp/_split. block:
 // WPO warps.
 //
 // ## Why Q needs the split and K/V do not
@@ -1895,9 +1888,7 @@ __global__ void attn_flash_decode_split(
 // output head dimension the same way during `P V`. Unlike that kernel there
 // is only one logical head-group per block (the 8 real heads all live in one
 // `m16n8k8` M-dimension), so every warp of the block cooperates on the same
-// score tile and the barriers below are `__syncthreads()` rather than the
-// per-group `bar_group`/`__syncwarp` split prefill needs for its several
-// independent head-groups.
+// score tile and the barriers below are `__syncthreads()`.
 //
 // `P V` pads the dead second half of *its* A operand with zero rather than
 // reusing it for anything -- `P` and `V` are already accepted under
@@ -1990,7 +1981,7 @@ __global__ void NAME(                                                           
     /* behind the first two in the trace. 36 blocks per call is 216 */        \
     /* resident together -- one wave -- at identical numerics, which the */   \
     /* 48-LOGICAL-split attempt could not claim (rejected: 2.278388e-5 */     \
-    /* against the 1e-5 deep-window gate, docs/BENCHMARKS.md 2026-08-20). */  \
+    /* against the 1e-5 deep-window gate, docs/BENCHMARKS.md). */             \
     long long n_visible = (long long)(*key_offset) + 1;                       \
     long long per = (n_visible + n_splits - 1) / n_splits;                     \
                                                                                 \
@@ -2101,9 +2092,7 @@ __global__ void NAME(                                                           
             /* partials -- mixing that with a base-2-scaled m/l here would */  \
             /* cancel invisibly for a single real split (`f = exp(m - gm)` */  \
             /* is always 1 when there is only one) and corrupt the merge */    \
-            /* the moment two real splits combine. Caught by */                \
-            /* `debug_decode_mma_probe`: exact at n_keys=1, 9.8e-2 wrong at */  \
-            /* n_keys=2. */                                                    \
+            /* the moment two real splits combine. */                          \
             if (g < gqa) {                                                    \
                 s_sh[g * (8 * (WPO)) + 8 * warp + 2 * tg]     = (s0 + s2) * scale; \
                 s_sh[g * (8 * (WPO)) + 8 * warp + 2 * tg + 1] = (s1 + s3) * scale; \
@@ -2112,9 +2101,7 @@ __global__ void NAME(                                                           
         __syncthreads();                                                       \
                                                                                 \
         /* The online softmax: one lane per key, as many of the 8 real rows */ \
-        /* at a time as a warp has lanes to spare. Mirrors */                  \
-        /* attn_flash_causal_mma's rat/krow/kcol split exactly, with 8 real */ \
-        /* rows split over WPO warps instead of MMA_QT over MMA_WPH. */        \
+        /* at a time as a warp has lanes to spare. */                          \
         {                                                                       \
             const int kt = 8 * (WPO);                                         \
             const int rpw = 8 / (WPO);           /* rows this warp owns */    \
@@ -2235,7 +2222,7 @@ __global__ void NAME(                                                           
     }                                                                          \
                                                                                 \
     /* Write the raw (unnormalized) partial: attn_flash_decode_combine */      \
-    /* merges these across DEC_SPLITS blocks with the same log-sum-exp */      \
+    /* merges these across the splits with the same log-sum-exp */             \
     /* identity attn_flash_decode_warp's partials already use, unmodified. */  \
     _Pragma("unroll")                                                          \
     for (int t = 0; t < ((MAX_DIM) / (8 * (WPO))); ++t) {                              \
@@ -2374,28 +2361,9 @@ __global__ void attn_flash_causal_t1(
 }
 
 
-// The decode step's per-sequence rotary and cache append, batched over the
-// launch: one grid advances every sequence's query and key through
-// `attn_rope_partial_neox`'s arithmetic and appends the roped key and the
-// value to that sequence's own cache, each sequence reading its own
-// position through a scalar pointer slot -- the idiom `conv1d_step_batch`
-// and the GDN step kernels use, so graph capture sees stable pointers.
-//
-// It replaces three launches per sequence per layer (rope q, rope k,
-// append) that were issued on a side stream each. At decode width every
-// one of them was under six microseconds, i.e. mostly its own floor.
-//
-// Bit-identical to the three kernels it replaces, by construction: the
-// rotary body is `attn_rope_partial_neox`'s with `t = 0` (the position is
-// `(double)*pos + (double)0`, which is exact), the tail is a copy, and the
-// cache write is `f2h` of the same float the separate append read back
-// from `k_out`. `attention_differential` gates it against the separate
-// launches.
-//
-// grid: (q_heads + kv_heads, n_seq). block: head_dim. Head blocks below
-// `q_heads` rope the query; the rest rope one key head and append it with
-// its value. Thread `d < rope_dim / 2` owns the pair `(d, d + half)`;
-// threads at and past `rope_dim` copy the tail.
+// Pointer slots a batched decode launch carries, one per sequence: each
+// sequence's position and caches arrive as scalar arguments, so graph capture
+// sees stable pointers, and `attn_slot` selects a block's own.
 #define ATTN_STEP_SLOTS 8
 
 __device__ __forceinline__ unsigned long long attn_slot(
@@ -2683,7 +2651,7 @@ __global__ void attn_flash_decode_warp_k2_128(const float* __restrict__ q,const 
 const APPEND_THREADS: u32 = 256;
 
 /// Sequences one `attn_decode_rope_append_batch` launch carries: the
-/// kernel's pointer-slot count (`ATTN_STEP_SLOTS`).
+/// kernel's pointer-slot count.
 pub const STEP_SLOTS: usize = 8;
 
 /// Element format of one half of the KV cache, as the kernels address it.
@@ -2880,7 +2848,6 @@ impl AttnDecodeScratch {
 pub struct AttentionKernels {
     split: CudaFunction,
     rope: CudaFunction,
-    rope_small: CudaFunction,
     rope_imrope: CudaFunction,
     flash: CudaFunction,
     flash_gqa: CudaFunction,
@@ -2947,9 +2914,9 @@ pub struct AttentionKernels {
     /// graph capture, so each captured width bakes its own scheduling. The
     /// partials are bit-identical at any value (the kernel grid-strides its
     /// logical splits), so this is a pure wave-shape knob — see
-    /// [`MMA_DECODE_SPLITS`] for the arithmetic and docs/BENCHMARKS.md
-    /// 2026-08-20 for the measurement (+0.4--1.6% at 32K N=3 with 36; -13%
-    /// at N=1, which is why it must be per width and not global).
+    /// [`MMA_DECODE_SPLITS`] for the arithmetic and docs/BENCHMARKS.md for
+    /// the measurement (+0.4--1.6% at 32K N=3 with 36; -13% at N=1, which is
+    /// why it must be per width and not global).
     decode_mma_blocks: std::sync::atomic::AtomicUsize,
     /// Logical key slices per tensor-core decode call — the slice
     /// boundaries and partial layout the combine merges. Defaults to
@@ -3027,7 +2994,6 @@ impl AttentionKernels {
         Ok(Self {
             split: rust.load_function("attn_split_query_gate")?,
             rope: rust.load_function("attn_rope_partial_neox")?,
-            rope_small: rust.load_function("attn_rope_partial_neox")?,
             rope_imrope: rust.load_function("attn_rope_partial_imrope")?,
             flash: module.load_function("attn_flash_causal")?,
             flash_gqa: module.load_function("attn_flash_causal_gqa")?,
@@ -3243,7 +3209,7 @@ impl AttentionKernels {
     }
 
     /// Dynamic shared memory one block requests: the score and weight tiles,
-    /// which are now `QUERY_TILE` rows deep, plus the three per-row softmax
+    /// which are `QUERY_TILE` rows deep, plus the three per-row softmax
     /// scalars. The query tile itself is in registers. See the module docs.
     pub fn shared_bytes(&self) -> usize {
         (2 * QUERY_TILE * self.keys_per_tile() + 3 * QUERY_TILE) * size_of::<f32>()
@@ -3267,10 +3233,9 @@ impl AttentionKernels {
 
     /// Dynamic shared memory the tensor-core kernel requests.
     ///
-    /// The staged Q, K and V tiles in fp16, plus the score tile and the three
-    /// per-row softmax scalars in fp32. Q and K carry four words of padding per
-    /// row and V four per dimension; see the kernel comment for why those exact
-    /// strides are what make every fragment read conflict-free.
+    /// The staged K and V tiles in fp16; see `mma_shared_bytes`. The kernel
+    /// comment has why their strides are what make every fragment read
+    /// conflict-free.
     pub fn shared_bytes_mma(&self) -> usize {
         mma_shared_bytes(self.head_dim)
     }
@@ -3353,8 +3318,7 @@ impl AttentionKernels {
     /// blocks split the key range between them and each reads its slice once,
     /// so the traffic is `kv_heads * window` however many blocks there are.
     /// Exposed because a benchmark that applies the prefill model to the decode
-    /// path reports a bandwidth many times the card's, which is how this was
-    /// noticed.
+    /// path reports a bandwidth many times the card's.
     pub fn splits_the_key_axis(&self, n_query: usize) -> bool {
         n_query == 1 && self.decode_split_is_available()
     }
@@ -3381,10 +3345,6 @@ impl AttentionKernels {
         }
     }
 
-    /// Whether flash decoding can service this geometry.
-    ///
-    /// Same three conditions as the GQA-shared kernel — it is the same block
-    /// shape with one query row instead of four.
     /// Whether the warp-per-split decode kernel can service this geometry.
     ///
     /// A lane holds `head_dim / 32` dimensions and they must be a whole number
@@ -3397,6 +3357,10 @@ impl AttentionKernels {
             && self.head_dim / 32 <= ATTN_MAXD
     }
 
+    /// Whether flash decoding can service this geometry.
+    ///
+    /// Same three conditions as the GQA-shared kernel — it is the same block
+    /// shape with one query row instead of four.
     pub fn decode_split_is_available(&self) -> bool {
         self.gqa_ratio() >= 2
             && self.gqa_ratio() * 32 <= 1024
@@ -3549,16 +3513,7 @@ impl AttentionKernels {
         let head_dim = self.head_dim as i32;
         let rope_dim_i = rope_dim as i32;
         let n_tokens_i = n_tokens as i32;
-        // Small grids go to the Rust kernel: it spreads a token band over the
-        // otherwise idle rotary threads when the grid fits the card's SMs, and
-        // measured faster up to a 192-block key grid. A 512-block query grid
-        // measured 0.6-0.9% slower, so wide grids stay CUDA C++.
-        let kernel = if cfg.grid_dim.0 * cfg.grid_dim.1 <= RUST_ROPE_MAX_BLOCKS {
-            &self.rope_small
-        } else {
-            &self.rope
-        };
-        let mut builder = stream.launch_builder(kernel);
+        let mut builder = stream.launch_builder(&self.rope);
         builder
             .arg(input)
             .arg(out)
@@ -3764,11 +3719,6 @@ impl AttentionKernels {
             });
         }
 
-        // A partial tile costs its empty rows in full: the score loop runs a
-        // multiply-add and a shuffle reduction per row per key whether or not
-        // the row exists. Decode is `n_query == 1`, where that is seven
-        // eighths of the kernel, so below a whole tile the one-row
-        // instantiation is launched instead.
         // Decode gets its own two-pass shape. See the kernel comment: a single
         // query row cannot be tiled, so `attn_flash_causal_t1` could only ever
         // launch `q_heads` blocks, and this splits the key axis instead.
@@ -4307,9 +4257,9 @@ impl AttentionKernels {
     /// Write this batch's keys and values into the cache at `positions[0]`.
     ///
     /// `key` and `value` are `[n_tokens][kv_heads][head_dim]`; the caches are
-    /// the same layout over `max_keys` positions. This replaced two
+    /// the same layout over `max_keys` positions. A kernel rather than two
     /// device-to-device copies into host-computed slices — see the kernel's
-    /// own comment for why a host-computed destination address had to go.
+    /// own comment for why the destination is addressed on the device.
     #[allow(clippy::too_many_arguments)]
     pub fn append_kv(
         &self,

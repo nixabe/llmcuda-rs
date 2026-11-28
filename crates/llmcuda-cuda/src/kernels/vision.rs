@@ -36,7 +36,7 @@ use half::f16;
 /// Errors from the vision device ops.
 #[derive(Debug)]
 pub enum VisionError {
-    /// NVRTC rejected the source, or the module failed to load.
+    /// A kernel failed to load from the module.
     Build(String),
     /// cuBLASLt refused the matmul (no heuristic, bad descriptor).
     Blas(cudarc::cublaslt::result::CublasError),
@@ -129,7 +129,7 @@ pub struct VisionKernels {
 }
 
 impl VisionKernels {
-    /// Compile and load the kernels on `ctx`, binding GEMMs to `stream`.
+    /// Load the kernels on `ctx`, binding GEMMs to `stream`.
     pub fn new(ctx: &Arc<CudaContext>, stream: Arc<CudaStream>) -> Result<Self, VisionError> {
         let rust = ctx
             .load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))

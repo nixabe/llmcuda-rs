@@ -1,8 +1,7 @@
 //! CUDA kernels. Most are compiled from CUDA C++ at load time through NVRTC;
 //! the ones listed at [`RUST_KERNELS_PTX`] are Rust, compiled ahead of time by
 //! cuda-oxide and embedded as PTX, and have no CUDA C++ source. Their Rust
-//! source and regeneration tool live in `device-kernels`. Kernels are
-//! moving from the first group to the second one at a time. Which language a
+//! source and regeneration tool live in `device-kernels`. Which language a
 //! kernel is in is fixed in the source; there is no feature or runtime
 //! switch.
 //!
@@ -49,38 +48,8 @@ pub const TARGET_ARCH: &str = "compute_75";
 /// it replaces, passes that kernel's differential tests, and costs the model
 /// nothing measurable. The CUDA C++ is then deleted.
 ///
-/// Rust only: `tensor_add`, `softplus_elementwise`, `rope_partial`,
-/// `rms_norm_rows`, `rms_norm_swiglu_rows`, `rms_norm_swiglu_q8_rows`, the
-/// four `conv1d_*` kernels, `attn_split_query_gate`, `attn_row_positions`,
-/// `attn_flash_decode_combine`, `moe_swiglu`, `moe_reduce`, `gdn_silu`,
-/// `gdn_split_qkv`, `gdn_gates`, `gdn_scan_decay`, `k2_combine`,
-/// `k2_combine_residual`, `k2_values`, `k2_gate`, `k2_norm`, the three
-/// `k2_dispatch_*` passes, `moe_align_count`, `argmax_partial`,
-/// `argmax_final`, `hg_splitk_reduce`, `dense_ffn_add_residual`,
-/// `mtp_concat_eh`, `dflash_tap`, `hg_to_half`, `vision_gelu`, `vision_gelu_erf`,
-/// `vision_add_f16`, `vision_half_to_float`, `attn_kv_append`,
-/// `dense_swiglu_narrow`, `dec_add_owner_rows`, `dec_span_mean`,
-/// `dec_attention_combine`, `dec_layer_norm`, `k2_rotary_apply`,
-/// `attn_flash_decode_combine_k2_batch`, `embed_q8_0`, `dequantize_q8_0`,
-/// `gdn_silu_split_qkv`, `gdn_conv_silu_split_step_batch`,
-/// `gdn_normalize_qk`, `gdn_chunk_normalize_qk`, `dense_rms_norm_narrow`,
-/// `dequantize_q6_k`, `vision_softmax_rows`, `vision_rope_qk`,
-/// `k2_rotary_prepare`, `moe_block_gate_and_combine`, `gdn_recurrent_step`,
-/// `gdn_norm_alpha_beta_gates`, `gdn_proj_f32`, `dec_final_scores` and
-/// `argmax_prob`, `swiglu_mul`, `sigmoid_gate_mul`, `attn_rope_partial_neox`,
-/// `moe_route`, `moe_dispatch_t1`, `moe_route_dispatch_t1`,
-/// `moe_align_block_size`, `attn_rope_partial_imrope`, `attn_kv_append_kv8`,
-/// `attn_decode_rope_append_batch`, `vision_layer_norm`, `hg_q8_to_half_w`,
-/// `dec_lexical`, `dec_question_fields`, `dec_features`, `fwd_embed_quant`,
-/// `k2_rotary_append`, `k2_rotary_append_kv8`, `mma_quantize_rows_q8`,
-/// `mma_repack_q8_0`, `mma_repack_q8_0_h`, and the `inkling2_loop` family:
-/// `ink_embed`, `ink_linear`, `ink_mix`, `ink_ctrl_pair`, `ink_ctrl_apply`,
-/// `ink_conv`, `ink_clip`, `ink_rms_groups`, `ink_rel_table`, `ink_attn`,
-/// `ink_gather_half`, `ink_situ_half`, `ink_moe_combine`, `ink_softcap`,
-/// `ink_dec_inputs`, `ink_dec_kv`, `ink_dec_attn`, `ink_dec_attn_merge`, `ink_dec_commit`, `ink_dec_ffn_in`,
-/// `ink_dec_ffn_out`, `ink_dec_gate`, `ink_dec_ctrl`, `ink_dec_norm`,
-/// `ink_dec_router` and `ink_dec_route`.
-/// No kernel exists in both languages.
+/// `device-kernels/regenerate.py` carries the list of entry points. No
+/// kernel exists in both languages.
 ///
 /// The PTX is built with implicit multiply-add fusion off
 /// (`CUDA_OXIDE_NO_FMA`): a kernel fuses where its source says `mul_add` and
@@ -93,8 +62,7 @@ pub const RUST_KERNELS_PTX: &str = include_str!("rust/tensor_add.ptx");
 /// The Rust source [`RUST_KERNELS_PTX`] was generated from.
 ///
 /// Not compiled here; the engine's toolchain cannot build it. It is carried
-/// so tests can pin the properties of a kernel that exist only in its
-/// source, as they do for the CUDA C++ ones.
+/// for the tests that check a launch contract against a kernel's source.
 ///
 /// One file per kernel family, concatenated; every function is at item level
 /// in its file, which [`rust_kernel_source`] relies on.
@@ -119,8 +87,6 @@ pub const RUST_KERNELS_SRC: &str = concat!(
 /// The text of one function of [`RUST_KERNELS_SRC`], kernel or device helper,
 /// from its `fn` line to its closing brace.
 ///
-/// For tests that pin a property visible only in a kernel's source.
-///
 /// # Panics
 /// If the source has no function of that name.
 pub fn rust_kernel_source(name: &str) -> &'static str {
@@ -139,17 +105,11 @@ pub fn rust_kernel_source(name: &str) -> &'static str {
 ///
 /// The same source is compiled several times per model build, because the
 /// kernel sets are constructed independently by the code that needs them
-/// rather than threaded down from one owner. `LayerOpsKernels::new` takes only
-/// a context — it has no geometry to specialize on, so all four of its call
-/// sites (`forward.rs`, and the GDN, attention and MoE blocks) produce
-/// byte-identical PTX. That was ~147 ms each, paid four times, and
-/// `Forward::reshape` doubled it by building a second shape over the same
-/// weights.
+/// rather than threaded down from one owner, and a reshape builds a second
+/// set over the same weights. A compile is on the order of 100 ms.
 ///
-/// Caching here rather than at each call site fixes every such case at once,
-/// including ones nobody has looked for, and it needs no cache threaded
-/// through four block constructors — which is what made this not worth fixing
-/// before the source-level instrumentation showed how much it cost.
+/// Caching here rather than at each call site covers every such case at once
+/// and needs no cache threaded through the block constructors.
 ///
 /// # Why the source is a sound key
 ///
@@ -179,10 +139,9 @@ pub fn nvrtc_invocations() -> usize {
 
 /// Whether `src` already has compiled PTX cached.
 ///
-/// Exists so a test can assert memoization directly. The obvious alternative —
-/// a delta on [`nvrtc_invocations`] — is a global counter and races with any
-/// other test compiling in the same binary, which is exactly how the first
-/// version of that test failed.
+/// Exists so a test can assert memoization directly. A delta on
+/// [`nvrtc_invocations`] cannot: it is a global counter and races with any
+/// other test compiling in the same binary.
 #[cfg(test)]
 fn is_cached(src: &str) -> bool {
     PTX_CACHE

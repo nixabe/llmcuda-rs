@@ -880,8 +880,8 @@ __device__ __forceinline__ void am_split2(float lo, float hi, unsigned& H, unsig
 //           permuted the same way (column n of product m is dim 16n + m),
 //           so a lane's share of a value row is one 32-byte run.
 //
-// The scalar kernel this replaces computed each score as a 128-step dot in
-// one thread: 6.7 ms a layer at 512 rows.
+// The scalar kernel computes each score as a 128-step dot in one thread:
+// 6.7 ms a layer at 512 rows.
 extern "C" __global__ void __launch_bounds__(32) ink_attn_mma(
     const float* __restrict__ q, const unsigned short* __restrict__ k_cache,
     const unsigned short* __restrict__ v_cache, const float* __restrict__ table,

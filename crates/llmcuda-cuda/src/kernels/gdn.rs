@@ -21,9 +21,8 @@
 //! `ggml_repeat_4d` (`src/models/qwen35moe.cpp:466`), which *tiles* rather than
 //! stretches. Dividing instead — `v_head / 2`, the other plausible reading —
 //! pairs every value head with the wrong query and stays finite and fluent.
-//! That was this kernel's convention until it was gated against the captured
-//! `final_output-N`: `h % 16` reproduces it to `max_abs 7.15e-7`, `h / 2` to
-//! `5.59e-1` at cosine `0.975`.
+//! Against the captured `final_output-N`, `h % 16` reproduces it to
+//! `max_abs 7.15e-7`, `h / 2` to `5.59e-1` at cosine `0.975`.
 //!
 //! ## Why two kernels
 //!
@@ -42,12 +41,12 @@
 //! ## One warp per state row
 //!
 //! A warp owns row `S[v_index][*]`, four consecutive key indices per lane as
-//! one `float4`. One *thread* per row was rejected early — it needs the row
+//! one `float4`. One *thread* per row is rejected — it needs the row
 //! twice, because 128 floats will not stay in one thread's registers — and
-//! the first shipped form gave each row a whole *block*, one thread per
-//! element, which read the row once but paid two block-wide reductions
-//! (two `__syncthreads`, a shared round trip, a serial cross-warp sum) per
-//! row and moved state at 44% of the streaming roofline. The warp form is
+//! a whole *block* per row, one thread per element, reads the row once but
+//! pays two block-wide reductions (two `__syncthreads`, a shared round
+//! trip, a serial cross-warp sum) per row and measured 44% of the
+//! streaming roofline. The warp form is
 //! the structure between the two: the row stays in four registers per lane,
 //! both reductions are barrier-free shuffle butterflies, and every load and
 //! store is a 16-byte vector.
@@ -155,9 +154,9 @@ impl GdnKernels {
         qk_heads: usize,
     ) -> Result<Self, GdnError> {
         // A warp owns four consecutive key indices per 128-element chunk of
-        // a state row, and the chunk loop unrolls against STEP_MAX_CHUNKS in
-        // the kernel source, so the head dimension must be a whole number of
-        // 128-element chunks and at most 128 * STEP_MAX_CHUNKS = 512.
+        // a state row, and the kernel spells out four chunks, so the head
+        // dimension must be a whole number of 128-element chunks and at most
+        // 512.
         if head_dim == 0 || !head_dim.is_multiple_of(128) || head_dim > 512 {
             return Err(GdnError::UnsupportedHeadDim { head_dim });
         }
@@ -238,10 +237,10 @@ impl GdnKernels {
 
     /// Advance `n` sequences' states by one token each, in one launch pair.
     ///
-    /// The per-sequence launches this replaces were correct and slow twice
-    /// over: 2n launches per layer of launch floor, and — for the state
-    /// kernel — one sequence's 4 MiB of traffic per launch where one launch
-    /// can stream all of them. Every activation buffer is the batch scratch
+    /// Per-sequence launches are slow twice over: 2n launches per layer of
+    /// launch floor, and — for the state kernel — one sequence's 4 MiB of
+    /// traffic per launch where one launch can stream all of them. Every
+    /// activation buffer is the batch scratch
     /// (`[n][width]`, sequence-major); only the state is per-sequence, and it
     /// rides in as `STEP_MAX_BATCH` scalar pointer slots so graph capture
     /// sees exactly the pointer stability the per-sequence launches gave it.

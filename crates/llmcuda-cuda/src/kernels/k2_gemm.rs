@@ -29,8 +29,8 @@ use std::sync::Arc;
 /// Resident bytes per 256-value Q4_K record and row: codes, half d/dmin and
 /// the unpacked scale and min bytes. Every field is whole words, so the
 /// four-row interleave keeps each word group 16-byte aligned. The per-group
-/// code sums these records once carried are recomputed by the one reader
-/// that wants them, the 8-bit activation experiment.
+/// code sums are recomputed by the one reader that wants them, the 8-bit
+/// activation experiment.
 pub const Q4_RECORD_BYTES: usize = 148;
 /// Resident bytes per 256-value Q6_K record and row: 210 bytes of codes, half
 /// d and subscales, padded so a four-row record group is 896 bytes, a whole
@@ -239,8 +239,8 @@ __device__ __forceinline__ void raw_imma4(int* d,unsigned a,unsigned b) {
 template<int Q,int IR=4>
 __device__ __forceinline__ int weight_sum(const unsigned char* __restrict__ row,unsigned i){
     if(Q==0){int sum=0;float sc,m;for(int z=0;z<4;++z)sum=raw_dp4a(raw_pack4<Q,IR>(row,i+z*4,&sc,&m),0x01010101,sum);return sum;}
-    // Q4: the sum of the 32-value group holding i, which records once
-    // carried precomputed and only this 8-bit experiment read.
+    // Q4: the sum of the 32-value group holding i; only this 8-bit
+    // experiment reads it.
     int sum=0;float sc,m;unsigned base=i&~31u;
     for(int z=0;z<8;++z)sum=raw_dp4a(raw_pack4<Q,IR>(row,base+z*4,&sc,&m),0x01010101,sum);return sum;
 }

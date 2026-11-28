@@ -51,11 +51,9 @@ pub struct Dequantizer {
     q6_k: cudarc::driver::CudaFunction,
 }
 
-/// Something went wrong compiling or launching a dequantization kernel.
+/// Something went wrong loading or launching a dequantization kernel.
 #[derive(Debug)]
 pub enum DequantError {
-    /// NVRTC rejected the source, or the module failed to load.
-    Compile(String),
     /// The driver failed.
     Driver(DriverError),
     /// The input byte count is not a whole number of blocks.
@@ -72,7 +70,6 @@ pub enum DequantError {
 impl std::fmt::Display for DequantError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Compile(m) => write!(f, "kernel compilation failed: {m}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::Ragged {
                 format,
@@ -97,7 +94,7 @@ impl From<DriverError> for DequantError {
 const THREADS: u32 = 256;
 
 impl Dequantizer {
-    /// Compile the kernels for `ctx`.
+    /// Load the kernels for `ctx`.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, DequantError> {
         let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
         Ok(Self {

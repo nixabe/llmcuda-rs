@@ -86,7 +86,7 @@
 //! measurement that settles it); `head_dim` 128, `chunk_len` 64.
 //!
 //! Chunks are sequentially dependent through `S`, so the host loops over them
-//! and each chunk runs three launches, after a whole-sequence normalization
+//! and each chunk runs four launches, after a whole-sequence normalization
 //! pass that has no cross-token dependency:
 //!
 //! 1. `gdn_chunk_gram` — the Gram matrices `k_i . k_t` and `k_i . q_t`. Both
@@ -94,9 +94,10 @@
 //!    read them once. `beta_t`, which is per value head, folds in later.
 //! 2. `gdn_chunk_inter` — `S_in k_t` and `S_in q_t`, before the state is
 //!    overwritten.
-//! 3. `gdn_chunk_solve_and_apply` — substitution, per-token output and the
-//!    chunk-end state fused, because all three consume `U` and `U` would
-//!    otherwise round-trip through global memory.
+//! 3. `gdn_chunk_solve_and_apply` — substitution and per-token output fused,
+//!    because both consume `U` while it is in shared memory.
+//! 4. `gdn_chunk_state_update` — the chunk-end state, a separate launch
+//!    because it is parallel over one more axis than the solve.
 
 use std::sync::Arc;
 
@@ -121,14 +122,13 @@ pub use super::gdn::L2_EPS;
 /// KiB by default; the remaining 16 KiB needs
 /// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`. Staying under the
 /// default keeps the launch path free of a per-function attribute call, and
-/// the chunked geometry fits with room to spare (32.5 KiB at `chunk_len = 64`,
-/// `head_dim = 128`).
+/// the chunked geometry fits with room to spare (10.25 KiB at
+/// `chunk_len = 64`).
 pub const MAX_SHARED_BYTES: usize = 48 * 1024;
 
 /// Tokens one `gdn_chunk_inter` block carries. Mirrors the kernel's
-/// `INTER_TT`; the drift test below is what keeps the two in step, because a
-/// mismatch would size the shared staging for a different tile than the
-/// kernel indexes into and read past its end.
+/// `INTER_TT`: a mismatch would size the shared staging for a different tile
+/// than the kernel indexes into and read past its end.
 ///
 /// `grid.x` is `chunk_len / INTER_TT` and every block in it reads the whole
 /// `head_dim x head_dim` state slice for its head, so this is also how many
@@ -187,9 +187,9 @@ extern "C" {
 
 // Everything between the q/k/v projection and the scan, in one launch.
 //
-// A prefill pass ran this as three: the causal convolution
+// The unfused form is three launches: the causal convolution
 // (`conv1d_causal_depthwise`, once a sequence), the SiLU with the q/k/v split
-// (`gdn_silu_split_qkv`) and `gdn_chunk_normalize_qk` above. Each walks the
+// (`gdn_silu_split_qkv`) and `gdn_chunk_normalize_qk`. Each walks the
 // same `[tokens][conv_dim]` stream -- 201 MB at 6,138 tokens -- and between
 // them they read it three times and wrote it four, counting the convolved and
 // the activated copies that only a trace reads. Here a block owns one value
@@ -440,7 +440,7 @@ __global__ void gdn_scan_prelude(
 // layer to achieve the same thing.
 //
 // Every warp of a head still re-reads `q` and `k`, but adjacent value columns
-// now share one register load and one decay/beta calculation. Sharing across
+// share one register load and one decay/beta calculation. Sharing across
 // warps through shared memory would reintroduce the barriers this shape exists
 // to avoid.
 #define SCAN_WARPS 4
@@ -455,10 +455,8 @@ __global__ void gdn_scan_prelude(
 // slice is a fixed stride, and only the recurrent state -- one allocation
 // per sequence -- needs the eight scalar pointer slots, selected by a
 // warp-uniform switch exactly as `gdn_recurrent_step` selects its own. Each
-// sequence's scan touches only its own z slice and its own state, which is
-// what kept three sequences' scans bit-identical to three serial launches
-// when this axis was added -- and what un-serialized the 44%-occupancy scan,
-// which used to run once per sequence on one stream.
+// sequence's scan touches only its own z slice and its own state, so a
+// batch's scans are bit-identical to serial launches.
 __global__ void gdn_scan_prefill(
     unsigned long long s0, unsigned long long s1,
     unsigned long long s2, unsigned long long s3,
@@ -853,18 +851,13 @@ __global__ void gdn_chunk_gram(
 // out rather than fusing it is what lets the fused kernel spend its whole
 // shared-memory budget on U.
 //
-// grid: (C, value_heads). block: head_dim threads, one per value index.
+// grid: (ceil(C / INTER_TT), value_heads). block: head_dim threads, one per
+// value index.
 // Tokens one block carries. The state row this kernel contracts against does
-// not depend on `t`, so a block per token re-read the whole `head_dim x
+// not depend on `t`, so a block per token would re-read the whole `head_dim x
 // head_dim` state matrix `c` times per chunk — 134 MB per chunk at Qwen3.6's
 // geometry, for 2 MB of distinct state. Carrying INTER_TT tokens divides both
 // that traffic and the load instructions that fetch it by INTER_TT.
-//
-// Eight and not sixteen: the accumulators are 2 * INTER_TT registers per
-// thread and the grid is `ceil(c / INTER_TT) * value_heads` blocks. At c = 64
-// and 32 value heads, eight gives 256 blocks over 72 SMs; sixteen would halve
-// that to 128 and buy only another factor of two on traffic that is already
-// L2-resident.
 #define INTER_TT 16
 
 __global__ void gdn_chunk_inter(
@@ -912,7 +905,7 @@ __global__ void gdn_chunk_inter(
     for (int u = 0; u < INTER_TT; ++u) { acc_k[u] = 0.0f; acc_q[u] = 0.0f; }
 
     // `s` is loaded once and multiplied into every carried token, which is the
-    // whole point: the inner loop is now INTER_TT multiply-adds per state
+    // whole point: the inner loop is INTER_TT multiply-adds per state
     // element instead of one. The `float4` widens the load only — the four
     // components are consumed x, y, z, w, so each accumulator still sums over
     // `j` ascending.
@@ -925,7 +918,7 @@ __global__ void gdn_chunk_inter(
         // is: eight scalar shared loads per eight multiply-adds is one memory
         // instruction per unit of arithmetic. Widening them is a load
         // widening only — the components are still consumed x, y, z, w, so
-        // each accumulator sums over `j` ascending exactly as before.
+        // each accumulator sums over `j` ascending.
         #pragma unroll
         for (int u = 0; u < INTER_TT; ++u) {
             float4 kv = *(const float4*)(sk + u * head_dim + j);
@@ -952,10 +945,11 @@ __global__ void gdn_chunk_inter(
     }
 }
 
-// The chunk: solve for U', emit every token's output, advance the state.
+// The chunk: solve for U', emit every token's output, publish U' for the
+// state update.
 //
-// grid: (value_heads,). block: head_dim threads, one per value index vi.
-// shared: U'[c][head_dim], then gcum[c], then decay[c].
+// grid: (value_heads, head_dim / VB). block: VB * SOLVE_TT threads.
+// shared: U'[c][VB], then gcum[c], then decay[SOLVE_TT][c].
 //
 // The unknown is u'_t = lambda_t u_t, not u_t. See the module docs for the
 // substitution and for why the textbook `u_t` form is unusable in fp32 on this
@@ -1039,12 +1033,11 @@ __global__ void gdn_chunk_solve_and_apply(
     // a different decay for the same input, which is a gratuitous divergence
     // on a quantity that multiplies every output in the chunk.
     //
-    // Exponentiating here — the previous `lambda[t] = expf(running)` — is what
-    // made this kernel unusable: `running` reaches -91.58 on this model, so
-    // `lambda[t]` underflows and the `v_t / lambda[t]` it fed overflowed to
-    // inf and then NaN. Everything below exponentiates a *difference* of two
-    // gcum entries instead, which is bounded above by 1 for non-positive
-    // log-decays.
+    // Exponentiating here — `lambda[t] = expf(running)` — is unusable:
+    // `running` reaches -91.58 on this model, so `lambda[t]` underflows and
+    // a `v_t / lambda[t]` overflows to inf and then NaN. Everything below
+    // exponentiates a *difference* of two gcum entries instead, which is
+    // bounded above by 1 for non-positive log-decays.
     if (threadIdx.x == 0) {
         float running = 0.0f;
         for (int t = 0; t < c; ++t) {
@@ -1077,8 +1070,8 @@ __global__ void gdn_chunk_solve_and_apply(
         // The whole block fills `decay`, and it fills the *whole* coefficient
         // rather than the exponential alone.
         //
-        // `beta_t * kk_row[i] * decay[i]` does not depend on `vl`, so the
-        // inner loop below was making all VB lanes recompute the same two
+        // `beta_t * kk_row[i] * decay[i]` does not depend on `vl`, so in
+        // the inner loop below all VB lanes would recompute the same two
         // products and reload the same `kk_row[i]` from global. Hoisting them
         // here leaves that loop one shared read and one multiply-add, which
         // matters more than the arithmetic saved: sections 1 and 2 are a
@@ -1172,11 +1165,11 @@ __global__ void gdn_chunk_solve_and_apply(
 //   S[h][vi][j] = lambda_last[h] * S[h][vi][j] + sum_i U'[h][i][vi] k[i][j]
 //
 // grid: (value_heads, head_dim / STATE_VB, head_dim / STATE_JB), one thread
-// per (vi, j) pair. Every output is independent, so this saturates where its
-// parent could not.
+// per 4x4 tile of (vi, j) cells. Every output is independent, so this
+// saturates where the solve could not.
 //
 // The `i` loop runs ascending and the update is a single fused
-// `lambda * S + acc`, both as the solve had them: reassociating the sum or
+// `lambda * S + acc`: reassociating the sum or
 // splitting the fused multiply-add into a scale pass and an accumulate pass
 // would round differently on a value that is carried into every later chunk.
 #define STATE_VT 4
@@ -1184,7 +1177,7 @@ __global__ void gdn_chunk_solve_and_apply(
 // two operands of the outer product are one `float4` each and the thread does
 // sixteen multiply-adds with them.
 //
-// The first version gave each thread one `(vi, j)` cell and looped `i`:
+// One `(vi, j)` cell per thread, looping `i`, is:
 //
 //   float kv = k_norm[...j];              // one global load
 //   acc += su[i * STATE_VB + vl] * kv;    // one shared load, one FMA
@@ -1202,20 +1195,9 @@ __global__ void gdn_chunk_solve_and_apply(
 // address broadcast to all 32.
 #define STATE_VLANES 8
 #define STATE_JLANES 32
-// The bands themselves. `STATE_VB` is unchanged at 32, so the staged `su`
-// tile is the same 8 KiB it was; `STATE_JB` is now the whole 128-wide state
-// row, which is what removes `grid.z` and with it the repeated staging that
-// the sweep below was working around.
-//
-//   4   1,705.97 tok/s
-//   8   1,727.74
-//   16  1,721.89
-//   32  1,710.30
-//
-// Those were measured with one cell per thread, where `STATE_JB` traded the
-// number of passes over `uprime` against the block size. With a register tile
-// the block covers 32x128 cells with the same 256 threads and `grid.z` is 1,
-// so `uprime` is staged once per value band and the trade is gone.
+// The bands themselves. `STATE_JB` is the whole 128-wide state row: the
+// block covers 32x128 cells with 256 threads and `grid.z` is 1, so `uprime`
+// is staged once per value band.
 #define STATE_VB (STATE_VLANES * STATE_VT)
 #define STATE_JB (STATE_JLANES * STATE_JT)
 
@@ -1388,11 +1370,6 @@ pub struct GdnChunkedScratch {
 }
 
 impl GdnChunkedScratch {
-    /// The longest sequence this scratch can service.
-    pub fn max_seq_len(&self) -> usize {
-        self.max_seq_len
-    }
-
     /// The normalized, pre-scaled `q` and the normalized `k` the last scan
     /// read, `[max_seq_len][qk_heads][head_dim]` each.
     pub fn normalized(&self) -> (&CudaSlice<f32>, &CudaSlice<f32>) {
@@ -1501,11 +1478,6 @@ impl GdnChunkedKernels {
     /// `hq + qk_heads`, … and not a contiguous run.
     pub fn heads_per_kv(&self) -> usize {
         self.value_heads / self.qk_heads
-    }
-
-    /// Tokens processed per triangular solve.
-    pub fn chunk_len(&self) -> usize {
-        self.chunk_len
     }
 
     /// The `1/sqrt(head_dim)` scale folded into `q`.
@@ -1621,9 +1593,8 @@ impl GdnChunkedKernels {
     /// each, advancing every state.
     ///
     /// The scan is a whole-chunk sequential walk at 1,024 resident warps —
-    /// 44% of the card — and batched prefill used to run it once per
-    /// sequence on one stream, serializing three walks that share no data.
-    /// One launch runs them concurrently. `q`/`k`/`v`, the gates and `out`
+    /// 44% of the card — and the sequences' walks share no data, so one
+    /// launch runs them concurrently. `q`/`k`/`v`, the gates and `out`
     /// are the flattened sequence-major batch buffers
     /// (`[n][seq_len][...]`); the per-sequence states ride in as
     /// `STEP_MAX_BATCH`-style scalar pointer slots.
@@ -1992,8 +1963,8 @@ impl GdnChunkedKernels {
                 .arg(&qk_heads)
                 .arg(&chunk_start)
                 .arg(&c_i32);
-            // SAFETY: the grid is (c, value_heads) and the block is head_dim
-            // threads, so the state index `(h * head_dim + vi) * head_dim + j`
+            // SAFETY: the grid is (ceil(c / INTER_TT), value_heads) and the
+            // block is head_dim threads, so the state index `(h * head_dim + vi) * head_dim + j`
             // stays inside `value_heads * head_dim * head_dim` and the output
             // index `(h * c + t) * head_dim + vi` inside
             // `value_heads * chunk_len * head_dim`.
@@ -2027,10 +1998,10 @@ impl GdnChunkedKernels {
                 .arg(&chunk_start)
                 .arg(&c_i32);
             // SAFETY: one block per (value head, SOLVE_VB-wide band of value
-            // indices), SOLVE_VB threads per block, and shared memory sized
-            // for exactly the `c * SOLVE_VB` entries of U' this band holds
-            // plus the `c` cumulative log-decays and the `c` decay ratios the
-            // kernel indexes. `uprime` is `value_heads * chunk_len * head_dim`
+            // indices), SOLVE_VB * SOLVE_TT threads per block, and shared
+            // memory sized for exactly the `c * SOLVE_VB` entries of U' this
+            // band holds plus the `c` cumulative log-decays and the
+            // `SOLVE_TT * c` decay ratios the kernel indexes. `uprime` is `value_heads * chunk_len * head_dim`
             // and `lambda_last` is `value_heads`. Every other global index is
             // bounded by the same reasoning as the two kernels above, and
             // `c >= 1` inside the loop so `gcum[c - 1]` is in range.
@@ -2055,8 +2026,8 @@ impl GdnChunkedKernels {
                 .arg(&qk_heads)
                 .arg(&chunk_start)
                 .arg(&c_i32);
-            // SAFETY: one thread per (value index, state column) pair, so the
-            // state index `(h * head_dim + vi) * head_dim + j` covers
+            // SAFETY: one thread per 4x4 tile of (value index, state column)
+            // pairs, so the state index `(h * head_dim + vi) * head_dim + j` covers
             // `value_heads * head_dim * head_dim` exactly once. Shared memory
             // holds the `c * STATE_VB` slice of `uprime` this block reads.
             unsafe { builder.launch(update_cfg) }?;
@@ -2069,13 +2040,11 @@ impl GdnChunkedKernels {
 
 /// Shared memory the fused solve kernel needs for a chunk of `c` tokens.
 ///
-/// `U'` is `c x head_dim`, the cumulative log-decay is `c` more floats, and one
-/// row of decay ratios is `c` more. Nothing else is resident — that is the
-/// whole reason the triangular system is solved by substitution rather than by
-/// materialising the `c x c` inverse, and the same reason the `c x c` decay
-/// mask llama.cpp builds as a tensor is rebuilt here one row at a time.
+/// `U'` is `c x SOLVE_VB`, the cumulative log-decay is `c` more floats, and
+/// one row of decay ratios per token lane is `SOLVE_TT * c` more. Nothing else
+/// is resident: the `c x c` decay mask llama.cpp builds as a tensor is rebuilt
+/// here one row at a time.
 fn shared_bytes_for_solve(c: usize) -> usize {
-    // U', the cumulative log-decays, and one decay row per token lane.
     (c * SOLVE_VB as usize + c + SOLVE_TT as usize * c) * size_of::<f32>()
 }
 
@@ -2086,9 +2055,8 @@ mod tests {
     #[test]
     fn shared_memory_at_the_real_geometry_fits_a_turing_block() {
         // chunk_len 64 over a SOLVE_VB-wide band, plus one decay row per
-        // token lane: 10.5 KiB, well inside the 48 KiB a block gets without
-        // the opt-in carve-out. It was 32.5 KiB when a block owned a whole
-        // head, and 8.5 KiB when the output section ran one token at a time.
+        // token lane: 10.25 KiB, well inside the 48 KiB a block gets without
+        // the opt-in carve-out.
         let needed = shared_bytes_for_solve(64);
         assert_eq!(
             needed,
@@ -2101,10 +2069,8 @@ mod tests {
             "the solve block is SOLVE_VB * SOLVE_TT threads",
         );
         assert!(needed < MAX_SHARED_BYTES, "{needed} bytes");
-        // A 64x64 inverse *would* now fit beside it — 8.5 + 16 KiB — which is
-        // why the module docs no longer offer shared memory as a reason to
-        // prefer forward substitution. The arithmetic reason is untouched and
-        // is asserted separately by `no_inverse_is_materialised`.
+        // A 64x64 inverse would fit beside it, so shared memory is not the
+        // reason the solve substitutes; the module docs give the reasons.
         assert!(needed + 64 * 64 * 4 < MAX_SHARED_BYTES);
     }
 

@@ -8,7 +8,9 @@
 //! ## Toolchain
 //!
 //! The engine uses **cudarc + NVRTC**, with CUDA C++ kernel sources compiled at
-//! load time. That choice was gated on the spike in [`spike`], which runs on
+//! load time beside Rust kernels compiled ahead of time to PTX
+//! ([`kernels::RUST_KERNELS_PTX`]). That choice was gated on the spike in
+//! [`spike`], which runs on
 //! the target hardware and verifies sm_75 PTX emission, inline-PTX
 //! availability, warp intrinsic lowering, and CUDA graph capture. See
 //! `docs/TOOLCHAIN.md` for the reasoning and the alternative that was

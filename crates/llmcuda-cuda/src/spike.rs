@@ -12,8 +12,8 @@
 //!    router's top-k over 256 experts is a warp-level bitonic selection, so
 //!    these are load-bearing, not conveniences.
 //! 4. Are CUDA Graphs reachable? Graph capture over on-device MoE indirection
-//!    is the thesis of the whole project (milestone 06). If it were not
-//!    reachable from Rust the architecture would need rethinking.
+//!    is milestone 06. If it were not reachable from Rust the architecture
+//!    would need rethinking.
 //!
 //! Each check below actually compiles, launches, and verifies numerical
 //! output. None of them is satisfied by "the API exists".
@@ -321,10 +321,9 @@ pub fn check_warp_intrinsics(ctx: &std::sync::Arc<CudaContext>) -> CheckOutcome 
 
 /// Q4 — can a launch be captured into a CUDA graph and replayed?
 ///
-/// This is the project's largest expected single win, so it is verified by
-/// replaying a captured graph and checking the device state actually advanced
-/// once per replay — not merely by observing that the capture API returned
-/// `Ok`.
+/// Verified by replaying a captured graph and checking the device state
+/// actually advanced once per replay — not merely by observing that the
+/// capture API returned `Ok`.
 ///
 /// # The event-tracking constraint
 ///

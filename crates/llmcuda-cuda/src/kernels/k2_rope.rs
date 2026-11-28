@@ -33,10 +33,9 @@ impl K2Rope {
         Self::with_kv_formats(ctx, stream, tokens, dim, rope_dim, KvFormats::F16)
     }
 
-    /// [`Self::new`] whose batched decode append writes `kv`'s formats.
-    /// Binary16 compiles this module's source unchanged; a q8_0 half prepends the shared
-    /// quantizer, so `k2_rotary_append` stays bit-identical to
-    /// `attn_kv_append_kv8`.
+    /// [`Self::new`] whose batched decode append writes `kv`'s formats. A
+    /// q8_0 half launches `k2_rotary_append_kv8`, which stays bit-identical
+    /// to `attn_kv_append_kv8`.
     pub fn with_kv_formats(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,

@@ -157,7 +157,7 @@ pub fn probe_all() -> Result<Vec<DeviceInfo>, DriverError> {
 /// never gets to answer `false` on a machine with no driver installed — the
 /// one machine this function exists to recognize. Every GPU-gated test in the
 /// workspace calls through here, so without this they all abort instead of
-/// skipping, which is how CI on a GPU-less runner failed.
+/// skipping.
 ///
 /// A driver that is present but unhappy still returns `Err` normally; only
 /// the library-not-found case unwinds. The panic message is written to

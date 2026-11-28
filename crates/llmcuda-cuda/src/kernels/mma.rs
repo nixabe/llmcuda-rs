@@ -68,9 +68,6 @@ pub const MMA_K: usize = 16;
 const MMA_SRC: &str = r#"
 extern "C" {
 
-// Two little-endian bytes as an IEEE half, widened. NVRTC has no include path,
-// so <cuda_fp16.h> is unreachable; `cvt.f32.f16` is the same hardware
-// conversion `__half2float` lowers to.
 // Assemble four bytes into an MMA operand register.
 //
 // A Q8_0 block is 34 bytes -- a 2-byte scale then 32 quants -- so the quants
@@ -86,29 +83,15 @@ __device__ __forceinline__ unsigned int pack4(const unsigned char* p) {
          | ((unsigned int)p[3] << 24);
 }
 
+// Two little-endian bytes as an IEEE half, widened. NVRTC has no include path,
+// so <cuda_fp16.h> is unreachable; `cvt.f32.f16` is the same hardware
+// conversion `__half2float` lowers to.
 __device__ __forceinline__ float load_half_le_mma(const unsigned char* p) {
     unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
     float f;
     asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(bits));
     return f;
 }
-
-// d[m][n] = sum_k a[m][k] * b[n][k], int8 operands, int32 accumulate.
-//
-// `a` is [M][K] row-major and `b` is [N][K] row-major -- b is the transpose of
-// the mathematical right operand, which is what `.col` means and what every
-// quantized weight layout in this project already stores.
-//
-// One warp per output tile. grid.x tiles the N axis, grid.y the M axis, so the
-// launch shape is a function of the declared geometry alone and stays
-// capturable in a CUDA graph (AGENTS.md rule 5).
-//
-// K must be a multiple of 16. The caller checks it; a kernel-side check would
-// have to be a branch on a host value in the inner loop.
-//
-// The activation operand is quantized by the Rust kernel
-// `mma_quantize_rows_q8`: weights ship as Q8_0 and feed the MMA directly,
-// activations are fp32 and must be narrowed to match.
 
 // out[t][n] = sum_k w[n][k] * x[t][k], with `w` a Q8_0 GGUF tensor and `x`
 // pre-quantized by `mma_quantize_rows_q8`, computed on integer tensor cores.
@@ -227,17 +210,15 @@ __global__ void mma_q8_0_proj(
 // pass afterwards.
 //
 //   quants: int8  [n_rows][k]
-//   scales: fp32  [n_rows][k / 32]   (`mma_repack_q8_0`, a Rust kernel)
 //   scales: fp16  [n_rows][k / 32]   (`mma_repack_q8_0_h`, a Rust kernel)
 
 // Contraction the block stages per trip, and the padded row stride it stages
 // into.
 //
-// The inner loop used to read its B fragment straight from global on every
-// 32-element block: four warps sharing one row band meant four fetches of the
-// same bytes, and every one of them was a dependent global load in a kernel
-// that only fits eight warps to an SM. L1 caught most of the traffic and none
-// of the latency.
+// Reading the B fragment straight from global on every 32-element block makes
+// four warps sharing one row band fetch the same bytes four times, each a
+// dependent global load: L1 catches most of the traffic and none of the
+// latency.
 //
 // Staged, each weight byte is fetched once per block and the mainloop reads
 // shared. `PROJ_WSTRIDE` is 144 rather than 128 because the fragment load is
@@ -281,14 +262,10 @@ __device__ __forceinline__ void mma_q8_0_proj_split_body(
     // The warps of a block walk **the same weight rows** and different tokens,
     // not the other way round.
     //
-    // Every block in `y` re-reads the whole weight band -- that is the shape
-    // of this kernel and the reason the token tile was swept end to end rather
-    // than in isolation. What the sweep could not change is that the warps of
-    // a block used to take *different* row bands, so four warps meant four
-    // disjoint weight reads and the block shared nothing. Giving them one row
-    // band and four token tiles makes three of the four reads L1 hits and
-    // divides the band's DRAM traffic by `blockDim.y` -- at 512 tokens, eight
-    // passes over the weights become two.
+    // Every block in `y` re-reads the whole weight band, so giving a block's
+    // warps one row band and four token tiles, rather than four disjoint row
+    // bands, divides the band's DRAM traffic by `blockDim.y` -- at 512 tokens,
+    // eight passes over the weights become two.
     int t0   = (blockIdx.y * blockDim.y + threadIdx.y) * MMA_TOKS;
     int n0   = blockIdx.x * MMA_ROWS;
     // No early return: the staging loop below is a block-wide barrier pair and
@@ -429,6 +406,18 @@ MMA_PROJ_SPLIT_ENTRY(mma_q8_0_proj_split_h, unsigned short)
 
 extern "C" {
 
+// d[m][n] = sum_k a[m][k] * b[n][k], int8 operands, int32 accumulate.
+//
+// `a` is [M][K] row-major and `b` is [N][K] row-major -- b is the transpose of
+// the mathematical right operand, which is what `.col` means and what every
+// quantized weight layout in this project already stores.
+//
+// One warp per output tile. grid.x tiles the N axis, grid.y the M axis, so the
+// launch shape is a function of the declared geometry alone and stays
+// capturable in a CUDA graph (AGENTS.md rule 5).
+//
+// K must be a multiple of 16. The caller checks it; a kernel-side check would
+// have to be a branch on a host value in the inner loop.
 __global__ void mma_int8_gemm(
     const signed char* __restrict__ a,
     const signed char* __restrict__ b,
@@ -554,35 +543,18 @@ pub const MMA_TOKENS: usize = MMA_M;
 /// weight traffic — and the register pressure, which is
 /// `(MMA_SPLIT_TOKS / 8) * (MMA_ROWS / 8) * 2` accumulators per thread.
 ///
-/// # A tuning result that reversed twice
+/// # Why 32
 ///
-/// This constant was 64 for most of the project's life, and the reason was
-/// weight traffic. The token tile divides the grid — `grid.y` is `tokens /
-/// MMA_SPLIT_TOKS` and **every block in `y` re-reads the whole weight band** —
-/// so a narrow tile multiplied the DRAM traffic. A full sweep at the time,
-/// end to end, put 64 ahead of everything:
+/// The token tile divides the grid — `grid.y` is `tokens / MMA_SPLIT_TOKS`
+/// and **every block in `y` re-reads the whole weight band** — which argues
+/// for a wide tile. But each block stages the band in shared memory once,
+/// with `uint4` loads, so that traffic is small, and what a wide tile costs
+/// is register pressure: `(MMA_SPLIT_TOKS / 8) * (MMA_ROWS / 8) * 2`
+/// accumulators per thread, 128 of them at 64 x 64, which pins ptxas at 255
+/// registers and eight warps to an SM. Halving it to 64 roughly doubles the
+/// resident warps.
 ///
-/// | tile | n = 128 | n = 512 |
-/// |---|---:|---:|
-/// | 64 x 64  | 889.34 | **1341.39** |
-/// | 64 x 32  | 933.32 | 1309.01 |
-/// | 32 x 64  | 861.89 | 1284.06 |
-/// | 16 x 128 | 905.99 | 1228.07 |
-/// | 32 x 128 | 684.86 | 1211.75 |
-/// | 16 x 64  | 915.18 | 1164.79 |
-///
-/// and a later sweep under the shared-row-band mapping agreed: `8 x 32 x 64`
-/// measured 1,369 against `4 x 64 x 64`'s 1,435.
-///
-/// **Staging the weight tile in shared memory reversed it.** Once each block
-/// fetches the band once, with `uint4` loads, instead of once per warp with
-/// scattered four-byte reads, the traffic argument for a wide token tile is
-/// gone — and what is left is the register pressure the wide tile was buying
-/// its way out of: `(MMA_SPLIT_TOKS / 8) * (MMA_ROWS / 8) * 2` accumulators
-/// per thread, 128 of them at 64 x 64, which pins ptxas at 255 registers and
-/// eight warps to an SM. Halving it to 64 roughly doubles the resident warps.
-///
-/// Re-swept end to end with the staged tile, tok/s at n = 512:
+/// Swept end to end with the staged tile, tok/s at n = 512:
 ///
 /// | warps x tokens x rows | tok/s |
 /// | --- | ---: |
@@ -595,15 +567,11 @@ pub const MMA_TOKENS: usize = MMA_M;
 /// | 4 x 32 x 128 | 2,085.36 |
 /// | 8 x 64 x 64 | 2,077.50 |
 ///
-/// The kernel went 53.0 -> 38.4 ms per 512-token pass across the two changes
-/// together, and neither is worth much without the other: staging alone was
-/// 2.0 ms, and the narrow tile alone had already been measured as a loss,
-/// twice.
-///
-/// Recorded at length because the isolated `bench_mma` benchmark points the
-/// wrong way here — a microbenchmark of a kernel that re-reads a weight
-/// measures cache residency it will not have in situ — and because a tuning
-/// result is only valid against the kernel structure it was measured on.
+/// A tuning result is only valid against the kernel structure it was measured
+/// on: without the staged tile, 64 measured ahead. And the isolated
+/// `bench_mma` benchmark points the wrong way here — a microbenchmark of a
+/// kernel that re-reads a weight measures cache residency it will not have in
+/// situ.
 pub const MMA_SPLIT_TOKS: usize = 32;
 
 /// Contraction the split projection stages per trip. Mirrors `PROJ_KC`.
@@ -627,11 +595,11 @@ const fn proj_shared_bytes() -> u32 {
 /// Batch width at or above which the engine's blocks route their projections
 /// through the integer tensor cores.
 ///
-/// Deliberately **not** [`MMA_SPLIT_TOKS`], though it was the same constant
-/// until the tile was retuned. They answer different questions: the tile is
-/// how much work one warp holds, and this is whether a batch is wide enough to
-/// be worth quantizing activations for at all. A decode step of one token
-/// would pay the whole fixed cost to fill an eighth of a fragment.
+/// Deliberately **not** [`MMA_SPLIT_TOKS`]. They answer different questions:
+/// the tile is how much work one warp holds, and this is whether a batch is
+/// wide enough to be worth quantizing activations for at all. A decode step
+/// of one token would pay the whole fixed cost to fill an eighth of a
+/// fragment.
 pub const MMA_SPLIT_TOKENS: usize = 64;
 
 /// The compiled integer tensor-core kernels.
@@ -641,7 +609,6 @@ pub struct MmaKernels {
     proj: CudaFunction,
     proj_split: CudaFunction,
     proj_split_h: CudaFunction,
-    repack: CudaFunction,
     repack_h: CudaFunction,
 }
 
@@ -660,7 +627,6 @@ impl MmaKernels {
             proj: module.load_function("mma_q8_0_proj")?,
             proj_split: module.load_function("mma_q8_0_proj_split")?,
             proj_split_h: module.load_function("mma_q8_0_proj_split_h")?,
-            repack: rust.load_function("mma_repack_q8_0")?,
             repack_h: rust.load_function("mma_repack_q8_0_h")?,
         })
     }
@@ -711,61 +677,19 @@ impl MmaKernels {
         Ok(())
     }
 
-    /// Split a Q8_0 tensor into aligned quants and fp32 scales, on device.
-    ///
-    /// Prefer [`Self::repack_q8_0_half`] for anything large: widening the
-    /// scale buys no precision and costs 5.9% more traffic on every read.
+    /// Split a Q8_0 tensor into aligned quants and its scales, on device, with
+    /// the scales left at the width the file stores them in.
     ///
     /// `src` is the GGUF byte stream, `q` is `[elements]` int8 and `scales` is
-    /// `[elements / 32]` fp32. Run once at load: the repacked form is what
-    /// [`Self::q8_0_proj_split`] reads, and the difference between the two
-    /// layouts is 3.2x.
-    pub fn repack_q8_0(
-        &self,
-        stream: &Arc<CudaStream>,
-        src: &CudaSlice<u8>,
-        q: &mut CudaSlice<i8>,
-        scales: &mut CudaSlice<f32>,
-        elements: usize,
-    ) -> Result<(), MmaError> {
-        if !elements.is_multiple_of(32) {
-            return Err(MmaError::RaggedContraction { k: elements });
-        }
-        let blocks = elements / 32;
-        expect_len("repack src", src.len(), blocks * 34)?;
-        expect_len("repack q", q.len(), elements)?;
-        expect_len("repack scales", scales.len(), blocks)?;
-        if blocks == 0 {
-            return Ok(());
-        }
-
-        const WARPS: u32 = 4;
-        let cfg = LaunchConfig {
-            grid_dim: (blocks.div_ceil(WARPS as usize) as u32, 1, 1),
-            block_dim: (32, WARPS, 1),
-            shared_mem_bytes: 0,
-        };
-        let n = blocks as i64;
-        let mut builder = stream.launch_builder(&self.repack);
-        builder.arg(src).arg(&mut *q).arg(&mut *scales).arg(&n);
-        // SAFETY: one warp per 32-element block over a grid covering every
-        // block and returning above it; all three buffers were checked against
-        // the block count.
-        unsafe { builder.launch(cfg) }?;
-        Ok(())
-    }
-
-    /// As [`Self::repack_q8_0`], with the scales left at the width the file
-    /// stores them in.
+    /// `[elements / 32]` raw IEEE-half bits — the two bytes at the head of
+    /// each Q8_0 block, moved rather than converted, so this is the identity
+    /// on the value. Widening the scale to fp32 would cost 1.125 bytes an
+    /// element against Q8_0's own 1.0625 and buy no precision, which is 5.9%
+    /// of every read of a weight that is only ever read once per pass.
     ///
-    /// `scales` is `[elements / 32]` raw IEEE-half bits — the two bytes at the
-    /// head of each Q8_0 block, moved rather than converted, so this is the
-    /// identity on the value. Prefer it wherever the repacked tensor is large
-    /// enough for its scale array to be traffic: the fp32 form costs 1.125
-    /// bytes an element against Q8_0's own 1.0625 and buys no precision, which
-    /// is 5.9% of every read of a weight that is only ever read once per pass.
-    ///
-    /// [`Self::q8_0_proj_split_half`] is the matching consumer.
+    /// Run once at load: the repacked form is what
+    /// [`Self::q8_0_proj_split_half`] reads, and the difference between the
+    /// two layouts is 3.2x.
     pub fn repack_q8_0_half(
         &self,
         stream: &Arc<CudaStream>,

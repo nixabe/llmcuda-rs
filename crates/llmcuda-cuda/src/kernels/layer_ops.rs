@@ -48,8 +48,8 @@
 //! # One language
 //!
 //! Every kernel here is Rust, compiled ahead of time
-//! ([`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX)); this module no longer
-//! invokes NVRTC. The source is [`RUST_KERNELS_SRC`](super::RUST_KERNELS_SRC).
+//! ([`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX)). The source is
+//! [`RUST_KERNELS_SRC`](super::RUST_KERNELS_SRC).
 
 use std::sync::Arc;
 
@@ -76,12 +76,9 @@ pub const MAX_CONV_KERNEL: usize = 8;
 /// the strided reduction for RMSNorm.
 const MAX_BLOCK: usize = 1024;
 
-/// The NVRTC translation unit for the layer ops that are still CUDA C++:
-/// Something went wrong compiling or launching a layer-op kernel.
+/// Something went wrong loading or launching a layer-op kernel.
 #[derive(Debug)]
 pub enum LayerOpsError {
-    /// NVRTC rejected the source, or the module failed to load.
-    Compile(String),
     /// The driver failed.
     Driver(DriverError),
     /// A row width the kernel cannot service.
@@ -101,7 +98,6 @@ pub enum LayerOpsError {
 impl std::fmt::Display for LayerOpsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Compile(m) => write!(f, "kernel compilation failed: {m}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::UnsupportedWidth { width } => {
                 write!(f, "row width {width} must be non-zero")
@@ -185,9 +181,8 @@ pub struct LayerOpsKernels {
 }
 
 impl LayerOpsKernels {
-    /// Load the layer ops: the Rust ones from
-    /// [`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX), which lists them, and
-    /// the rest compiled from CUDA C++ by NVRTC.
+    /// Load the layer ops from
+    /// [`RUST_KERNELS_PTX`](super::RUST_KERNELS_PTX).
     ///
     /// All loading happens before hot-path launches or graph capture.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
@@ -531,12 +526,7 @@ impl LayerOpsKernels {
         let n_i64 = n as i64;
         let width_i32 = width as i32;
         let broadcast_i32 = i32::from(shape == GateShape::PerRow);
-        // Elementwise gating is the Rust kernel; the per-row broadcast stays
-        // CUDA C++, where the Rust port loses at prefill sizes.
-        let kernel = match shape {
-            GateShape::Elementwise | GateShape::PerRow => &self.sigmoid_gate,
-        };
-        let mut builder = stream.launch_builder(kernel);
+        let mut builder = stream.launch_builder(&self.sigmoid_gate);
         builder
             .arg(x)
             .arg(gate)

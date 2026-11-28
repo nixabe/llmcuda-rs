@@ -133,10 +133,6 @@ const TILE_ROWS: u32 = 8;
 const GEMM_THREADS: u32 = TILE_ROWS * 32;
 
 /// Experts one lane of `moe_route`'s selection warp holds in registers.
-///
-/// Spelled here as well as in the kernel source, because NVRTC compiles from
-/// a string with no access to Rust constants;
-/// `the_routing_warp_bound_matches_the_kernel` asserts the two agree.
 const ROUTE_LANE_EXPERTS: usize = 16;
 
 /// Warps splitting the contraction in the one-token shared expert.
@@ -174,7 +170,7 @@ const MMA_N: u32 = 8;
 /// Output rows one block covers. Mirrors `MOE_MMA_ROWS`.
 const MMA_ROWS: u32 = MMA_WARPS * MMA_N;
 /// Dispatch slots one block stages, wide variant. Mirrors `MOE_MMA_M` on
-/// `moe_expert_ffn_mma`/`moe_expert_down_mma`.
+/// `moe_expert_ffn_mma_fused_iq`/`moe_expert_down_mma`.
 ///
 /// A `block_size` above this would have its tail silently dropped, so
 /// [`MoeKernels::new`] rejects such a geometry rather than trusting callers.
@@ -183,11 +179,11 @@ const MMA_M: usize = 64;
 /// to `moe_expert_ffn_mma_impl`/`moe_expert_down_mma_impl` in
 /// `moe_expert_ffn_mma_narrow`/`moe_expert_down_mma_narrow`.
 ///
-/// `MMA_M` was this value until "Widening M on the routed-expert MMA
-/// kernels" traded three blocks/SM for two to fit a wider staged tile --
-/// a real win from 8,192 tokens up, and a real loss at 512, where an
-/// average expert's traffic does not fill even the *narrow* tile and the
-/// occupancy cut buys nothing. [`MoeKernels::new`] picks between the two
+/// The wide tile trades three blocks/SM for two to fit a wider staged tile
+/// ("Widening M on the routed-expert MMA kernels") -- a real win from 8,192
+/// tokens up, and a real loss at 512, where an average expert's traffic does
+/// not fill even the *narrow* tile and the occupancy cut buys nothing.
+/// [`MoeKernels::new`] picks between the two
 /// compiled kernels by `block_size`, at this constant as the boundary --
 /// see "Two compiled widths instead of one" in docs/BENCHMARKS.md for the
 /// crossover measurement.
@@ -275,7 +271,7 @@ const fn mma_ffn_q8_shared_bytes() -> u32 {
 }
 
 /// Shared bytes the tensor-core grouped GEMM needs at dispatch-slot ceiling
-/// `m` (`MMA_M` for `moe_expert_ffn_mma`, `MMA_M_NARROW` for
+/// `m` (`MMA_M` for `moe_expert_ffn_mma_fused_iq`, `MMA_M_NARROW` for
 /// `moe_expert_ffn_mma_narrow`): two staged weight tiles, their scale tiles,
 /// the int8 activation tile, its per-32 scales, and one activation row index
 /// per staged slot.
@@ -329,10 +325,9 @@ impl ExpertQuant {
     /// Index into the tuned kernels' per-format arrays.
     ///
     /// `dequant_tile_ct` takes the format as a template parameter, so each
-    /// tuned family is compiled once per shipped format and the runtime
-    /// ladder is gone. Community formats have no tuned instantiation -- the
-    /// caller must route them to the `*_community` kernels before reaching
-    /// this, which `tuned_format` below is for.
+    /// tuned family is compiled once per shipped format. Community formats
+    /// have no tuned instantiation -- the caller must route them to the
+    /// `*_community` kernels before reaching this.
     fn tuned_index(self) -> usize {
         match self {
             Self::Q6K => 0,
@@ -343,8 +338,8 @@ impl ExpertQuant {
 
     /// Whether this format is read only by the `*_community` kernels.
     ///
-    /// The tuned families' `dequant_tile` names two formats and must go on
-    /// naming exactly two; everything else routes to the plain path.
+    /// The tuned families are instantiated at two formats and must stay at
+    /// exactly two; everything else routes to the plain path.
     pub const fn is_community(self) -> bool {
         matches!(self, Self::Q4_0 | Self::Q4K | Self::Q5K)
     }
@@ -465,8 +460,7 @@ impl QuantTensor<'_> {
 
 pub(crate) const MOE_SRC: &str = r#"
 // Tile shape. Mirrored by `TILE_M` / `TILE_K` / `TILE_ROWS` on the Rust side,
-// which size the shared memory and the grid; `tile_shape_is_mirrored_in_rust`
-// asserts the two never drift.
+// which size the shared memory and the grid.
 // Experts one lane of the routing warp can hold in registers. 16 covers 512
 // experts; the launch path rejects anything wider.
 #define Q6K_SB 224
@@ -556,7 +550,7 @@ __device__ __forceinline__ float q8_0_value(signed char q, float d) {
 // standalone dequant kernel uses:
 //
 // 1. **The superblock header is hoisted.** Addressing an element by its flat
-//    index alone — the shape the first version of this kernel used — re-reads
+//    index alone re-reads
 //    the fp16 delta and re-derives the scale pointer for *every* element,
 //    2,048 redundant header loads per weight row per token. `i0` is a
 //    multiple of 128, so the tile lies inside one 128-element half of one
@@ -671,9 +665,6 @@ __device__ __forceinline__ void dequant_tile_q8_0_wide(
     }
 }
 
-// The GEMM prologue: unpack exactly the weight tile about to be multiplied.
-// Nothing is materialized in fp32 beyond the four values in registers.
-
 
 // -------------------------------------------------------------------------
 // Community-quant tiles: Q4_0, Q4_K, Q5_K.
@@ -685,9 +676,9 @@ __device__ __forceinline__ void dequant_tile_q8_0_wide(
 //
 // **These are reached only from `dequant_tile_community` below, which only the
 // `_community` kernels call.** That separation is the whole design and it was
-// paid for: an earlier attempt (2238d5d, reverted in 40f7fc6) added these
-// three as arms of `dequant_tile` itself. That function is `__forceinline__`
-// with a *runtime* `quant`, so every arm it names is emitted at every one of
+// paid for: an attempt (2238d5d, reverted in 40f7fc6) added these three as
+// arms of the tuned kernels' prologue. That function was `__forceinline__`
+// with a *runtime* `quant`, so every arm it named was emitted at every one of
 // its nine call sites -- five unpack bodies where two had been. It cost
 // `moe_shared_ffn_gemv` +20 registers, `moe_expert_ffn_flat` +18,
 // `moe_expert_ffn` +16, `moe_expert_ffn_gemv` +11, moved twenty kernels, and
@@ -695,10 +686,9 @@ __device__ __forceinline__ void dequant_tile_q8_0_wide(
 // it was worse (+44 and +38), because a device call spills live values across
 // the ABI boundary. See BENCHMARKS.md's WHY NOT row.
 //
-// So `dequant_tile` above is untouched and still names exactly two formats.
-// Nothing on the shipped path can see this code, which is checkable rather
-// than assertable: the 33 pre-existing kernels' register allocation is
-// byte-identical with these present.
+// So the tuned kernels' prologue (`dequant_tile_ct` below) takes the format
+// at compile time and the tuned kernels instantiate it at Q6_K and Q8_0 only:
+// nothing on the shipped path can see this code.
 //
 // All three keep the tile contract the Q6_K prologue established: `i0` is a
 // multiple of MOE_TK, a lane owns the four *consecutive* elements
@@ -809,20 +799,19 @@ __device__ __forceinline__ void dequant_tile_k_affine(
 }
 
 // The community ladder. All five formats, in its own function, called only
-// from the `_community` kernels -- so the two-arm `dequant_tile` above pays
-// nothing for any of this existing.
+// from the `_community` kernels -- so the tuned kernels' `dequant_tile_ct`
+// below pays nothing for any of this existing.
 //
 // It names Q6_K and Q8_0 as well as the three new ones because a *pair* can be
 // mixed: `Q4_K_M` gives some layers a Q4_K `ffn_gate_exps` beside a Q6_K
 // `ffn_up_exps`, and one kernel reads both. Five arms here cost nothing --
 // this function has exactly four call sites, all inside kernels that are the
-// slow path by construction -- where the same five arms inside `dequant_tile`
-// cost 5.05% of a decode step.
+// slow path by construction -- where the same five arms behind a runtime
+// `quant` in the tuned prologue cost 5.05% of a decode step.
 //
 // The codes are `ExpertQuant::code()`; a mismatch between the two lists reads
 // every expert of the swapped formats as the other one, which is finite and
-// wrongly scaled rather than a crash. `quant_codes_match_the_kernel` in the
-// Rust tests below pins them.
+// wrongly scaled rather than a crash.
 __device__ __forceinline__ void dequant_tile_community(
     const unsigned char* __restrict__ src, int quant, long long i0, int wlane, float* out
 ) {
@@ -835,18 +824,17 @@ __device__ __forceinline__ void dequant_tile_community(
 
 // The GEMM prologue, with the format as a **compile-time** parameter.
 //
-// This is the shape 40f7fc6's revert message prescribed. The runtime-`quant`
-// form this replaces was `__forceinline__` with the format in a register, so
-// every arm it named was emitted at every one of its nine call sites and the
-// arms paid for each other -- three added formats cost the two already there
+// A runtime-`quant` form of this `__forceinline__` function, with the format
+// in a register, emits every arm it names at every one of its call sites and
+// the arms pay for each other -- three added formats cost the two already there
 // up to +20 registers and 5.05% of a decode step. With `Q` a template
 // parameter each instantiation contains exactly one unpacker and the branch
 // is gone before ptxas sees it, so the cost of naming a format is borne only
 // by the kernels instantiated at it.
 //
-// The codes match `ExpertQuant::code()`; `quant_codes_match_the_kernel` pins
-// the two lists, because a swap reads every expert of both formats as the
-// other one -- finite, wrongly scaled weights rather than a crash.
+// The codes match `ExpertQuant::code()`: a swap reads every expert of both
+// formats as the other one -- finite, wrongly scaled weights rather than a
+// crash.
 template<int Q>
 __device__ __forceinline__ void dequant_tile_ct(
     const unsigned char* __restrict__ src, long long i0, int wlane, float* out
@@ -879,8 +867,8 @@ __device__ __forceinline__ void dequant_tile_ct(
 // The thread -> (row, column) map is deliberately rigid: a thread's column is
 // `threadIdx.x % MOE_TK` for the whole kernel and only its row advances, so
 // both halves are a compile-time-bounded unrolled loop over MOE_STAGE
-// elements. An earlier version indexed the tile linearly and recovered the
-// row and column with a division, which cost a *software integer division*
+// elements. Indexing the tile linearly and recovering the row and column
+// with a division costs a *software integer division*
 // (`flat / top_k` divides by a runtime value — twenty-odd instructions on
 // sm_75) on every staged float. The row offsets are divided once per tile row
 // instead, by the MOE_TM threads that fill `rows`.
@@ -948,7 +936,7 @@ __device__ __forceinline__ float4 tile_row4(const float* xs, int m, int wlane) {
 extern __shared__ __align__(16) float llmcuda_shared[];
 
 // Sum TM independent accumulators across a warp, leaving the totals in every
-// lane. Replaces the old block-wide reduction: a warp now owns a whole output
+// lane. A warp owns a whole output
 // row, so nothing has to cross a warp boundary and the epilogue needs no
 // `__syncthreads` at all.
 template<int TM>
@@ -1093,16 +1081,6 @@ __device__ __forceinline__ void tile_gemm_single(
 // `moe_expert_ffn_mma`, not the tiled kernels the earlier diff's own
 // differential and benchmark coverage was checking. See "MoE's small-bucket
 // GEMV..." in docs/BENCHMARKS.md for the full account.
-//
-// These two functions are new code with no existing caller, so nothing
-// above this point in the file changes: `tile_gemm_pair`, `tile_gemm_single`
-// and `MOE_TILE_DISPATCH` are untouched, byte for byte, from what they were
-// before this section existed. Whether keeping the *addition* itself out of
-// `moe_expert_ffn_mma`'s register allocation requires more than that --
-// e.g. a separate compilation unit, since `ptxas`'s allocator has now been
-// measured to cross `__global__` function boundaries within one `nvrtc`
-// module -- is exactly what this session's `cuobjdump -sass` A/B (recorded
-// in BENCHMARKS.md) exists to answer, not assumed here.
 //
 // One live row, read directly rather than staged through
 // `prefetch_tile`/`commit_tile` -- the same pattern `moe_expert_ffn_gemv`
@@ -1500,11 +1478,10 @@ moe_expert_ffn_mma_impl(
         //
         // The float arithmetic that remains is `(float)acc * (dx * d)`, where
         // `d` is the superblock delta hoisted above and `dx` the activation
-        // scale for these 32 elements. Against the old expression this is one
-        // rounding instead of three per pair of sub-blocks, so the result is
-        // not bit-identical to what this kernel produced before -- it is
-        // slightly *more* accurate, and `tests/forward_pass.rs` gates the
-        // difference against llama.cpp's own activations.
+        // scale for these 32 elements. That is one rounding per pair of
+        // sub-blocks where scaling each MMA result separately takes three;
+        // `tests/forward_pass.rs` gates the result against llama.cpp's own
+        // activations.
         for (int kk = 0; kk < MOE_MMA_KC; kk += 32) {
             unsigned int bg[2], bu[2];
             #pragma unroll
@@ -1592,15 +1569,11 @@ moe_expert_ffn_mma_impl(
     // The k-loop's own barriers sit at the TOP of each staging trip, so
     // nothing orders the last trip's consume phase against what comes next.
     // The FUSE_IQ tile below reuses the staging allocation, and without this
-    // barrier a warp that finished its fragments early overwrote staged
-    // weight and activation bytes a sibling warp was still contracting --
-    // a real race, and the cause of the 2026-08-20 wide-flattened-prefill
-    // divergence: the corruption pattern follows the block schedule, so it
-    // changed with the pass width and masqueraded as flattening error
-    // (first divergence layer 1 MoE at 5.7e-5, amplified to 2.39 by layer
-    // 39 through routing flips; bit-exact at every waypoint once the fused
-    // path was disabled). The non-fused instantiation writes only to global
-    // `inter` and needs no barrier here.
+    // barrier a warp that finished its fragments early overwrites staged
+    // weight and activation bytes a sibling warp is still contracting. The
+    // corruption pattern follows the block schedule, so it changes with the
+    // pass width and reads as flattening error. The non-fused instantiation
+    // writes only to global `inter` and needs no barrier here.
     if constexpr (FUSE_IQ) {
         __syncthreads();
     }
@@ -1835,10 +1808,10 @@ extern "C" {
 //
 // ## Why one block per dispatch block and not one per slot
 //
-// The first version gave every (row, slot) pair its own block, so the tokens
-// sharing an expert each re-read that expert's whole weight stack: at a
-// 512-token step that is 16x the traffic a tiled form needs, and the measured
-// result was 6.5 GB/s against a 672 GB/s card. Here a block owns a whole
+// Giving every (row, slot) pair its own block makes the tokens sharing an
+// expert each re-read that expert's whole weight stack: at a 512-token step
+// that is 16x the traffic a tiled form needs, and it measured 6.5 GB/s
+// against a 672 GB/s card. Here a block owns a whole
 // `block_size` run — which by construction belongs to *one* expert — stages
 // those slots' activations in shared memory, and multiplies each dequantized
 // weight into all MOE_TM accumulators before dropping it. The stack is then
@@ -2150,7 +2123,7 @@ __device__ __forceinline__ void moe_expert_ffn_gemv_impl(
 
     float ag[1] = {0.0f};
     float au[1] = {0.0f};
-    // Two tiles in flight. The two `dequant_tile` calls of one iteration are
+    // Two tiles in flight. The two `dequant_tile_ct` calls of one iteration are
     // already independent, but the *next* iteration's loads cannot issue
     // until this one's arithmetic has consumed its registers unless the loop
     // is unrolled — and this kernel moves its weights at 46% of the card's
@@ -2405,8 +2378,9 @@ moe_expert_ffn_mma_fused_iq(
 // Writes each (token, k) contribution to its own slice of `partial` rather
 // than accumulating into the output with atomics. Two reasons: atomicAdd
 // makes the summation order non-deterministic, so the same input would give
-// bit-different output run to run; and the deterministic reduction below can
-// then sum in ascending k, matching the reference's per-token loop.
+// bit-different output run to run; and the deterministic reduction
+// (`moe_reduce`) can then sum in ascending k, matching the reference's
+// per-token loop.
 //
 // Padding slots read `inter` as zero rather than as whatever the previous
 // step left there, and `store_slot_contribution` drops their output entirely.
@@ -2604,7 +2578,7 @@ __global__ void moe_expert_down_flat_q8(
 
 
 // Two compiled variants of the same body, for the same reason
-// `moe_expert_ffn_mma`/`moe_expert_ffn_mma_narrow` above are two. See that
+// `moe_expert_ffn_mma_fused_iq`/`moe_expert_ffn_mma_narrow` above are two. See that
 // pair's comment.
 __global__ void __launch_bounds__(MOE_MMA_WARPS * 32, 4)
 moe_expert_down_mma_narrow(
@@ -4126,10 +4100,9 @@ pub struct MoeBuffers {
     /// Live-row count for each `block_size`-wide dispatch bucket, written
     /// alongside `expert_ids` by `moe_align_block_size`.
     ///
-    /// No expert kernel reads it any more — the ones that did were the
-    /// decode-width bucketed variants the flat routed-pair kernels replaced.
-    /// It survives as the observable form of the dispatch kernel's collision
-    /// handling, which `moe_differential.rs` asserts on directly.
+    /// No expert kernel reads it. It is the observable form of the dispatch
+    /// kernel's collision handling, which `moe_differential.rs` asserts on
+    /// directly.
     bucket_live: CudaSlice<i32>,
     /// Per-expert selection counts, handed from the dispatch kernel's
     /// counting pass to its scatter pass. Device-side only: no host ever
@@ -4182,11 +4155,6 @@ impl MoeBuffers {
             BufferScope::Routed => Ok(()),
             BufferScope::SharedOnly => Err(MoeError::SharedOnlyBuffers { entry }),
         }
-    }
-
-    /// Mutable routing outputs for architecture-specific device routers.
-    pub fn routing_mut(&mut self) -> (&mut CudaSlice<i32>, &mut CudaSlice<f32>) {
-        (&mut self.topk_ids, &mut self.topk_weights)
     }
 
     /// Selected expert ids, `[max_tokens][experts_per_token]`.
@@ -4245,10 +4213,9 @@ impl MoeBuffers {
 
     /// Total device bytes held.
     ///
-    /// Every allocation, including the int8 staging buffers. Those used to be
-    /// left out, which was noise at the MoE model's 512-wide expert and is
-    /// not at the dense model's 17,408-wide FFN: `siq` and `iq` alone are
-    /// 143 MiB at a 4,096-token prefill there.
+    /// Every allocation, including the int8 staging buffers: noise at the
+    /// MoE model's 512-wide expert, but at the dense model's 17,408-wide FFN
+    /// `siq` and `iq` alone are 143 MiB at a 4,096-token prefill.
     pub fn bytes(&self) -> usize {
         (self.topk_ids.len()
             + self.sorted_token_ids.len()
@@ -4274,7 +4241,6 @@ impl MoeBuffers {
     }
 }
 
-/// Compiled MoE kernels for one fixed geometry.
 /// One layer's shared expert repacked for the integer tensor cores.
 ///
 /// About 3.4 MB per layer — three `intermediate * hidden` matrices as int8
@@ -4377,6 +4343,7 @@ impl SharedExpertInt8 {
     }
 }
 
+/// Compiled MoE kernels for one fixed geometry.
 pub struct MoeKernels {
     route: CudaFunction,
     dispatch_t1: CudaFunction,
@@ -4496,18 +4463,13 @@ impl MoeKernels {
         // one that can actually bite.
         //
         // The quantity to bound is `expert_block_capacity`, which is what every
-        // dispatch launch puts in grid.y. This used to bound `sorted_capacity`
-        // — the *slot* count, `block_size` times larger — and so capped context
-        // at about 7,168 tokens where grid.y is 2,040 of an available 65,535.
-        //
-        // That bound was not arbitrary, though, and relaxing it alone was not
-        // enough: `MmaKernels::quantize_rows` took `rows` on grid.y, and the
-        // down projection passes `sorted_capacity` as `rows`. Past 7,168 tokens
-        // the launch failed with a bare `CUDA_ERROR_INVALID_VALUE`. That kernel
-        // now takes rows on grid.x, where the limit is 2^31-1, so the slot
-        // count no longer reaches a 65,535 axis anywhere. Nothing else needs it
-        // to: inside the dispatch kernels it is a loop bound, and outside it is
-        // a length for `sorted_token_ids` and `inter`, both indexed by `int`.
+        // dispatch launch puts in grid.y -- not `sorted_capacity`, the *slot*
+        // count, `block_size` times larger. The slot count reaches no 65,535
+        // axis: `MmaKernels::quantize_rows`, which the down projection hands
+        // `sorted_capacity` as `rows`, takes rows on grid.x, where the limit is
+        // 2^31-1; inside the dispatch kernels it is a loop bound, and outside
+        // it is a length for `sorted_token_ids` and `inter`, both indexed by
+        // `int`.
         if geometry.expert_block_capacity() > 65_535 {
             return Err(bad(
                 "dispatch-block capacity exceeds the 65535 grid.y limit",
@@ -4831,13 +4793,12 @@ impl MoeKernels {
 
     /// Route every format through the `*_community` kernels.
     ///
-    /// For differential tests, and it exists because of a specific failure:
+    /// For differential tests:
     /// the community formats have no tuned instantiation, so a harness that
     /// checks them against Q6_K and Q8_0 as a control is comparing two
     /// different *kernels* against one reference. The control then passes
     /// while covering none of the code under test -- which is the trap
-    /// `docs/TESTING.md`'s Controls section is about, arrived at a second
-    /// time by a different route.
+    /// `docs/TESTING.md`'s Controls section is about.
     ///
     /// With this set, the control runs the same kernels as the cases and a
     /// green control means something.
@@ -4887,12 +4848,11 @@ impl MoeKernels {
     /// no launch geometry changes, which is what keeps the sequence
     /// capturable.
     /// A repeat with the same count writes nothing. That is not only an
-    /// elided copy — forty layers share one `MoeBuffers`, so a pass used to
-    /// publish the same number forty times — it is what keeps the write out
-    /// of a CUDA graph capture. The source is a host slice, and a copy from
-    /// pageable host memory is not something a capture may contain; hoisting
-    /// it to `Forward::publish_inputs` and making the repeats free is how the
-    /// step below it became recordable.
+    /// elided copy — forty layers share one `MoeBuffers` — it is what keeps
+    /// the write out of a CUDA graph capture. The source is a host slice, and
+    /// a copy from pageable host memory is not something a capture may
+    /// contain; `Forward::publish_inputs` publishes it once and the repeats
+    /// are free, which is what makes the step below it recordable.
     pub fn set_valid_tokens(
         &self,
         stream: &Arc<CudaStream>,
@@ -5367,10 +5327,9 @@ impl MoeKernels {
                     &self.expert_ffn_flat[ffn_idx]
                 };
                 let mut direct_builder = stream.launch_builder(direct);
-                // Neither entry point takes a format any more: `_q6` was
-                // always specialized, and `expert_ffn_flat[ffn_idx]` now is
-                // too. The `q6` split survives only because the two have
-                // different bodies, not different signatures.
+                // Neither entry point takes a format: both are specialized.
+                // The `q6` split exists because the two have different
+                // bodies, not different signatures.
                 direct_builder.arg(gate.bytes);
                 direct_builder.arg(up.bytes);
                 direct_builder
@@ -5421,9 +5380,7 @@ impl MoeKernels {
 
         // `&& !down_community` because the community branch below owns the
         // down projection at every width. Without it a one-token community
-        // pass launched this *and* that one, and the second write won -- which
-        // is how the Q6_K control passed while doubly dispatched, masking a
-        // Q8_0 failure that was really this bug.
+        // pass launches this *and* that one, and the second write wins.
         if gemv && !down_community {
             let cfg = LaunchConfig {
                 grid_dim: (

@@ -2,8 +2,7 @@
 //! scalar fp32 reference, over the **whole** 248,320-entry vocabulary, on
 //! the real Q8_0 `output.weight` taken from the model file.
 //!
-//! This is the last kernel G006 needs before a forward pass can produce
-//! logits, and it is the one whose output a user sees directly: everything
+//! This is the kernel whose output a user sees directly: everything
 //! upstream is checked against a reference, but the LM head's argmax *is*
 //! the sampled token. A kernel that is well inside any sensible tolerance
 //! and still flips one argmax has produced a different model, and no mean
@@ -290,7 +289,7 @@ fn upload_head(stream: &Arc<CudaStream>, bytes: &[u8]) -> CudaSlice<u8> {
 }
 
 /// Report both metrics and the evidence that `max_rel_error` is a floor
-/// artefact rather than a measurement, per `.omc/handoffs/team-plan.md`.
+/// artefact rather than a measurement.
 fn report(label: &str, candidate: &[f32], reference: &[f32]) {
     let result = compare(candidate, reference);
     println!("{label}: {result}");
@@ -700,7 +699,7 @@ fn the_row_tiled_three_token_paths_are_bit_identical_to_the_untiled_kernel() {
     }
 
     // Informal timing so the retained tile's win is visible where the gate
-    // runs; the whole-pass A/B in docs/BENCHMARKS.md is the real evidence.
+    // runs. It is not a whole-pass measurement.
     let time = |kernels: &LmHeadKernels, label: &str| {
         let mut d_logits = stream
             .alloc_zeros::<f32>(g.max_tokens * g.vocab)

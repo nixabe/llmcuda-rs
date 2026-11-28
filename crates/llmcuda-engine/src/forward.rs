@@ -21,10 +21,9 @@
 //! [`crate::DeviceWeights`] holds the model in **one** 29.6 GiB arena and
 //! hands out byte ranges into a single `CudaSlice<u8>`. Every kernel entry
 //! point takes `&CudaSlice<T>` and validates its whole element count, so a
-//! range could not be passed to one. Both landed blocks worked around it by
-//! copying their layer's weights into fresh allocations at construction, and
-//! at 725 MiB per MoE layer that is 28.3 GiB of duplicate over 40 layers —
-//! the model, twice, on a 48 GiB card.
+//! range could not be passed to one. Copying each layer's weights into fresh
+//! allocations at construction instead is, at 725 MiB per MoE layer, 28.3 GiB
+//! of duplicate over 40 layers — the model, twice, on a 48 GiB card.
 //!
 //! Three things keep fixed-token shapes from duplicating model weights:
 //!
@@ -209,8 +208,6 @@ pub(crate) const ROPE_FREQ_BASE_SUFFIX: &str = "rope.freq_base";
 /// Something went wrong building or running the forward pass.
 #[derive(Debug)]
 pub enum ForwardError {
-    /// NVRTC rejected the embedding source, or the module failed to load.
-    Compile(String),
     /// The driver failed.
     Driver(DriverError),
     /// A Gated DeltaNet block failed.
@@ -322,7 +319,6 @@ pub enum ForwardError {
 impl std::fmt::Display for ForwardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Compile(m) => write!(f, "embedding kernel compilation failed: {m}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::Gdn(e) => write!(f, "{e}"),
             Self::GdnVerify(e) => write!(f, "{e}"),
@@ -529,7 +525,7 @@ pub const DENSE_FFN_OWNED_ROLES: [Role; 4] = [
 ///
 /// Taking the FFN kind rather than defaulting to the MoE list is what stops a
 /// dense model from resident-loading its whole FFN twice: `FfnGate` is not in
-/// `MOE_OWNED_ROLES`, so the old filter would have kept it.
+/// `MOE_OWNED_ROLES`, so a MoE-only filter would keep it.
 pub fn arena_holds_for(ffn: FfnConfig, role: Role) -> bool {
     match ffn {
         FfnConfig::Moe(_) => !MOE_OWNED_ROLES.contains(&role),
@@ -916,11 +912,11 @@ struct BatchAttentionStreams {
 impl Forward {
     /// Build the whole stack for exactly `tokens` positions.
     ///
-    /// `weights` must have been loaded with [`arena_holds`] as the filter, and
-    /// `directory` must be the one it was loaded from, resolved against
-    /// `file`. The token count is fixed here rather than per call because
-    /// every kernel in the chain validates its buffer lengths against the
-    /// declared geometry exactly.
+    /// `weights` must have been loaded with [`arena_holds_model_entry`] (or
+    /// the role-only [`arena_holds`]) as the filter, and `directory` must be
+    /// the one it was loaded from, resolved against `file`. The token count
+    /// is fixed here rather than per call because every kernel in the chain
+    /// validates its buffer lengths against the declared geometry exactly.
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
@@ -1057,9 +1053,6 @@ impl Forward {
             HeadFormat::Q4K => vocab * hidden / QK_K * 144,
             HeadFormat::Q5K => vocab * hidden / QK_K * 176,
         };
-        // The gather has a body per format; bf16 has none, because no file
-        // seen so far stores the *embedding* that way and an untested third
-        // path is worse than a named refusal.
         // `fwd_embed_quant`'s format codes, as its Rust source matches on
         // them. bf16 is the one format with no gather body: no file seen
         // so far stores the *embedding* that way, and an untested path is
@@ -1145,16 +1138,11 @@ impl Forward {
         // sequence would otherwise hold two copies of 1.13 GiB.
         // **Sharing is conditional on the donor having built it.** A pass that
         // wants none of the three paths builds an empty vector, and `reshape`
-        // hands that empty vector to the shape it spawns. That used to be
-        // the 4..63-token hole: those prefills built nothing, so a one-token
-        // decode they spawned fell back to the fp32 projection (13% of every
-        // decode step — 9.7 ms became 11.0) and a 2..3-token batch decode
-        // they spawned took the standard-layout tile (the 7.15e-7 GDN
-        // layer-0 residual). Every width now has a consumer, so every
-        // width builds it.
+        // hands that empty vector to the shape it spawns. Every width has
+        // a consumer, so every width builds it.
         //
         // A Q8_0 projection is repacked from a transient upload of the file's
-        // bytes rather than from the arena, which no longer carries it
+        // bytes rather than from the arena, which does not carry it
         // (`arena_holds_entry`): the repack is the only resident form, and
         // the upload is dropped as soon as the kernel has read it. Where the
         // arena *does* carry it — a load filtered by `arena_holds` — the
@@ -1396,14 +1384,6 @@ impl Forward {
         self.vocab
     }
 
-    /// `model.input_embed`: the embedding lookup, `[tokens][hidden]`.
-    pub fn embedded(&self) -> &CudaSlice<f32> {
-        // Valid only immediately after `run`'s first step, and overwritten by
-        // block 0's residual; `run` therefore hands the caller a view of every
-        // block boundary as it produces it. This accessor is the input.
-        &self.hidden_state
-    }
-
     /// `h_nextn`: the final output norm over **all** positions.
     pub fn final_norm(&self) -> &CudaSlice<f32> {
         &self.final_norm
@@ -1575,7 +1555,7 @@ impl Forward {
         // and a copy from pageable host memory is not something a graph may
         // contain.
         self.publish_inputs(stream, state, &vec![0i32; self.tokens])?;
-        // Single-stream decode wants one block per split: at N=1 the 72
+        // Single-stream decode wants one block per split: at N=1 the
         // splits are already one thin wave and fewer blocks just halve the
         // memory parallelism (measured -13% at 32K). Reset here so a batch
         // capture that ran earlier on these shared kernels cannot leak its
@@ -2168,14 +2148,13 @@ impl Forward {
         // Three or more concurrent sequence-local decode-attention calls
         // overflow the 288 resident-block budget at one block per split, so
         // the batch capture bakes 48 blocks per call: at the 96 logical
-        // splits the kernels now default to, each block computes exactly two
+        // splits the kernels default to, each block computes exactly two
         // splits, the three calls' 288 blocks fill one wave, and the
         // partials are bit-identical at any block count — the block choice
         // is scheduling, not numerics (the split count is numerics, gated
-        // separately; see MMA_DECODE_SPLITS). 96/48 measured 151.2/153.2
-        // vs the prior 72/36's 149.5/148.3 at 32K N=3
-        // (docs/BENCHMARKS.md 2026-08-20). Below three sequences the
-        // default already fits one wave and stays.
+        // separately; see MMA_DECODE_SPLITS, which carries the
+        // measurement). Below three sequences the default already fits one
+        // wave and stays.
         let batch_blocks = if n >= 3 { 48 } else { 0 };
         for block in &mut self.attention {
             block.set_decode_mma_blocks(batch_blocks);
@@ -2389,7 +2368,7 @@ impl Forward {
                     // this pass's own -- built for `tokens = n` at
                     // construction, same as every other per-layer field
                     // here -- so there is no second `Forward` to keep in
-                    // step with this one any more.
+                    // step with this one.
                     //
                     // Positions come from `self.batch_positions`, published
                     // once for all `n` sequences by `publish_batch_inputs`,
@@ -3281,10 +3260,9 @@ impl Forward {
     /// - A state left where a previous call finished gives a **continuation**,
     ///   which is what decode is.
     ///
-    /// The distinction used to be made here, by zeroing unconditionally. It is
-    /// the caller's now, because the whole difference between prefill and
-    /// decode is which of the two they want, and a pass that always resets can
-    /// only ever be the first. Forgetting to reset is not silent: a second
+    /// The distinction is the caller's, because the whole difference between
+    /// prefill and decode is which of the two they want, and a pass that
+    /// always resets can only ever be the first. Forgetting to reset is not silent: a second
     /// cold prefill through a used state resumes the previous prompt's
     /// convolution taps and recurrent matrix, and produces a completely
     /// different, entirely finite result.
@@ -3835,8 +3813,7 @@ fn alias_gdn_proj(
 
 /// Build one Gated DeltaNet layer's split int8 repack, or `None` when its
 /// projections are not all Q8_0 (they then have no repack and take the
-/// generic kernels over their stored bytes — the old unconditional repack
-/// would have run the Q8_0 repacker over Q6_K superblocks).
+/// generic kernels over their stored bytes).
 ///
 /// Each projection is repacked from the arena alias when `w` holds one, and
 /// otherwise from a transient upload of the file's bytes that is dropped
@@ -3885,19 +3862,13 @@ fn repack_gdn_layer(
 
 /// Alias one resident Q8_0 tensor, rejecting any other stored format.
 ///
-/// The rejection is this function's whole job and it used to be missing. The
-/// body was `alias_projection(..)?.0`, which *reads* a format and then drops
-/// it on the floor: `alias_projection` accepts Q8_0, bf16, Q6_K and f16,
-/// because the head GEMV has a reader for each. Its three callers here —
-/// `attn_qkv`, `attn_gate`, `ssm_out` — hand the bytes to the GDN block,
-/// which reads them as `Projection::Q8_0`, a type with no other quantized
-/// variant. A uniformly Q6_K file therefore loaded those three tensors and
-/// unpacked 210-byte superblocks with the 34-byte Q8_0 unpacker, producing
-/// fluent, wrong text rather than an error — the exact failure mode
+/// The rejection is this function's whole job. `alias_projection` accepts
+/// Q8_0, bf16, Q6_K and f16, because the head GEMV has a reader for each, but
+/// the caller here hands the bytes to the GDN block as
+/// `GateProjection::Q8_0`. Without the check a file storing the tensor Q6_K
+/// would have its 210-byte superblocks unpacked by the 34-byte Q8_0 unpacker,
+/// producing fluent, wrong text rather than an error — the exact failure mode
 /// `AGENTS.md` names as the highest-likelihood risk in this project.
-///
-/// Neither shipped file could reach it: both store all three Q8_0. That is
-/// what made it worth fixing before a community quant found it instead.
 fn alias_q8_0(
     weights: &DeviceWeights,
     stream: &Arc<CudaStream>,
@@ -4113,19 +4084,14 @@ mod tests {
     /// `alias_q8_0` must refuse every format `alias_projection` accepts but
     /// the GDN block cannot read.
     ///
-    /// This is a regression test for a silent-wrong-numbers defect, not a
-    /// hypothetical. `alias_q8_0`'s body was `alias_projection(..)?.0`, which
-    /// reads a format and discards it, and `alias_projection` accepts Q8_0,
-    /// bf16, Q6_K and f16 because the head GEMV has a reader for each. Its
-    /// callers are `attn_qkv`, `attn_gate` and `ssm_out`, which the GDN block
-    /// reads as `Projection::Q8_0` — an enum whose only other variant is f32.
-    /// A uniformly Q6_K file would have unpacked 210-byte superblocks with
-    /// the 34-byte Q8_0 unpacker and generated fluent, wrong text.
+    /// `alias_projection` accepts Q8_0, bf16, Q6_K and f16 because the head
+    /// GEMV has a reader for each; letting one of the others through here
+    /// would unpack 210-byte superblocks with the 34-byte Q8_0 unpacker and
+    /// generate fluent, wrong text.
     ///
     /// The check is tested through the pure `require_q8_0` rather than
     /// `alias_q8_0` because the latter needs a *resident* tensor in a format
-    /// no file on this host stores. That is the whole difficulty, and it is
-    /// why the defect survived: the shipped files cannot reach it.
+    /// no file on this host stores.
     #[test]
     fn only_q8_0_may_be_aliased_as_q8_0() {
         assert!(

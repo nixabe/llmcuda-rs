@@ -1,6 +1,6 @@
 //! `gdn_conv_silu_split_step_batch` against the two launches it replaces.
 //!
-//! At decode width the Gated DeltaNet step ran `conv1d_step_batch` and then
+//! The two-launch form runs `conv1d_step_batch` and then
 //! `gdn_silu_split_qkv`, the second reading back what the first wrote. The
 //! fused launch convolves a channel and gates its own accumulator, with the
 //! same per-channel arithmetic as each separate kernel, so its five outputs

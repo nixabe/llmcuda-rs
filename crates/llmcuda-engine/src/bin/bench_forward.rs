@@ -5,18 +5,16 @@
 //!
 //! One call to [`Forward::run`] is a complete pass over `n` tokens: embedding
 //! lookup, 40 blocks, final norm, LM head. It carries **no state between
-//! calls** — `run` zeroes the Gated DeltaNet recurrent matrices and
-//! convolution caches every time, and there is no KV cache for the ten
-//! attention layers, so each pass recomputes its whole window.
+//! repetitions** — the sequence state is reset before every pass, which zeroes
+//! the Gated DeltaNet recurrent matrices and convolution caches and rewinds
+//! the KV cache to position 0, so each pass recomputes its whole window.
 //!
 //! That makes this directly comparable to llama.cpp's **`pp` (prompt
 //! processing)** figure, which is also a full forward over a batch. It is
 //! **not** comparable to llama.cpp's `tg` (token generation): a decode step
-//! reuses a KV cache and resumes a recurrent state, and llmcuda-rs has neither
-//! yet — that is story G007. Reporting the `n = 1` row as a decode rate would
-//! be comparing a cold full pass against a warm incremental one, so it is
-//! labelled a *latency floor* instead: it is what one pass costs, and a real
-//! decode step cannot be slower than the work it shares with this.
+//! reuses a KV cache and resumes a recurrent state, which is what
+//! `bench_decode` measures. Reporting the `n = 1` row as a decode rate would
+//! be comparing a cold full pass against a warm incremental one.
 //!
 //! Methodology mirrors `llama-bench`: the model is loaded once, each batch
 //! size gets its own `Forward` (the token count is fixed at construction),
@@ -163,8 +161,7 @@ fn main() {
     // activation memory that scales with the prompt and activation memory that
     // is constant. The engine already supports it — `Forward::run` runs
     // `self.tokens` positions at `state.position()` and advances the state, and
-    // a one-token `Forward` chained this way is exactly what decode is. Only
-    // this harness was missing it.
+    // a one-token `Forward` chained this way is exactly what decode is.
     if let Some(chunk) = env_usize("LLMCUDA_BENCH_CHUNK") {
         chunked_prefill(
             &ctx,
@@ -259,10 +256,9 @@ fn main() {
                 .then(Profiler::new)
                 .transpose()
                 .expect("start timed prefill capture");
-            // The reset is inside the timed region because it used to be
-            // inside `run`, and moving it out would make these numbers
-            // quietly incomparable with every prefill measurement already in
-            // docs/BENCHMARKS.md.
+            // The reset is inside the timed region: the prefill measurements
+            // in docs/BENCHMARKS.md include it, and moving it out would make
+            // these numbers quietly incomparable with them.
             let t = Instant::now();
             state.reset(&stream).expect("reset");
             forward
@@ -462,7 +458,7 @@ fn env_usize(key: &str) -> Option<usize> {
 /// Prefill a prompt as a chain of fixed-shape passes over one sequence state.
 ///
 /// The pass is built once at `chunk` positions and reused for every prompt
-/// length, because its shape no longer depends on the prompt — which is the
+/// length, because its shape does not depend on the prompt — which is the
 /// whole point. What scales with the prompt is the `SequenceState`: the KV
 /// cache for the ten attention layers, and nothing else, since the Gated
 /// DeltaNet's recurrent state is a fixed `[value_heads][head_dim][head_dim]`

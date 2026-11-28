@@ -2,7 +2,7 @@
 //! reference, at Qwen3.6's real MoE geometry and on real quantized expert
 //! weights taken from the model file.
 //!
-//! This is the milestone-05 gate. MoE runs on **every one of the 40 layers**
+//! This is the milestone-04 gate. MoE runs on **every one of the 40 layers**
 //! plus the MTP head, so an error here is an error on every token; and
 //! unlike the numeric kernels, most of what can go wrong is *discrete* — a
 //! different expert selected, a token placed in the wrong run, a padding
@@ -117,6 +117,13 @@ const SHARED_INPUT_SEED: u64 = 0x_5EED_0E05;
 /// `cosine = 1.000000`. The bound below is ~51x that — room for hardware and
 /// driver variation, not room for a formulation bug, which would land orders
 /// of magnitude away on an output whose own max magnitude is only 1.0e-2.
+const ROUTED_GATE: Tolerance = Tolerance {
+    max_abs_error: 5e-7,
+    max_rel_error: 5e-2,
+    min_cosine_similarity: 1.0 - 1e-6,
+    allow_non_finite: false,
+};
+
 /// The same output from the integer tensor-core path, which is a different
 /// arithmetic and needs a different bound.
 ///
@@ -143,13 +150,6 @@ const ROUTED_MMA_GATE: Tolerance = Tolerance {
     max_abs_error: 1.0e-4,
     max_rel_error: f32::INFINITY,
     min_cosine_similarity: 0.9999,
-    allow_non_finite: false,
-};
-
-const ROUTED_GATE: Tolerance = Tolerance {
-    max_abs_error: 5e-7,
-    max_rel_error: 5e-2,
-    min_cosine_similarity: 1.0 - 1e-6,
     allow_non_finite: false,
 };
 
@@ -656,8 +656,7 @@ fn device_grouped_forward_matches_the_reference_on_real_expert_weights() {
 /// narrow/wide MMA split (`MMA_M_NARROW` in `llmcuda-cuda`'s moe kernels is 32).
 /// The test above never leaves the narrow (M=32) `moe_expert_ffn_mma` /
 /// `moe_expert_down_mma` variant, since `BLOCK_SIZE` is 16 — this is the
-/// wide (M=64) variant's only correctness gate. See "Two compiled widths
-/// instead of one" in `docs/BENCHMARKS.md`.
+/// wide (M=64) variant's only correctness gate.
 #[test]
 fn device_grouped_forward_matches_the_reference_at_the_wide_mma_width() {
     grouped_forward_matches_the_reference(MoeGeometry {
@@ -906,7 +905,7 @@ fn grouped_forward_matches_the_reference(g: MoeGeometry) {
         flat_grouped.iter().map(|v| v.abs()).sum::<f32>() / flat_grouped.len() as f32,
     );
 
-    // Evidence for GATE's claim that max_rel_error is a floor artefact: the
+    // Evidence for ROUTED_GATE's claim that max_rel_error is a floor artefact: the
     // element driving it must be near zero. If it stops being, the absolute
     // bound is no longer a sufficient gate and this fails loudly.
     let driver = flat_grouped[vs_grouped.max_rel_error_index].abs();
@@ -1187,9 +1186,8 @@ fn the_one_token_dispatch_matches_the_reference_slot_for_slot() {
 /// points** with bit-identical inputs and identical routing: once through
 /// `max_tokens = 1` (the true single-stream shape, `moe_expert_ffn_gemv`/
 /// `moe_expert_down_gemv`), once through `max_tokens = 2` with only one
-/// valid token (`gemv` is false at `max_tokens > 1`, so this takes
-/// `moe_expert_ffn_direct`/`moe_expert_down_direct`). Every routed bucket
-/// holds exactly one live slot when there is exactly one valid token.
+/// valid token (`gemv` is false at `max_tokens > 1`, so this takes the flat
+/// routed-pair kernels `moe_expert_ffn_flat*`/`moe_expert_down_flat*`).
 ///
 /// With one live token there is no collision and no staged tile: this checks
 /// that independently compiled one-row kernels preserve the established
@@ -1302,9 +1300,8 @@ fn gemv_and_direct_isolate_the_one_live_token_case() {
 
     let via_gemv = run(1);
     // `MOE_NARROW_DECODE_MAX` is 4 in `llmcuda-cuda`; 2 is comfortably inside
-    // it and above 1, so `gemv` is false and `narrow` is true -- with one
-    // live token, `bucket_live[blk] == 1` for every active bucket, so grid.z
-    // slot zero is the only direct block that performs work.
+    // it and above 1, so `gemv` is false and `narrow` is true -- and
+    // `valid_tokens` gates the flat grid to the one live token's pairs.
     let via_direct = run(2);
 
     let result = compare(&via_gemv, &via_direct);
@@ -1321,9 +1318,9 @@ fn gemv_and_direct_isolate_the_one_live_token_case() {
 }
 
 /// As [`gemv_and_direct_isolate_the_one_live_token_case`], with two tokens
-/// routed to the same expert set. Every active bucket has `bucket_live == 2`,
-/// so the direct decode kernels launch two independent grid.z blocks that
-/// read the same expert weights and write distinct dispatch slots.
+/// routed to the same expert set, so the flat decode kernels run two
+/// independent blocks per expert that read the same expert weights and write
+/// distinct pair rows.
 ///
 /// Token 0's row is compared against the same token, alone, through
 /// `max_tokens = 1` (`gemv`) -- identical hidden state, identical routing.
@@ -1374,7 +1371,7 @@ fn gemv_and_direct_isolate_the_two_live_token_case() {
     let hidden1: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
     assert_carries_signal("hidden state", &hidden0);
     // Same logits for both tokens -- identical top-k, so every one of the
-    // 8 buckets they land in has `bucket_live == 2`, not a mix of 1 and 2.
+    // 8 experts they route to is read by both, not a mix of one and two.
     let logits: Vec<f32> = rng.vec_f32(moe_cfg(&config).num_experts as usize, -8.0, 8.0);
 
     let gate = QuantTensor {
@@ -1451,9 +1448,8 @@ fn gemv_and_direct_isolate_the_two_live_token_case() {
             .build_dispatch(&stream, &mut buffers)
             .expect("dispatch");
         // Confirm the routing this test's whole premise depends on: both
-        // tokens really did land in the same buckets, so `bucket_live == 2`
-        // is what the kernel actually saw, not an artifact of a router
-        // tie-break this test did not anticipate.
+        // tokens really did route to the same experts, not an artifact of a
+        // router tie-break this test did not anticipate.
         let ids = stream.clone_dtoh(buffers.topk_ids()).expect("ids back");
         stream.synchronize().expect("sync");
         assert_eq!(
@@ -1638,9 +1634,8 @@ fn the_exact_regime_at_eight_tokens_matches_the_gemv_token_for_token() {
     // The regime must hold across the width boundaries the default
     // selection switches at: 4 is `MOE_NARROW_DECODE_MAX` (where the flag
     // is a no-op against the native narrow regime), 5 is past it, and 8 is
-    // `MMA_MIN_TOKENS` — where the first version of the flag still let the
-    // Q8_0 down projection slip onto the tensor-core path and read dispatch
-    // tables the exact regime never builds.
+    // `MMA_MIN_TOKENS` — where the Q8_0 down projection's tensor-core path
+    // would read dispatch tables the exact regime never builds.
     let (alone0, _, _) = run_gemv(0);
     for probe_width in [2usize, 4, 5, 8] {
         let (out, _, _) = run_exact_batch(probe_width);
@@ -1679,14 +1674,13 @@ fn the_exact_regime_at_eight_tokens_matches_the_gemv_token_for_token() {
 /// The shared expert's one-token GEMV (`moe_shared_ffn_gemv` /
 /// `moe_shared_down_gemv`, `max_tokens == 1`) against its token-tiled
 /// generalization (`moe_shared_ffn_gemv_t*` / `moe_shared_down_gemv_t*`,
-/// `1 < max_tokens <= 16`). The previous pairing — GEMV vs
-/// `moe_shared_ffn` — disagreed at `max_abs = 1.12e-8` because the
-/// GEMV splits the 2,048-term product across four warps and the tile
-/// reduces it in one. This is the gate that the tiled GEMV matches
-/// the one-token kernel operand-for-operand.
+/// `1 < max_tokens <= 16`). `moe_shared_ffn` is not the comparison: the
+/// GEMV splits the 2,048-term product across four warps and that tile
+/// reduces it in one, so the two differ in the last bits. This is the gate
+/// that the tiled GEMV matches the one-token kernel operand-for-operand.
 ///
 /// Token 0 of a three-token tiled launch is compared against the same
-/// row run alone through the GEMV. Three is the audit's own batch width
+/// row run alone through the GEMV. Three is the serving decode width
 /// and is well below `SHARED_MMA_MIN_TOKENS`, so both sides stay on the
 /// fp32 kernels.
 #[test]
@@ -2117,9 +2111,6 @@ fn the_combine_is_the_same_bits_with_one_block_a_token_or_eight() {
 }
 
 /// The routed geometry of the model these differential tests target.
-///
-/// `ModelConfig::ffn` became an enum when the dense `qwen35` architecture
-/// landed; everything in this file is about the routed one.
 fn moe_cfg(c: &ModelConfig) -> llmcuda_model::MoeConfig {
     c.moe().expect("these tests target the routed model")
 }

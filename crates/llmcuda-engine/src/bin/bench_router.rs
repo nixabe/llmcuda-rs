@@ -2,7 +2,7 @@
 //! the widths a pass actually launches it at.
 //!
 //! `logits[t][e] = dot(ffn_gate_inp[e], normed[t])` is the smallest matmul in
-//! the layer and was 2.44 ms of one at 6,138 tokens, a byte of L2 traffic per
+//! the layer, and register-tiled it costs a byte of L2 traffic per
 //! multiply-add. `moe_block_router_logits_wide` is the same product through
 //! shared-memory tiles, at one warp or eight a block; this measures the three
 //! against each other and finds the widths where each stops paying, which is
@@ -35,8 +35,7 @@ const WARMUP: usize = 5;
 const REPS: usize = 40;
 const ROUNDS: usize = 3;
 
-/// Xorshift64*, inline: `llmcuda_kernels::rng` is a dev-dependency and not
-/// reachable from a binary.
+/// Xorshift64.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {

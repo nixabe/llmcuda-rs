@@ -33,8 +33,7 @@ const WARMUP: usize = 2;
 const REPS: usize = 10;
 const ROUNDS: usize = 4;
 
-/// Xorshift64*, inline: `llmcuda_kernels::rng` is a dev-dependency and not
-/// reachable from a binary.
+/// Xorshift64.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {

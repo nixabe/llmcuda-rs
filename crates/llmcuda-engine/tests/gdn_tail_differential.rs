@@ -1,8 +1,8 @@
 //! `rms_norm_swiglu_q8_rows` against the two launches it replaces.
 //!
-//! At tensor-core width the Gated DeltaNet ran its output norm with the
-//! SwiGLU (`rms_norm_swiglu_rows`), writing `final_output` as floats, and
-//! then quantized that for the output projection (`mma_quantize_rows_q8`).
+//! The two-launch form runs the Gated DeltaNet's output norm with the SwiGLU
+//! (`rms_norm_swiglu_rows`), writing `final_output` as floats, and then
+//! quantizes that for the output projection (`mma_quantize_rows_q8`).
 //! The fused launch does both with the same arithmetic per element and writes
 //! only the int8 operand and its scales, so those must be **bit-identical**
 //! to the two-launch form's -- every quant and every scale.

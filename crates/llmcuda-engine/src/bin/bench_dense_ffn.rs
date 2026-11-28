@@ -65,8 +65,8 @@ const PEAK_GB_S: f64 = 672.0;
 ///
 /// A repetition count is the wrong unit here. At one token the block is 0.55
 /// ms, so three of them is under two milliseconds — far too short for the
-/// card to leave its idle clock, and the first row of the table measured 9%
-/// slow with a 7.7% spread until this was a duration instead. The card is
+/// card to leave its idle clock; counted in repetitions, the warmup leaves
+/// the first row of the table 9% slow with a 7.7% spread. The card is
 /// pinned at its boost clock well inside a quarter second.
 const WARMUP_MS: u128 = 400;
 

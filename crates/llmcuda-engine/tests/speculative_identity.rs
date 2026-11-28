@@ -1,4 +1,4 @@
-//! The correctness contract R6 is legal under: speculative decode must emit
+//! The correctness contract MTP speculative decode is legal under: it must emit
 //! **exactly** what plain, non-speculative greedy decode emits.
 //!
 //! This is a hard gate rather than a tolerance because under greedy
@@ -11,7 +11,7 @@
 //! acceptance or in the Gated DeltaNet rollback
 //! (`crates/llmcuda-engine/src/block/gdn_verify.rs`), not a numerics question.
 //!
-//! Two regimes, both required by the brief:
+//! Two regimes:
 //!
 //! - **Natural text** ([`speculative_decode_matches_plain_greedy_on_a_natural_prompt`]):
 //!   the golden capture's own 19-token prompt, which the model was captured
@@ -23,7 +23,7 @@
 //!   nearly every step, which is exactly the case a rollback bug would show
 //!   up in and a mostly-successful draft would not.
 //!
-//! Both decode at least 64 tokens, per the brief.
+//! Both decode at least 64 tokens.
 //!
 //! SKIPS — reporting that it skipped — without a driver, a supported device,
 //! or the model file.
@@ -52,7 +52,6 @@ const ROPE_FREQ_BASE_KEY: &str = "qwen35moe.rope.freq_base";
 
 /// `docs/SCHEDULER.md`'s `DEFAULT_DRAFT_TOKENS_PER_STEP`.
 const DRAFT_TOKENS: usize = 3;
-/// The brief's floor.
 const MIN_STEPS: usize = 64;
 
 /// Each case makes roughly 30 GiB of model weights resident. Rust's test

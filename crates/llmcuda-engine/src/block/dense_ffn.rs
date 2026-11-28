@@ -77,7 +77,7 @@ const SPLIT_WARPS: u32 = 4;
 
 /// Rows one warp of the split GEMV owns, per token tile.
 ///
-/// Indexed by `tokens - 1`. It falls as the token tile widens for the reason
+/// It falls as the token tile widens for the reason
 /// `GdnBlock`'s own table gives — the accumulator array is `RT * TT` floats
 /// and the staged weight words another `2 * RT` — but where that block was
 /// holding accumulators under a budget, this one is holding *occupancy*, and
@@ -105,8 +105,6 @@ const SPLIT_WARPS: u32 = 4;
 /// tokens `RT = 8` runs a quarter of the warps and is still 10% faster.
 /// Numbers and method in `docs/BENCHMARKS.md`.
 ///
-/// `LLMCUDA_DENSE_SPLIT_ROWS` overrides every entry with one value, so the
-/// table can be re-measured in a single binary rather than argued about.
 /// The compiled `(TT, RT)` pairs, in increasing width.
 ///
 /// Not every width has an entry point: past four tokens the pass is a
@@ -240,10 +238,6 @@ pub const DENSE_REPACK_INT8: bool = true;
 /// comes from the same `valid_tokens` device scalar the MoE kernels gate on,
 /// and the launch shape comes from the geometry — AGENTS.md rule 5.
 const GLUE_SRC: &str = r#"
-extern "C" {
-
-}
-
 // ---------------------------------------------------------------------------
 // The narrow-batch MLP over the split int8 layout.
 // ---------------------------------------------------------------------------
@@ -262,8 +256,9 @@ extern "C" {
 // **Copied rather than shared.** `block/gdn.rs` owns the original, it is on
 // the measured path for the model this project's whole benchmark record is
 // about, and moving its source into a shared translation unit would move its
-// codegen for no reason. The same argument as `GDN_GATES_Q8`. The two copies
-// are kept identical by `the_split_gemv_body_matches_the_gdn_blocks`.
+// codegen for no reason. The same argument as `GDN_GATES_Q8`. The two copies'
+// weight traversal is kept identical by
+// `the_split_gemv_weight_traversal_matches_the_gdn_blocks`.
 __device__ __forceinline__ float warp_reduce_sum(float v) {
     for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
     return v;
@@ -323,8 +318,7 @@ __device__ __forceinline__ void dense_half2(unsigned int packed, float& a, float
 // narrowing through `unsigned char` first makes the int8 sign-extend rather
 // than taking an implementation-defined conversion from a value above 127 —
 // the same idiom as `lm_head.rs`. `GdnBlock`'s copy of this GEMV writes the
-// same eight lines out longhand; they are compared by
-// `both_split_gemvs_sign_extend_their_quants_the_same_way`.
+// same eight lines out longhand.
 #define DENSE_UNPACK_EIGHT(W, CUR, D, U)                                     \
     do {                                                                     \
         const unsigned int* q_ = (const unsigned int*)&(CUR);                \
@@ -815,8 +809,7 @@ struct SplitGemv {
     swiglu_narrow: CudaFunction,
     gate_out: CudaSlice<f32>,
     up_out: CudaSlice<f32>,
-    /// The GEMV's activation operands, at half width. See
-    /// [`DENSE_NARROW_ACTIVATIONS`].
+    /// The GEMV's activation operands, at half width.
     normed_h: CudaSlice<u16>,
     activated_h: CudaSlice<u16>,
     /// One element each, for the epilogue pointers a given launch does not
@@ -1249,7 +1242,6 @@ impl DenseFfnBlock {
 /// Launch shape and shared memory are [`LayerOpsKernels::rms_norm`]'s,
 /// because the kernel body is — one block a row, a block as wide as the row
 /// rounded up to a warp and capped at 1,024, one float of scratch a warp.
-/// `the_dense_norm_matches_layer_ops` is what keeps the two from drifting.
 #[allow(clippy::too_many_arguments)]
 fn dense_rms_norm(
     stream: &Arc<CudaStream>,
@@ -1293,7 +1285,7 @@ fn dense_rms_norm(
     Ok(())
 }
 
-/// `act_h = (half)(silu(gate) * up)`, one launch for what was three.
+/// `act_h = (half)(silu(gate) * up)` in one launch.
 fn swiglu_narrow(
     stream: &Arc<CudaStream>,
     f: &CudaFunction,
@@ -1446,7 +1438,7 @@ mod tests {
     /// identical**: this one takes its activations as halves and consumes
     /// them eight at a time, and it selects its epilogue from an argument
     /// instead of a template parameter. Both differences are on the
-    /// activation side. See `DENSE_NARROW_ACTIVATIONS`.
+    /// activation side.
     ///
     /// What is still a copy is the *weight* traversal — the row and scale
     /// base addresses, the 512-element step, the lane's 16-byte window, and

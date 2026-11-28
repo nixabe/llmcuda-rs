@@ -1,7 +1,7 @@
 //! `gdn_scan_prelude` and `gdn_scan_prefill_fold` against the launches they
 //! replace.
 //!
-//! A batched prefill ran the causal convolution once a sequence, then
+//! The separate form runs the causal convolution once a sequence, then
 //! `gdn_silu_split_qkv`, then `gdn_chunk_normalize_qk`, then
 //! `gdn_scan_prefill`. The fused prelude does the first three in one launch
 //! and the folded scan does the fourth in fewer instructions, and both

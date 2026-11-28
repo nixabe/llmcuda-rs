@@ -220,8 +220,8 @@ const ROPE_MAX_REL_DRIVER_ABS_ERROR: f32 = 1e-6;
 
 /// The RMS epsilon. `ModelConfig` carries no epsilon field, and llama.cpp
 /// reads `f_norm_rms_eps` from the file; 1e-6 is the value the Qwen3 family
-/// ships and is what `llmcuda_kernels`' own tests use. Whatever the loader ends
-/// up reading, host and device get the same number here, which is what this
+/// ships and is what `llmcuda_kernels`' own tests use. Whatever the loader
+/// reads, host and device get the same number here, which is what this
 /// test is measuring.
 const RMS_EPS: f32 = 1e-6;
 
@@ -1183,9 +1183,6 @@ fn a_shape_that_does_not_match_the_declared_geometry_is_rejected_not_run() {
 }
 
 /// The routed geometry of the model these differential tests target.
-///
-/// `ModelConfig::ffn` became an enum when the dense `qwen35` architecture
-/// landed; everything in this file is about the routed one.
 fn moe_cfg(c: &ModelConfig) -> llmcuda_model::MoeConfig {
     c.moe().expect("these tests target the routed model")
 }

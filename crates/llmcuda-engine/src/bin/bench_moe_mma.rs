@@ -6,8 +6,7 @@
 //! the single biggest named cost after attention. The routed-expert MMA
 //! kernel measured 16.1% of the card's 198 TOP/s int8 peak at its own real
 //! shape and 31% of bandwidth peak, so it is latency-bound rather than
-//! traffic-bound, and the same section names a Marlin-style shared-memory
-//! staging pipeline as what would reach higher.
+//! traffic-bound.
 //!
 //! This runs `MoeKernels::grouped_forward` — routing, dispatch, both MMA
 //! GEMMs and the reduction — against one real layer's quantized expert
@@ -58,16 +57,14 @@ const LAYER: u32 = 0;
 /// plus the 512 row bench_attention and bench_mma already use. Each gets its
 /// own dispatch tile width from `llmcuda_engine::forward::moe_block_size` --
 /// the engine's own choice, not a fixed constant, since 512 and 8,192 now
-/// take different compiled kernels. See "Two compiled widths instead of
-/// one" in docs/BENCHMARKS.md.
+/// take different compiled kernels.
 const TOKEN_COUNTS: [usize; 2] = [512, 8192];
 
 const WARMUP: usize = 3;
 const REPS: usize = 10;
 
-/// Xorshift64*, inline rather than through `llmcuda_kernels::rng` — that crate is
-/// a dev-dependency, reachable from `tests/` and not from a binary. Nothing
-/// here checks a value; correctness belongs to `moe_differential.rs`.
+/// Xorshift64. Nothing here checks a value; correctness belongs to
+/// `moe_differential.rs`.
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {

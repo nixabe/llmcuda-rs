@@ -1,8 +1,7 @@
 //! Load the real model onto a real GPU and verify it arrived intact.
 //!
-//! This is the milestone-01 gate for device residency. It is the first test in
-//! the project that moves model weights across PCIe, and it asserts four
-//! things that a build success does not:
+//! This is the gate for device residency. It asserts four things that a build
+//! success does not:
 //!
 //! 1. Every tensor the schema names is resident, with no byte left unwritten.
 //! 2. Read-back is bit-identical to the memory-mapped file, sampled across
@@ -186,8 +185,7 @@ fn the_model_becomes_resident_on_a_gpu_intact_and_within_budget() {
         }
         if weights.find(Role::GdnQkv, Some(layer)).is_some() {
             gdn += 1;
-            // The short convolution is easy to forget — it has no entry in
-            // `docs/KERNELS.md` — so assert it explicitly.
+            // The short convolution is easy to forget, so assert it explicitly.
             assert!(
                 weights.find(Role::GdnConv1d, Some(layer)).is_some(),
                 "GDN layer {layer} has no short convolution",

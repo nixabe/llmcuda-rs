@@ -72,15 +72,7 @@ fn fill(n: usize, seed: u64) -> Vec<i8> {
         .collect()
 }
 
-fn run_case(
-    ctx: &Arc<CudaContext>,
-    stream: &Arc<CudaStream>,
-    kernels: &MmaKernels,
-    m: usize,
-    n: usize,
-    k: usize,
-) {
-    let _ = ctx;
+fn run_case(stream: &Arc<CudaStream>, kernels: &MmaKernels, m: usize, n: usize, k: usize) {
     let a = fill(m * k, 0x51ED_1234 ^ (m as u64) << 8 ^ k as u64);
     let b = fill(n * k, 0xBEEF_0007 ^ (n as u64) << 8 ^ k as u64);
 
@@ -141,7 +133,7 @@ fn integer_tensor_cores_reproduce_the_exact_reference_on_sm_75() {
         (13, 8, 16),           // ragged M only
         (8, 11, 16),           // ragged N only
     ] {
-        run_case(&ctx, &stream, &kernels, m, n, k);
+        run_case(&stream, &kernels, m, n, k);
     }
 }
 

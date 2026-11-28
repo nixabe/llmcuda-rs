@@ -243,7 +243,6 @@ fn twin_sequences_stay_identical_through_every_stage() {
 
     let mut step = 0usize;
     let mut window_ids = vec![0i32; n_seq * WINDOW];
-    let mut draft = [0i32; DRAFT_TOKENS];
     while emitted[0].len() < MIN_STEPS {
         let k_target = step % (DRAFT_TOKENS + 1);
         let e = emitted[0].len();
@@ -256,7 +255,6 @@ fn twin_sequences_stay_identical_through_every_stage() {
                 } else {
                     (correct + 1) % vocab as i32
                 };
-                draft[j] = tok;
                 window_ids[s * WINDOW + 1 + j] = tok;
             }
         }

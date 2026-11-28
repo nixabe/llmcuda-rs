@@ -931,11 +931,11 @@ mod tests {
     fn a_speculative_output_ceiling_is_capped_rather_than_refused() {
         // 1024 blocks across 3 slots is 341 blocks each, so one slot may
         // reserve 87,296 tokens. A caller asking for 300,000 output tokens
-        // on a 1,000-token prompt used to be refused outright, because
-        // admission reserves prompt + max_output in full and 301,000 tokens
-        // needs 1,176 blocks of a 1,024-block pool. It is now capped to the
-        // slot's share and admitted; if it really generates that far it
-        // stops there and reports `length`.
+        // on a 1,000-token prompt cannot be reserved in full: admission
+        // reserves prompt + max_output and 301,000 tokens needs 1,176 blocks
+        // of a 1,024-block pool. It is capped to the slot's share and
+        // admitted; if it really generates that far it stops there and
+        // reports `length`.
         let e = engine(1024);
         assert!(
             e.place(req(1, 1_000, 300_000), &[]).is_ok(),
@@ -983,11 +983,10 @@ mod tests {
     }
     #[test]
     fn a_generating_sequence_grows_a_name_for_the_snapshots_it_reaches() {
-        // The limitation this replaced: a 20-token prompt yields no complete
-        // block, so the snapshot at 2048 had nothing to be filed under and
-        // the reply was never shareable. Now the chain grows with the reply,
-        // so the boundary the sequence generates through is named by the time
-        // it gets there.
+        // A 20-token prompt yields no complete block, so the snapshot at 2048
+        // has nothing to be filed under until the chain grows with the reply:
+        // the boundary the sequence generates through is named by the time it
+        // gets there.
         let cache = CacheConfig::with_defaults(ModelConfig::qwen3_6_35b_a3b()).unwrap();
         let block = cache.attention_block_size();
         let interval = cache.gdn_retention_interval() as usize;

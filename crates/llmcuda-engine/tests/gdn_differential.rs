@@ -15,28 +15,22 @@
 //! drifting — and the state is what a later token, or a resumed prefix cache
 //! hit, actually depends on.
 //!
-//! ## The blind spot this test used to have
+//! ## The query/key head broadcast
 //!
 //! The CPU reference runs **one head**, so the caller — this file — performs
-//! the query/key head broadcast itself. For a long time it did so with
-//! `qk = h / heads_per_kv`, which is exactly the mapping the kernel had
-//! hard-coded. Device and reference therefore agreed with each other while both
-//! disagreed with the model: llama.cpp indexes the query/key head as
-//! `fastmodulo(h_idx, n_k_heads)`
+//! the query/key head broadcast itself, as `h % qk_heads`: llama.cpp indexes
+//! the query/key head as `fastmodulo(h_idx, n_k_heads)`
 //! (`ggml/src/ggml-cuda/gated_delta_net.cu:37`) and its non-fused fallback
 //! broadcasts with `ggml_repeat_4d`, which tiles. Gated against the captured
 //! `final_output-N`, `h % 16` reproduces block 0 to `max_abs 7.15e-7` and
 //! `h / 2` to `5.59e-1` at cosine `0.975`.
 //!
 //! A shared convention between the thing under test and the oracle is not a
-//! test of that convention, so two things changed:
-//!
-//! 1. the broadcast here is `h % qk_heads`, matching the fixed kernel; and
-//! 2. [`the_query_key_head_broadcast_is_modulo_not_division`] runs the *same*
-//!    device output against *both* mappings and requires the modulo one to
-//!    pass and the division one to fail. That test discriminates the two
-//!    without any captured tensor, so it would have caught the defect on the
-//!    day the kernel landed, and it fails if either side silently reverts.
+//! test of that convention, so
+//! [`the_query_key_head_broadcast_is_modulo_not_division`] runs the *same*
+//! device output against *both* mappings and requires the modulo one to pass
+//! and the division one to fail. That test discriminates the two without any
+//! captured tensor, and it fails if either side silently reverts.
 //!
 //! ## Why the two cannot be bit-identical
 //!
@@ -317,12 +311,11 @@ fn the_query_key_head_broadcast_is_modulo_not_division() {
     // they are checked too so that a kernel which is simply broken fails here
     // as a broken kernel rather than as a mapping verdict.
     //
-    // Measured against the mapping the kernel shipped with
-    // (`h / heads_per_kv`): value head 1 scores max_abs 2.131e-2 at cosine
-    // -0.056 and head 2 max_abs 2.354e-2 at cosine -0.263 — the outputs are
-    // not merely inaccurate, they point in an unrelated direction. With the
-    // kernel on modulo every head lands at max_abs 4e-9 to 1e-8, cosine
-    // 1.000000.
+    // Measured: the two mappings' references differ on value head 1 by
+    // max_abs 2.131e-2 at cosine -0.056 and on head 2 by max_abs 2.354e-2 at
+    // cosine -0.263 — not merely inaccurate, an unrelated direction — while
+    // the kernel lands on the modulo one at max_abs 4e-9 to 1e-8, cosine
+    // 1.000000, on every head.
     let Some(ctx) = setup() else { return };
     let head_dim = 128usize;
     let value_heads = 4usize;

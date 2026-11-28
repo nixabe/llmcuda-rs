@@ -726,7 +726,6 @@ impl DeviceRuntimeHandle {
         })
     }
 
-    /// How much room this device's pinned snapshot arena has left.
     /// [`Self::spawn`] for `inkling2_loop`: the same thread, channel and
     /// commands over [`crate::inkling::serve::InklingRuntime`]. That runtime
     /// keeps no snapshots, so a resume, a decision and a snapshot request
@@ -805,6 +804,7 @@ impl DeviceRuntimeHandle {
         })
     }
 
+    /// How much room this device's pinned snapshot arena has left.
     pub fn snapshot_slots(&self) -> &SnapshotSlots {
         &self.slots
     }

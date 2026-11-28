@@ -5,7 +5,7 @@
 //! a wrong shape or a wrong tensor role would fail first: the pass runs
 //! without erroring, and every output is finite and in the vocabulary's
 //! range. `tests/gdn_verify_differential.rs` covers the numerically
-//! sensitive half of R6 (the recurrent-state rollback); this file covers
+//! sensitive half of MTP speculative decode (the recurrent-state rollback); this file covers
 //! block 40's own wiring — the loader, the `eh_proj` GEMM, the concat, and
 //! the dense-attention + MoE block reused from layer index `config.
 //! num_layers`.

@@ -2,9 +2,8 @@
 //! forward pass.
 //!
 //! Story G006's objective is a full forward pass whose logits match llama.cpp.
-//! Until something recorded llama.cpp's answer for a fixed prompt, that gate
-//! was not executable — there was nothing to compare against. This file is the
-//! reader for what [`docs/ORACLE.md`](../../../docs/ORACLE.md) captures, plus
+//! This file is the reader for what
+//! [`docs/ORACLE.md`](../../../docs/ORACLE.md) captures, plus
 //! the tests that prove the capture is intact and that its memory layout is
 //! read the same way this repository's own GGUF loader reads the file.
 //!
@@ -61,9 +60,8 @@ const DEFAULT_MODEL_PATH: &str = concat!(
     "/../../models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf"
 );
 
-/// The prompt the golden was captured for. Recorded here so a stale capture
-/// taken against a different prompt fails loudly rather than comparing against
-/// the wrong activations.
+/// The prompt the golden was captured for, as text. A stale capture taken
+/// against a different prompt is caught by [`GOLDEN_TOKENS`], not by this.
 pub const GOLDEN_PROMPT: &str = "The capital of France is Paris. The capital of Germany is Berlin. \
      The capital of Japan is";
 

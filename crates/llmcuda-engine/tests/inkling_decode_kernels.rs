@@ -83,7 +83,6 @@ fn decode_attention_matches_an_f64_oracle_past_the_window_and_the_chunk() {
         kernels.use_decode_attention(mode);
         let mut rng = Xorshift64Star::new(0xdeca77);
 
-        // (positions of the rows, window, extent, log scale)
         let cases: [AttentionCase; 9] = [
             // Sliding: one row before the window fills, one a chunk deep, one
             // past the window with four chunks to scan.

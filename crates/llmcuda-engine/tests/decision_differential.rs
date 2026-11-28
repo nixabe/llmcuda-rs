@@ -837,8 +837,6 @@ fn real_head_matches_the_scalar_reference() {
     };
     let mib = |b: usize| b as f64 / (1 << 20) as f64;
     {
-        // The runtime's defaults: DEFAULT_DECISION_MAX_POSITIONS,
-        // DECISION_MAX_QUESTIONS, DECISION_MAX_OPTIONS.
         let defaults = DecisionLimits {
             max_positions: llmcuda_engine::runtime::DEFAULT_DECISION_MAX_POSITIONS,
             max_questions: llmcuda_engine::runtime::DECISION_MAX_QUESTIONS,

@@ -3,8 +3,7 @@
 //!
 //! ## What is compared, and against what
 //!
-//! The writers — `attn_kv_append_kv8` and the q8_0 branch of
-//! `k2_rotary_append` — against `llmcuda_kernels::quant::quantize_q8_0`, the
+//! The writers — `attn_kv_append_kv8` and `k2_rotary_append_kv8` — against `llmcuda_kernels::quant::quantize_q8_0`, the
 //! port of llama.cpp's `quantize_row_q8_0_ref`, **byte for byte**: codes and
 //! binary16 scales are integers and bit patterns, so there is nothing to
 //! tolerate. The two writers are also held bit-equal to each other, as their

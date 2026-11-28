@@ -12,8 +12,8 @@
 //! community build of either architecture, stores `ffn_*_exps` as a *mixture*
 //! of Q4_K, Q5_K and Q6_K depending on the layer, so an engine reading only
 //! Q6_K and Q8_0 cannot load one at all. These three formats have no int8
-//! tensor-core body — `ExpertQuant::has_mma_body()` is false for each, and
-//! the MMA pair selection returns `None` for any pair involving them — so
+//! tensor-core body — the MMA pair selection returns `None` for any pair
+//! involving them — so
 //! what is under test here is specifically the fp32 `dequant_tile` prologue.
 //!
 //! ## Why a small synthetic geometry and synthetic weights
@@ -178,11 +178,9 @@ const GATE: Tolerance = Tolerance {
 /// launched twice, and which tuned branch it has to suppress depends on the
 /// token count: one token takes the GEMV pair, `<= MOE_NARROW_DECODE_MAX`
 /// takes the flat direct kernels, and above that the tiled ones. A bug in any
-/// one of those is invisible at the other widths -- the first version of this
-/// routing double-dispatched the down projection at *every* width and passed
-/// a Q6_K control anyway, because the second kernel overwrote the first with
-/// the right answer. Only Q8_0, and only through the community control,
-/// showed it.
+/// one of those is invisible at the other widths, and a double dispatch of
+/// the down projection can pass a Q6_K control outright, because the second
+/// kernel overwrites the first with the right answer.
 fn check_widths(quant: ExpertQuant, label: &str, force_community: bool) {
     for (max_tokens, num_tokens) in [(1usize, 1usize), (2, 2), (4, 3), (8, 6)] {
         check_at(
@@ -367,7 +365,7 @@ fn the_q5_k_expert_prologue_matches_the_scalar_reference() {
 /// Not redundant with `moe_differential.rs`: this runs them at a geometry and
 /// a weight distribution that file never exercises, so a prologue that was
 /// accidentally depending on the real shape shows up here. It is also the
-/// control — if these fail, the harness is wrong rather than the new
+/// control — if these fail, the harness is wrong rather than the community
 /// prologues, and the tolerance below is not evidence about anything.
 #[test]
 fn the_shipped_formats_pass_the_same_harness() {
@@ -402,7 +400,7 @@ fn the_shipped_formats_pass_through_the_community_kernels_too() {
 /// carefully the routed pair was checked.
 ///
 /// Same control discipline: Q6_K and Q8_0 are run through the community
-/// kernels too, so a green result on the three new formats is not resting on
+/// kernels too, so a green result on the three community formats is not resting on
 /// a control that took a different path.
 fn check_shared(quant: ExpertQuant, label: &str, force_community: bool, max_tokens: usize) {
     let Some(ctx) = device() else { return };

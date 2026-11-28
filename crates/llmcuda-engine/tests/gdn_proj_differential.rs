@@ -4,7 +4,7 @@
 //! layout, the one-token path single-stream decode actually takes whenever
 //! the int8 repack is resident).
 //!
-//! Same method `moe_proj_differential`... no, `moe_differential.rs`'s
+//! Same method `moe_differential.rs`'s
 //! `gemv_and_direct_isolate_the_one_live_token_case` / `gemv_and_direct_
 //! isolate_the_two_live_token_case` established: real weights, identical
 //! input, two different compiled entry points, direct comparison, no
@@ -16,10 +16,8 @@
 //!    same per-lane order (`blk[2 + lane]` for each 32-element block in
 //!    turn), so the prediction is yes.
 //! 2. Is `gdn_proj_split_gemv` -- the repacked, vectorized-4-per-lane
-//!    layout -- bit-identical to either of the above? The kernel's own
-//!    comment already says no ("the warp reduction sums in a different
-//!    order... equivalent rather than bit-identical"); this measures it
-//!    rather than trusting the comment.
+//!    layout -- bit-identical to either of the above? It reduces in a
+//!    different order, so the prediction is no; this measures it.
 //!
 //! Only `project()`'s public dispatch is exercised for (1): `tokens == 1`
 //! takes the untiled kernel and `tokens > 1` takes the tiled one, so
@@ -179,9 +177,7 @@ fn untiled_and_tiled_standard_layout_already_agree() {
 /// standard-layout form, on the identical row.
 ///
 /// Not gated on a tolerance: this documents where the two-kernel-family
-/// mismatch actually lives, per the kernel's own comment
-/// ("the warp reduction sums in a different order... equivalent rather
-/// than bit-identical").
+/// mismatch actually lives.
 #[test]
 fn split_layout_gemv_disagrees_with_the_standard_layout() {
     let Some((ctx, file, config)) = setup() else {
@@ -240,10 +236,9 @@ fn split_layout_gemv_disagrees_with_the_standard_layout() {
     );
 }
 
-/// `project_split_tiled` (the new batch path at `1 < tokens < MMA_SPLIT_
+/// `project_split_tiled` (the batch path at `1 < tokens < MMA_SPLIT_
 /// TOKENS`) against `project_split_gemv` (the one-token path) on the
-/// identical row. This is the pairing `run_batch_decode` vs `run` now
-/// actually take once the tiled split kernel is wired in.
+/// identical row. This is the pairing `run_batch_decode` and `run` take.
 ///
 /// Bit-exact: column 0 of the tiled launch must see the GEMV's own
 /// sequence of additions, operand for operand. A nonzero here means the

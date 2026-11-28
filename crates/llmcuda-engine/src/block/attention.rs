@@ -675,20 +675,6 @@ fn all_or_nothing_int8() -> bool {
     std::env::var_os("LLMCUDA_ATTN_INT8_ALL_OR_NOTHING").is_some()
 }
 
-/// The per-pass buffers every Gated Attention layer needs, owned once.
-///
-/// These are pure scratch: each is written and consumed inside a single
-/// layer's [`GatedAttentionBlock::forward`] and carries nothing across layers.
-/// The ten layers run strictly in sequence, so one set serves all of them, and
-/// holding one set instead of ten is the difference between 1.68 MB and
-/// 0.17 MB of VRAM per token of context.
-///
-/// That is not a micro-optimization at this geometry. `q_dim` is 4,096 —
-/// sixteen heads of 256 — and seven of these buffers are that wide, so a
-/// private copy per layer was the single largest consumer of per-token memory
-/// in the engine, larger than the Gated DeltaNet block and the MoE dispatch
-/// put together. `GdnBlock` was already shared across its thirty layers; this
-/// is the same arrangement for the other ten.
 /// Query rows below this run one at a time through the flash-decode split.
 ///
 /// Sixteen because that is the widest speculative verify pass the serving
@@ -699,6 +685,20 @@ fn all_or_nothing_int8() -> bool {
 /// never takes this path.
 const ROW_DECODE_MAX_QUERY: usize = 16;
 
+/// The per-pass buffers every Gated Attention layer needs, owned once.
+///
+/// These are pure scratch: each is written and consumed inside a single
+/// layer's [`GatedAttentionBlock::forward`] and carries nothing across layers.
+/// The ten layers run strictly in sequence, so one set serves all of them, and
+/// holding one set instead of ten is the difference between 1.68 MB and
+/// 0.17 MB of VRAM per token of context.
+///
+/// That is not a micro-optimization at this geometry. `q_dim` is 4,096 —
+/// sixteen heads of 256 — and seven of these buffers are that wide, so a
+/// private copy per layer would be the single largest consumer of per-token
+/// memory in the engine, larger than the Gated DeltaNet block and the MoE
+/// dispatch put together. `GdnBlock` is shared across its thirty layers the
+/// same way.
 pub struct AttnScratch {
     tokens: usize,
     pub(crate) normed: CudaSlice<f32>,
@@ -915,12 +915,6 @@ impl AttnScratch {
         }
     }
 
-    /// Drop the quantized activation mirror. See
-    /// [`GatedAttentionBlock::disable_tensor_cores`].
-    pub fn forget_quantized_activations(&mut self) {
-        self.xq = None;
-    }
-
     /// `attn_norm-N`: the input RMSNorm, `[tokens][hidden]`.
     pub fn normed_input(&self) -> &CudaSlice<f32> {
         &self.normed
@@ -1077,9 +1071,7 @@ impl AttnInt8 {
         let mma = MmaKernels::new(ctx)?;
         // Per projection, not per layer. A tensor this repack cannot read
         // stays `None` and its projection runs the GEMV; the ones beside it
-        // keep the tensor cores. Every tensor that reached the integer path
-        // before reaches it still, through the same call with the same
-        // arguments, so this is a change to *coverage* and not to arithmetic.
+        // keep the tensor cores.
         let one = |format: HeadFormat,
                    src: &CudaSlice<u8>,
                    elements: usize|
@@ -1142,8 +1134,8 @@ impl GatedAttentionBlock {
 
     /// Whether this block has any repacked int8 weight resident.
     ///
-    /// Per-projection since the `qwen35` file arrived: this is true when at
-    /// least one of the four is on the integer path, not when all are. For
+    /// Per-projection: this is true when at least one of the four is on the
+    /// integer path, not when all are. For
     /// `qwen35moe`, where every projection is Q8_0, the two readings agree.
     pub fn tensor_cores_enabled(&self) -> bool {
         self.int8.is_some()
@@ -1209,7 +1201,7 @@ impl GatedAttentionBlock {
     /// Set how many blocks this block's tensor-core decode launches over
     /// its logical splits — `0` restores one block per split. Bit-identical
     /// scheduling knob; see the mixer's own doc and
-    /// `docs/BENCHMARKS.md` 2026-08-20 for the wave arithmetic.
+    /// `docs/BENCHMARKS.md` for the wave arithmetic.
     pub fn set_decode_mma_blocks(&mut self, blocks: usize) {
         self.kernels.mixer.set_decode_mma_blocks(blocks);
     }
@@ -1746,9 +1738,9 @@ impl GatedAttentionBlock {
 
         // 8. Append this batch's keys and values to the cache, at the absolute
         //    positions they belong to. One kernel for both halves, reading the
-        //    position from the device — this was two `cuMemcpyDtoDAsync` calls
-        //    into host-computed slices, which is the same traffic but bakes a
-        //    host-chosen destination address into the launch and so cannot be
+        //    position from the device — two `cuMemcpyDtoDAsync` calls into
+        //    host-computed slices would be the same traffic but bake a
+        //    host-chosen destination address into the launch, which cannot be
         //    replayed from a CUDA graph.
         k.mixer.append_kv(
             stream,
@@ -2489,17 +2481,7 @@ impl GatedAttentionBlock {
     }
 }
 
-/// Copy a resident Q8_0 tensor into a buffer of its own.
-///
-/// [`HeadTensor`] carries a whole `CudaSlice`, and its element count is
-/// checked against the declared geometry, so a sub-range of the weight arena
-/// cannot be passed directly — the arena is one 29.6 GiB slab. The copy is a
-/// device-to-host-to-device round trip of at most 17.8 MiB (`attn_q`), paid
-/// once at construction and never on the forward path. The fix is a borrowed
-/// device view that `llmcuda-cuda` does not expose yet — `cudarc` 0.19 can make a
-/// `CudaView` of a sub-range but not an owned `CudaSlice`, and every kernel
-/// entry point takes the latter.
-/// Copy a resident projection into a typed buffer, keeping its format.
+/// Upload a projection into a typed buffer, keeping its format.
 ///
 /// The two model files do not agree on that format: `qwen35moe` stores all
 /// four projections Q8_0, while `qwen35` stores `attn_q`, `attn_k` and

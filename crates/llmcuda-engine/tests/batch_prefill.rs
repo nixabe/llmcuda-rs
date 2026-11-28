@@ -90,12 +90,12 @@ fn read(stream: &Arc<CudaStream>, data: &cudarc::driver::CudaSlice<f32>) -> Vec<
 /// one 6,138-row physical pass carrying three whole 2,046-token prompts,
 /// against three serial 2,046-row passes.
 ///
-/// The carried-chunk test above gates the flattening math at 64-token
-/// chunks; this gates the exact shape `docs/BENCHMARKS.md`'s 2026-08-20
-/// prefill head-to-head measured (3,737--3,804 tok/s against llama.cpp's
-/// tuned 3,342.41), so that number is tied to a correctness result at its
-/// own width rather than to a smaller one's. Same gates as above: per-token
-/// logit tolerance and exact argmax agreement per sequence.
+/// The carried-chunk test below gates the flattening math at 64-token
+/// chunks; this gates the exact shape `docs/BENCHMARKS.md`'s 2K prefill
+/// head-to-head measures, so that number is tied to a correctness result at
+/// its own width rather than to a smaller one's. Same gates as the
+/// carried-chunk test: per-token logit tolerance and exact argmax agreement
+/// per sequence.
 ///
 /// SKIPS — reporting that it skipped — without a driver, a supported device,
 /// or the model file.

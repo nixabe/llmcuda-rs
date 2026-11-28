@@ -22,17 +22,17 @@
 //! `min GB` column — the same traffic counted once per KV head, which is what
 //! an ideal kernel would move — is the redundancy the block shape imposes.
 //!
-//! `TFLOP/s` counts the causal half only, so it is comparable to the ~22
-//! TFLOP/s llama.cpp reaches on this card and to the ~65 the fp16 tensor cores
-//! peak at.
+//! `TFLOP/s` counts the causal half only, so it is comparable to the ~65
+//! TFLOP/s the fp16 tensor cores peak at.
 //!
 //! ## Decode
 //!
 //! `LLMCUDA_ATTN_CHUNK=1` runs this at `n_query = 1`, which is decode's shape
 //! and routes through [`AttentionKernels::forward`]'s two-pass split rather
 //! than any prefill kernel — `traffic()` below already special-cases it via
-//! `splits_the_key_axis`. Every `DEPTHS` row then times
-//! `attn_flash_decode_warp` + `attn_flash_decode_combine` alone, in seconds
+//! `splits_the_key_axis`. Every `DEPTHS` row then times the split kernel
+//! `decode()` picks for that depth (`attn_flash_decode_warp` or the
+//! tensor-core one) plus `attn_flash_decode_combine`, alone, in seconds
 //! rather than the `bench_decode` minute a full model load costs. It does not
 //! cover the rest of a decode step: at shallow depth attention is a small
 //! fraction of one (~5% measured with `nsys --cuda-graph-trace=node` at
@@ -121,8 +121,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let stream = Arc::clone(&streams[0]);
     let kernels = AttentionKernels::new(&ctx, Q_HEADS, KV_HEADS, HEAD_DIM)?;
     // A/B levers for the tensor-core decode kernel against
-    // `attn_flash_decode_warp`'s per-key online softmax, which `decode()`
-    // otherwise prefers by default. Set `LLMCUDA_DISABLE_DECODE_MMA` to force
+    // `attn_flash_decode_warp`'s per-key online softmax; `decode()`
+    // otherwise picks between them by depth. Set `LLMCUDA_DISABLE_DECODE_MMA` to force
     // the warp kernel, or `LLMCUDA_DECODE_MMA_WPO` (2 or 4) to pick the
     // occupancy width — see docs/BENCHMARKS.md.
     if std::env::var("LLMCUDA_DISABLE_DECODE_MMA").is_ok() {
@@ -284,8 +284,7 @@ fn traffic(kernels: &AttentionKernels, depth: usize, chunk: usize) -> (usize, us
 
     // Flash decoding splits the key range between its blocks instead of giving
     // each one the whole window, so its traffic is the minimum by construction
-    // and the redundancy is 1. Applying the prefill model here reported 26,581
-    // GB/s against a 672 GB/s card, which is how the distinction got noticed.
+    // and the redundancy is 1.
     if kernels.splits_the_key_axis(chunk) {
         return (minimum, minimum);
     }

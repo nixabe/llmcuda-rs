@@ -62,8 +62,6 @@ const EMBED_THREADS: u32 = 256;
 /// Something went wrong building or running the MTP draft head.
 #[derive(Debug)]
 pub enum MtpBlockError {
-    /// NVRTC rejected the glue source, or the module failed to load.
-    Compile(String),
     /// The driver failed.
     Driver(DriverError),
     /// The dense-attention half of block 40 failed.
@@ -95,7 +93,6 @@ impl std::fmt::Display for MtpBlockError {
                 f,
                 "no feed-forward block is implemented for architecture `{architecture}`",
             ),
-            Self::Compile(m) => write!(f, "MTP glue kernel compilation failed: {m}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::Attention(e) => write!(f, "{e}"),
             Self::Moe(e) => write!(f, "{e}"),
@@ -167,7 +164,7 @@ pub struct MtpBlock {
     /// A fork marker [`Self::forward_batch_decode`] hands the attention
     /// block. Drafting batches are 1-3 tokens, so the per-sequence chains
     /// run serially on the main stream (no side lanes) — the event is
-    /// required by the signature, recorded and never waited on.
+    /// required by the signature and never recorded.
     batch_fork: CudaEvent,
     moe: FfnBlock,
     moe_weights: Arc<FfnLayerWeights>,
@@ -562,7 +559,7 @@ impl MtpBlock {
             .arg(&tokens_i32);
         // SAFETY: grid covers exactly `t` rows, `d_tokens` and `tok_embd` are
         // both sized `t` (elements / `hidden`) by construction, and the token
-        // embedding table was checked resident and Q8_0 at construction.
+        // embedding table was checked resident at construction.
         unsafe { builder.launch(cfg) }?;
 
         // 2. `mtp_enorm`.
@@ -748,11 +745,8 @@ impl MtpBlock {
     }
 }
 
-/// Alias one resident Q8_0 tensor, rejecting any other stored format.
-///
-/// Mirrors `forward.rs`'s private `alias_q8_0` — duplicated rather than
-/// shared because that one is private to `Forward` and returns a
-/// `ForwardError`, not an `MtpBlockError`.
+/// Alias one resident projection tensor, with the format the file stored it
+/// in; a format the LM-head GEMV does not read is rejected.
 fn alias_projection(
     weights: &DeviceWeights,
     stream: &Arc<CudaStream>,
@@ -803,6 +797,6 @@ fn alias_f32(
     let alias = weights
         .f32_of(stream, role, layer)
         .ok_or(MtpBlockError::MissingWeight { role, layer })?;
-    // SAFETY: as `alias_q8_0`.
+    // SAFETY: as `alias_projection`.
     Ok(ManuallyDrop::new(unsafe { alias.into_aliasing_slice() }))
 }

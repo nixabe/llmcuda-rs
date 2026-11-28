@@ -42,7 +42,6 @@ use tracing::debug;
 /// The draft *count* is deliberately absent: it comes from the scheduler,
 /// which has to charge those tokens against its step budget whether or not
 /// they are later accepted. Carrying it here too would let the two disagree.
-///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Speculation {
     /// One token per decode step, drafted by nothing.
@@ -272,11 +271,6 @@ impl Worker {
     /// This worker's identifier.
     pub fn id(&self) -> WorkerId {
         self.id
-    }
-
-    /// The CUDA device this worker is for.
-    pub fn device_ordinal(&self) -> usize {
-        self.device_ordinal
     }
 
     /// The cache geometry this worker was built with.

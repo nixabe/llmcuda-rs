@@ -3,10 +3,7 @@
 //! `batched_decode_agrees_with_independent_single_stream_decodes` tolerates:
 //! *which layer, and which family within it*, first disagrees.
 //!
-//! Its rough location -- "further up, in `GatedAttentionBlock`'s and
-//! `GdnBlock`'s own batched-vs-single-stream reduction order" -- was inferred
-//! from the final logits, not measured layer by layer. This dumps the
-//! per-layer, per-stage hidden state both paths produce, via
+//! This dumps the per-layer, per-stage hidden state both paths produce, via
 //! [`Forward::run_with_stage_waypoints`] and
 //! [`Forward::run_batch_decode_with_stage_waypoints`], and reports max-abs
 //! divergence per layer, tagged by which family produced it: the layer's
@@ -53,8 +50,8 @@ const DEFAULT_MODEL_PATH: &str = concat!(
 /// a "family" comparison means.
 const BATCH: usize = 3;
 
-/// Largest single prefill pass, same bound `bench_decode_batch` uses so a
-/// context above this still prefills in chunks.
+/// Largest single prefill pass, so a context above this still prefills in
+/// chunks.
 const MAX_PREFILL_CHUNK: usize = 2048;
 
 fn model_path() -> PathBuf {

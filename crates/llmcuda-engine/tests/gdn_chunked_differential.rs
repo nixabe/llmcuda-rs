@@ -33,45 +33,34 @@
 //! - 197 tokens carrying **this model's real decay rates**, including the
 //!   per-token log-decays measured on Qwen3.6 blocks 0 and 20. See below.
 //!
-//! ## The two blind spots this test used to have
+//! ## Two blind spots of synthetic inputs
 //!
 //! **Decay range.** The synthetic `log_decay` above is drawn from
 //! `[-0.101, -0.001]`, so the cumulative in-chunk decay never falls below
 //! `exp(-6.5)` and `1/lambda_t` never exceeds 660. The real model is nowhere
 //! near that: block 0's smallest per-token log-decay is **-91.578** and block
 //! 20's is **-12.436**, so `lambda` reaches `2.46e-42` by the second token of
-//! a chunk. The kernel formed `v_t / lambda_t`, which overflows fp32 at
-//! `|v_t| > 1.2e-4` against a measured `max|v_t|` of 6.95: block 0's chunked
-//! prefill came out 38912/38912 `NaN` and block 20's 20480/38912, while block
-//! 4 — worst per-token log-decay only -5.99 — passed at `5.96e-8`. A test
-//! whose inputs cannot reach the failure is not a test of it, so
+//! a chunk. A kernel that forms `v_t / lambda_t` overflows fp32 at
+//! `|v_t| > 1.2e-4` against a measured `max|v_t|` of 6.95. A test whose inputs
+//! cannot reach the failure is not a test of it, so
 //! [`device_chunked_gdn_survives_this_models_real_decay_rates`] injects those
 //! exact measured values and gates on the result being finite.
 //!
-//! That case originally compared against the **recurrent** reference only,
-//! because the host `chunked_forward` in `llmcuda-kernels` divided by the
-//! cumulative decay too and overflowed on precisely these inputs, so it could
-//! not serve as an oracle for them. The case detected that per head, said so,
-//! and fell back to the recurrent form, which never accumulates a decay and is
-//! immune.
-//!
-//! The host form has since been reformulated the same way. The mechanism
-//! worked as designed: with zero heads now excluded, this case gates against
-//! the host chunked oracle again with **no edit to the gating logic** — and at
-//! `2.235e-8`, some 450x tighter than the recurrent-form comparison. The
-//! per-head exclusion is deliberately kept rather than deleted, so a future
-//! regression degrades this test to a weaker oracle loudly instead of
-//! silently comparing against `NaN`.
+//! The case gates against the host chunked oracle, and against the
+//! **recurrent** reference, which never accumulates a decay and is immune to
+//! overflow. A head on which the host `chunked_forward` in `llmcuda-kernels`
+//! overflows is detected per head, reported, and excluded as a chunked oracle.
+//! The exclusion is deliberate: a future regression degrades this test to a
+//! weaker oracle loudly instead of silently comparing against `NaN`.
 //!
 //! **Broadcast convention.** The CPU reference runs one head, so this file
-//! performs the query/key head broadcast, and it used to do so with
-//! `qk = h / heads_per_kv` — the same mapping the kernel had hard-coded.
-//! Device and reference agreed with each other while both disagreed with the
-//! model, which indexes the query/key head as `fastmodulo(h_idx, n_k_heads)`
+//! performs the query/key head broadcast, as `h % qk_heads`: the model indexes
+//! the query/key head as `fastmodulo(h_idx, n_k_heads)`
 //! (`ggml/src/ggml-cuda/gated_delta_net.cu:37`) and broadcasts with
-//! `ggml_repeat_4d`, which tiles. Both sides now use `h % qk_heads`, and
+//! `ggml_repeat_4d`, which tiles. A mapping shared by the device and the
+//! reference can agree with itself while disagreeing with the model, so
 //! [`the_query_key_head_broadcast_is_modulo_not_division`] scores one device
-//! run against both candidate mappings so the convention is measured rather
+//! run against both candidate mappings and the convention is measured rather
 //! than shared.
 //!
 //! ## Why the two cannot be bit-identical
@@ -668,20 +657,13 @@ fn device_scan_gdn_survives_this_models_real_decay_rates() {
 }
 
 fn real_decay_case(ctx: &Arc<CudaContext>, form: Form) {
-    // The defect-2 gate. The synthetic decays the two cases above use bottom
-    // out at exp(-6.5) per chunk; this model reaches exp(-91.578) in a single
-    // token, and the kernel's original `v_t / lambda_t` overflowed fp32 there
-    // and filled the chunk with NaN. The reformulated kernel never divides by
-    // a cumulative decay — see `llmcuda_cuda::kernels::gdn_chunked`'s module docs
-    // — so the worst that can happen is an underflow to +0, which is the
-    // correct limit.
-    //
-    // Measured on this exact input with the `v_t / lambda_t` form and the
-    // query/key broadcast already corrected, so the number is attributable to
-    // the division alone: **41330 of 806912 output elements and 32768 of
-    // 524288 state elements non-finite**. With the reformulation: 0 and 0,
-    // agreeing with the recurrent form at max_abs 5.18e-7 (outputs) and
-    // 9.86e-7 (state), cosine 1.000000000.
+    // The synthetic decays the two cases above use bottom out at exp(-6.5)
+    // per chunk; this model reaches exp(-91.578) in a single token, where a
+    // `v_t / lambda_t` form overflows fp32 and fills the chunk with NaN — on
+    // this exact input, 41330 of 806912 output elements and 32768 of 524288
+    // state elements. The kernel never divides by a cumulative decay — see
+    // `llmcuda_cuda::kernels::gdn_chunked`'s module docs — so the worst that
+    // can happen is an underflow to +0, which is the correct limit.
     let config = ModelConfig::qwen3_6_35b_a3b();
     let g = config.gdn;
     let head_dim = g.head_dim as usize;
@@ -812,10 +794,9 @@ fn real_decay_case(ctx: &Arc<CudaContext>, form: Form) {
             &mut state_vs_recurrent,
         );
 
-        // The host chunked form divides by the cumulative decay and therefore
-        // has the very defect this case exists to catch. Gate on it only where
-        // it survived, so this starts checking it automatically once it is
-        // fixed rather than needing an edit here.
+        // A host chunked form that divided by the cumulative decay would have
+        // the very defect this case exists to catch, so gate on it only where
+        // it stays finite.
         let (chunk_out, chunk_state) =
             chunked_forward(head_dim, chunk_len, &q, &k, &v, &decay, &beta, Some(s0));
         let ref_chunk_out: Vec<f32> = chunk_out.concat();
@@ -841,7 +822,7 @@ fn real_decay_case(ctx: &Arc<CudaContext>, form: Form) {
     println!(
         "  llmcuda-kernels' host chunked_forward overflowed on {host_chunked_overflowed}/{value_heads} \
          heads and was excluded as an oracle for those \
-         (0 is expected: the host form no longer divides by the cumulative decay)",
+         (0 is expected: the host form does not divide by the cumulative decay)",
     );
 }
 
@@ -857,10 +838,10 @@ fn the_query_key_head_broadcast_is_modulo_not_division() {
     //   division: 0->0, 1->0, 2->1, 3->1
     // so heads 1 and 2 discriminate and heads 0 and 3 are the control.
     //
-    // Measured against the mapping the kernel shipped with: head 1 scores
-    // max_abs 5.304e-2 at cosine 0.0016 and head 2 max_abs 5.729e-2 at cosine
-    // 0.0074. With the kernel on modulo every head lands at max_abs ~2e-8,
-    // cosine 1.000000.
+    // Measured: the two mappings' references differ on head 1 by max_abs
+    // 5.304e-2 at cosine 0.0016 and on head 2 by max_abs 5.729e-2 at cosine
+    // 0.0074, while the kernel lands on the modulo one at max_abs ~2e-8,
+    // cosine 1.000000, on every head.
     let Some(ctx) = setup() else { return };
     let head_dim = 128usize;
     let value_heads = 4usize;

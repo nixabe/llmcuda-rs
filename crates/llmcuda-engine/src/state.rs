@@ -119,12 +119,12 @@ pub struct SequenceState {
     /// `position`, on the device, as one `i32`.
     ///
     /// The rotary embedding, the causal bound and the cache append all need
-    /// the position, and all three used to take it as a host argument. That
+    /// the position, and taking it as a host argument
     /// is exactly what stops a decode step from being captured once as a CUDA
     /// graph and replayed: a recorded launch keeps the argument it was
     /// recorded with, so the replay would rotate by, and append at, the
     /// position of the step that was captured — forever. Holding it here and
-    /// pushing four bytes before each step makes every step the same launch
+    /// pushing eight bytes before each step makes every step the same launch
     /// sequence. It is also `AGENTS.md` rule 5.
     ///
     /// The host copy stays because the bounds checks are still the host's job
@@ -133,13 +133,13 @@ pub struct SequenceState {
     /// than by [`Self::advance`] so that a failed pass cannot leave the device
     /// claiming a position no cache was written for.
     ///
-    /// Two elements since M-RoPE: `[0]` is the cache-slot / causal position,
+    /// Two elements: `[0]` is the cache-slot / causal position,
     /// `[1]` the rotary base (`position + rope_delta`). For a text-only
     /// sequence `rope_delta` is 0 and the two are equal, which is what keeps
     /// that path byte-identical; after an image the rotary base lags the
     /// slot position because an image advances rope "time" by its longest
     /// grid edge, not its token count (see `llmcuda_kernels::mrope`). One
-    /// buffer, one publish — the same four... eight bytes per step.
+    /// buffer, one publish — eight bytes per step.
     d_position: CudaSlice<i32>,
     /// Aliased one-element views of `d_position[0]` / `d_position[1]`,
     /// created once at construction. Kernel wrappers demand exactly-one-

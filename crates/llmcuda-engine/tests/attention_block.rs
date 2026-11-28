@@ -110,7 +110,7 @@ const Q8_1_LEVELS: f32 = 127.0;
 /// `abs_over_rms` is the worst absolute error as a fraction of the reference
 /// tensor's RMS — scale-free, unlike `compare()`'s `max_rel_error`, whose
 /// `REL_EPS = 1e-6` floor makes it report `abs_error / 1e-6` for the many
-/// near-zero elements in these tensors (see `.omc/handoffs/team-plan.md`).
+/// near-zero elements in these tensors.
 ///
 /// Every op in this class is a pure fp32 formula with no reduced-precision
 /// step anywhere in llama.cpp's version of it, so agreement is at the fp32
@@ -197,7 +197,7 @@ const DEVICE_VS_HOST: Gate = Gate {
 /// `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32` accumulates in fp32 but
 /// **rounds its operands to fp16**, and four of them are rounded on the way in
 /// — Q and K before `Q K^T`, then P and V before `P V`. The host reference does
-/// none of that, so this comparison now measures fp16 operand rounding and not
+/// none of that, so this comparison measures fp16 operand rounding and not
 /// reduction order.
 ///
 /// fp16 carries an 11-bit significand, so four roundings bound the output's
@@ -213,8 +213,7 @@ const DEVICE_VS_HOST: Gate = Gate {
 ///
 /// This is not a quality regression. llama.cpp runs the same fp16 tensor-core
 /// attention on this card, so the `dev|gold` comparison in this file — device
-/// against llama.cpp's own capture — is what actually tracks fidelity, and it
-/// did not move.
+/// against llama.cpp's own capture — is what actually tracks fidelity.
 const DEVICE_VS_HOST_TENSOR_CORE: Gate = Gate {
     abs_over_rms: 2e-2,
     min_cosine: 1.0 - 1e-7,
@@ -715,7 +714,7 @@ struct DeviceStep<'a> {
     /// Bound for the `dev|host` comparison. Defaults to [`DEVICE_VS_HOST`];
     /// the steps the flash kernel produces override it with
     /// [`DEVICE_VS_HOST_TENSOR_CORE`], because on those the host reference and
-    /// the device no longer run the same arithmetic.
+    /// the device do not run the same arithmetic.
     host_gate: Gate,
     /// RMS to normalize the `dev|gold` absolute bound by, when the step's own
     /// output does not set the scale of its error. See [`assert_gate`].
@@ -1043,7 +1042,7 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
         // A cache sized to this window and written from position 0 makes the
         // pass a cold prefill, which is what the capture recorded.
         let mut cache = KvCache::new(&stream, &config, tokens).expect("kv cache allocates");
-        // The position is a device scalar now, so a cold prefill has to say so
+        // The position is a device scalar, so a cold prefill has to say so
         // in device memory rather than by passing a host zero.
         let positions = stream.alloc_zeros::<i32>(1).expect("alloc position");
         block
@@ -1420,10 +1419,7 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
             // error while having an RMS of its own that is far smaller, so its
             // own RMS is not what sets the scale of the error. `attn_gated-3`
             // is the case in point -- RMS 8.8e-3 carrying `attn_pregate-3`'s
-            // error at RMS 3.8e-1. Only `dev|gold` did this before, which was
-            // an asymmetry rather than a decision; it went unnoticed while the
-            // device and the host ran identical arithmetic and the error was
-            // three orders below either bound.
+            // error at RMS 3.8e-1.
             assert_gate(
                 &format!("{}-{layer} dev|host", s.name),
                 &vs_host,

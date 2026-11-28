@@ -174,7 +174,7 @@ fn main() -> ExitCode {
     // the 128K target most needs measured. `Forward::run` already advances the
     // sequence state by its own width, which is exactly what decode does at one
     // token, so chunking is a property of the driver and not of the engine.
-    // Defaults to the whole prompt, which is the old behaviour.
+    // Defaults to the whole prompt.
     let chunk = std::env::var("LLMCUDA_DECODE_CHUNK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -207,8 +207,8 @@ fn main() -> ExitCode {
         }
     };
     // A/B lever for the tensor-core decode kernel against
-    // `attn_flash_decode_warp`'s per-key online softmax, which `decode()`
-    // otherwise prefers by default. Set `LLMCUDA_DISABLE_DECODE_MMA` to force
+    // `attn_flash_decode_warp`'s per-key online softmax; `decode()`
+    // otherwise picks between them by depth. Set `LLMCUDA_DISABLE_DECODE_MMA` to force
     // the warp kernel, or `LLMCUDA_DECODE_MMA_WPO` (2 or 4) to pick the
     // occupancy width — see docs/BENCHMARKS.md.
     if std::env::var("LLMCUDA_DISABLE_DECODE_MMA").is_ok() {
@@ -249,9 +249,7 @@ fn main() -> ExitCode {
 
     // Sampling is on the device and synchronizes there, so the timed region
     // holds a full autoregressive step: forward, greedy pick, and the four
-    // bytes the host needs to choose the next input. Reducing the 248,320
-    // logits on the host instead moved 993 KiB across PCIe and scanned them
-    // on one core every step, which measured as 0.5 ms of an 11.6 ms step.
+    // bytes the host needs to choose the next input.
     // Capture the step once. Capture executes nothing, so the state is
     // untouched and the first replay below is the first token generated.
     let graph = match step.capture_step(&stream, &mut state) {

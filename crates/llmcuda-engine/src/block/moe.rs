@@ -109,7 +109,7 @@ const THREADS: u32 = 256;
 
 /// Lanes that contribute to the shared expert's gate dot product.
 ///
-/// Mirrors `MOE_GATE_LANES`, asserted below. Fixed rather than "the block
+/// Mirrors `MOE_GATE_LANES`. Fixed rather than "the block
 /// width" because the gate is a floating-point sum: changing how many lanes
 /// carry it reassociates 2,048 products and moves the gate.
 const GATE_LANES: u32 = 256;
@@ -1347,18 +1347,6 @@ impl MoeBlock {
         &self.buffers
     }
 
-    /// Run the whole block over `tokens` tokens.
-    ///
-    /// `residual` is the mixer output already added back to the block's input
-    /// — llama.cpp's `attn_residual-N` — and is both the RMSNorm's input and
-    /// the residual the block's output is added to. `ffn_out` receives
-    /// `ffn_out-N` and `l_out` receives `l_out-N`; every buffer is
-    /// `[max_tokens][hidden]`.
-    ///
-    /// Rows past `tokens` are never written, which is checkable: a kernel that
-    /// ran on a stale slot would leave a plausible value where the caller left
-    /// a zero.
-    #[allow(clippy::too_many_arguments)]
     /// Publish this pass's token count into the device scalar the MoE kernels
     /// gate on, ahead of the pass.
     ///
@@ -1376,6 +1364,18 @@ impl MoeBlock {
         Ok(())
     }
 
+    /// Run the whole block over `tokens` tokens.
+    ///
+    /// `residual` is the mixer output already added back to the block's input
+    /// — llama.cpp's `attn_residual-N` — and is both the RMSNorm's input and
+    /// the residual the block's output is added to. `ffn_out` receives
+    /// `ffn_out-N` and `l_out` receives `l_out-N`; every buffer is
+    /// `[max_tokens][hidden]`.
+    ///
+    /// Rows past `tokens` are never written, which is checkable: a kernel that
+    /// ran on a stale slot would leave a plausible value where the caller left
+    /// a zero.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -1416,12 +1416,6 @@ impl MoeBlock {
             self.eps,
         )?;
 
-        // Fork for the shared-expert side stream, recorded HERE — after
-        // `normed` lands and before any routed work is enqueued — so the
-        // side stream's dependency is exactly `normed` and the shared pair
-        // genuinely runs beside the router/dispatch/expert kernels below.
-        // Recording at the shared-expert call site instead would capture
-        // the whole routed path into the fork and overlap nothing.
         // 2. router logits, then softmax + top-k + renormalize on the device.
         self.launch_router(stream, &w.router, None)?;
 

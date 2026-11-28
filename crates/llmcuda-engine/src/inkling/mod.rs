@@ -10,15 +10,12 @@
 //! convolutions, the cache append, attention) runs per segment.
 //!
 //! The arithmetic follows `llmcuda_kernels::inkling`, which is held to a
-//! llama.cpp capture; `tests/inkling_forward.rs` holds this module to both.
+//! llama.cpp capture; `tests/inkling_forward.rs` holds this module to the
+//! same capture.
 //! Contractions run on the fp16 tensor cores ([`HgemmKernels`]): activations
 //! are rounded to binary16 and weights to the binary16 of their stored value
 //! (exact for NVFP4 and for bf16 in range), with fp32 accumulation. The
 //! router's logits alone stay fp32 end to end, as llama.cpp keeps them.
-//!
-//! This is the first, plain version: every layer application keeps a
-//! full-length cache, and attention is a scalar scan. Neither is the shape
-//! the model should be served in.
 
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
@@ -927,11 +924,6 @@ impl InklingPass {
         })
     }
 
-    /// Rows a pass runs.
-    pub fn rows(&self) -> usize {
-        self.rows
-    }
-
     /// Record the experts of every routing from here on: `[rows][top_k]`
     /// per layer application, in execution order. A diagnostic; it reads
     /// the device back at every layer.
@@ -944,8 +936,8 @@ impl InklingPass {
         self.route_log.as_deref().unwrap_or(&[])
     }
 
-    /// Start timing stages: every stage boundary synchronizes the stream
-    /// from here on, so a profiled pass is slower than a plain one.
+    /// Start timing stages: every stage boundary records a CUDA event from
+    /// here on, and each pass first waits for the previous one's events.
     pub fn enable_profiling(&mut self) {
         self.profile = Some(Profile::start());
     }

@@ -1,16 +1,12 @@
 //! Integer tensor cores against the fp32 path, at the shapes that matter.
 //!
-//! `docs/BENCHMARKS.md` establishes that prefill is compute-bound and that
-//! fp32 is within ~2x of its structural ceiling while the gap to llama.cpp is
-//! ~5x. This measures the only instruction that changes that arithmetic.
-//!
 //! The shapes are the Gated DeltaNet projection's real ones: `[tokens, 2048]`
-//! against `[8192, 2048]` is `blk.N.attn_qkv.weight`, which is 30 of 40 layers
-//! and was 59.1% of a prefill pass before it was tiled.
+//! against `[8192, 2048]` is `blk.N.attn_qkv.weight`, which is 30 of 40 layers.
 //!
-//! Reported per shape: the fp32 rate, the int8 rate, and the ratio. The int8
-//! column includes the activation quantization, because that is a cost the
-//! fp32 path does not pay and excluding it would flatter the result.
+//! Reported per shape: the int8 rate through the GGUF block layout and through
+//! the split layout, and the split rate as a share of the int8 peak. Both
+//! include the activation quantization, because that is a cost the fp32 path
+//! does not pay and excluding it would flatter the result.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -34,11 +30,9 @@ const REPS: usize = 10;
 
 /// Deterministic bytes in the Q8_0 layout: `{ ggml_half d; int8_t qs[32]; }`.
 ///
-/// Written inline rather than through `llmcuda_kernels::quant` because this is a
-/// timing harness and `llmcuda-kernels` is a dev-dependency, reachable from
-/// `tests/` and not from a binary. Nothing here checks a value — correctness
-/// belongs to `tests/mma_differential.rs`, which does use the validated
-/// quantizer. The only property this needs is that the bytes are the right
+/// Nothing here checks a value — correctness belongs to
+/// `tests/mma_differential.rs`, which does use the validated quantizer. The
+/// only property this needs is that the bytes are the right
 /// shape and the scales are not degenerate, because a stack of zeros would let
 /// the hardware skip work and flatter the measurement.
 fn q8_0_rows(rows: usize, k: usize, seed: u64) -> Vec<u8> {

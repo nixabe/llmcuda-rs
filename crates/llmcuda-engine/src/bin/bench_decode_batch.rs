@@ -1,12 +1,8 @@
 //! Aggregate decode throughput across batched sequences: the number that
 //! compares to `llama-batched-bench -npl N`.
 //!
-//! `bench_decode` measures one sequence decoding alone — 77.4 tok/s at a
-//! 32,768-token context, `docs/BENCHMARKS.md`'s baseline. This measures `N`
-//! sequences decoding *together* through [`Forward::run_batch_decode`], which
-//! is the feature that number has no answer to: llama.cpp reaches 154.58
-//! tok/s aggregate at three parallel sequences over the same context by
-//! batching them, and this engine had nothing that did that until now.
+//! `bench_decode` measures one sequence decoding alone. This measures `N`
+//! sequences decoding *together* through [`Forward::run_batch_decode`].
 //!
 //! # What is and is not measured
 //!

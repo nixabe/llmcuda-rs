@@ -108,13 +108,8 @@ fn setup() -> Option<Fixture> {
 
 /// A small deterministic pseudo-random hidden state — this test checks
 /// internal self-consistency between two code paths on the same real
-/// weights, not agreement with a captured oracle, so any finite input that
-/// does not drive this layer's real decay rates to overflow will do. Values
-/// are kept small (`[-0.5, 0.5)`) for the same reason
-/// `gdn_chunked_differential.rs`'s synthetic inputs are: this layer's real
-/// `ssm_a` reaches a per-token log-decay of -91.58 (block 0, head 9), and a
-/// large-magnitude activation is what turned that into an `inf` the first
-/// time (see that file's module docs).
+/// weights, not agreement with a captured oracle, so any finite input of a
+/// realistic scale (`[-0.5, 0.5)`) will do.
 fn pseudo_random_hidden(n: usize, seed: u64) -> Vec<f32> {
     let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
     (0..n)

@@ -179,9 +179,9 @@ impl LoadReport {
 /// QuantTensor`] carries one and validates its *whole* element count against
 /// the declared geometry. `cudarc` 0.19 can produce a `CudaView` of a
 /// sub-range but not a `CudaSlice`, so a tensor inside the arena could not be
-/// handed to a kernel at all. Both landed blocks worked around that by copying
-/// their layer's weights into fresh allocations at construction — 725 MiB per
-/// MoE layer, which does not survive being multiplied by 40.
+/// handed to a kernel at all. Copying each layer's weights into fresh
+/// allocations at construction instead costs 725 MiB per MoE layer, which
+/// does not survive being multiplied by 40.
 ///
 /// This is the alternative: `cuMemAlloc` returns a plain device address, a
 /// sub-range of it is also a plain device address, and

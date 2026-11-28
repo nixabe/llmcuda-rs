@@ -4,9 +4,8 @@
 //! [`Forward::capture_step`] records one token's worth of work — the
 //! embedding gather, forty blocks, the final norm, the LM head and the argmax
 //! — as a CUDA graph, and [`Forward::replay_step`] launches it again at every
-//! later position. That is worth 3.8 ms of a 10.6 ms step, and it is only
-//! correct if the recorded launches contain **nothing that changes between
-//! steps**. A recorded launch keeps the arguments it was recorded with, so a
+//! later position. It is only correct if the recorded launches contain
+//! **nothing that changes between steps**. A recorded launch keeps the arguments it was recorded with, so a
 //! single host-side position left anywhere on the path would make every
 //! replayed step rotate by, attend up to, and append at the position that was
 //! captured — and the model would still emit fluent, entirely finite,

@@ -2,9 +2,8 @@
 //! guaranteed to agree on.
 //!
 //! The GDN block's own projections — `attn_qkv`, `attn_gate`, `ssm_out` —
-//! were the last wall in `docs/MODEL.md`'s format table. `Projection` had two
-//! variants because `gdn_proj_*` had two readers, so a uniformly Q6_K file
-//! loaded its experts, head, embedding and gates and stopped here.
+//! read every format other than Q8_0 and f32 through `Projection::Quant` and
+//! `gdn_proj_qgeneric_*`, which is what lets a uniformly Q6_K file load.
 //!
 //! Both shipped files store all three Q8_0, so as with the gates there is no
 //! golden and no fixture. This makes one, the same way
@@ -30,8 +29,7 @@
 //! Q8_0 is in the list as a **control that runs the code under test**: it has
 //! its own faster kernel, but `Projection::Quant(bytes, ProjQuant::Q8_0)`
 //! goes through the generic one, so a green result on the other six is not
-//! resting on a control that took a different path. That distinction caught a
-//! real double-dispatch bug in the MoE community routing the same day.
+//! resting on a control that took a different path.
 //!
 //! SKIPS — reporting that it skipped — without a driver, a supported device,
 //! or the model file.

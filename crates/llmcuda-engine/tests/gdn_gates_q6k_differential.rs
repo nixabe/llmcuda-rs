@@ -1,12 +1,10 @@
 //! `gdn_alpha_beta_gates_q6k{,_t1}` against the f32 gate kernel, on weights
 //! the two are guaranteed to agree on.
 //!
-//! The α/β gates were the last consumer in the engine with no reader beyond
-//! f32 and Q8_0, so a uniform Q6_K file could not load even once every other
-//! tensor had one. The new kernel unpacks Q6_K in its inner loop. Nothing
-//! shipped stores these two tensors that way — Qwen3.6 has them f32, Qwen3.8
-//! Q8_0 — so there is no golden to compare against and no file to read. This
-//! test makes one.
+//! The Q6_K gate kernel unpacks Q6_K in its inner loop, so a uniform Q6_K
+//! file can load. Nothing shipped stores these two tensors that way — Qwen3.6
+//! has them f32, Qwen3.8 Q8_0 — so there is no golden to compare against and
+//! no file to read. This test makes one.
 //!
 //! The method is `lm_head_formats_differential.rs`'s: take the real weights,
 //! requantize them on the host, and feed *the same numbers* to two kernels.
@@ -251,12 +249,10 @@ fn the_q6_k_gate_kernel_matches_the_f32_one_on_the_values_it_encodes() {
     //
     // 2 and 9 are the ones worth naming. A token count that is neither one
     // nor a multiple of the tile is where a kernel and the grid it was sized
-    // with can disagree, and that disagreement — `tt` and a second width
-    // derived by rules that agreed at 1 and 3 and not at 2 — is what faulted
-    // main in e4d43e0. It cannot happen here, because `tt` and the function
-    // come out of one match arm and the grid comes out of that same `tt`.
-    // Tested rather than argued, because that is what the router's own
-    // differential had missing at exactly this width.
+    // with can disagree — `tt` and a second width derived by rules that agree
+    // at 1 and 3 and not at 2. It cannot happen here, because `tt` and the
+    // function come out of one match arm and the grid comes out of that same
+    // `tt`; that is tested rather than argued.
     for tokens in [1usize, 2, 7, 8, 9, 17] {
         let mut rng = Xorshift64Star::new(0x_6A11_E500 ^ tokens as u64);
         let x_host = rng.vec_f32(tokens * hidden, -1.0, 1.0);

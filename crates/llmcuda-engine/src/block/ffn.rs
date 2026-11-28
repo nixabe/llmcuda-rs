@@ -1,12 +1,11 @@
 //! Which feed-forward block a layer runs, chosen once from the model config.
 //!
 //! [`crate::forward::Forward`] holds one of these per pass and one
-//! [`FfnLayerWeights`] per block, and calls [`FfnBlock::forward`] in exactly
-//! the places it used to call `MoeBlock::forward`. The dispatch is a match on
-//! a two-variant enum rather than a trait object because there are two
-//! architectures, both known at build time, and the alternative — a `dyn`
-//! call per layer per step — would put a vtable indirection inside the one
-//! loop that runs 40 or 64 times a token.
+//! [`FfnLayerWeights`] per block, and calls [`FfnBlock::forward`] once per
+//! layer. The dispatch is a match on an enum rather than a trait object
+//! because the architectures are all known at build time, and the
+//! alternative — a `dyn` call per layer per step — would put a vtable
+//! indirection inside the one loop that runs 40 or 64 times a token.
 //!
 //! Pairing is checked, not assumed: handing a [`MoeBlock`] a dense layer's
 //! weights is a mismatch this returns an error for rather than a shape check
@@ -191,16 +190,6 @@ impl FfnBlock {
             Self::Moe(b) => b.normed(),
             Self::Dense(b) => b.normed(),
             Self::K2(b) => b.normed(),
-        }
-    }
-
-    /// The routed block, if this is one. `None` on the dense path, which has
-    /// no router logits, no dispatch tables and no shared-expert gate to
-    /// inspect.
-    pub fn as_moe(&self) -> Option<&MoeBlock> {
-        match self {
-            Self::Moe(b) => Some(b),
-            Self::Dense(_) | Self::K2(_) => None,
         }
     }
 

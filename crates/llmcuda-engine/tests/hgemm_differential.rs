@@ -858,8 +858,8 @@ fn the_bf16_exponent_keeps_the_max_under_fp16s_top_binade() {
 /// against every tile, and two weights through one object so the copy made
 /// for the first is not served for the second. An overwrite at the natural
 /// stride is the only form the library path takes; the accumulate and
-/// wide-stride forms fall back to `hg_q8_*`, and that fallback is checked to
-/// leave the columns outside the output untouched.
+/// wide-stride forms fall back to `hg_q8_*`, and the accumulate fallback is
+/// checked to add onto the library's result without making a copy.
 #[test]
 fn the_library_path_meets_the_same_rounding_contract() {
     let Some(ctx) = device() else { return };

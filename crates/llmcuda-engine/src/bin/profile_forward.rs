@@ -1,8 +1,7 @@
 //! Per-stage breakdown of the forward pass: where the milliseconds go.
 //!
-//! `bench_forward` says the pass costs 38 ms at one token and 6.8 s at 512.
-//! It does not say *what* costs that, and every explanation offered so far has
-//! been a suspicion rather than a measurement. This binary partitions the pass
+//! `bench_forward` says what the whole pass costs. It does not say *what*
+//! costs that. This binary partitions the pass
 //! into consecutive, non-overlapping spans — reset, embedding, then a mixer
 //! and a MoE for each of the 40 blocks, then the final norm and the LM head —
 //! and reports each one's share.
@@ -459,9 +458,9 @@ fn main() {
         let timed_plain = |f: &mut Forward, st: &mut SequenceState| {
             let mut plain = Vec::with_capacity(reps);
             for _ in 0..reps {
-                // Inside the timed region: the reset used to live inside
-                // `run`, and moving it out would make these numbers
-                // incomparable with the ones already recorded.
+                // Inside the timed region: the numbers already recorded
+                // include the reset, and moving it out would make these
+                // incomparable with them.
                 let t = Instant::now();
                 st.reset(&stream).expect("reset");
                 f.run(&stream, st, &ids, |_, _| {}).expect("pass");

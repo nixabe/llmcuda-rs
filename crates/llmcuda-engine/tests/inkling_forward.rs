@@ -21,8 +21,9 @@ const L_OUT_COSINE: f32 = 0.995;
 /// both files. Measured, CPU reference / device: Q4_K_XL cosine 0.99996 /
 /// 0.99994, max-abs 0.17 / 0.20; Q8_K_XL 0.99935 / 0.99918, max-abs 0.57 /
 /// 0.85. llama.cpp sits further from exact arithmetic on the bf16 file, and
-/// every pairwise comparison here carries the routing flips described
-/// above; the tight gates are the kernel-level differential tests. The
+/// every pairwise comparison here carries the routing flips
+/// `inkling_reference.rs` describes; the tight gates are the kernel-level
+/// differential tests. The
 /// argmax is asserted equal.
 const LOGIT_COSINE: f32 = 0.999;
 const LOGIT_MAX_ABS: f32 = 1.0;

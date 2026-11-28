@@ -103,8 +103,7 @@ use llmcuda_model::weights::{Directory, Role};
 ///
 /// Duplicated from [`llmcuda_cuda::kernels::dequant`] rather than imported so the
 /// kernel source below and the host-side row-stride arithmetic are checked
-/// against the same two literals; `the_q8_0_row_stride_matches_the_kernel`
-/// asserts they agree with the upstream constants.
+/// against the same two literals.
 const QK8_0: usize = 32;
 const BLOCK_Q8_0_BYTES: usize = 34;
 
@@ -128,28 +127,19 @@ const GATE_TT: u32 = 8;
 /// `the_projection_tiles_match_the_kernel` asserts the two agree.
 ///
 /// `2` and `4` exist for batched decode, where `tokens` is the number of
-/// sequences advancing together rather than a prefill chunk. Below the old
-/// floor of 8 this used to fall back to `project_per_sequence`, one untiled
-/// launch per sequence — correct, but paying the weight traffic `tokens`
-/// times over rather than once.
+/// sequences advancing together rather than a prefill chunk, so the weight
+/// traffic is paid once rather than once per sequence.
 ///
-/// Adding a tile is not enough on its own — `proj_tile_for` also had to
-/// change how it chooses one. Its old rule, "widest tile no wider than
-/// `tokens`", picked tile 2 for 3 tokens: `ceil(3 / 2)` is two *independent*
-/// grid.y slices, and each one re-walks the whole weight matrix on its own —
-/// the reuse is within a slice, not across them. Two slices is two full
-/// weight reads for 3 tokens, worse than it looks, and it measured worse in
-/// practice: on `bench_decode_batch` at a 32,768-token context, adding tile
-/// 2 under the old rule made N=3 *slower* than the per-sequence fallback it
-/// replaced (41.1 ms/step against 38.6 ms). `proj_tile_for` now picks the
-/// smallest tile that covers `tokens` in a *single* slice below the widest
-/// declared tile, which sends 3 tokens to tile 4 instead — one guarded slice
-/// at 75% live, one weight read, not two. 2 tokens still gets tile 2 as the
-/// exact fit it always was; only the in-between counts changed. See
-/// `docs/BENCHMARKS.md` for the regression and the
-/// fix, and for the original 8/16 floor, which was measured at 19+ tokens
-/// under the old multi-slice rule that still governs tokens at or above the
-/// widest declared tile.
+/// A tile narrower than `tokens` is not a saving: "widest tile no wider than
+/// `tokens`" picks tile 2 for 3 tokens, and `ceil(3 / 2)` is two
+/// *independent* grid.y slices, each re-walking the whole weight matrix on
+/// its own — the reuse is within a slice, not across them. That rule
+/// measured *slower* than one untiled launch per sequence on
+/// `bench_decode_batch` at a 32,768-token context, N=3 (41.1 ms/step against
+/// 38.6 ms). `proj_tile_for` therefore picks the smallest tile that covers
+/// `tokens` in a *single* slice below the widest declared tile, which sends
+/// 3 tokens to tile 4 — one guarded slice at 75% live, one weight read, not
+/// two. See `docs/BENCHMARKS.md`.
 const PROJ_TILES: [u32; 4] = [2, 4, 8, 16];
 
 /// Output rows each warp accumulates, per tile width above.
@@ -203,9 +193,9 @@ const PROJ_ROWS: [u32; 4] = [1, 1, 4, 4];
 /// 4, 8, 16] picks 2 that way, and `ceil(3 / 2)` is two full weight reads for
 /// three tokens, not one; picking the smallest covering tile sends it to 4
 /// instead, one guarded slice at 75% live. See `PROJ_TILES`'s doc comment
-/// for the measurement that changed this rule.
+/// for the measurement behind this rule.
 ///
-/// **At or above it**, the original "widest tile, however many slices"
+/// **At or above it**, the "widest tile, however many slices"
 /// rule: `tokens` is large enough that repeating the widest tile amortizes
 /// the weight read across the most tokens per slice, proven at 128 and 512
 /// tokens in `PROJ_ROWS`'s own sweep, and a single covering tile does not
@@ -221,8 +211,7 @@ fn proj_tile_for(tokens: usize) -> (usize, u32) {
 /// Token tile widths of the split-layout projection family, ascending, and
 /// the row tile each carries. Spelled here and in the
 /// `GDN_PROJ_SPLIT_ENTRY` instantiations, which NVRTC compiles from a string
-/// with no access to Rust constants;
-/// `the_split_projection_tiles_match_the_kernel` asserts the two agree.
+/// with no access to Rust constants.
 ///
 /// The row tile shrinks as the token tile grows because the accumulator
 /// array is `rows * tile` floats per thread and past 16 the register
@@ -261,8 +250,9 @@ const ELEMENTWISE_BLOCK: u32 = 256;
 /// `pub(crate)` for one reason: [`crate::block::dense_ffn`] carries a copy of
 /// the split-layout projection GEMV's template body, deliberately rather than
 /// sharing the translation unit, and
-/// `the_split_gemv_body_matches_the_gdn_blocks` is what keeps the two copies
-/// from drifting. That test has to be able to read this string.
+/// `the_split_gemv_weight_traversal_matches_the_gdn_blocks` is what keeps the
+/// two copies' weight traversal from drifting. That test has to be able to
+/// read this string.
 pub(crate) const GDN_BLOCK_SRC: &str = r#"
 extern "C" {
 
@@ -335,11 +325,9 @@ __global__ void gdn_proj_q8_0(
 // The same projection over the formats a community quant produces.
 // -------------------------------------------------------------------------
 //
-// `attn_qkv`, `attn_gate` and `ssm_out` are Q8_0 in both shipped files, and
-// `Projection` had exactly two variants because `gdn_proj_*` had exactly two
-// readers. That made this the last wall in `docs/MODEL.md`'s table: a
-// uniformly Q6_K file loaded its experts, head, embedding and gates and
-// stopped here.
+// `attn_qkv`, `attn_gate` and `ssm_out` are Q8_0 in both shipped files; these
+// readers are what lets a uniformly quantized community file load its
+// projections too.
 //
 // **These are separate entry points, not arms of `gdn_proj_q8_0`.** Same rule
 // the MoE prologue arrived at the expensive way (`40f7fc6`, -5.05%): a
@@ -556,7 +544,7 @@ GDN_PROJ_QUANT(gdn_proj_qgeneric_bf16, gdn_dq_bf16, (long long)k_dim * 2)
 // A wide tile wins at 512 and collapses at 19. The cause is the guarded path:
 // when fewer tokens are live than the tile is wide, every thread still carries
 // the full accumulator array — the register pressure is paid and the work is
-// not done. `proj_tile_for` picks the widest fully-live tile.
+// not done. `proj_tile_for` picks the tile.
 #define GDN_PROJ_TILED(NAME, TT, RR)                                          \
 __global__ void NAME(                                                         \
     const unsigned char* __restrict__ weight,                                 \
@@ -649,13 +637,6 @@ GDN_PROJ_TILED(gdn_proj_q8_0_t4,  4,  1)
 GDN_PROJ_TILED(gdn_proj_q8_0_t8,  8,  4)
 GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16, 4)
 
-// out[t][n] = sum_k weight[n][k] * x[t][k], with `weight` an f32 GGUF tensor.
-//
-// `ssm_alpha.weight` and `ssm_beta.weight` reach this kernel as f32 — they
-// are f32 in Qwen3.6's file and widened from Q8_0 in Qwen3.8's, see
-// `GdnLayerWeights::load` — and are only
-// [2048, 32], so they get the simple strided form rather than the block-wise
-// one above.
 // alpha-N / beta-N and the three gate quantities they feed, in one launch.
 //
 // `ssm_alpha.weight` and `ssm_beta.weight` are both f32 `[hidden, heads]`,
@@ -1002,9 +983,8 @@ GDN_GATES_Q6K(gdn_alpha_beta_gates_q6k_t1, 1)
 // golden capture.
 //
 // ADD fuses the residual: `summed[t][n] = sum + residual[t][n]`, and `out`
-// is still written because it is a captured waypoint. This was previously
-// only fused at one token (`gdn_proj_split_gemv_add`); the template fuses it
-// at every width, which retires a `tensor_add` launch per GDN layer from the
+// is still written because it is a captured waypoint. The template fuses it
+// at every width, which saves a `tensor_add` launch per GDN layer in the
 // batched decode step.
 //
 // grid: (ceil(n_rows / (warps * RT)), ceil(tokens / TT)). block: (32, warps).
@@ -1420,8 +1400,7 @@ impl GdnGeometry {
     ///
     /// Half `value_dim`, because there are half as many query/key heads. This
     /// is the width [`GdnBlock::split_qkv`] emits and both mixer kernels
-    /// expect; handing them `value_dim` instead is the workaround this block
-    /// carried until the kernels learned the modulo mapping themselves.
+    /// expect.
     pub const fn key_dim(&self) -> usize {
         self.qk_heads * self.head_dim
     }
@@ -1550,9 +1529,8 @@ pub enum GateProjection {
 
 /// Which of [`GateProjection`]'s forms a pair is in.
 ///
-/// A three-way tag rather than the boolean this used to be: the gate kernel
-/// has an instantiation per format and per token tile, and a boolean could
-/// only ever name two of the three.
+/// A three-way tag: the gate kernel has an instantiation per format and per
+/// token tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateFormat {
     /// `gdn_alpha_beta_gates{,_t1}`.
@@ -1587,11 +1565,6 @@ impl GateProjection {
     /// `alpha_beta_gates` does not go through this — it dispatches on the
     /// *pair* so both gates share one launch — but anything projecting a
     /// single gate does.
-    ///
-    /// This returned `Option` for one commit, because `Projection` had no
-    /// variant a Q6_K gate could become and inventing one with no kernel
-    /// behind it is how the aliasing defect in `ea1c83d` happened. The
-    /// generic readers exist now, so the honest signature is total again.
     pub fn as_projection(&self) -> Projection<'_> {
         match self {
             Self::F32(v) => Projection::F32(v),
@@ -1610,8 +1583,7 @@ impl GateProjection {
 /// the instruction usable at all. See `docs/BENCHMARKS.md`.
 ///
 /// Costs about 37.7 MiB per layer, 1.13 GiB over the 30 Gated DeltaNet
-/// layers. It used to be held *in addition* to the arena's copy of the same
-/// three tensors; since every width reads it, the engine now loads with those
+/// layers. Every width reads it, so the engine loads with those three
 /// tensors kept out of the arena and this is their only resident form (see
 /// [`GdnLayerWeights`]). Built once at construction rather than per pass.
 pub struct GdnLayerInt8 {
@@ -1986,7 +1958,7 @@ impl Scratch {
         let heads = tokens * g.value_heads;
         let value = tokens * g.value_dim();
         // q and k are half the width of v: 16 query/key heads against 32 value
-        // heads. They were `value` too while this block broadcast them itself.
+        // heads.
         let key = tokens * g.key_dim();
         Ok(Self {
             tokens,
@@ -2187,11 +2159,8 @@ impl GdnBlock {
     /// Compile every kernel this block needs, for `geometry`.
     ///
     /// Both mixer kernels get the model's real `qk_heads` (16), so they apply
-    /// `qk_head = h % qk_heads` themselves over a narrow q and k. They were
-    /// constructed with `qk_heads == value_heads` while their internal map was
-    /// `h / heads_per_kv` and this block had to pre-broadcast; that made the
-    /// chunked form compute its two `chunk_len x chunk_len` Gram matrices 32
-    /// times per chunk rather than 16. See the module docs.
+    /// `qk_head = h % qk_heads` themselves over a narrow q and k. See the
+    /// module docs.
     pub fn new(ctx: &Arc<CudaContext>, geometry: GdnGeometry) -> Result<Self, GdnBlockError> {
         let stream = ctx.default_stream();
 
@@ -2592,11 +2561,6 @@ impl GdnBlock {
             result?;
             return Ok(self.mixer);
         }
-
-        // All three Q8_0 projections read the same normed activations, so the
-        // int8 conversion is done once here rather than three times inside
-        // `project`. `None` keeps the fp32 path, which is what decode and
-        // small batches take.
 
         let result = self.run(
             stream,
@@ -3142,13 +3106,12 @@ impl GdnBlock {
         // `docs/BENCHMARKS.md` for the nsys-diff
         // that found it kernel by kernel rather than assuming it.
         //
-        // Below the tensor-core tile, `1 < tokens < MMA_SPLIT_TOKENS` used
-        // to take `gdn_proj_q8_0_t*` — the *standard* Q8_0 layout, a
-        // different per-lane grouping than the GEMV. That is the pairing
-        // the divergence audit measured as GDN's first disagreeing FMA at
-        // layer 0. `split_tiled` is the GEMV's own grouping,
-        // amortized across those tokens, so batch(N) and single-stream
-        // now share a reduction order.
+        // Below the tensor-core tile, `1 < tokens < MMA_SPLIT_TOKENS` takes
+        // `split_tiled`: the GEMV's own grouping, amortized across those
+        // tokens, so batch(N) and single-stream share a reduction order.
+        // `gdn_proj_q8_0_t*` — the *standard* Q8_0 layout — groups per lane
+        // differently, and that pairing is what the divergence audit
+        // measured as GDN's first disagreeing FMA at layer 0.
         let gemv = tc.filter(|_| tokens == 1);
         let split_tiled = tc.filter(|_| tokens > 1 && !Self::uses_tensor_cores(tokens));
         let tc = tc.filter(|_| Self::uses_tensor_cores(tokens));
@@ -3843,8 +3806,8 @@ impl GdnBlock {
     ///
     /// `out` is `linear_attn_out-N` and `summed` is `attn_residual-N`; both
     /// are written because `out` is a captured waypoint. Fusing the add at
-    /// every width (not just one token, as before) retires a `tensor_add`
-    /// launch per GDN layer from the batched decode step.
+    /// every width saves a `tensor_add` launch per GDN layer in the batched
+    /// decode step.
     #[allow(clippy::too_many_arguments)]
     pub fn project_split_add(
         &self,
@@ -4438,9 +4401,8 @@ impl GdnBlock {
     ///
     /// `q` and `k` come out `[tokens][qk_heads][head_dim]` and `v`
     /// `[tokens][value_heads][head_dim]` — the shapes llama.cpp captures, and
-    /// the shapes both mixer kernels want now that they index the query/key
-    /// head as `h % qk_heads` themselves. This used to broadcast q and k up to
-    /// `value_heads` because they did not.
+    /// the shapes both mixer kernels want: they index the query/key head as
+    /// `h % qk_heads` themselves.
     ///
     /// Superseded on the forward path by [`Self::silu_split_qkv`]. Kept
     /// because `tests/gdn_block.rs` runs it on the golden capture's own
@@ -4652,8 +4614,7 @@ impl GdnBlock {
     /// `q` and `k` are `[tokens][qk_heads][head_dim]`, `v` is
     /// `[tokens][value_heads][head_dim]`, and `log_decay` and `beta` are
     /// `[tokens][value_heads]`. The kernels pair value head `h` with query/key
-    /// head `h % qk_heads`; they took an already-broadcast q and k until they
-    /// learned to do that themselves.
+    /// head `h % qk_heads`.
     ///
     /// One token takes the recurrent kernel and more than one takes the chunked
     /// kernel. The two must agree: prefill fills the state a later decode
@@ -4713,8 +4674,6 @@ impl GdnBlock {
     }
 }
 
-/// A fixed grid over a grid-stride loop, so the launch shape does not depend on
-/// a host-side length and stays capturable in a CUDA graph (AGENTS.md rule 5).
 /// A default-on switch: off only when the variable is exactly `0`. Read once,
 /// at construction, so `bench_forward`'s `LLMCUDA_BENCH_AB` can build one
 /// pass each way.
@@ -4722,6 +4681,8 @@ fn env_enabled(name: &str) -> bool {
     std::env::var(name).as_deref() != Ok("0")
 }
 
+/// A fixed grid over a grid-stride loop, so the launch shape does not depend on
+/// a host-side length and stays capturable in a CUDA graph (AGENTS.md rule 5).
 fn elementwise_cfg(n: usize) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (

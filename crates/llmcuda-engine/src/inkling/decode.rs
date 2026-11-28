@@ -3,10 +3,10 @@
 //!
 //! [`super::InklingPass`] runs this shape correctly and slowly — its
 //! launches are sized for hundreds of rows, and at one row a layer is some
-//! sixty of them. Here a layer is ten: the attention inputs, one or two
-//! projection packs, keys and values into the cache, attention, the output
-//! projection, everything up to the routing, the two expert projections,
-//! and the tail. The contractions are the decode GEMM
+//! sixty of them. Here a layer is about a dozen: the attention inputs, one
+//! or two projection packs, keys and values into the cache, attention, the
+//! output projection, everything up to the routing, the two expert
+//! projections, and the tail. The contractions are the decode GEMM
 //! ([`llmcuda_cuda::kernels::inkling::DecodeGemm`]): the arithmetic class of
 //! the prefill path — binary16 activations, the binary16 of each stored
 //! weight, fp32 accumulation — in a different summation order, so the two
@@ -429,11 +429,6 @@ impl InklingDecode {
                 None
             },
         })
-    }
-
-    /// Sequences a step advances.
-    pub fn rows(&self) -> usize {
-        self.rows
     }
 
     /// Record the experts of every routing from here on; see

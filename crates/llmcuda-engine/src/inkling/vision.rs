@@ -238,11 +238,6 @@ impl InklingVisionForward {
         })
     }
 
-    /// The patch budget this instance was allocated for.
-    pub fn max_patches(&self) -> usize {
-        self.max_patches
-    }
-
     /// The tower's configuration.
     pub fn config(&self) -> &InklingVisionConfig {
         &self.cfg

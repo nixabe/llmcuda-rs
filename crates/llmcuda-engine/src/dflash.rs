@@ -21,7 +21,7 @@
 //! one: `LmHeadKernels` for all nine GEMM shapes, `AttentionKernels` (built
 //! at the drafter's own 32/8/128 geometry) for rope, cache append and the
 //! per-row decode attention, `LayerOpsKernels` for norms and SwiGLU. The
-//! only new device code is the tiny glue below: a Q8_0 embedding gather
+//! only new device code is tiny glue: a Q8_0 embedding gather
 //! (the same kernel `block/mtp.rs` carries) — the target's embedding table
 //! and LM head are aliased, not copied, exactly as the MTP head does.
 //!
@@ -64,8 +64,6 @@ const EMBED_THREADS: u32 = 256;
 /// Something went wrong loading or running the DFlash drafter.
 #[derive(Debug)]
 pub enum DFlashError {
-    /// NVRTC rejected the glue source, or the module failed to load.
-    Compile(String),
     /// The driver failed.
     Driver(DriverError),
     /// The drafter GGUF does not match the schema.
@@ -92,7 +90,6 @@ pub enum DFlashError {
 impl std::fmt::Display for DFlashError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Compile(e) => write!(f, "DFlash glue compile failed: {e}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::Schema(e) => write!(f, "drafter GGUF mismatch: {e}"),
             Self::WrongQuant { name, found } => {
@@ -246,13 +243,6 @@ pub fn load_dflash_weights(
 /// injection; see [`DFlashForward::draft`]).
 pub struct DFlashDraftCache {
     layers: Vec<KvCache>,
-}
-
-impl DFlashDraftCache {
-    /// Bytes held across all layers.
-    pub fn bytes(&self) -> u64 {
-        self.layers.iter().map(KvCache::bytes).sum()
-    }
 }
 
 /// The drafter's execution state: kernels, projections, and step scratch.
@@ -453,11 +443,6 @@ impl DFlashForward {
             config,
             weights,
         })
-    }
-
-    /// The drafter's configuration.
-    pub fn config(&self) -> &DFlashConfig {
-        &self.config
     }
 
     /// A fresh per-sequence draft cache covering `max_seq` positions.
@@ -939,9 +924,8 @@ impl DFlashForward {
             }
         }
 
-        // Final norm, the (target's) LM head over the mask rows only, and
-        // one argmax per drafted position. Row 0 (the committed token's
-        // slot) predicts nothing this path uses.
+        // Final norm, then the (target's) LM head and one argmax per
+        // drafted position.
         {
             let x = unsafe { subslice(stream, &self.x, 0, t * hidden) };
             let mut normed = unsafe { subslice(stream, &self.normed, 0, t * hidden) };

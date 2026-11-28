@@ -1,5 +1,5 @@
-//! Phase 1.1 of the TensorRT trunk plan: TensorRT's GEMMs against the
-//! engine's, at every Qwen3.6-35B-A3B Q8_0 projection shape.
+//! TensorRT's GEMMs against the engine's, at every Qwen3.6-35B-A3B Q8_0
+//! projection shape.
 //!
 //! ```sh
 //! export TENSORRT_ROOT=/path/to/tensorrt-11 CUDA_ROOT=/path/to/cuda-12
@@ -16,14 +16,14 @@
 //!   projections take today. The incumbent.
 //! - `hgemm`: `to_half` + the engine's own fp16 GEMM, for reference.
 //! - `trt-exact`: TensorRT, fp32 in, Cast, fp16 GEMM, Cast, fp32 out, one
-//!   exact-shape profile per token count, as the plan specifies.
+//!   exact-shape profile per token count.
 //! - `trt-dyn`: the same network with one dynamic profile, the only form
 //!   whose rows did not depend on the row count in `trt_probe` U6.
 //! - `trt-q8dq`: INT8 codes with a fp16 scale per 32 (a lossless Q8_0)
 //!   dequantized in-engine, dynamic profile.
 //! - `trt-int4`: INT4 with one scale per output channel, requantized from
-//!   the Q8_0 weight, dynamic profile. Lossy, so never a candidate under the
-//!   plan's gates; measured to say what INT4 buys in TensorRT on this card.
+//!   the Q8_0 weight, dynamic profile. Lossy, so never a candidate; measured
+//!   to say what INT4 buys in TensorRT on this card.
 //!
 //! Weights are synthetic Q8_0 blocks at the real shapes (timing does not
 //! depend on values); activations are uniform in [-1, 1].

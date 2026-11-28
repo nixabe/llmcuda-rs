@@ -426,7 +426,7 @@ fn prefilling_in_chunks_agrees_with_prefilling_in_one_pass() {
     // path a long prompt actually takes and which nothing else here covers.
     //
     // Not bit-identical, for the reasons in the module docs: the MoE's grouped
-    // GEMM tiles differently at 128 rows than at 32, and the scan sums the same
+    // GEMM tiles differently at 256 rows than at 64, and the scan sums the same
     // terms in a different order. The argmax is the gate.
     let Some((ctx, file)) = setup() else {
         return;

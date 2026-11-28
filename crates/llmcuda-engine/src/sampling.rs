@@ -12,10 +12,10 @@
 //! rather than a kernel needing a differential harness, per-request RNG state
 //! lives in ordinary structs instead of graph-stable device buffers, and the
 //! captured decode graph does not change shape at all. Measured, the price
-//! is 2.7% of a token at one session and 4.3% at three, once the top-k
-//! selection stopped materializing the vocabulary and the row landed in
-//! page-locked memory (`docs/BENCHMARKS.md`, "Sampling"); it was 10.7% and
-//! 19.0% before. A device sampler would be competing for what is left.
+//! is 2.7% of a token at one session and 4.3% at three, with a top-k
+//! selection that does not materialize the vocabulary and the row landing
+//! in page-locked memory (`docs/BENCHMARKS.md`, "Sampling"). A device
+//! sampler would be competing for what is left.
 //!
 //! # Distribution semantics
 //!
@@ -66,7 +66,7 @@ pub struct SamplingParams {
 }
 
 impl SamplingParams {
-    /// Greedy argmax: what every request did before this module existed.
+    /// Greedy argmax.
     pub const GREEDY: Self = Self {
         temperature: 0.0,
         top_k: 0,

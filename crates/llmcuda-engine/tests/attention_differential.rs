@@ -5,7 +5,7 @@
 //! This is the G004 gate. Gated Attention covers 10 of Qwen3.6's 40 layers
 //! plus the MTP head at block 40, and unlike Gated DeltaNet it has a
 //! Turing-validated codebase to port the *algorithm* from
-//! (`fattn-vec.cuh`) — which means a wrong answer here has no excuse.
+//! (`fattn-mma-f16.cuh`) — which means a wrong answer here has no excuse.
 //!
 //! ## What is compared, and against what
 //!
@@ -148,13 +148,10 @@ const F16_HALF_ULP: f32 = 1.0 / 2048.0;
 ///
 /// **This is a wider gate than [`GATE`] and that is the point, not a
 /// concession.** The scalar kernels stay on `GATE`; this applies only where the
-/// arithmetic genuinely changed. And the change is not a quality regression:
-/// llama.cpp runs the same fp16 tensor-core attention on this card, so matching
-/// its arithmetic moved this engine's *model output* closer to llama.cpp's, not
-/// further — `forward_pass` measures the top-8 ranking agreement going from 4
-/// of 8 to 7 of 8 and the winning logit's gap from +0.070 to -0.0007. The error
-/// against a scalar fp32 host reference rose; the error against the thing being
-/// reproduced fell.
+/// arithmetic genuinely differs. It is not a quality regression: llama.cpp runs
+/// the same fp16 tensor-core attention on this card, so matching its arithmetic
+/// brings this engine's *model output* closer to llama.cpp's, not further, even
+/// though the error against a scalar fp32 host reference is larger.
 const MMA_GATE: Tolerance = Tolerance {
     max_abs_error: 8.0 * F16_HALF_ULP,
     max_rel_error: 8.0 * F16_HALF_ULP / 1e-6,
@@ -266,7 +263,7 @@ fn run_device(
     let mut d_out = stream
         .alloc_zeros::<f32>(n_query * q_heads * head_dim)
         .expect("allocate output");
-    // The causal bound is read from device memory now, so the offset this
+    // The causal bound is read from device memory, so the offset this
     // test varies has to be uploaded rather than passed.
     let d_pos = stream
         .clone_htod(&[key_offset as i32])
@@ -596,13 +593,13 @@ fn device_attention_matches_the_reference_for_a_mid_sequence_query_block() {
 /// only shape that reaches the split/combine pair.
 ///
 /// `DEPTHS` above includes `n_query == 1`, but only at `key_offset == 0`, where
-/// the window is a single key: 63 of the 64 slices are empty and the merge has
-/// nothing to merge. This runs 4,096 keys, so every slice carries 64 of them
-/// and the combine folds 64 genuine `(m, l, acc)` triples.
+/// the window is a single key: every slice but one is empty and the merge has
+/// nothing to merge. This runs 4,096 keys, so every slice carries keys and
+/// the combine folds one genuine `(m, l, acc)` triple per slice.
 ///
-/// The three lengths are deliberate. 4,096 divides `DECODE_SPLITS * DEC_KT`
-/// evenly; 4,097 forces one slice to carry a ragged final tile; and 61 is
-/// shorter than `DECODE_SPLITS * DEC_KT`, so most slices are empty and the
+/// The three lengths are deliberate. 4,096 and 4,097 leave the final slice at
+/// two different ragged lengths; and 61 is shorter than
+/// `DECODE_SPLITS * DEC_KT`, so many slices are empty and the
 /// identity partial (`m = -inf`, `l = 0`) has to fold in as exactly zero rather
 /// than as a NaN out of `exp(-inf - -inf)`.
 ///
@@ -612,8 +609,8 @@ fn device_attention_matches_the_reference_for_a_mid_sequence_query_block() {
 /// this suite stays at depths cheap enough to run in a test rather than at
 /// the threshold's own 16,384+), then again with the tensor-core kernel
 /// forced on at each occupancy width. Forcing is what keeps
-/// `attn_flash_decode_mma_wpo{2,4}` under this gate at all now that `Auto`
-/// would otherwise never select it at these depths.
+/// `attn_flash_decode_mma_wpo{2,4}` under this gate at all, since `Auto`
+/// never selects it at these depths.
 #[test]
 fn device_decode_matches_the_reference_over_a_deep_window() {
     let Some(ctx) = setup() else { return };

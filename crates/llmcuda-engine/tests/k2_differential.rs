@@ -219,7 +219,6 @@ fn k2_operations_match_the_cpu_reference() {
 
 #[test]
 fn tiled_and_grouped_projections_preserve_scalar_contractions() {
-    use llmcuda_cuda::kernels::k2::K2Dispatch;
     if !driver_available() {
         println!("SKIPPED: no CUDA driver");
         return;

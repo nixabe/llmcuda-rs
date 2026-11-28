@@ -122,8 +122,8 @@ const BLOCK_MIN_COSINE: f32 = 1.0 - 5e-3;
 ///
 /// Those two absolute numbers are a measurement and they move when the flash
 /// kernel's softmax tile width changes, so the gate is [`MAX_ABS_GROWTH`] and
-/// not either of them — see the assert itself for why "must fall" was the
-/// wrong shape for this clause.
+/// not either of them — see the assert itself for why the absolute error is
+/// not required to fall.
 const MAX_COSINE_DEFECT_GROWTH: f32 = 3.0;
 
 /// Largest per-block growth in `max_abs_error` still called accumulation.
@@ -422,8 +422,8 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
 
     // And again without the read-backs, which is the number that means
     // something about the engine rather than about this test's
-    // instrumentation. Note this is a **debug** build; nothing here is a
-    // performance claim, only a cost of running the gate.
+    // instrumentation. Nothing here is a performance claim, only a cost of
+    // running the gate.
     let mut passes = 0usize;
     let mut clean_total = Duration::ZERO;
     while clean_total < Duration::from_secs(2) && passes < 20 {
@@ -438,7 +438,7 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
     }
     let per_pass = clean_total / passes as u32;
     println!(
-        "\n=== timing (debug build, not a performance claim) ===\n\
+        "\n=== timing (not a performance claim) ===\n\
          instrumented pass (41 read-backs): {:8.1} ms\n\
          clean pass, mean of {passes:>2}:            {:8.1} ms  ({:.1} tok/s over {tokens} tokens)\n\
          load + build, once:                {:8.1} s",
@@ -452,8 +452,7 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
     // function of its input. It is not automatic: every Gated DeltaNet block
     // carries a recurrent matrix and a convolution cache across calls, so a
     // pass that did not reset them would resume from the previous prompt and
-    // return something finite, plausible and completely different. This
-    // caught exactly that.
+    // return something finite, plausible and completely different.
     let rerun_logits = dtoh(&stream, forward.logits());
     let differing = logits
         .iter()
@@ -595,18 +594,17 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
             //
             // Held to `MAX_ABS_GROWTH` — the bound the rest of this curve
             // already calls accumulation — and not to a stricter, unnamed 1.0x.
-            // Requiring the absolute error to *fall* was never what this clause
-            // meant, and it was also redundant: a collapse of `C` turns an
+            // Requiring the absolute error to *fall* would be redundant: a
+            // collapse of `C` turns an
             // absolute growth of `A` into a relative growth of roughly `A * C`,
             // and `explained_by_magnitude_collapse` above already demands
             // `C >= growth / 2`, which caps `A` near 2 on its own. What is left
             // for this assert to catch is an absolute error that jumped by
             // itself, and that is exactly what `MAX_ABS_GROWTH` names.
             //
-            // The 1.0x form was passing on a coincidence, and the coincidence
-            // broke when the flash kernel's softmax tile narrowed from 32 keys
-            // to 8. `max_abs_error` is a single-element order statistic over
-            // 38,912 values where `cosine` is the whole vector, and at block 31
+            // It would also gate on noise. `max_abs_error` is a single-element
+            // order statistic over 38,912 values where `cosine` is the whole
+            // vector, and at block 31
             // the two disagree about which kernel is closer to llama.cpp: the
             // GQA-shared kernel measures cosine 0.998381 against the
             // per-query-head kernel's 0.998296 — better — while its worst

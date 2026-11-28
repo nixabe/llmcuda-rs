@@ -214,7 +214,7 @@ fn a_ragged_input_is_rejected_rather_than_read_past() {
     let stream = ctx.default_stream();
     let dequant = Dequantizer::new(&ctx).expect("kernels must compile");
 
-    // One byte short of a whole superblock. Truncating instead of rejecting
+    // One byte past a whole superblock. Truncating instead of rejecting
     // would dequantize whatever follows the tensor in device memory.
     let ragged = stream
         .clone_htod(&vec![0u8; BLOCK_Q6_K_BYTES + 1])

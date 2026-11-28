@@ -127,13 +127,6 @@ pub struct StepTimes {
     pub commit_ms: f64,
 }
 
-impl StepTimes {
-    /// Sum of the three spans. Compare against host wall to see launch tax.
-    pub fn gpu_ms(self) -> f64 {
-        self.draft_ms + self.verify_ms + self.commit_ms
-    }
-}
-
 /// One draft-verify-accept-commit round's outcome, for the caller to record
 /// acceptance statistics with. The honest measure is accepted tokens per
 /// wall-clock second, not drafted ones.

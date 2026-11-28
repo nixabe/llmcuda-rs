@@ -147,7 +147,7 @@ const REL_MEANINGFUL_FLOOR: f32 = 1e-3;
 ///
 /// The only disagreement available is the reduction order — llama.cpp's CUDA
 /// `rms_norm` reduces 2048 squares in a warp tree, as does
-/// `layer_ops::rms_norm_rows` — so this is the tightest gate here and the one
+/// `LayerOpsKernels::rms_norm` — so this is the tightest gate here and the one
 /// that would catch a wrong epsilon or a wrong norm weight outright. Its
 /// `max_rel_error` is genuinely meaningful (it lands on elements of order 1)
 /// and is gated as such.
@@ -171,11 +171,6 @@ const LOUT_MAX_ABS: f32 = 1e-1;
 const LOUT_MIN_COSINE: f32 = 1.0 - 5e-5;
 const LOUT_MAX_REL: f32 = 1e-2;
 
-/// Device grouped GEMM against the `llmcuda-kernels` scalar reference.
-///
-/// Both are fp32 over bit-identical dequantized weights; what is left is a
-/// warp-shuffle tree against a sequential sum. This is the bound that has to
-/// stay near round-off for the cross-check to mean anything.
 /// The shared expert's sigmoid gate, recovered from the golden.
 ///
 /// `GATE_MAX_ABS` compares two scalars and is the sharp gate. `GATE_MAX_FIT_
@@ -193,9 +188,8 @@ const GATE_MAX_FIT_RESIDUAL: f32 = 5e-2;
 /// above `MMA_MIN_TOKENS`, so the gate/up projections run on `mma.m8n8k16`
 /// with the activations quantized to int8. That is a different arithmetic
 /// from the scalar fp32 reference, not a reassociation of it, and it needs a
-/// bound that says so — the previous 5e-6 was the fp32-summation-order bound
-/// and is still enforced, on the fp32 path, by
-/// `moe_differential.rs::ROUTED_GATE`.
+/// bound that says so; the fp32-summation-order bound is enforced, on the fp32
+/// path, by `moe_differential.rs::ROUTED_GATE`.
 ///
 /// The weights are not approximated: a Q6_K quant is an integer in
 /// `[-32, 31]`, the tensor core multiplies it exactly, and the int32
@@ -302,7 +296,6 @@ fn run_block(
 ///
 /// Only the MTP head needs this, and only because it has no captured input of
 /// its own — it never executes in llama.cpp's main graph.
-#[allow(clippy::too_many_arguments)]
 fn run_block_on(
     stream: &Arc<CudaStream>,
     block: &mut MoeBlock,

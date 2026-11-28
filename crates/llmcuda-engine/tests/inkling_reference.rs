@@ -22,7 +22,7 @@ use llmcuda_kernels::inkling;
 /// to three tokens out of twelve (the test prints the count per
 /// application). The worst layer output observed is 0.99883 on Q4_K_XL and
 /// 0.99782 on Q8_K_XL, both where two tokens reroute. A wrong operator
-/// shows up as 0.3-0.8, as the unscaled-bias bug did.
+/// shows up as 0.3-0.8.
 const L_OUT_COSINE: f32 = 0.995;
 
 /// Floors on the last position's logits against llama.cpp, wide enough for

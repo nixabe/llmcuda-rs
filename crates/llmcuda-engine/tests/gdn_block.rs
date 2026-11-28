@@ -20,31 +20,27 @@
 //!    block runs end to end from `l_out-(N-1)` and every intermediate is
 //!    compared, so the numbers show where error enters and how it accumulates.
 //!
-//! ## Two findings this file exists to have produced
+//! ## Two traps this file gates
 //!
-//! **The query/key heads are shared by modulo, and both landed GDN kernels
-//! divided.** llama.cpp's fused op indexes the query/key head as
-//! `fastmodulo(h_idx, n_k_heads)` and its non-fused fallback broadcasts with
-//! `ggml_repeat_4d`, which tiles; `llmcuda_cuda::kernels::gdn` and
-//! `::gdn_chunked` both computed `h / heads_per_kv` internally.
+//! **The query/key heads are shared by modulo, not division.** llama.cpp's
+//! fused op indexes the query/key head as `fastmodulo(h_idx, n_k_heads)` and
+//! its non-fused fallback broadcasts with `ggml_repeat_4d`, which tiles;
+//! `h / heads_per_kv` is the plausible wrong reading.
 //! [`the_query_key_head_broadcast_is_modulo_not_division`] discriminates the
 //! two against the captured `final_output-N` using nothing but captured
-//! tensors, and still does. Both kernels were corrected in `d4d2f4d`, so
-//! `block::gdn` no longer materialises the broadcast and this file no longer
-//! widens the capture's 16-head `q_conv_predelta` / `k_conv_predelta` before
-//! feeding them to the mixer.
+//! tensors.
 //!
-//! **The chunked prefill kernel overflowed on this model's real decay rates.**
-//! `gdn_chunk_solve_and_apply` formed `v_t / lambda_t` where
-//! `lambda_t = exp(sum_{i<=t} log_decay_i)`. Block 0 head 9 has a per-token
-//! log-decay of -91.58, so `lambda` reached 2.5e-42 by the second token and the
-//! quotient was `inf`. See
+//! **This model's real decay rates overflow a chunked form that divides by
+//! the cumulative decay.** Forming `v_t / lambda_t` where
+//! `lambda_t = exp(sum_{i<=t} log_decay_i)` fails here: block 0 head 9 has a
+//! per-token log-decay of -91.58, so `lambda` reaches 2.5e-42 by the second
+//! token and the quotient is `inf`. See
 //! [`the_chunked_prefill_kernel_overflows_on_this_models_decay_rates`], which
-//! localizes where that would have happened and now gates the chunked form
-//! against the recurrent one instead of failing. The chained end-to-end test
-//! still drives the block one token at a time, because that also threads the
-//! convolution cache and the recurrent state through 19 separate calls — the
-//! carry a decode loop performs, and exercised nowhere else.
+//! localizes where that would happen and gates the chunked form against the
+//! recurrent one. The chained end-to-end test drives the block one token at a
+//! time, because that also threads the convolution cache and the recurrent
+//! state through 19 separate calls — the carry a decode loop performs, and
+//! exercised nowhere else.
 //!
 //! ## The one large tolerance, and why it is not this block's
 //!
@@ -172,8 +168,8 @@ const CHAINED_BLOCK_OUTPUT: Tolerance = Tolerance {
 ///
 /// Same weights, same gates, same convolution cache; only the delta-rule kernel
 /// differs, so this is far tighter than anything gated against llama.cpp.
-/// Measured on block 4, the one layer whose decay rates the chunked kernel
-/// survives: `max_abs 5.96e-8` on the output and `4.17e-7` on the final state.
+/// Measured on block 4: `max_abs 5.96e-8` on the output and `4.17e-7` on the
+/// final state.
 const CHUNKED_VS_RECURRENT: Tolerance = Tolerance {
     max_abs_error: 5e-5,
     max_rel_error: 1e2,
@@ -344,12 +340,6 @@ fn gate(step: &str, r: &ComparisonResult, tolerance: &Tolerance) {
     }
 }
 
-// A host `broadcast_heads` used to live here, to widen the capture's 16-head
-// `q_conv_predelta` / `k_conv_predelta` to 32 heads for a mixer that could not
-// do the mapping itself. Both kernels index `h % qk_heads` now, so nothing in
-// this file broadcasts and the head map is discriminated only where it belongs
-// — inside `delta_rule_host`, against `final_output-N`.
-
 // ---------------------------------------------------------------------------
 // A host transcription of llama.cpp's fused gated delta net
 // ---------------------------------------------------------------------------
@@ -442,8 +432,7 @@ fn norm_and_gate_host(
 ///
 /// The recurrent kernel is a decode kernel: it advances the state by exactly
 /// one token. Running a sequence through it is what a decode loop does, and it
-/// is what anchors the chunked form, which now also runs on this model's decay
-/// rates.
+/// is what anchors the chunked form.
 ///
 /// `q` and `k` are `[tokens][qk_heads][head_dim]`, `v` is
 /// `[tokens][value_heads][head_dim]`.
@@ -500,9 +489,7 @@ fn mix_recurrently(
 ///
 /// llama.cpp's fused op indexes it as `fastmodulo(h_idx, n_k_heads)` and its
 /// non-fused fallback broadcasts with `ggml_repeat_4d`, which tiles — so value
-/// head 17 reads query/key head 1, not 8. Both landed GDN kernels implemented
-/// `h / heads_per_kv` until `d4d2f4d`; `block::gdn` materialised the broadcast
-/// itself in the meantime, and now delegates it.
+/// head 17 reads query/key head 1, not 8.
 ///
 /// The discrimination runs entirely on captured tensors: golden
 /// `q_conv_predelta` / `k_conv_predelta` / `v_conv_predelta`, golden `gate` and
@@ -630,8 +617,8 @@ fn the_projection_gap_is_llama_cpps_activation_quantization() {
     let golden_qkv = fx.golden.f32(&format!("linear_attn_qkv_mixed-{layer}"));
 
     // A sample of output rows spanning the q, k and v thirds of the fused
-    // stream. All 8,192 rows in f64 on the host would be 319M multiply-adds in
-    // a debug build for no extra information.
+    // stream. All 8,192 rows in f64 on the host would be 319M multiply-adds
+    // for no extra information.
     let key_dim = geo.qk_heads * geo.head_dim;
     let sample: Vec<usize> = (0..128)
         .chain(key_dim..key_dim + 128)
@@ -1088,11 +1075,10 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
 
 /// The whole block, end to end, on the real weights for the golden prompt.
 ///
-/// Driven one token at a time — the decode path — because
-/// [`the_chunked_prefill_kernel_overflows_on_this_models_decay_rates`] shows
-/// the prefill kernel cannot run this data. Every waypoint is reported so drift
-/// is visible where it enters; the gate is on the block's output against
-/// `attn_residual-N`.
+/// Driven one token at a time — the decode path; the prefill kernel on the
+/// same data is [`the_chunked_prefill_kernel_overflows_on_this_models_decay_rates`].
+/// Every waypoint is reported so drift is visible where it enters; the gate is
+/// on the block's output against `attn_residual-N`.
 ///
 /// Running the prompt token by token also threads the convolution cache and the
 /// recurrent state through 19 separate calls, which is exactly the carry a
@@ -1204,10 +1190,10 @@ fn the_whole_block_matches_llama_cpp_token_by_token() {
     }
 }
 
-/// **A defect in a landed kernel, localized.**
+/// The chunked prefill kernel on this model's real decay rates.
 ///
-/// `gdn_chunk_solve_and_apply` in `crates/llmcuda-cuda/src/kernels/gdn_chunked.rs`
-/// forms the right-hand side of its triangular system as
+/// The textbook chunked delta rule forms the right-hand side of its triangular
+/// system as
 ///
 /// ```text
 /// W_t      = beta_t * (v_t / lambda_t - S_in k_t),
@@ -1226,7 +1212,9 @@ fn the_whole_block_matches_llama_cpp_token_by_token() {
 ///
 /// `|v|` reaches 17.3, so `v / lambda` reaches 2.8e42 — past `f32::MAX` — and
 /// the chunk fills with `inf`, then `NaN`. At `chunk_len = 64` rather than 19
-/// tokens this gets worse, not better.
+/// tokens this gets worse, not better. `gdn_chunk_solve_and_apply` in
+/// `crates/llmcuda-cuda/src/kernels/gdn_chunked.rs` therefore solves for
+/// `u'_t = lambda_t u_t` and never divides by a cumulative decay.
 ///
 /// llama.cpp is immune twice over: its fused CUDA op is the recurrent form and
 /// never accumulates a decay at all, and its non-fused chunked form
@@ -1234,8 +1222,10 @@ fn the_whole_block_matches_llama_cpp_token_by_token() {
 /// `exp(g_cum_last - g_cum)`, both bounded above by 1 because the log-decays
 /// are negative.
 ///
-/// This is not a tolerance question — the output is not finite — so there is
-/// nothing to widen. The test is what a fix has to make pass.
+/// This is not a tolerance question — a reintroduced division makes the output
+/// non-finite — so there is nothing to widen. The test reports where the
+/// division would first overflow and gates the chunked form against the
+/// recurrent one and against llama.cpp.
 #[test]
 fn the_chunked_prefill_kernel_overflows_on_this_models_decay_rates() {
     let Some(fx) = setup() else { return };
@@ -1329,8 +1319,7 @@ fn the_chunked_prefill_kernel_overflows_on_this_models_decay_rates() {
 
         // The convolution cache is advanced by the same kernel either way, once
         // over 19 tokens or nineteen times over one, so it must land on the
-        // same three carried inputs bit for bit regardless of the mixer. This
-        // half passes, which is what narrows the defect to the mixer.
+        // same three carried inputs bit for bit regardless of the mixer.
         let r = report(
             "convolution cache",
             &dtoh(&stream, &chunked_state.conv),
@@ -1377,11 +1366,9 @@ fn the_chunked_prefill_kernel_overflows_on_this_models_decay_rates() {
          for u'_t = lambda_t u_t rather than u_t, so no cumulative decay is ever \
          divided by. Qwen3.6's per-token log-decays reach -91.58 (block 0), so \
          lambda underflows to a subnormal within two tokens and any quotient by \
-         it exceeds f32::MAX. `gdn_chunked.rs` carries the derivation and a \
-         source-level test forbidding the division; a non-finite result here \
-         means the substitution was undone or a new one was introduced.\n\
-         The synthetic activations gdn_chunked_differential.rs uses never reach \
-         those decay rates, so its own differential test would not catch it.\n\
+         it exceeds f32::MAX. `gdn_chunked.rs` carries the derivation; a \
+         non-finite result here means the substitution was undone or a new \
+         division was introduced.\n\
          llama.cpp is immune in both of its forms: the fused CUDA op is recurrent \
          and never accumulates a decay, and build_delta_net_chunking only multiplies \
          by exp(g_cum) and exp(g_cum_last - g_cum), both bounded above by 1.",

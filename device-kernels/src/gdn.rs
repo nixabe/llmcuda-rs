@@ -198,7 +198,8 @@ pub unsafe fn gdn_silu_split_qkv(
 /// x, conv_raw and silu cover sequences * conv_dim floats; weight covers
 /// conv_dim * conv_kernel; each used state pointer covers conv_dim *
 /// (conv_kernel - 1) floats and belongs to one sequence; q, k and v as
-/// `gdn_split_qkv`. All outputs are mutually disjoint.
+/// `gdn_split_qkv`. All outputs are mutually disjoint. Every index fits
+/// in 32 bits: sequences * conv_dim * conv_kernel is below 2^31.
 #[kernel]
 pub unsafe fn gdn_conv_silu_split_step_batch(
     x: *const f32,
@@ -221,9 +222,9 @@ pub unsafe fn gdn_conv_silu_split_step_batch(
     value_heads: i32,
     conv_kernel: i32,
 ) {
-    let h = thread::blockIdx_x() as i64;
-    let t = thread::blockIdx_y() as i64;
-    let d = thread::threadIdx_x() as i64;
+    let h = thread::blockIdx_x() as i32;
+    let t = thread::blockIdx_y() as i32;
+    let d = thread::threadIdx_x() as i32;
     let state = match t {
         0 => s0,
         1 => s1,
@@ -234,9 +235,8 @@ pub unsafe fn gdn_conv_silu_split_step_batch(
         6 => s6,
         _ => s7,
     } as *mut f32;
-    let head_dim = head_dim as i64;
-    let key_dim = qk_heads as i64 * head_dim;
-    let conv_dim = 2 * key_dim + value_heads as i64 * head_dim;
+    let key_dim = qk_heads * head_dim;
+    let conv_dim = 2 * key_dim + value_heads * head_dim;
     let carry = conv_kernel - 1;
     unsafe {
         let xt = x.add((t * conv_dim) as usize);
@@ -245,27 +245,27 @@ pub unsafe fn gdn_conv_silu_split_step_batch(
         let iv = 2 * key_dim + h * head_dim + d;
         let mut vv = conv_step_channel(
             *xt.add(iv as usize),
-            weight.add((iv * conv_kernel as i64) as usize),
-            state.add((iv * carry as i64) as usize),
+            weight.add((iv * conv_kernel) as usize),
+            state.add((iv * carry) as usize),
             carry,
         );
         *cr.add(iv as usize) = vv;
         vv = vv / (1.0 + (-vv).exp());
         *sr.add(iv as usize) = vv;
-        *v.add(((t * value_heads as i64 + h) * head_dim + d) as usize) = vv;
-        if h < qk_heads as i64 {
+        *v.add(((t * value_heads + h) * head_dim + d) as usize) = vv;
+        if h < qk_heads {
             let iq = h * head_dim + d;
-            let ik = key_dim + h * head_dim + d;
+            let ik = key_dim + iq;
             let mut qv = conv_step_channel(
                 *xt.add(iq as usize),
-                weight.add((iq * conv_kernel as i64) as usize),
-                state.add((iq * carry as i64) as usize),
+                weight.add((iq * conv_kernel) as usize),
+                state.add((iq * carry) as usize),
                 carry,
             );
             let mut kv = conv_step_channel(
                 *xt.add(ik as usize),
-                weight.add((ik * conv_kernel as i64) as usize),
-                state.add((ik * carry as i64) as usize),
+                weight.add((ik * conv_kernel) as usize),
+                state.add((ik * carry) as usize),
                 carry,
             );
             *cr.add(iq as usize) = qv;
@@ -274,7 +274,7 @@ pub unsafe fn gdn_conv_silu_split_step_batch(
             kv = kv / (1.0 + (-kv).exp());
             *sr.add(iq as usize) = qv;
             *sr.add(ik as usize) = kv;
-            let o = ((t * qk_heads as i64 + h) * head_dim + d) as usize;
+            let o = ((t * qk_heads + h) * head_dim + d) as usize;
             *q.add(o) = qv;
             *k.add(o) = kv;
         }

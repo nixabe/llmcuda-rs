@@ -74,6 +74,11 @@ pub enum LoadError {
         free: u64,
         device: usize,
     },
+    /// The uploads did not fill the arena that was sized for them.
+    ///
+    /// The arena's capacity is the padded sum of the kept tensors, so a
+    /// shortfall is a tensor that was reserved for and never uploaded.
+    Incomplete { used: u64, capacity: u64 },
     /// A read-back did not match the file.
     Mismatch {
         name: String,
@@ -101,6 +106,10 @@ impl std::fmt::Display for LoadError {
                 "device {device} has {:.2} GiB free, weights need {:.2} GiB",
                 *free as f64 / (1u64 << 30) as f64,
                 *needed as f64 / (1u64 << 30) as f64,
+            ),
+            Self::Incomplete { used, capacity } => write!(
+                f,
+                "the weights filled {used} B of a {capacity} B arena sized from the same directory",
             ),
             Self::Mismatch {
                 name,
@@ -138,6 +147,8 @@ pub struct LoadReport {
     pub bytes: u64,
     /// Arena capacity, padding included.
     pub arena_bytes: u64,
+    /// Arena bytes the uploads took, padding included.
+    pub arena_used: u64,
     /// Free VRAM before the arena was allocated.
     pub free_before: u64,
     /// Free VRAM after every upload completed.
@@ -164,9 +175,10 @@ impl LoadReport {
     /// Whether every reserved byte was written.
     ///
     /// The arena is sized exactly from the directory, so this is false if and
-    /// only if a tensor was reserved and never uploaded.
+    /// only if a tensor was reserved and never uploaded. A load that returns
+    /// has already been held to it ([`LoadError::Incomplete`]).
     pub fn complete(&self) -> bool {
-        self.bytes > 0
+        self.arena_used == self.arena_bytes
     }
 }
 
@@ -533,11 +545,13 @@ impl DeviceWeights {
         let elapsed = started.elapsed();
         let (free_after, _) = memory_info(ctx)?;
 
-        debug_assert_eq!(
-            arena.used(),
-            capacity as usize,
-            "arena sized from the directory but not filled by it",
-        );
+        let arena_used = arena.used() as u64;
+        if arena_used != capacity {
+            return Err(LoadError::Incomplete {
+                used: arena_used,
+                capacity,
+            });
+        }
 
         let tensors = placements.len();
         // `info` rather than `debug`: this is the line that says where startup
@@ -570,6 +584,7 @@ impl DeviceWeights {
                 tensors,
                 bytes,
                 arena_bytes: capacity,
+                arena_used,
                 free_before,
                 free_after,
                 elapsed,
@@ -760,6 +775,7 @@ mod tests {
             tensors: 0,
             bytes: 0,
             arena_bytes: 0,
+            arena_used: 0,
             free_before: 100,
             free_after: 200,
             elapsed: Duration::from_secs(1),

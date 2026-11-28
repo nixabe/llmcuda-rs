@@ -129,7 +129,8 @@ fn the_model_becomes_resident_on_a_gpu_intact_and_within_budget() {
         directory.len(),
         "not every tensor in the directory was uploaded",
     );
-    assert!(report.complete(), "load reported no bytes written");
+    assert!(report.complete(), "the uploads did not fill the arena");
+    assert!(report.bytes > 0, "load reported no bytes written");
 
     // Alignment padding is the only legitimate gap between what the file
     // holds and what the arena reserves.

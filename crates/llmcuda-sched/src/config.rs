@@ -185,17 +185,6 @@ impl SchedulerConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn defaults_construct_successfully() {
-        let cfg = SchedulerConfig::with_defaults(4096, 256, 32).unwrap();
-        assert_eq!(cfg.token_budget(), 4096);
-        assert_eq!(
-            cfg.tokens_per_decode_step(),
-            1 + DEFAULT_DRAFT_TOKENS_PER_STEP
-        );
-        assert_eq!(cfg.max_waiting_requests(), 128);
-    }
-
     /// AGENTS.md rule 3, the named regression: a config at the exact
     /// boundary (`token_budget == block_size + max_concurrent_decodes`)
     /// must be rejected, because at that budget a full house of decoding

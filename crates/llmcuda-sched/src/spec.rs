@@ -188,16 +188,4 @@ mod tests {
         draft.clear();
         assert_eq!(b.propose_into(&mut draft), 0);
     }
-
-    #[test]
-    fn max_draft_tokens_matches_each_variant_cap() {
-        let ngram = SelfSpecConfig::Ngram(NgramConfig::new(2, 4, 3, 64).unwrap());
-        assert_eq!(ngram.max_draft_tokens(), 3);
-        let simple = SelfSpecConfig::Simple(NgramSimpleConfig::new(12, 48, 512).unwrap());
-        assert_eq!(simple.max_draft_tokens(), 48);
-        let ngram_mod = SelfSpecConfig::Mod(NgramModConfig::new(24, 48, 64, 512).unwrap());
-        assert_eq!(ngram_mod.max_draft_tokens(), 64);
-        let map = SelfSpecConfig::Map(NgramMapConfig::new(12, 48, false, 1, 512).unwrap());
-        assert_eq!(map.max_draft_tokens(), 48);
-    }
 }

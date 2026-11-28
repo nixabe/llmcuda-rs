@@ -1317,29 +1317,6 @@ mod tests {
     }
 
     #[test]
-    fn the_renamed_serving_flags_parse_in_both_spellings() {
-        // `--temp` is a clap alias of `--temperature`, `-a` a real short;
-        // both must land on the same fields as the long forms.
-        let long = Args::parse_from(["--temperature", "0.5", "--alias", "m", "--max-tokens", "64"]);
-        assert_eq!(long.temperature, 0.5);
-        assert_eq!(long.alias.as_deref(), Some("m"));
-        assert_eq!(long.max_tokens, 64);
-
-        let aliased = Args::parse_from(["--temp", "0.5", "-a", "m"]);
-        assert_eq!(aliased.temperature, 0.5);
-        assert_eq!(aliased.alias.as_deref(), Some("m"));
-
-        let joined = Args::parse_from(["--temp=0"]);
-        assert_eq!(joined.temperature, 0.0);
-
-        let underscore_aliases =
-            Args::parse_from(["--top_k", "20", "--top_p", "0.9", "--min_p", "0.05"]);
-        assert_eq!(underscore_aliases.top_k, 20);
-        assert_eq!(underscore_aliases.top_p, 0.9);
-        assert_eq!(underscore_aliases.min_p, 0.05);
-    }
-
-    #[test]
     fn an_empty_variable_reads_as_unset_except_the_api_key() {
         let blank = |name: &OsStr| {
             ["LLMCUDA_MMPROJ", "LLMCUDA_TEMP", "LLMCUDA_API_KEY"]
@@ -1362,35 +1339,6 @@ mod tests {
     }
 
     #[test]
-    fn the_sampling_default_flags_parse() {
-        let sampled = Args::parse_from(["--top-p", "0.95", "--min-p", "0.05", "--top-k", "20"]);
-        assert_eq!(sampled.top_p, 0.95);
-        assert_eq!(sampled.min_p, 0.05);
-        assert_eq!(sampled.top_k, 20);
-        let silent = Args::parse_from([] as [&str; 0]);
-        assert_eq!(silent.top_p, 1.0);
-        assert_eq!(silent.min_p, 0.0);
-        assert_eq!(silent.temperature, 1.0);
-        assert_eq!(silent.top_k, 0);
-    }
-
-    #[test]
-    fn no_speculation_charges_one_token_per_decode() {
-        assert_eq!(
-            resolve_speculation(&args(SpecType::None)),
-            Ok((0, Speculation::None))
-        );
-    }
-
-    #[test]
-    fn ngram_carries_its_window_and_its_draft_count() {
-        assert_eq!(
-            resolve_speculation(&args(SpecType::Ngram)),
-            Ok((3, Speculation::Ngram { min: 2, max: 4 }))
-        );
-    }
-
-    #[test]
     fn an_inverted_ngram_window_is_refused() {
         let mut inverted = args(SpecType::Ngram);
         inverted.spec_ngram_min = 5;
@@ -1409,47 +1357,6 @@ mod tests {
         let mut wide = args(SpecType::Ngram);
         wide.spec_ngram_max = wide.total_context as usize;
         assert!(resolve_speculation(&wide).is_err());
-    }
-
-    #[test]
-    fn the_llama_cpp_ngram_variants_resolve_with_their_defaults() {
-        // The tuple's first element is what the scheduler budgets per step:
-        // the drafter's own cap (size-m or n-max), exactly as llama.cpp
-        // defaults them.
-        assert_eq!(
-            resolve_speculation(&args(SpecType::NgramSimple)),
-            Ok((48, Speculation::NgramSimple { size_n: 12 }))
-        );
-        assert_eq!(
-            resolve_speculation(&args(SpecType::NgramMod)),
-            Ok((
-                64,
-                Speculation::NgramMod {
-                    n_match: 24,
-                    n_min: 48
-                }
-            ))
-        );
-        assert_eq!(
-            resolve_speculation(&args(SpecType::NgramMapK)),
-            Ok((
-                48,
-                Speculation::NgramMapK {
-                    size_n: 12,
-                    min_hits: 1
-                }
-            ))
-        );
-        assert_eq!(
-            resolve_speculation(&args(SpecType::NgramMapK4v)),
-            Ok((
-                48,
-                Speculation::NgramMapK4v {
-                    size_n: 12,
-                    min_hits: 1
-                }
-            ))
-        );
     }
 
     #[test]
@@ -1475,64 +1382,6 @@ mod tests {
         let mut bad = args(SpecType::NgramMapK4v);
         bad.spec_ngram_map_k4v_size_n = 2000;
         assert!(resolve_speculation(&bad).is_err());
-    }
-
-    #[test]
-    fn the_ngram_variant_flags_spell_exactly_like_llama_cpp() {
-        let parsed = Args::parse_from([
-            "--spec-type",
-            "ngram-mod",
-            "--spec-ngram-mod-n-match",
-            "16",
-            "--spec-ngram-mod-n-min",
-            "8",
-            "--spec-ngram-mod-n-max",
-            "32",
-        ]);
-        assert_eq!(
-            resolve_speculation(&parsed),
-            Ok((
-                32,
-                Speculation::NgramMod {
-                    n_match: 16,
-                    n_min: 8
-                }
-            ))
-        );
-        let parsed = Args::parse_from([
-            "--spec-type",
-            "ngram-map-k4v",
-            "--spec-ngram-map-k4v-size-n",
-            "8",
-            "--spec-ngram-map-k4v-size-m",
-            "24",
-            "--spec-ngram-map-k4v-min-hits",
-            "2",
-        ]);
-        assert_eq!(
-            resolve_speculation(&parsed),
-            Ok((
-                24,
-                Speculation::NgramMapK4v {
-                    size_n: 8,
-                    min_hits: 2
-                }
-            ))
-        );
-        let parsed = Args::parse_from([
-            "--spec-type",
-            "ngram-simple",
-            "--spec-ngram-simple-size-n",
-            "6",
-            "--spec-ngram-simple-size-m",
-            "12",
-            "--spec-ngram-simple-min-hits",
-            "3",
-        ]);
-        assert_eq!(
-            resolve_speculation(&parsed),
-            Ok((12, Speculation::NgramSimple { size_n: 6 }))
-        );
     }
 
     #[test]

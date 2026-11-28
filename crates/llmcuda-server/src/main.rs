@@ -565,7 +565,8 @@ fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
             }
             let Some(path) = &args.spec_dflash else {
                 return Err(
-                    "--spec-type dflash needs --spec-dflash <drafter.gguf>                      (the trained DFlash checkpoint)"
+                    "--spec-type spec-dflash needs --spec-dflash <drafter.gguf> \
+                     (the trained DFlash checkpoint)"
                         .to_owned(),
                 );
             };
@@ -1219,8 +1220,9 @@ fn main() -> std::process::ExitCode {
     // startup rather than on the first chat request.
     //
     // What happens when it cannot be used depends on who asked. `--jinja` on
-    // the command line is a requirement, and an unusable template fails the
-    // process. On the default it is a preference: the hand-written ChatML
+    // the command line is a requirement, as it is for the architectures this
+    // server has no hand-written markup for, and an unusable template fails
+    // the process. On the default it is a preference: the hand-written ChatML
     // serves instead, and the reason is said out loud rather than left to be
     // inferred from the output.
     let jinja_required = args.jinja || is_k2 || is_inkling;
@@ -1231,7 +1233,12 @@ fn main() -> std::process::ExitCode {
         match tokenizer::chat_template_from_gguf(&model_path) {
             Ok(Some(template)) => Some(template),
             Ok(None) if required => {
-                error!("--jinja given, but the model file has no `tokenizer.chat_template`");
+                let why = if args.jinja {
+                    "--jinja given"
+                } else {
+                    "this architecture is served only through its own template"
+                };
+                error!("{why}, but the model file has no `tokenizer.chat_template`");
                 return std::process::ExitCode::FAILURE;
             }
             Ok(None) => {

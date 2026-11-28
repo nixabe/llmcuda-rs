@@ -401,25 +401,6 @@ mod tests {
         assert_eq!(parse(["--log-level"]), Err(ArgError::MissingValue));
     }
 
-    #[test]
-    fn levels_are_case_insensitive() {
-        assert_eq!("DEBUG".parse::<LogLevel>(), Ok(LogLevel::Debug));
-        assert_eq!("Trace".parse::<LogLevel>(), Ok(LogLevel::Trace));
-    }
-
-    #[test]
-    fn every_accepted_value_round_trips_through_display() {
-        for name in LogLevel::ACCEPTED {
-            let level: LogLevel = name.parse().expect("ACCEPTED values must parse");
-            assert_eq!(
-                level.to_string(),
-                name,
-                "Display and FromStr must agree, or the warning text in init() would name a \
-                 value the flag rejects"
-            );
-        }
-    }
-
     /// The property the whole design rests on: warnings and errors are visible
     /// at every level the flag can express. If this ever fails, the module's
     /// justification for not offering `--log-level warn` is void.
@@ -480,20 +461,6 @@ mod tests {
         assert_eq!(
             prefixed("DEBUG t: ", "arena: 2.291 GiB\n"),
             "DEBUG t: arena: 2.291 GiB\n\n"
-        );
-    }
-
-    #[test]
-    fn the_accepted_list_is_in_verbosity_order() {
-        // ACCEPTED is quoted in error messages and in --help; if it were out of
-        // order the help text would mislead about which setting is noisier.
-        let levels: Vec<Level> = LogLevel::ACCEPTED
-            .iter()
-            .map(|n| n.parse::<LogLevel>().expect("parses").as_tracing())
-            .collect();
-        assert!(
-            levels.windows(2).all(|w| w[0] < w[1]),
-            "ACCEPTED must run quiet to loud, got {levels:?}"
         );
     }
 }

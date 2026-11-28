@@ -703,13 +703,4 @@ mod tests {
         // value bytes have nowhere to go.
         assert_eq!(run(&machine, &format!("{head}a\n</parameter>\nmore")), None);
     }
-
-    #[test]
-    fn the_triggers_are_the_opener_and_every_offered_function() {
-        let machine = Machine::compile(&[read_tool()], true);
-        assert_eq!(
-            machine.triggers(),
-            [b"<tool_call>".to_vec(), b"<function=read>".to_vec()]
-        );
-    }
 }

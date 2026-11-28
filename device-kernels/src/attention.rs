@@ -2,7 +2,7 @@
 //! multimodal forms, KV-cache appends and the decode combine.
 
 use crate::common::{f2h, kvq8_quantize};
-use cuda_device::{device, kernel, thread};
+use cuda_device::{SharedArray, device, kernel, thread, warp};
 
 /// Production attention RoPE, using two token groups on underfilled grids.
 ///
@@ -125,11 +125,16 @@ pub unsafe fn attn_row_positions(position: *const i32, out: *mut i32, n: i32) {
 /// the subtraction never forms inf - inf; a split with no keys has
 /// `m = -inf` and contributes nothing.
 ///
+/// A split's rescale `exp(m - max)` depends on the head alone, so it is
+/// taken once a block and read from shared memory by every dimension;
+/// taking it in each thread was half of the kernel. Each thread still
+/// fuses its own numerator and denominator in ascending split order.
+///
 /// # Safety
 /// part_acc covers n_splits * q_heads * head_dim floats, part_m and
 /// part_l n_splits * q_heads, out q_heads * head_dim; out is disjoint
 /// from the inputs. n_splits >= 1, blockIdx.x < q_heads and threadIdx.x <
-/// head_dim.
+/// head_dim. The block is 1-D, a multiple of 32 and at most 1024 threads.
 #[device]
 unsafe fn decode_combine(
     part_acc: *const f32,
@@ -140,37 +145,90 @@ unsafe fn decode_combine(
     head_dim: i32,
     n_splits: i32,
 ) {
+    static mut FACTOR: SharedArray<f32, 1024> = SharedArray::UNINIT;
+    static mut WARP_MAX: SharedArray<f32, 32> = SharedArray::UNINIT;
     let h = thread::blockIdx_x() as usize;
-    let d = thread::threadIdx_x() as usize;
+    let tid = thread::threadIdx_x() as i32;
+    let block = thread::blockDim_x() as i32;
+    let d = tid as usize;
     let row = q_heads as usize;
     unsafe {
+        let factor = SharedArray::as_raw_mut_ptr(&raw mut FACTOR);
+        let warp_max = SharedArray::as_raw_mut_ptr(&raw mut WARP_MAX);
+
+        // The global maximum: each thread's share of the splits, then the
+        // warp, then the block. A maximum does not depend on its order.
         let mut gm = f32::NEG_INFINITY;
-        let mut m = part_m.add(h);
-        let mut s = 0;
+        let mut s = tid;
         while s < n_splits {
-            gm = gm.max(*m);
-            m = m.wrapping_add(row);
-            s += 1;
+            gm = gm.max(*part_m.add(h + s as usize * row));
+            s += block;
+        }
+        let mut off = 16;
+        while off > 0 {
+            gm = gm.max(warp::shuffle_xor_f32_sync(u32::MAX, gm, off));
+            off >>= 1;
+        }
+        if tid & 31 == 0 {
+            *warp_max.add((tid >> 5) as usize) = gm;
+        }
+        thread::sync_threads();
+        let mut w = 0;
+        while w < block >> 5 {
+            gm = gm.max(*warp_max.add(w as usize));
+            w += 1;
         }
 
-        let mut m = part_m.add(h);
+        // A split's rescale is the same number in every thread of the
+        // block, so one thread takes its exponential and the rest read it.
+        // Splits go a block-width at a time, in ascending order.
         let mut l = part_l.add(h);
         let mut acc = part_acc.add(h * head_dim as usize + d);
+        let step = row * head_dim as usize;
         let (mut num, mut den) = (0.0f32, 0.0f32);
-        let mut s = 0;
-        while s < n_splits {
-            let ms = *m;
-            let f = if ms == f32::NEG_INFINITY {
-                0.0
-            } else {
-                (ms - gm).exp()
-            };
-            num = f.mul_add(*acc, num);
-            den = f.mul_add(*l, den);
-            m = m.wrapping_add(row);
-            l = l.wrapping_add(row);
-            acc = acc.wrapping_add(row * head_dim as usize);
-            s += 1;
+        let mut base = 0;
+        while base < n_splits {
+            let mine = base + tid;
+            if mine < n_splits {
+                let ms = *part_m.add(h + mine as usize * row);
+                *factor.add(d) = if ms == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    (ms - gm).exp()
+                };
+            }
+            thread::sync_threads();
+            let end = (base + block).min(n_splits);
+            let mut f = factor as *const f32;
+            let mut s = base;
+            while s + 3 < end {
+                let fv = (*f, *f.add(1), *f.add(2), *f.add(3));
+                let av = (*acc, *acc.add(step), *acc.add(2 * step), *acc.add(3 * step));
+                let lv = (*l, *l.add(row), *l.add(2 * row), *l.add(3 * row));
+                num = fv.0.mul_add(av.0, num);
+                den = fv.0.mul_add(lv.0, den);
+                num = fv.1.mul_add(av.1, num);
+                den = fv.1.mul_add(lv.1, den);
+                num = fv.2.mul_add(av.2, num);
+                den = fv.2.mul_add(lv.2, den);
+                num = fv.3.mul_add(av.3, num);
+                den = fv.3.mul_add(lv.3, den);
+                f = f.add(4);
+                acc = acc.wrapping_add(4 * step);
+                l = l.wrapping_add(4 * row);
+                s += 4;
+            }
+            while s < end {
+                num = (*f).mul_add(*acc, num);
+                den = (*f).mul_add(*l, den);
+                f = f.add(1);
+                acc = acc.wrapping_add(step);
+                l = l.wrapping_add(row);
+                s += 1;
+            }
+            // Before the next chunk overwrites the factors.
+            thread::sync_threads();
+            base += block;
         }
         *out.add(h * head_dim as usize + d) = num / den;
     }

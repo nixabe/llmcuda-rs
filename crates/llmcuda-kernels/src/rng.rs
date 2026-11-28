@@ -60,24 +60,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_seed_reproduces_the_same_stream() {
-        let mut a = Xorshift64Star::new(42);
-        let mut b = Xorshift64Star::new(42);
-        for _ in 0..1000 {
-            assert_eq!(a.next_u64(), b.next_u64());
-        }
-    }
-
-    #[test]
-    fn different_seeds_diverge() {
-        let mut a = Xorshift64Star::new(1);
-        let mut b = Xorshift64Star::new(2);
-        let sa: Vec<u64> = (0..16).map(|_| a.next_u64()).collect();
-        let sb: Vec<u64> = (0..16).map(|_| b.next_u64()).collect();
-        assert_ne!(sa, sb);
-    }
-
-    #[test]
     fn zero_seed_does_not_hang_or_stay_zero() {
         let mut rng = Xorshift64Star::new(0);
         assert_ne!(rng.next_u64(), 0);

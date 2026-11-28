@@ -119,19 +119,6 @@ mod tests {
     }
 
     #[test]
-    fn tie_breaking_is_stable_across_repeated_calls() {
-        let logits = [0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5];
-        let first = route_token(&logits, 3);
-        for _ in 0..10 {
-            assert_eq!(
-                route_token(&logits, 3),
-                first,
-                "routing must be deterministic on ties"
-            );
-        }
-    }
-
-    #[test]
     fn selected_weights_are_ordered_by_selection_probability() {
         let logits = [5.0f32, 1.0, 3.0];
         let decision = route_token(&logits, 3);

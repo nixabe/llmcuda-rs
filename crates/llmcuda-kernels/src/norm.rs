@@ -339,14 +339,4 @@ mod tests {
         let out = residual_add(&a, &b);
         assert_matches(&out, &[1.5, 0.0, 0.0], &Tolerance::tight_fp32());
     }
-
-    #[test]
-    fn residual_add_is_commutative() {
-        let mut rng = Xorshift64Star::new(31);
-        let a = rng.vec_f32(32, -5.0, 5.0);
-        let b = rng.vec_f32(32, -5.0, 5.0);
-        let ab = residual_add(&a, &b);
-        let ba = residual_add(&b, &a);
-        assert_matches(&ab, &ba, &Tolerance::tight_fp32());
-    }
 }

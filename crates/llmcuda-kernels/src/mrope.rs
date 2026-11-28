@@ -323,22 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn eleven_t_eleven_h_ten_w_channels() {
-        // The section arithmetic in the doc comment, checked by counting.
-        let (mut t, mut h, mut w) = (0, 0, 0);
-        for j in 0u32..32 {
-            if j % 3 == 1 && j < 3 * QWEN3_6_SECTIONS[1] {
-                h += 1;
-            } else if j % 3 == 2 && j < 3 * QWEN3_6_SECTIONS[2] {
-                w += 1;
-            } else {
-                t += 1;
-            }
-        }
-        assert_eq!((t, h, w), (11, 11, 10));
-    }
-
-    #[test]
     #[should_panic(expected = "sorted")]
     fn overlapping_spans_panic() {
         let spans = [

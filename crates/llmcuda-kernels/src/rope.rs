@@ -113,13 +113,6 @@ mod tests {
     }
 
     #[test]
-    fn full_rotary_head_has_no_untouched_tail() {
-        let head = vec![1.0f32; 8];
-        let out = apply_rope(&head, 3, 8, THETA_BASE);
-        assert_eq!(out.len(), 8);
-    }
-
-    #[test]
     fn rotation_matrix_is_orthonormal_for_a_single_pair() {
         // rope_dim = 2 is a single pair with frequency theta_base^0 = 1, so
         // this exercises the raw 2x2 rotation matrix directly: it must

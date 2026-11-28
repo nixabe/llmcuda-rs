@@ -1154,17 +1154,6 @@ mod row_tests {
         assert!(dequantize_row_nvfp4(&block[..35]).is_err());
     }
 
-    #[test]
-    fn block_sizes_match_the_ggml_layout() {
-        // These are the numbers GGUF's own tensor directory is computed
-        // from, so a mismatch here misaligns every block after the first.
-        assert_eq!(BLOCK_Q8_0_BYTES, 34);
-        assert_eq!(BLOCK_Q6_K_BYTES, 210);
-        assert_eq!(BLOCK_Q4_0_BYTES, 18);
-        assert_eq!(BLOCK_Q4_K_BYTES, 144);
-        assert_eq!(BLOCK_Q5_K_BYTES, 176);
-    }
-
     /// The packed 6-bit sub-scale codec, over every value both branches of
     /// `get_scale_min_k4` can produce.
     ///

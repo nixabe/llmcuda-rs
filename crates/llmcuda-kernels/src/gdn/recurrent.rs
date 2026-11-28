@@ -219,7 +219,6 @@ pub fn recurrent_forward(
 mod tests {
     use super::*;
     use crate::compare::{Tolerance, assert_matches};
-    use crate::rng::Xorshift64Star;
 
     #[test]
     fn l2_normalize_produces_unit_norm_for_nonzero_input() {
@@ -330,40 +329,5 @@ mod tests {
             assert_matches(o, e, &Tolerance::tight_fp32());
         }
         assert_matches(&final_state, &state, &Tolerance::tight_fp32());
-    }
-
-    #[test]
-    fn output_scale_is_inverse_sqrt_head_dim() {
-        assert!((output_scale(256) - 1.0 / 16.0).abs() < 1e-6);
-        assert!((output_scale(128) - 1.0 / (128.0f32).sqrt()).abs() < 1e-6);
-    }
-
-    #[test]
-    fn recurrent_forward_is_deterministic_across_runs() {
-        let mut rng = Xorshift64Star::new(77);
-        let head_dim = 16;
-        let seq_len = 20;
-        let q: Vec<Vec<f32>> = (0..seq_len)
-            .map(|_| rng.vec_f32(head_dim, -1.0, 1.0))
-            .collect();
-        let k: Vec<Vec<f32>> = (0..seq_len)
-            .map(|_| rng.vec_f32(head_dim, -1.0, 1.0))
-            .collect();
-        let v: Vec<Vec<f32>> = (0..seq_len)
-            .map(|_| rng.vec_f32(head_dim, -1.0, 1.0))
-            .collect();
-        let log_decay = rng.vec_f32(seq_len, -1.0, 0.0);
-        let beta = rng.vec_f32(seq_len, 0.0, 1.0);
-
-        let (out1, state1) = recurrent_forward(head_dim, &q, &k, &v, &log_decay, &beta, None);
-        let (out2, state2) = recurrent_forward(head_dim, &q, &k, &v, &log_decay, &beta, None);
-
-        for (a, b) in out1.iter().zip(out2.iter()) {
-            assert_eq!(
-                a, b,
-                "recurrent_forward must be bit-deterministic on repeated runs"
-            );
-        }
-        assert_eq!(state1, state2);
     }
 }

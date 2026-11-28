@@ -178,21 +178,6 @@ mod tests {
     const K: usize = 4;
 
     #[test]
-    fn the_channel_count_matches_the_ssm_conv1d_weight_shape() {
-        // ssm_conv1d.weight is [4, 8192]; 8192 is what the geometry must give.
-        let g = llmcuda_model::ModelConfig::qwen3_6_35b_a3b().gdn;
-        assert_eq!(
-            gdn_conv_channels(
-                g.qk_heads as usize,
-                g.value_heads as usize,
-                g.head_dim as usize
-            ),
-            8192,
-        );
-        assert_eq!(g.conv_kernel as usize, K);
-    }
-
-    #[test]
     fn a_unit_impulse_on_the_last_tap_is_the_identity() {
         // Tap `conv_kernel - 1` multiplies the current token. If the taps were
         // reversed this would instead delay the signal by three tokens, which

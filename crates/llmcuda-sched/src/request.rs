@@ -53,9 +53,9 @@ pub struct PrefillItem {
 /// it is fully testable without a GPU.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BatchDescription {
-    /// Decode-ready requests, batched first per AGENTS.md's scheduling
-    /// policy: batch all pending decodes, then spend what's left on
-    /// prefill.
+    /// Decode-ready requests, batched first per docs/SCHEDULER.md's
+    /// scheduling policy: batch all pending decodes, then spend what's left
+    /// on prefill.
     pub decodes: Vec<DecodeItem>,
     /// Prefill work this step, in schedule order. The last entry may be a
     /// partial chunk of a longer prompt if the token budget ran out.

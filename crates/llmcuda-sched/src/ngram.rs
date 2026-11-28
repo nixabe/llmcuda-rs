@@ -251,8 +251,7 @@ pub struct Verification {
 ///
 /// `target` must contain at least `draft.len() + 1` tokens: one target result
 /// for every draft position and the bonus token used when the whole draft is
-/// accepted. Sampling-aware verification can be added above this primitive;
-/// the engine currently uses greedy argmax sampling.
+/// accepted. Sampling-aware verification can be added above this primitive.
 pub fn verify_greedy(draft: &[i32], target: &[i32]) -> Option<Verification> {
     if target.len() < draft.len() + 1 {
         return None;
@@ -276,7 +275,7 @@ mod tests {
         NgramConfig::new(2, 4, 3, capacity).unwrap()
     }
 
-    /// The pre-index behavior: newest earlier occurrence of the longest
+    /// The reference policy: newest earlier occurrence of the longest
     /// suffix, by direct backward scan. The hash index must agree whenever
     /// it drafts at all.
     fn scan_propose(history: &[i32], config: NgramConfig, room: usize) -> Vec<i32> {
@@ -369,9 +368,9 @@ mod tests {
         let ngram_config = NgramConfig::new(2, 2, 3, 5).unwrap();
         let mut ngram = NgramSpeculator::new(ngram_config);
         ngram.observe_all(&[1, 2, 3, 7, 8, 9, 1, 2]);
-        // History ring now holds [9, 1, 2] of the original occurrence's era —
-        // the (1,2)->3 continuation is gone; only the fresh (1,2) at the tail
-        // remains, and it has no continuation yet.
+        // History ring now holds [7, 8, 9, 1, 2] — the (1,2)->3 continuation
+        // is gone; only the fresh (1,2) at the tail remains, and it has no
+        // continuation yet.
         let mut draft = Vec::with_capacity(3);
         // Whatever happens, it must not fabricate tokens: any draft must be a
         // verified continuation of a real in-ring occurrence.

@@ -59,7 +59,7 @@ pub struct SchedulerConfig {
     /// not straddle a snapshot boundary, so that interval is the widest pass
     /// the engine can issue, and slicing on it costs no throughput: the same
     /// tokens move at the same width, spread across sessions instead of
-    /// stacked behind one. Zero means no cap, which is the old behaviour.
+    /// stacked behind one. Zero means no cap.
     prefill_slice: u32,
 }
 
@@ -168,8 +168,8 @@ impl SchedulerConfig {
     /// be scheduled and materialized in KV before rejection could happen.
     ///
     /// Sizing the budget for this (the drafted case) rather than
-    /// `1` (the accepted case) is what AGENTS.md's speculative-decode note
-    /// requires — sizing for the accepted case causes admission to
+    /// `1` (the accepted case) is what docs/SCHEDULER.md's speculative-decoding
+    /// note requires — sizing for the accepted case causes admission to
     /// oscillate as the draft acceptance rate varies step to step.
     pub fn tokens_per_decode_step(&self) -> u32 {
         1 + self.draft_tokens_per_step

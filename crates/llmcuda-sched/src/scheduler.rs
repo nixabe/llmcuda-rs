@@ -170,12 +170,12 @@ impl Scheduler {
     /// prefill continuation neither admit a request nor reserve a block, so
     /// the answer here is the answer phase 3 reaches.
     ///
-    /// Gating the reserve on a non-empty queue alone was not enough. A worker
+    /// Gating the reserve on a non-empty queue alone is not enough. A worker
     /// running its full complement of sequences with a further request queued
-    /// held back a slice of every step that phase 3 then refused to spend,
-    /// because `running.len() < max_concurrent_decodes` was already false —
-    /// dead budget on every step until a slot freed, which is exactly when
-    /// the queue is longest.
+    /// would hold back a slice of every step that phase 3 then refuses to
+    /// spend, because `running.len() < max_concurrent_decodes` is already
+    /// false — dead budget on every step until a slot frees, which is exactly
+    /// when the queue is longest.
     fn admission_can_proceed(&self) -> bool {
         if self.running.len() >= self.config.max_concurrent_decodes() as usize {
             return false;
@@ -362,7 +362,7 @@ impl Scheduler {
     /// 1. Every decode-ready running request is scheduled unconditionally.
     ///    Each consumes [`SchedulerConfig::tokens_per_decode_step`] tokens
     ///    of budget (the drafted case, not the accepted case — see
-    ///    AGENTS.md's speculative-decode note).
+    ///    docs/SCHEDULER.md's speculative-decoding note).
     /// 2. Running requests still mid-prefill (chunked from an earlier step)
     ///    continue with whatever budget remains, before any new admission.
     /// 3. Waiting requests are pulled into the running batch and given
@@ -375,8 +375,8 @@ impl Scheduler {
     ///
     /// In phases 2 and 3, the first request whose remaining work exceeds
     /// the remaining budget is chunked (scheduled partially) and nothing
-    /// further is scheduled that step — this is the "chunking the last
-    /// request that does not fit" behavior AGENTS.md describes.
+    /// further is scheduled in that phase — this is the "chunking the last
+    /// request that does not fit" behavior docs/SCHEDULER.md describes.
     pub fn step(&mut self) -> BatchDescription {
         let mut batch = BatchDescription::default();
         self.step_into(&mut batch);
@@ -411,8 +411,8 @@ impl Scheduler {
         //
         // Zero unless phase 3 can actually spend it, and that is the whole
         // point: with nobody admittable there is nobody to hold it for, the
-        // chunk below takes the entire budget exactly as it always did, and
-        // peak prefill throughput is untouched. The reserve only exists in
+        // chunk below takes the entire budget, and peak prefill throughput is
+        // untouched. The reserve only exists in
         // the state that was pathological — a long prompt mid-flight and
         // somebody queued behind it who can be let in.
         //
@@ -429,12 +429,12 @@ impl Scheduler {
 
         // Phase 2: every request still mid-prefill shares the step.
         //
-        // "Shares" is the whole point, and it used to say "first". The old
-        // loop stopped at the first request whose prompt did not fit in one
-        // step, so that request took the entire budget every step until it
-        // finished and every other admitted session got nothing. On one card
-        // with four sessions that produced first tokens at 34, 71, 136 and
-        // 203 seconds: one prompt at a time wearing three slots. A session
+        // "Shares" is the whole point. A loop that stops at the first request
+        // whose prompt does not fit in one step gives that request the entire
+        // budget every step until it finishes, and every other admitted
+        // session gets nothing. On one card with four sessions that produced
+        // first tokens at 34, 71, 136 and 203 seconds: one prompt at a time
+        // wearing three slots. A session
         // that is merely *admitted* is not a session that is running.
         //
         // Two things make sharing free rather than a trade. The grant is
@@ -502,8 +502,8 @@ impl Scheduler {
         // Reached whatever phase 2 left, which under the sharing loop above
         // is the admission reserve plus anything the running sessions could
         // not use. It is deliberately not gated on whether phase 2 truncated
-        // somebody: that gate is what kept the reserve from ever being
-        // spent, which was the starvation this reserve exists to prevent.
+        // somebody: that gate would keep the reserve from ever being spent,
+        // which is the starvation this reserve exists to prevent.
         while budget > 0 && self.running.len() < self.config.max_concurrent_decodes() as usize {
             let Some(candidate) = self.waiting.front() else {
                 break;
@@ -560,8 +560,7 @@ mod tests {
     #[test]
     fn a_lone_long_prefill_still_takes_the_whole_step() {
         // The throughput case, and the reason the reserve is conditional. No
-        // waiting request means no reserve, so the chunk is the full budget
-        // exactly as before this existed.
+        // waiting request means no reserve, so the chunk is the full budget.
         let mut s = sched(4096, 256, 3, 100_000);
         s.admit(NewRequest {
             id: RequestId(1),
@@ -987,7 +986,7 @@ mod tests {
         //
         // A's prompt spans six steps at a 1024-token budget, so there is a
         // mid-prefill step to observe. Its chunk must stay the whole budget:
-        // gated on a non-empty queue alone this was 1024 - 1024/2 = 512.
+        // gated on a non-empty queue alone it would be 1024 - 1024/2 = 512.
         let config = SchedulerConfig::new(1024, 256, 4, 0.25, 0).unwrap();
         let mut s = Scheduler::new(config, 40);
         s.admit(req(1, 6000, 0)).unwrap();
@@ -1055,7 +1054,7 @@ mod tests {
         }
     }
 
-    /// The regression this replaced: one long prompt must not own every step.
+    /// Regression: one long prompt must not own every step.
     #[test]
     fn a_long_prompt_no_longer_starves_the_sessions_beside_it() {
         let config = SchedulerConfig::new(4096, 256, 3, 0.0, 0)
@@ -1078,8 +1077,8 @@ mod tests {
         .expect("admitted");
 
         // Step once to admit the newcomer. Admission alone proves nothing —
-        // the old serial loop admitted it too, then never served it again —
-        // so the assertion is about the steps *after* it is running.
+        // a serial loop admits it too, then never serves it again — so the
+        // assertion is about the steps *after* it is running.
         batch.prefills.clear();
         s.step_into(&mut batch);
         assert!(s.is_running(RequestId(2)), "newcomer admitted");

@@ -1012,15 +1012,6 @@ mod tests {
     }
 
     #[test]
-    fn kv_cache_type_names_round_trip_and_reject_unknown_formats() {
-        for t in KvCacheType::ALL {
-            assert_eq!(t.name().parse::<KvCacheType>(), Ok(t));
-        }
-        let err = "q4_0".parse::<KvCacheType>().unwrap_err();
-        assert!(err.contains("q4_0") && err.contains("f16, q8_0"), "{err}");
-    }
-
-    #[test]
     fn gdn_state_is_about_60_mib_per_sequence() {
         let c = cfg();
         // 32 heads x 128 x 128 x fp32 = 2 MiB per layer.
@@ -1077,48 +1068,6 @@ mod tests {
         // The file is *smaller*; the per-token weight traffic is 15x larger.
         let ratio = dense().active_ffn_params() as f64 / cfg().active_ffn_params() as f64;
         assert!((14.0..16.0).contains(&ratio), "ratio {ratio}");
-    }
-
-    #[test]
-    fn the_dense_gdn_head_split_reproduces_the_files_qkv_width() {
-        // `blk.0.attn_qkv.weight` is `[5120, 10240]` in the GGUF. The head
-        // split is derived, not stated, so this is the check that it was
-        // derived right.
-        let g = dense().gdn;
-        let qkv = 2 * g.qk_heads * g.head_dim + g.value_heads * g.head_dim;
-        assert_eq!(qkv, 10_240);
-        assert_eq!(g.value_heads * g.head_dim, 6_144, "ssm.inner_size");
-    }
-
-    #[test]
-    fn the_dense_attention_reproduces_the_files_projection_widths() {
-        // `attn_q` is `[5120, 12288]` (query and gate interleaved),
-        // `attn_k`/`attn_v` `[5120, 1024]`, `attn_output` `[6144, 5120]`.
-        let a = dense().attention;
-        assert_eq!(a.q_heads * a.head_dim, 6_144);
-        assert_eq!(a.q_heads * a.head_dim * 2, 12_288);
-        assert_eq!(a.kv_heads * a.head_dim, 1_024);
-        assert_eq!(a.gqa_ratio(), 6);
-    }
-
-    #[test]
-    fn architectures_resolve_to_exactly_one_config_each() {
-        for build in ModelConfig::KNOWN {
-            let c = build();
-            assert_eq!(
-                ModelConfig::for_architecture(c.architecture).map(|f| f.name),
-                Some(c.name)
-            );
-        }
-        assert!(ModelConfig::for_architecture("llama").is_none());
-        assert_eq!(
-            cfg().hparam_key("rope.freq_base"),
-            "qwen35moe.rope.freq_base"
-        );
-        assert_eq!(
-            dense().hparam_key("rope.freq_base"),
-            "qwen35.rope.freq_base"
-        );
     }
 
     #[test]

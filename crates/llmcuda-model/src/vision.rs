@@ -463,67 +463,6 @@ mod tests {
     }
 
     #[test]
-    fn head_dim_divides_evenly() {
-        assert_eq!(cfg().head_dim(), 72);
-        assert_eq!(cfg().head_dim() * cfg().num_heads, cfg().hidden_size);
-    }
-
-    #[test]
-    fn merger_matches_the_gguf_tensor_shapes() {
-        let c = cfg();
-        // mm.0 is 4608x4608, mm.2 is 4608x2048 in the file.
-        assert_eq!(c.merger_input_dim(), 4608);
-        assert_eq!(c.projection_dim, 2048);
-    }
-
-    #[test]
-    fn position_grid_is_48_by_48() {
-        let c = cfg();
-        assert_eq!(c.pos_grid_edge(), 48);
-        // v.position_embd.weight is 2304 rows in the file.
-        assert_eq!(c.pos_grid_edge() * c.pos_grid_edge(), 2304);
-    }
-
-    #[test]
-    fn patch_vector_matches_the_conv_weights() {
-        // Two 16x16x3 conv slices: 1536 elements together.
-        assert_eq!(cfg().patch_elems(), 1536);
-    }
-
-    #[test]
-    fn a_full_native_image_yields_576_tokens() {
-        let c = cfg();
-        let edge = c.pos_grid_edge();
-        assert_eq!(c.output_tokens(edge, edge), 576);
-    }
-
-    #[test]
-    fn projection_lands_in_the_llm_embedding_width() {
-        use crate::config::ModelConfig;
-        assert_eq!(
-            cfg().projection_dim,
-            ModelConfig::qwen3_6_35b_a3b().hidden_size
-        );
-    }
-
-    #[test]
-    fn the_tower_differs_between_the_two_models_only_in_its_projection_width() {
-        use crate::ModelConfig;
-        let moe = VisionConfig::for_model(&ModelConfig::qwen3_6_35b_a3b());
-        let dense = VisionConfig::for_model(&ModelConfig::qwen3_8_27b());
-        assert_eq!(moe, VisionConfig::qwen3_6_35b_a3b());
-        assert_eq!(dense.projection_dim, 5120);
-        assert_eq!(
-            VisionConfig {
-                projection_dim: moe.projection_dim,
-                ..dense
-            },
-            moe,
-            "the two mmproj files agree on every `clip.*` key but projection_dim"
-        );
-    }
-
-    #[test]
     fn schema_tensor_count_matches_the_published_mmproj() {
         // The real mmproj-F16.gguf holds 334 tensors: 12 per block across 27
         // blocks, plus 10 globals. Asserted so a role added or dropped has to

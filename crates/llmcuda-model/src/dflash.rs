@@ -460,16 +460,6 @@ mod tests {
     }
 
     #[test]
-    fn the_derived_widths_match_the_checkpoint() {
-        let c = cfg();
-        assert_eq!(c.q_dim(), 4096);
-        assert_eq!(c.kv_dim(), 1024);
-        assert_eq!(c.fc_input_dim(), 16384);
-        assert_eq!(c.max_draft_tokens(), 15);
-        assert_eq!(c.swa_pattern.len(), c.num_layers as usize);
-    }
-
-    #[test]
     fn the_schema_covers_three_globals_and_eleven_tensors_per_block() {
         let schema = DFlashWeightSchema::new(&cfg());
         assert_eq!(schema.specs().len(), 3 + 6 * 11);

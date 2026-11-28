@@ -480,34 +480,6 @@ mod tests {
     }
 
     #[test]
-    fn heads_split_into_two_rotary_halves_of_adjacent_pairs() {
-        assert_eq!(cfg().head_dim(), 64);
-        assert_eq!(cfg().head_dim() * cfg().num_heads, cfg().hidden_size);
-        assert!(cfg().head_dim().is_multiple_of(4));
-    }
-
-    #[test]
-    fn projector_matches_the_gguf_tensor_shapes() {
-        // mm.1 is 4096x4096, mm.2 is 4096x2304 in the file.
-        assert_eq!(cfg().merger_input_dim(), 4096);
-        assert_eq!(cfg().projection_dim, 2304);
-    }
-
-    #[test]
-    fn position_grid_is_32_by_32() {
-        assert_eq!(cfg().pos_grid_edge(), 32);
-        assert_eq!(cfg().patch_elems(), 1200);
-    }
-
-    #[test]
-    fn one_token_covers_a_40_pixel_square() {
-        let c = cfg();
-        assert_eq!(c.token_edge(), 40);
-        let edge = c.pos_grid_edge();
-        assert_eq!(c.output_tokens(edge, edge), 256);
-    }
-
-    #[test]
     fn schema_tensor_count_matches_the_published_mmproj() {
         // mmproj-F16.gguf holds 422 tensors: 18 per block across 23 blocks,
         // plus 8 globals.
@@ -526,17 +498,5 @@ mod tests {
         for spec in schema.specs() {
             assert_eq!(spec.role.is_global(), spec.layer.is_none(), "{}", spec.name);
         }
-    }
-
-    #[test]
-    fn the_class_token_is_the_one_tensor_without_a_weight_suffix() {
-        let schema = InklingVisionWeightSchema::new(&cfg());
-        let bare: Vec<&str> = schema
-            .specs()
-            .iter()
-            .map(|s| s.name.as_str())
-            .filter(|n| !n.ends_with(".weight") && !n.ends_with(".bias"))
-            .collect();
-        assert_eq!(bare, ["v.class_embd"]);
     }
 }

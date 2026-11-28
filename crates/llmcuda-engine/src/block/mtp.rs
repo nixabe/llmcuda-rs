@@ -157,6 +157,8 @@ pub struct MtpBlock {
     rms_eps: f32,
 
     embed_fn: CudaFunction,
+    /// `fwd_embed_quant`'s format code, or `-1` for the Q8_0 entry point.
+    embed_code: i32,
     concat_fn: CudaFunction,
     layer_ops: LayerOpsKernels,
     attn: GatedAttentionBlock,
@@ -309,7 +311,6 @@ impl MtpBlock {
         let rust = ctx.load_module(cudarc::nvrtc::Ptx::from_src(
             llmcuda_cuda::kernels::RUST_KERNELS_PTX,
         ))?;
-        let embed_fn = rust.load_function("embed_q8_0")?;
         let concat_fn = rust.load_function("mtp_concat_eh")?;
         let layer_ops = LayerOpsKernels::new(ctx)?;
 
@@ -337,7 +338,24 @@ impl MtpBlock {
             )?;
         let moe = FfnBlock::new(ctx, stream, config, moe_geometry, rms_eps)?;
 
-        let (w_token_embd, _) = alias_projection(weights, stream, Role::TokenEmbedding, None)?;
+        let (w_token_embd, embd_format) =
+            alias_projection(weights, stream, Role::TokenEmbedding, None)?;
+        // The gather for the table's own format, as `Forward` chooses it:
+        // Q8_0 has its own entry point, the rest go through
+        // `fwd_embed_quant` with its format code, and bf16 has no gather.
+        let (embed_fn, embed_code) = match embd_format {
+            HeadFormat::Q8_0 => (rust.load_function("embed_q8_0")?, -1i32),
+            HeadFormat::Q6K => (rust.load_function("fwd_embed_quant")?, 0),
+            HeadFormat::F16 => (rust.load_function("fwd_embed_quant")?, 4),
+            // `alias_projection` yields nothing else.
+            _ => {
+                return Err(MtpBlockError::WrongQuant {
+                    role: Role::TokenEmbedding,
+                    layer: None,
+                    found: GgmlType::Bf16,
+                });
+            }
+        };
         let (w_lm_head, lm_head_format) = alias_projection(weights, stream, Role::LmHead, None)?;
         let (w_eh_proj, eh_proj_format) =
             alias_projection(weights, stream, Role::MtpEhProj, Some(mtp_layer))?;
@@ -382,6 +400,7 @@ impl MtpBlock {
             tokens,
             rms_eps,
             embed_fn,
+            embed_code,
             concat_fn,
             layer_ops,
             attn,
@@ -557,9 +576,13 @@ impl MtpBlock {
             .arg(&mut self.tok_embd)
             .arg(&hidden_i32)
             .arg(&tokens_i32);
+        if self.embed_code >= 0 {
+            builder.arg(&self.embed_code);
+        }
         // SAFETY: grid covers exactly `t` rows, `d_tokens` and `tok_embd` are
         // both sized `t` (elements / `hidden`) by construction, and the token
-        // embedding table was checked resident at construction.
+        // embedding table was checked resident at construction, in the format
+        // `embed_fn` reads.
         unsafe { builder.launch(cfg) }?;
 
         // 2. `mtp_enorm`.

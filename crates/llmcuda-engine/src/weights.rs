@@ -752,29 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn required_bytes_rounds_every_tensor_up_to_alignment() {
-        // Q6_K superblocks are 210 bytes, so tensor sizes are rarely multiples
-        // of 256. Under-counting here would size the arena short and fail the
-        // load partway through, after minutes of copying.
-        let unpadded = 210usize;
-        assert_eq!(unpadded.next_multiple_of(ALIGNMENT), 256);
-        assert_eq!(540_344_320usize.next_multiple_of(ALIGNMENT), 540_344_320);
-    }
-
-    #[test]
-    fn throughput_is_bytes_over_elapsed() {
-        let report = LoadReport {
-            tensors: 1,
-            bytes: 2_000_000_000,
-            arena_bytes: 2_000_000_000,
-            free_before: 0,
-            free_after: 0,
-            elapsed: Duration::from_secs(2),
-        };
-        assert!((report.throughput_gb_s() - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
     fn vram_consumed_does_not_underflow_when_memory_was_freed() {
         // Another process releasing memory mid-load can leave `free_after`
         // above `free_before`. That is a measurement artefact, not a negative

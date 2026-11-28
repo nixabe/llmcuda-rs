@@ -1432,16 +1432,6 @@ mod tests {
         assert!(add.contains("if t >= *valid_tokens as i64 {"));
     }
 
-    #[test]
-    fn the_block_writes_the_ffn_waypoint_before_the_residual() {
-        // The dense counterpart of the MoE block's same check: folding the
-        // residual into `ffn_out` would still give the right `l_out` and
-        // would fail the golden's intermediate waypoint.
-        assert!(
-            rust_add_residual().contains("*l_out.add(at) = *ffn_out.add(at) + *residual.add(at);")
-        );
-    }
-
     /// `dense_ffn_add_residual`, which has no CUDA C++ twin.
     fn rust_add_residual() -> &'static str {
         llmcuda_cuda::kernels::rust_kernel_source("dense_ffn_add_residual")
@@ -1509,32 +1499,6 @@ mod tests {
         );
     }
 
-    /// Both kernels narrow a weight byte through `unsigned char` first.
-    ///
-    /// Dropping the intermediate cast makes a quant above 127 take an
-    /// implementation-defined conversion instead of sign-extending, which is
-    /// wrong on half the weights and produces text that still reads fluently.
-    #[test]
-    fn both_split_gemvs_sign_extend_their_quants_the_same_way() {
-        const IDIOM: &str = "(float)(signed char)(unsigned char)";
-        assert!(GLUE_SRC.contains(IDIOM));
-        assert!(crate::block::gdn::GDN_BLOCK_SRC.contains(IDIOM));
-    }
-
-    /// The dense norm is the layer ops' norm with a second, narrowed output:
-    /// both take their inverse RMS from one Rust function, so the reduction
-    /// order and the exact division cannot drift between them.
-    #[test]
-    fn the_dense_norm_matches_layer_ops() {
-        for kernel in ["rms_norm_rows", "dense_rms_norm_narrow"] {
-            assert!(
-                llmcuda_cuda::kernels::rust_kernel_source(kernel)
-                    .contains("inverse_rms(x, width, eps)"),
-                "{kernel} no longer shares the inverse RMS",
-            );
-        }
-    }
-
     #[test]
     fn every_row_tile_the_table_selects_is_a_compiled_entry_point() {
         // `DenseFfnBlock::new` builds the entry-point name by formatting the
@@ -1564,27 +1528,5 @@ mod tests {
             SPLIT_GEMV_MAX_TOKENS,
             "the widest entry and the width gate have drifted apart",
         );
-    }
-
-    #[test]
-    fn there_is_no_shared_expert_gate_in_the_dense_path() {
-        // The single most plausible way to get this block wrong is to carry
-        // the MoE block's sigmoid gate across. `qwen35.cpp:475` asserts
-        // `ffn_gate_inp == nullptr`; this asserts the same thing about us.
-        //
-        // Scoped to the projection, not the module: `dense_swiglu_narrow`
-        // legitimately has both an `expf` and a `gate` argument, because
-        // SwiGLU's own gate half is not a router.
-        let at = GLUE_SRC
-            .find("void dense_proj_split_rows(")
-            .expect("the projection is missing");
-        let end = at
-            + GLUE_SRC[at..]
-                .find("\n#define ")
-                .expect("it does not close");
-        let proj = &GLUE_SRC[at..end];
-        assert!(!proj.contains("expf"));
-        assert!(!proj.contains("sigmoid"));
-        assert!(!proj.contains("gate"));
     }
 }

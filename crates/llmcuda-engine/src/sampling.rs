@@ -381,36 +381,6 @@ mod tests {
         );
     }
 
-    /// Not a gate: prints what one sampled token costs the host at this
-    /// vocabulary, old selection against new. `--nocapture` to read it.
-    #[test]
-    fn top_k_selection_cost_at_vocabulary_width() {
-        let logits = noise(248_320, 11);
-        let mut scratch = Vec::with_capacity(logits.len());
-        let rounds = 200;
-        let started = std::time::Instant::now();
-        for _ in 0..rounds {
-            scratch.clear();
-            scratch.extend(
-                logits
-                    .iter()
-                    .enumerate()
-                    .map(|(index, &logit)| (finite_or_floor(logit), index as u32)),
-            );
-            scratch.select_nth_unstable_by(19, |a, b| b.0.total_cmp(&a.0));
-            scratch.truncate(20);
-            std::hint::black_box(&scratch);
-        }
-        let partition = started.elapsed() / rounds;
-        let started = std::time::Instant::now();
-        for _ in 0..rounds {
-            top_k_into(std::hint::black_box(&logits), 20, &mut scratch);
-            std::hint::black_box(&scratch);
-        }
-        let heap = started.elapsed() / rounds;
-        println!("top-20 of 248,320: partition {partition:?}, heap {heap:?}");
-    }
-
     fn sampler(temperature: f32, top_k: u32, top_p: f32, seed: u64) -> Sampler {
         Sampler::new(SamplingParams {
             temperature,

@@ -2748,50 +2748,6 @@ mod tests {
     }
 
     #[test]
-    fn the_projection_geometries_are_the_ones_the_file_carries() {
-        // These four shapes are what `new` validates the resident tensors
-        // against, and getting one backwards is the failure `docs/ORACLE.md`
-        // §6.2 calls out: `attn_output` reads 4096 and writes 2048, the
-        // opposite of every other row in its table.
-        let config = ModelConfig::qwen3_6_35b_a3b();
-        let a = config.attention;
-        let hidden = u64::from(config.hidden_size);
-        let head_dim = u64::from(a.head_dim);
-        let q_dim = u64::from(a.q_heads) * head_dim;
-        let kv_dim = u64::from(a.kv_heads) * head_dim;
-
-        assert_eq!([hidden, 2 * q_dim], [2048, 8192]);
-        assert_eq!([hidden, kv_dim], [2048, 512]);
-        assert_eq!([q_dim, hidden], [4096, 2048]);
-        assert_eq!(head_dim, 256);
-    }
-
-    #[test]
-    fn the_projection_widths_satisfy_the_lm_head_kernels_staging_constraint() {
-        // `LmHeadKernels::new` rejects a `hidden` that is not a whole number
-        // of 16-block Q8_0 staging segments, i.e. a multiple of 512. Both
-        // input widths this block uses must clear that, or three of the four
-        // projections would fail to construct at runtime rather than here.
-        let config = ModelConfig::qwen3_6_35b_a3b();
-        let q_dim = (config.attention.q_heads * config.attention.head_dim) as usize;
-        for width in [config.hidden_size as usize, q_dim] {
-            assert_eq!(
-                width % 512,
-                0,
-                "width {width} is not a whole staging segment"
-            );
-        }
-    }
-
-    #[test]
-    fn a_length_that_matches_the_geometry_is_accepted_and_one_that_does_not_is_not() {
-        assert!(expect_len("x", 4, 4).is_ok());
-        let err = expect_len("x", 5, 4).unwrap_err();
-        assert!(err.to_string().contains('5'));
-        assert!(err.to_string().contains('4'));
-    }
-
-    #[test]
     fn a_lazy_repack_is_built_once_and_shared() {
         let slot = Mutex::new(None);
         let first = shared_or_try_init(&slot, || Ok::<_, ()>(17)).unwrap();

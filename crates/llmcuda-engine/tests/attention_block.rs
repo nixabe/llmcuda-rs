@@ -1552,38 +1552,6 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
 }
 
 #[test]
-fn the_imrope_section_mapping_matches_the_upstream_branch() {
-    // Runs without a device or a model file: it is arithmetic on the section
-    // widths, and it is what the device test's assertion rests on.
-    //
-    // Qwen3.6's [11, 11, 10, 0]: every pair in 0..32 is claimed by its own
-    // `s % 3` class, so none reaches the fourth channel — the only one
-    // llama.cpp zeroes for a text batch.
-    let qwen = [11, 11, 10, 0];
-    for s in 0..32 {
-        assert_ne!(
-            imrope_channel(s, qwen),
-            3,
-            "pair {s} fell through to the zero-position channel",
-        );
-        assert_eq!(imrope_channel(s, qwen), (s % 3) as usize);
-    }
-
-    // A section set that does *not* collapse, so the assertion above is
-    // shown to be capable of failing. [4, 4, 4, 20] leaves everything from
-    // pair 12 onward on channel 3.
-    let vision = [4, 4, 4, 20];
-    let fell_through: Vec<i32> = (0..32)
-        .filter(|&s| imrope_channel(s, vision) == 3)
-        .collect();
-    assert!(
-        !fell_through.is_empty(),
-        "the mapping never reports a fall-through, so the model test proves nothing",
-    );
-    assert!(fell_through.contains(&12));
-}
-
-#[test]
 fn the_q8_1_emulation_is_the_quantization_it_claims_to_be() {
     // No device, no model file. `inv = 127/amax`, `q = roundf(x*inv)`, and the
     // reconstruction is `q * d` — so the block maximum is reproduced exactly

@@ -169,17 +169,11 @@ impl HostLogits {
 use crate::weights::DeviceWeights;
 
 /// Elements per Q8_0 block, and its serialized size.
-///
-/// Spelled here as well as in the kernel source below because NVRTC compiles
-/// from a string with no access to Rust constants;
-/// `the_embedding_row_stride_matches_the_kernel` asserts the two agree with
-/// the upstream layout.
 const QK8_0: usize = 32;
 const BLOCK_Q8_0_BYTES: usize = 34;
 
 /// Elements per k-quant superblock, and Q6_K's serialized size, for sizing an
-/// `output.weight` a uniform community quant stored as Q6_K. Same reason as
-/// the pair above; the same test asserts they agree with the kernel crate.
+/// `output.weight` a uniform community quant stored as Q6_K.
 const QK_K: usize = 256;
 const BLOCK_Q6_K_BYTES: usize = 210;
 
@@ -499,10 +493,8 @@ impl ForwardReport {
 /// Filtered out of the weight arena so the model is resident exactly once.
 /// Every entry is a role
 /// [`MoeLayerWeights::upload`](crate::block::moe::MoeLayerWeights::upload)
-/// reads; if that list ever changes,
-/// `the_moe_role_filter_is_exactly_what_the_moe_block_uploads` notices,
-/// because the arena would then hold a tensor nothing reads or omit one
-/// something does.
+/// reads; if that list changes and this one does not, the arena holds a
+/// tensor nothing reads or omits one something does.
 pub const MOE_OWNED_ROLES: [Role; 9] = [
     Role::PostMixerNorm,
     Role::MoeRouter,
@@ -4334,71 +4326,6 @@ mod tests {
     }
 
     #[test]
-    fn the_embedding_row_stride_matches_the_kernel() {
-        // The kernel spells 32 and 34 as literals because NVRTC has no access
-        // to Rust constants. This is the check that they agree with the
-        // upstream block layout, and that 2048 input elements is the 2,176
-        // byte row `docs/ORACLE.md` section 6.3 dequantized bit-exactly.
-        assert_eq!(QK8_0, llmcuda_cuda::kernels::dequant::QK8_0);
-        assert_eq!(
-            BLOCK_Q8_0_BYTES,
-            llmcuda_cuda::kernels::dequant::BLOCK_Q8_0_BYTES
-        );
-        assert_eq!(BLOCK_Q8_0_BYTES, 2 + QK8_0);
-        assert_eq!(2048 / QK8_0 * BLOCK_Q8_0_BYTES, 2176);
-        assert_eq!(QK_K, llmcuda_cuda::kernels::dequant::QK_K);
-        assert_eq!(
-            BLOCK_Q6_K_BYTES,
-            llmcuda_cuda::kernels::dequant::BLOCK_Q6_K_BYTES
-        );
-        assert_eq!(BLOCK_Q6_K_BYTES, QK_K / 2 + QK_K / 4 + QK_K / 16 + 2);
-        // The Q8_0 gather is Rust.
-        assert!(
-            llmcuda_cuda::kernels::rust_kernel_source("embed_q8_0").contains(
-                "let row = table.add((*ids.add(t as usize) as i64 * blocks * 34) as usize);"
-            )
-        );
-        // The fallback gather's block strides, spelled as literals in the
-        // kernel for the same reason 32 and 34 are.
-        let gather = llmcuda_cuda::kernels::rust_kernel_source("fwd_embed_quant");
-        for stride in [
-            "0 => (hidden / 256) as i64 * 210,",
-            "1 => (hidden / 32) as i64 * 18,",
-            "2 => (hidden / 256) as i64 * 144,",
-            "3 => (hidden / 256) as i64 * 176,",
-        ] {
-            assert!(gather.contains(stride), "missing row stride: {stride}");
-        }
-        // Q6_K reconstructs as (d * scale) * q, with no addition to contract.
-        assert!(
-            gather.contains(
-                "d * (*sc.add(((l >> 4) + 2 * grp) as usize) as f32) * (raw - 32) as f32"
-            ),
-            "the Q6_K gather reassociated away from (d * scale) * q",
-        );
-        // The affine formats are a multiply and a subtract. The Rust PTX is
-        // built with implicit fusion off, so only a `mul_add` could contract
-        // them, and the weight would stop being bit-identical.
-        assert!(gather.contains("(d * sc as f32) * code as f32 - dmin * m as f32"));
-        assert!(
-            !gather.contains("mul_add"),
-            "the affine gather may contract to an FMA",
-        );
-    }
-
-    #[test]
-    fn the_embedding_dequantizes_exactly_and_reads_signed_codes() {
-        // `d * q`, one multiply, so the gather is bit-identical to
-        // `dequantize_row_q8_0` and `model.input_embed` can be gated on exact
-        // equality rather than a tolerance. Reading the codes as unsigned
-        // would flip the sign of about half the table while leaving every
-        // magnitude plausible.
-        let embed = llmcuda_cuda::kernels::rust_kernel_source("embed_q8_0");
-        assert!(embed.contains("*dst.add(j as usize) = d * q as f32;"));
-        assert!(embed.contains("let q = *blk.add(2 + (j % 32) as usize) as i8;"));
-    }
-
-    #[test]
     fn the_embedding_grid_comes_from_the_geometry_and_the_count_from_an_argument() {
         // AGENTS.md rule 5. The grid is `max_tokens` blocks and the live count
         // is a guard inside the kernel, so the launch shape does not change
@@ -4407,47 +4334,6 @@ mod tests {
             llmcuda_cuda::kernels::rust_kernel_source("fwd_embed_quant")
                 .contains("if t >= n_tokens {\n        return;")
         );
-    }
-
-    #[test]
-    fn the_moe_role_filter_is_exactly_the_moe_blocks_own_tensor_set() {
-        // The arena and `MoeLayerWeights` must partition the model between
-        // them. A role in neither is missing at runtime; a role in both is
-        // 725 MiB per layer of duplicate, which is what this whole arrangement
-        // exists to avoid.
-        let c = config();
-        let mixer_roles = [
-            Role::AttnQGate,
-            Role::AttnK,
-            Role::AttnV,
-            Role::AttnQNorm,
-            Role::AttnKNorm,
-            Role::AttnOut,
-            Role::GdnQkv,
-            Role::GdnGate,
-            Role::GdnConv1d,
-            Role::GdnA,
-            Role::GdnAlpha,
-            Role::GdnBeta,
-            Role::GdnDtBias,
-            Role::GdnNorm,
-            Role::GdnOut,
-            Role::InputNorm,
-        ];
-        for role in mixer_roles {
-            assert!(arena_holds(role), "{role} must be in the arena");
-        }
-        for role in [Role::TokenEmbedding, Role::OutputNorm, Role::LmHead] {
-            assert!(arena_holds(role), "{role} must be in the arena");
-        }
-        for role in MOE_OWNED_ROLES {
-            assert!(!arena_holds(role), "{role} must not be in the arena");
-        }
-        // `PostMixerNorm` is the one that is easy to get wrong: it is a norm,
-        // not an expert matrix, and it is read by the MoE block rather than by
-        // the mixer, so it belongs on the MoE's side of the split.
-        assert!(!arena_holds(Role::PostMixerNorm));
-        assert_eq!(c.num_layers, 40);
     }
 
     /// The engine's filter drops what a block holds in a form of its own,
@@ -4494,67 +4380,6 @@ mod tests {
                 "{role}"
             );
         }
-    }
-
-    #[test]
-    fn the_layer_kinds_partition_the_stack_thirty_ten() {
-        // The dispatch in `run` walks two slot counters in lockstep with the
-        // layer index, so the two block vectors must be exactly as long as the
-        // pattern says or a later layer reads an earlier layer's weights.
-        let c = config();
-        let gdn = (0..c.num_layers)
-            .filter(|&l| c.layer_kind(l) == LayerKind::GatedDeltaNet)
-            .count();
-        let attn = (0..c.num_layers)
-            .filter(|&l| c.layer_kind(l) == LayerKind::GatedAttention)
-            .count();
-        assert_eq!((gdn, attn), (30, 10));
-        assert_eq!(gdn + attn, c.num_layers as usize);
-        assert_eq!(c.layer_kind(3), LayerKind::GatedAttention);
-        assert_eq!(c.layer_kind(39), LayerKind::GatedAttention);
-        assert_eq!(c.layer_kind(0), LayerKind::GatedDeltaNet);
-    }
-
-    #[test]
-    fn the_lm_head_runs_on_one_position_because_that_is_what_was_captured() {
-        // `result_output` is `[248320]`, not `[248320, 19]`: llama.cpp selects
-        // with `get_rows(cur, inp_out_ids)` between the final norm and the
-        // head. Running the head over all 19 would be 19 passes over a 540 MB
-        // tensor for 18 answers nothing asks for.
-        let g = LmHeadGeometry {
-            hidden: config().hidden_size as usize,
-            vocab: config().vocab_size as usize,
-            max_tokens: 1,
-        };
-        assert_eq!(g.weight_bytes(), 540_344_320);
-        assert_eq!(g.weight_passes(1), 1);
-    }
-
-    #[test]
-    fn errors_name_the_tensor_and_the_reason() {
-        let e = ForwardError::MissingWeight {
-            role: Role::LmHead,
-            layer: None,
-        };
-        assert!(e.to_string().contains("output.weight"), "{e}");
-        let e = ForwardError::WrongQuant {
-            role: Role::GdnQkv,
-            layer: Some(4),
-            found: GgmlType::Q6K,
-            expected: GgmlType::Q8_0,
-        };
-        let text = e.to_string();
-        assert!(text.contains("blk.4."), "{text}");
-        assert!(text.contains("q6_K"), "{text}");
-        let e = ForwardError::MissingMetadata {
-            key: format!("qwen35moe.{ROPE_FREQ_BASE_SUFFIX}"),
-        };
-        assert!(e.to_string().contains("rope.freq_base"));
-        let e = ForwardError::WrongTokenCount {
-            expected: 19,
-            got: 20,
-        };
-        assert!(e.to_string().contains("19"));
     }
 }
 

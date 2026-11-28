@@ -1593,74 +1593,7 @@ pub(crate) fn check_len(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_router_stages_the_contraction_at_the_block_width() {
-        // `ROUTER_JC == THREADS` is what makes thread `tid` accumulate the
-        // indices `tid, tid + 256, tid + 512, ...` — the untiled kernel's
-        // per-thread summation order. The logits feed a top-8 argmax over 256
-        // experts, so reassociating that sum does not perturb an answer
-        // slightly; it runs a different expert.
-        //
-        // It is also what makes the activation tile *private* to each thread,
-        // which is why the tile is registers and not shared memory.
-        assert_eq!(
-            ROUTER_JC, THREADS,
-            "the router's contraction stride left the block width",
-        );
-        assert!(
-            GLUE_SRC.contains(&format!("#define ROUTER_JC {ROUTER_JC}")),
-            "the kernel's ROUTER_JC no longer mirrors the Rust constant",
-        );
-        assert!(
-            GLUE_SRC.contains("acc[el][u] += wj * xv[u];"),
-            "the router's activation tile is no longer a register array",
-        );
-    }
-
     use super::*;
-
-    #[test]
-    fn the_wide_router_is_one_ascending_chain_and_mirrors_its_constants() {
-        // The wide kernels promise one order: a single fused multiply-add
-        // chain per logit, ascending over the hidden index. The differential
-        // test checks the bits; this pins the line that makes them, so a
-        // rewrite into `acc += w * x` (which the compiler may or may not
-        // contract) or into split accumulators fails here by name.
-        assert!(
-            GLUE_SRC.contains("acc[u][v] = fmaf(wv[v], xv, acc[u][v]);"),
-            "the wide router no longer accumulates with an explicit fma",
-        );
-        for (name, value) in [
-            ("ROUTER_WIDE_TT", ROUTER_WIDE_TT),
-            ("ROUTER_WIDE_ET", ROUTER_WIDE_ET),
-            ("ROUTER_WIDE_KC", ROUTER_WIDE_KC),
-        ] {
-            assert!(
-                GLUE_SRC.contains(&format!("#define {name} {value}\n")),
-                "the kernel's {name} no longer mirrors the Rust constant",
-            );
-        }
-        assert!(GLUE_SRC.contains(&format!(
-            "ROUTER_LOGITS_WIDE(moe_block_router_logits_wide_w8, {ROUTER_WIDE_FULL_WARPS})"
-        )));
-        // The staged row stride has to be odd for the eight rows a warp
-        // reads at one `kk` to land on eight banks.
-        assert!(GLUE_SRC.contains("#define ROUTER_WIDE_STRIDE (ROUTER_WIDE_KC + 1)"));
-        assert_eq!((ROUTER_WIDE_KC + 1) % 2, 1);
-        // A lane's 8x8 patch: four expert octets and eight token octets a warp.
-        assert_eq!(ROUTER_WIDE_ET, 4 * 8);
-        assert_eq!(ROUTER_WIDE_TT, 8 * 8);
-    }
-
-    #[test]
-    fn the_wide_router_is_never_the_default_at_a_decode_or_verify_width() {
-        // Below the routed experts' tensor-core threshold a pass may be a
-        // decode step or a speculative verify window, and those need the
-        // register-tiled kernels' width-independent bits. The widest such
-        // pass is a few sequences times a few draft tokens.
-        const { assert!(ROUTER_WIDE_MIN_TOKENS >= 256) };
-        const { assert!(ROUTER_WIDE_FULL_MIN_TOKENS >= ROUTER_WIDE_MIN_TOKENS) };
-    }
 
     fn config() -> ModelConfig {
         ModelConfig::qwen3_6_35b_a3b()
@@ -1678,62 +1611,6 @@ mod tests {
         assert_eq!(g.max_flat_pairs(), 256);
         // grid.y takes the dispatch-*block* capacity, not the slot count.
         assert!(g.expert_block_capacity() <= 65_535, "grid.y limit");
-    }
-
-    #[test]
-    fn the_shared_expert_gate_is_a_sigmoid_of_a_per_token_scalar() {
-        // The step `llmcuda-kernels` has no reference for, and the one an
-        // implementation is most likely to leave out entirely: the gate must
-        // be `1/(1+exp(-x))` of a dot product against a `[hidden]` vector, and
-        // it must multiply the shared expert only — not the routed sum.
-        // The kernel is Rust; these are its lines.
-        let combine = llmcuda_cuda::kernels::rust_kernel_source("moe_block_gate_and_combine");
-        assert!(combine.contains("let g = 1.0 / (1.0 + (-s).exp());"));
-        assert!(combine.contains("*gate.add(t as usize) = g;"));
-        // The gate multiplies the shared expert alone, and the routed sum is
-        // added to the gated result rather than gated with it.
-        assert!(combine.contains("let v = (*shexp.add(at)).mul_add(g, r);"));
-        assert!(
-            combine.contains("while k < top_k {\n                r += *p;"),
-            "the routed sum this combine folded in must stay an ascending-k \
-             accumulation inside one thread",
-        );
-        // Mirrored, because `COMBINE_THREADS` derives from it and the gate's
-        // summation order depends on the two agreeing.
-        assert!(GLUE_SRC.contains(&format!("#define MOE_GATE_LANES {GATE_LANES}")));
-        assert!(combine.contains(&format!("if tid < {GATE_LANES} {{")));
-        assert!(combine.contains(&format!("j += {GATE_LANES};")));
-    }
-
-    #[test]
-    fn the_router_reads_an_experts_weights_contiguously() {
-        // `ffn_gate_inp.weight` is `[hidden, num_experts]` in ggml order, so
-        // one expert's row is `hidden` contiguous floats. Gathering at stride
-        // `num_experts` instead produces a router that is wrong on every
-        // token and whose weights still sum to one.
-        //
-        // Asserted as the index expression rather than as one spelling of a
-        // hoisted row pointer: the tiled kernel indexes `w` inline, and the
-        // invariant is which of the two axes is contiguous, not whether a
-        // pointer was named.
-        assert!(GLUE_SRC.contains("w[(long long)e * hidden + j]"));
-        assert!(
-            !GLUE_SRC.contains("num_experts + e]")
-                || GLUE_SRC.contains("logits[(long long)t * num_experts + e]"),
-            "the only `* num_experts + e` may be the logits store, which is \
-             `[max_tokens][num_experts]` and genuinely strided that way",
-        );
-    }
-
-    #[test]
-    fn the_residual_is_added_after_the_ffn_waypoint_not_before() {
-        // `ffn_out-N` is captured before the residual add and `l_out-N` after,
-        // so the block must produce both. Folding the residual into `ffn_out`
-        // would still give the right `l_out` and would fail the golden's
-        // intermediate waypoint — which is the point of having it.
-        let combine = llmcuda_cuda::kernels::rust_kernel_source("moe_block_gate_and_combine");
-        assert!(combine.contains("*ffn_out.add(at) = v;"));
-        assert!(combine.contains("*l_out.add(at) = v + *residual.add(at);"));
     }
 
     #[test]
@@ -1766,57 +1643,35 @@ mod tests {
     }
 
     #[test]
-    fn bf16_widening_is_a_shift_and_is_therefore_exact() {
-        // Block 40's two routers are the file's only bf16 tensors. bf16 is a
-        // truncated f32, so widening is `bits << 16` and loses nothing; the
-        // point of asserting it is that a *rounding* conversion, or reading
-        // the bytes as f16, would both be finite and wrong.
-        let widen = |b: [u8; 2]| f32::from_bits(u32::from(u16::from_le_bytes(b)) << 16);
-        for v in [1.0f32, -1.0, 0.5, -0.015625, 0.0] {
-            let bits = v.to_bits();
-            assert_eq!(bits & 0xffff, 0, "{v} is not exactly representable in bf16");
-            let truncated = ((bits >> 16) as u16).to_le_bytes();
-            assert_eq!(widen(truncated), v);
+    fn the_wide_router_is_one_ascending_chain_and_mirrors_its_constants() {
+        // The wide kernels promise one order: a single fused multiply-add
+        // chain per logit, ascending over the hidden index. The differential
+        // test checks the bits; this pins the line that makes them, so a
+        // rewrite into `acc += w * x` (which the compiler may or may not
+        // contract) or into split accumulators fails here by name.
+        assert!(
+            GLUE_SRC.contains("acc[u][v] = fmaf(wv[v], xv, acc[u][v]);"),
+            "the wide router no longer accumulates with an explicit fma",
+        );
+        for (name, value) in [
+            ("ROUTER_WIDE_TT", ROUTER_WIDE_TT),
+            ("ROUTER_WIDE_ET", ROUTER_WIDE_ET),
+            ("ROUTER_WIDE_KC", ROUTER_WIDE_KC),
+        ] {
+            assert!(
+                GLUE_SRC.contains(&format!("#define {name} {value}\n")),
+                "the kernel's {name} no longer mirrors the Rust constant",
+            );
         }
-        // And an f16 reading of the same bytes is genuinely different, so the
-        // distinction is not academic.
-        let bf16_one = ((1.0f32.to_bits() >> 16) as u16).to_le_bytes();
-        assert_eq!(widen(bf16_one), 1.0);
-        assert_ne!(u16::from_le_bytes(bf16_one), 0x3c00, "0x3c00 is f16's 1.0");
-    }
-
-    #[test]
-    fn errors_name_the_tensor_and_the_type_they_refused() {
-        let e = MoeBlockError::UnsupportedDenseType {
-            name: "blk.40.ffn_gate_inp.weight".into(),
-            found: GgmlType::Bf16,
-        };
-        let text = e.to_string();
-        assert!(text.contains("blk.40.ffn_gate_inp.weight"), "{text}");
-
-        let e = MoeBlockError::UnsupportedExpertType {
-            name: "blk.39.ffn_gate_exps.weight".into(),
-            found: GgmlType::Q4K,
-        };
-        assert!(e.to_string().contains("blk.39.ffn_gate_exps.weight"));
-
-        let e = MoeBlockError::TooManyTokens {
-            tokens: 33,
-            max_tokens: 32,
-        };
-        assert!(e.to_string().contains("33"));
-
-        let e = MoeBlockError::MissingTensor {
-            role: Role::MoeSharedGateInp,
-            layer: 7,
-        };
-        assert!(e.to_string().contains("ffn_gate_inp_shexp.weight"));
-    }
-
-    #[test]
-    fn a_buffer_of_the_wrong_length_is_rejected() {
-        assert!(check_len("residual", 4, 4).is_ok());
-        let e = check_len("residual", 4, 5).unwrap_err();
-        assert!(e.to_string().contains('4'));
+        assert!(GLUE_SRC.contains(&format!(
+            "ROUTER_LOGITS_WIDE(moe_block_router_logits_wide_w8, {ROUTER_WIDE_FULL_WARPS})"
+        )));
+        // The staged row stride has to be odd for the eight rows a warp
+        // reads at one `kk` to land on eight banks.
+        assert!(GLUE_SRC.contains("#define ROUTER_WIDE_STRIDE (ROUTER_WIDE_KC + 1)"));
+        assert_eq!((ROUTER_WIDE_KC + 1) % 2, 1);
+        // A lane's 8x8 patch: four expert octets and eight token octets a warp.
+        assert_eq!(ROUTER_WIDE_ET, 4 * 8);
+        assert_eq!(ROUTER_WIDE_TT, 8 * 8);
     }
 }

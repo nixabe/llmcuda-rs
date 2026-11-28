@@ -68,9 +68,3 @@ pub(crate) unsafe fn subslice<T>(
     // into the middle of (or the whole of) `base`'s allocation.
     ManuallyDrop::new(unsafe { stream.upgrade_device_ptr::<T>(ptr + byte_offset, len) })
 }
-
-#[cfg(test)]
-mod tests {
-    // Exercised end-to-end by `tests/batch_decode.rs`, which needs a device;
-    // there is nothing to check about pointer arithmetic without one.
-}

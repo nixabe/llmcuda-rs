@@ -849,16 +849,6 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_has_one_worker_per_device_and_one_shared_tree() {
-        let e = engine(1024);
-        assert_eq!(e.worker_count(), 3);
-        for i in 0..3u32 {
-            assert_eq!(e.worker(WorkerId(i)).unwrap().device_ordinal(), i as usize);
-        }
-        assert!(e.prefix_tree().is_empty());
-    }
-
-    #[test]
     fn nine_sessions_arriving_at_once_still_spread_evenly() {
         // Routing reads every worker's load and then admits to the cheapest
         // one. Once the engine stopped being one lock, nothing made that

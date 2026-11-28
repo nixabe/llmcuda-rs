@@ -111,14 +111,6 @@ impl CacheConfig {
         self.model.gdn_state_bytes_per_sequence()
     }
 
-    /// How many attention blocks span one retention interval.
-    ///
-    /// `gdn_retention_interval` is validated at construction to be a
-    /// multiple of `attention_block_size`, so this divides evenly.
-    pub fn attention_blocks_per_retention_interval(&self) -> u32 {
-        self.gdn_retention_interval / self.attention_block_size
-    }
-
     /// Largest retention boundary at or below `matched_tokens`.
     ///
     /// This is the truncation rule from AGENTS.md rule 2: a matched prefix
@@ -170,13 +162,6 @@ impl CapacityReport {
     /// is intentionally no analogous single figure spanning both groups.
     pub fn attention_token_capacity(&self) -> u64 {
         u64::from(self.attention_free_blocks) * u64::from(self.attention_block_size)
-    }
-
-    /// Fixed bytes reserved if one more sequence needs a live GDN state slot
-    /// or one more retained snapshot. Constant regardless of how long that
-    /// sequence's attention context is.
-    pub fn gdn_bytes_per_additional_slot(&self) -> u64 {
-        self.gdn_bytes_per_slot
     }
 }
 

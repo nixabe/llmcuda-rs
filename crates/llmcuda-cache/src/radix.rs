@@ -256,10 +256,6 @@ impl RadixTree {
         }
     }
 
-    pub fn is_pinned(&self, hash: BlockHash) -> bool {
-        self.inner.read().nodes.get(&hash).is_some_and(|n| n.pinned)
-    }
-
     pub fn ref_count(&self, hash: BlockHash) -> u32 {
         self.inner
             .read()
@@ -293,8 +289,7 @@ impl RadixTree {
     /// This does a linear scan over all nodes per evicted block, which is
     /// adequate for a maintenance operation triggered when a pool runs low,
     /// but is not the hot path (allocation/free on the block pools is; see
-    /// [`crate::pool::BlockPool`]). Not benchmarked at scale — see the
-    /// crate's top-level report for what was and wasn't measured.
+    /// [`crate::pool::BlockPool`]). Not benchmarked at scale.
     pub fn evict_unreferenced(&self, max_nodes: usize) -> Vec<BlockId> {
         self.evict_unreferenced_entries(max_nodes)
             .into_iter()

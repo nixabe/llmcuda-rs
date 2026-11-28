@@ -1088,6 +1088,256 @@ extern "C" __global__ void __launch_bounds__(32) ink_attn_mma(
     }
 }
 
+// Decode attention on the tensor cores: one row's next position against
+// its own cache, every query head of a key-value head in one walk.
+//
+// The heads of a group read the same keys and values, so a warp holds the
+// group's queries as the rows of the A operand and each key and value is
+// loaded once for all of them; a block a query head read the cache once a
+// head. A query's hi and lo binary16 parts are rows g and g + 8 of one
+// product rather than two products, and so are a probability's: half the
+// MMAs of `ink_attn_mma` for the same hi + lo sums, the two parts added in
+// fp32 at the end. The operand orders are that kernel's.
+//
+// A (key-value head, row) is cut into gridDim.z * warps contiguous spans of
+// the visible keys, a warp a span, each at least `min_keys` long, so the
+// warps of a deep cache stream in parallel and a shallow one does not pay
+// for spans it has no keys for. A warp writes an unnormalized partial for
+// `ink_dec_attn_merge`, per head: `[max logit, sum exp(logit - max), dim
+// sums of exp(logit - max) * value]`, the sink's logit already subtracted.
+//
+// head_dim is 128, sixteen relative features, at most eight heads a group.
+//
+// grid: (kv_heads, rows, Z), a multiple of 32 threads.
+extern "C" __global__ void __launch_bounds__(128) ink_dec_attn_mma(
+    const float* __restrict__ proj, const unsigned long long* __restrict__ ptrs,
+    const int* __restrict__ pos, const float* __restrict__ q_clip,
+    const float* __restrict__ rel_clip, const float* __restrict__ rel_bias,
+    float* __restrict__ part,
+    int ldo, int q_off, int rel_off, int sink_off, int heads, int kv_heads,
+    int window, int extent, float qk_clip, float rel_bound, float alpha, float floor_at,
+    int mask, int min_keys
+) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int warps = blockDim.x >> 5;
+    const int z = blockIdx.z * warps + (threadIdx.x >> 5), nz = gridDim.z * warps;
+    const int kv = blockIdx.x, row = blockIdx.y;
+    const int group = heads / kv_heads;
+    const int h = kv * group + g;
+    const bool ok = g < group;
+    const long long stride = (long long)kv_heads * 128;
+    const float lowest = -1.0e30f;
+
+    const int p = pos[row];
+    const int lo = (window > 0 && p + 1 > window) ? p + 1 - window : 0;
+    const int lo8 = lo & ~7;
+    int len = (p + 1 - lo8 + nz - 1) / nz;
+    len = (max(len, min_keys) + 7) & ~7;
+    const long long first_ll = (long long)lo8 + (long long)z * len;
+    float* result = part + (((long long)row * heads + h) * nz + z) * 130;
+    if (first_ll > p) {
+        if (ok) {
+#pragma unroll
+            for (int i = 0; i < 32; ++i) result[2 + 32 * t + i] = 0.0f;
+            if (t == 0) {
+                result[0] = lowest;
+                result[1] = 0.0f;
+            }
+        }
+        return;
+    }
+    const int first = (int)first_ll;
+    const int last = min(p, first + len - 1);
+
+    const float* prow = proj + (long long)row * ldo;
+    const float tau =
+        alpha >= 0.0f ? 1.0f + alpha * logf(fmaxf((float)(p + 1) / floor_at, 1.0f)) : 1.0f;
+    // Row g of the A operand is the head's hi parts, row g + 8 its lo.
+    unsigned qh[16], ql[16];
+    float rf[16];
+    float sink = 0.0f;
+    {
+        float qv[32];
+        float ss = 0.0f, rs = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) qv[i] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) rf[i] = 0.0f;
+        if (ok) {
+            const float* qr = prow + q_off + h * 128 + 32 * t;
+            const float* qc = q_clip + h * 128 + 32 * t;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                qv[i] = qr[i] * qc[i];
+                ss = fmaf(qv[i], qv[i], ss);
+            }
+            const float* rr = prow + rel_off + h * 16;
+            const float* rc = rel_clip + h * 16;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                rf[i] = rr[i] * rc[i];
+                rs = fmaf(rf[i], rf[i], rs);
+            }
+            sink = prow[sink_off + h];
+        }
+        ss += __shfl_xor_sync(0xffffffff, ss, 1);
+        ss += __shfl_xor_sync(0xffffffff, ss, 2);
+        const float qf = fminf(qk_clip / (sqrtf(ss) + 1e-6f), 1.0f) * tau;
+        const float rfac = fminf(rel_bound / (sqrtf(rs) + 1e-6f), 1.0f) * tau;
+#pragma unroll
+        for (int s = 0; s < 16; ++s) am_split2(qv[2 * s] * qf, qv[2 * s + 1] * qf, qh[s], ql[s]);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) rf[i] *= rfac;
+    }
+    const unsigned short* k_cache = (const unsigned short*)ptrs[row * 6];
+    const unsigned short* v_cache = (const unsigned short*)ptrs[row * 6 + 1];
+    const float scale = 0.08838834764831845f;
+
+    float acc[16][4];
+#pragma unroll
+    for (int m = 0; m < 16; ++m)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[m][i] = 0.0f;
+    float top = lowest, total = 0.0f;
+
+    for (int j0 = first; j0 <= last; j0 += 8) {
+        float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const int jk = j0 + g;
+        uint4 k0 = make_uint4(0, 0, 0, 0), k1 = k0, k2 = k0, k3 = k0;
+        if (jk <= last) {
+            const uint4* kp =
+                (const uint4*)(k_cache + (long long)(jk & mask) * stride + kv * 128 + 32 * t);
+            k0 = kp[0];
+            k1 = kp[1];
+            k2 = kp[2];
+            k3 = kp[3];
+        }
+        const unsigned kw[16] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w,
+                                 k2.x, k2.y, k2.z, k2.w, k3.x, k3.y, k3.z, k3.w};
+#pragma unroll
+        for (int s = 0; s < 16; ++s) am_mma(c, qh[s], ql[s], kw[s]);
+
+        // c[0], c[1]: the head against keys j0 + 2t and j0 + 2t + 1, hi
+        // parts; c[2], c[3] the lo parts.
+        const int jv = j0 + 2 * t;
+        float s[2];
+        bool live[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int j = jv + i;
+            live[i] = ok && j <= p && j >= lo;
+            float bias = 0.0f;
+            if (live[i] && p - j < extent) {
+                const float* br = rel_bias + (long long)(p - j) * 16;
+#pragma unroll
+                for (int f = 0; f < 16; ++f) bias = fmaf(br[f], rf[f], bias);
+            }
+            s[i] = live[i] ? (c[i] + c[2 + i]) * scale + bias - sink : lowest;
+        }
+        float x = fmaxf(s[0], s[1]);
+        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, 1));
+        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, 2));
+        const float now = fmaxf(top, x);
+        if (now != top) {
+            const float f = __expf(top - now);
+            total *= f;
+#pragma unroll
+            for (int m = 0; m < 16; ++m) {
+                acc[m][0] *= f;
+                acc[m][1] *= f;
+                acc[m][2] *= f;
+                acc[m][3] *= f;
+            }
+            top = now;
+        }
+        const float p0 = live[0] ? __expf(s[0] - now) : 0.0f;
+        const float p1 = live[1] ? __expf(s[1] - now) : 0.0f;
+        total += p0 + p1;
+        unsigned a0, a1;
+        am_split2(p0, p1, a0, a1);
+
+        // Values of keys jv and jv + 1, dims [16g, 16g + 16).
+        unsigned wa[8], wb[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            wa[i] = 0u;
+            wb[i] = 0u;
+        }
+        if (jv <= last) {
+            const uint4* vp =
+                (const uint4*)(v_cache + (long long)(jv & mask) * stride + kv * 128 + 16 * g);
+            const uint4 v0 = vp[0], v1 = vp[1];
+            wa[0] = v0.x; wa[1] = v0.y; wa[2] = v0.z; wa[3] = v0.w;
+            wa[4] = v1.x; wa[5] = v1.y; wa[6] = v1.z; wa[7] = v1.w;
+        }
+        if (jv + 1 <= last) {
+            const uint4* vp = (const uint4*)(v_cache + (long long)((jv + 1) & mask) * stride +
+                                             kv * 128 + 16 * g);
+            const uint4 v0 = vp[0], v1 = vp[1];
+            wb[0] = v0.x; wb[1] = v0.y; wb[2] = v0.z; wb[3] = v0.w;
+            wb[4] = v1.x; wb[5] = v1.y; wb[6] = v1.z; wb[7] = v1.w;
+        }
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            const int sh = 16 * (m & 1);
+            const unsigned b = ((wa[m >> 1] >> sh) & 0xffffu) | (((wb[m >> 1] >> sh) & 0xffffu) << 16);
+            am_mma(acc[m], a0, a1, b);
+        }
+    }
+
+    total += __shfl_xor_sync(0xffffffff, total, 1);
+    total += __shfl_xor_sync(0xffffffff, total, 2);
+    // acc[m]: columns 2t and 2t + 1 of product m, dims 32t + m and
+    // 32t + 16 + m; the hi row's sums, then the lo row's.
+    if (ok) {
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            result[2 + 32 * t + m] = acc[m][0] + acc[m][2];
+            result[2 + 32 * t + 16 + m] = acc[m][1] + acc[m][3];
+        }
+        if (t == 0) {
+            result[0] = top;
+            result[1] = total;
+        }
+    }
+}
+
+// The partials of `ink_dec_attn_mma` joined, as `ink_dec_attn_merge` joins
+// them - the sink (weight one at logit zero), the normalization, the
+// output gate, binary16 out - but over the spans that hold keys only: the
+// span length is recomputed from the row's position, and a shallow row of
+// a full-attention layer has a few live spans of the grid's many.
+//
+// grid: (heads, rows), 128 threads.
+extern "C" __global__ void __launch_bounds__(128) ink_dec_attn_merge_live(
+    const float* __restrict__ part, const float* __restrict__ proj,
+    const int* __restrict__ pos, unsigned short* __restrict__ out,
+    int ldo, int gate_off, int nz, int window, int min_keys
+) {
+    const int tid = threadIdx.x, h = blockIdx.x, row = blockIdx.y, heads = gridDim.x;
+    const int p = pos[row];
+    const int lo = (window > 0 && p + 1 > window) ? p + 1 - window : 0;
+    const int span = p + 1 - (lo & ~7);
+    int len = (span + nz - 1) / nz;
+    len = (max(len, min_keys) + 7) & ~7;
+    const int live = min(nz, (span + len - 1) / len);
+    const float* base = part + ((long long)row * heads + h) * nz * 130;
+    float top = 0.0f;
+    for (int z = 0; z < live; ++z) top = fmaxf(top, base[z * 130]);
+    float total = expf(-top), acc = 0.0f;
+    for (int z = 0; z < live; ++z) {
+        const float* b = base + z * 130;
+        const float w = expf(b[0] - top);
+        total = fmaf(b[1], w, total);
+        acc = fmaf(b[2 + tid], w, acc);
+    }
+    const float gate = proj[(long long)row * ldo + gate_off + h * 128 + tid];
+    const float y = acc / total / (1.0f + expf(-gate));
+    unsigned short half;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(half) : "f"(y));
+    out[((long long)row * heads + h) * 128 + tid] = half;
+}
+
 // out[t][j] = sum_i w[j][i] * x[t][i] in fp32, ascending i, each product
 // fused into the running sum: ink_linear's sums exactly, eight rows of x a
 // block. A thread owns one output j and reads its weight row once for the
@@ -1792,8 +2042,29 @@ impl DecodeGemm {
 /// then the key, value, attention-output and feed-forward carries.
 pub const DEC_ROW_POINTERS: usize = 6;
 
-/// The most blocks one (head, row) of decode attention is split over.
-pub const DEC_ATTN_PARTS: usize = 8;
+/// The most partials one (head, row) of decode attention is split over.
+pub const DEC_ATTN_PARTS: usize = 128;
+
+/// Blocks a (head, row) of the scalar decode attention is split over.
+const DEC_ATTN_SCALAR_PARTS: usize = 8;
+
+/// Spans a (key-value head, row) of a sliding layer is cut into on the
+/// tensor-core path, and the fewest keys a span holds.
+const DEC_ATTN_SLIDING: (usize, i32) = (16, 64);
+
+/// The fewest keys a span of a full-attention layer holds.
+const DEC_ATTN_FULL_MIN_KEYS: i32 = 128;
+
+/// Which decode attention kernel runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeAttention {
+    /// A block a query head, fp32 scalar products.
+    Scalar,
+    /// Tensor cores on the layers that attend over everything.
+    MmaFull,
+    /// Tensor cores on every layer.
+    Mma,
+}
 
 /// The fused decode glue (`device-kernels/src/inkling_decode.rs`): what a
 /// layer does between its GEMMs when every row is the next position of its
@@ -1803,6 +2074,9 @@ pub struct InklingDecodeKernels {
     inputs: CudaFunction,
     kv: CudaFunction,
     attn: CudaFunction,
+    attn_mma: CudaFunction,
+    attn_merge_live: CudaFunction,
+    attn_mode: core::sync::atomic::AtomicU8,
     attn_merge: CudaFunction,
     commit: CudaFunction,
     ffn_in: CudaFunction,
@@ -1875,7 +2149,14 @@ impl InklingDecodeKernels {
     /// Load the entry points.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, InklingError> {
         let m = ctx.load_module(cudarc::nvrtc::Ptx::from_src(super::RUST_KERNELS_PTX))?;
+        let mma = ctx.load_module(
+            super::compile(ATTN_MMA_SRC, "inkling attention")
+                .map_err(|_| InklingError::Shape("the attention kernel failed to compile"))?,
+        )?;
         Ok(Self {
+            attn_mma: mma.load_function("ink_dec_attn_mma")?,
+            attn_merge_live: mma.load_function("ink_dec_attn_merge_live")?,
+            attn_mode: core::sync::atomic::AtomicU8::new(DecodeAttention::Mma as u8),
             inputs: m.load_function("ink_dec_inputs")?,
             kv: m.load_function("ink_dec_kv")?,
             attn: m.load_function("ink_dec_attn")?,
@@ -2161,6 +2442,12 @@ impl InklingDecodeKernels {
         Ok(())
     }
 
+    /// Choose the decode attention kernel. For A/B measurement and tests.
+    pub fn use_decode_attention(&self, which: DecodeAttention) {
+        self.attn_mode
+            .store(which as u8, core::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Attention of every row over its cache, clips and output gate
     /// included; `out` is binary16 `[rows][heads][dim]`. `log` is the
     /// logarithmic position scale of a full-attention layer.
@@ -2200,12 +2487,20 @@ impl InklingDecodeKernels {
         need("dec attn rel_clip", rel_clip.len(), heads * n_rel)?;
         need("dec attn rel_bias", rel_bias.len(), extent * n_rel)?;
         need("dec attn out", out.len(), rows * heads * dim)?;
-        // A block a 256-position chunk of a sliding window; a full layer's
-        // span has no bound, so its blocks take every eighth chunk each.
-        let nz = if window > 0 {
-            window.div_ceil(256).min(DEC_ATTN_PARTS)
-        } else {
-            DEC_ATTN_PARTS
+        let mode = self.attn_mode.load(core::sync::atomic::Ordering::Relaxed);
+        let mma = dim == 128
+            && n_rel == 16
+            && heads / kv_heads <= 8
+            && (mode == DecodeAttention::Mma as u8
+                || (mode == DecodeAttention::MmaFull as u8 && window == 0));
+        // Scalar: a block a 256-position chunk of a sliding window; a full
+        // layer's span has no bound, so its blocks take every eighth chunk
+        // each. Tensor cores: a warp a span of the keys.
+        let (nz, min_keys) = match (mma, window > 0) {
+            (true, true) => DEC_ATTN_SLIDING,
+            (true, false) => (DEC_ATTN_PARTS, DEC_ATTN_FULL_MIN_KEYS),
+            (false, true) => (window.div_ceil(256).min(DEC_ATTN_SCALAR_PARTS), 0),
+            (false, false) => (DEC_ATTN_SCALAR_PARTS, 0),
         };
         need("dec attn part", part.len(), rows * heads * nz * (dim + 2))?;
         let (kv, d, nr, w, e) = (
@@ -2216,30 +2511,75 @@ impl InklingDecodeKernels {
             extent as i32,
         );
         let (alpha, floor) = log.unwrap_or((-1.0, 1.0));
-        let mut b = stream.launch_builder(&self.attn);
-        b.arg(proj)
-            .arg(ptrs)
-            .arg(pos)
-            .arg(q_clip)
-            .arg(rel_clip)
-            .arg(rel_bias)
-            .arg(&mut *part)
-            .arg(&o.ldo)
-            .arg(&o.q)
-            .arg(&o.rel)
-            .arg(&o.sink)
-            .arg(&kv)
-            .arg(&d)
-            .arg(&nr)
-            .arg(&w)
-            .arg(&e)
-            .arg(&qk_clip)
-            .arg(&rel_bound)
-            .arg(&alpha)
-            .arg(&floor)
-            .arg(&mask);
-        // SAFETY: lengths checked; caches reached through the pointer table.
-        unsafe { b.launch(cfg((heads, rows, nz), 256, 0)) }?;
+        if mma {
+            let h = heads as i32;
+            let mut b = stream.launch_builder(&self.attn_mma);
+            b.arg(proj)
+                .arg(ptrs)
+                .arg(pos)
+                .arg(q_clip)
+                .arg(rel_clip)
+                .arg(rel_bias)
+                .arg(&mut *part)
+                .arg(&o.ldo)
+                .arg(&o.q)
+                .arg(&o.rel)
+                .arg(&o.sink)
+                .arg(&h)
+                .arg(&kv)
+                .arg(&w)
+                .arg(&e)
+                .arg(&qk_clip)
+                .arg(&rel_bound)
+                .arg(&alpha)
+                .arg(&floor)
+                .arg(&mask)
+                .arg(&min_keys);
+            // SAFETY: lengths checked; caches reached through the pointer
+            // table; a warp a partial, `nz` of them a (head, row).
+            unsafe { b.launch(cfg((kv_heads, rows, nz), 32, 0)) }?;
+            let nz = nz as i32;
+            let mut b = stream.launch_builder(&self.attn_merge_live);
+            b.arg(&*part)
+                .arg(proj)
+                .arg(pos)
+                .arg(&mut *out)
+                .arg(&o.ldo)
+                .arg(&o.gate)
+                .arg(&nz)
+                .arg(&w)
+                .arg(&min_keys);
+            // SAFETY: part was just written for this grid; out
+            // length-checked.
+            unsafe { b.launch(cfg((heads, rows, 1), 128, 0)) }?;
+            return Ok(());
+        } else {
+            let mut b = stream.launch_builder(&self.attn);
+            b.arg(proj)
+                .arg(ptrs)
+                .arg(pos)
+                .arg(q_clip)
+                .arg(rel_clip)
+                .arg(rel_bias)
+                .arg(&mut *part)
+                .arg(&o.ldo)
+                .arg(&o.q)
+                .arg(&o.rel)
+                .arg(&o.sink)
+                .arg(&kv)
+                .arg(&d)
+                .arg(&nr)
+                .arg(&w)
+                .arg(&e)
+                .arg(&qk_clip)
+                .arg(&rel_bound)
+                .arg(&alpha)
+                .arg(&floor)
+                .arg(&mask);
+            // SAFETY: lengths checked; caches reached through the pointer
+            // table.
+            unsafe { b.launch(cfg((heads, rows, nz), 256, 0)) }?;
+        }
         let nz = nz as i32;
         let mut b = stream.launch_builder(&self.attn_merge);
         b.arg(&*part)

@@ -6,7 +6,10 @@
 //! `LLMCUDA_BENCH_CHUNK` cuts each sequence's prefill into chunks of that
 //! many tokens (default: the whole prompt in one pass). Wall-clock around
 //! whole passes with the stream synchronized; the first row of each width
-//! is a warm-up and is reported as such. `LLMCUDA_PROFILE=1` adds a
+//! is a warm-up and is reported as such; `LLMCUDA_BENCH_ROUNDS` (default 3)
+//! counts it. `LLMCUDA_INK_DEC_ATTN=scalar|full` puts decode attention back
+//! on the scalar kernel, everywhere or on the sliding layers only.
+//! `LLMCUDA_PROFILE=1` adds a
 //! per-stage breakdown, synchronizing at every stage boundary; its totals
 //! are not the throughput.
 use std::sync::Arc;
@@ -86,13 +89,26 @@ fn run(args: &[String]) -> Result<()> {
         );
         let profiling = std::env::var_os("LLMCUDA_PROFILE").is_some();
         model.use_reference_kernels(std::env::var_os("LLMCUDA_INK_REFERENCE").is_some());
+        {
+            use llmcuda_cuda::kernels::inkling::DecodeAttention;
+            match std::env::var("LLMCUDA_INK_DEC_ATTN").as_deref() {
+                Ok("scalar") => model.use_decode_attention(DecodeAttention::Scalar),
+                Ok("full") => model.use_decode_attention(DecodeAttention::MmaFull),
+                _ => model.use_decode_attention(DecodeAttention::Mma),
+            }
+        }
         if profiling {
             decode.enable_profiling();
             for (_, pass) in &mut prefill {
                 pass.enable_profiling();
             }
         }
-        for round in 0..3 {
+        let rounds: usize = std::env::var("LLMCUDA_BENCH_ROUNDS")
+            .ok()
+            .map(|s| s.parse())
+            .transpose()?
+            .unwrap_or(3);
+        for round in 0..rounds {
             for s in &mut states {
                 s.reset(&stream)?;
             }

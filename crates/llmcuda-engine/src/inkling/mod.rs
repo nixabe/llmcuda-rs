@@ -525,6 +525,11 @@ impl InklingModel {
         self.kernels.use_reference_kernels(on);
     }
 
+    /// Choose the decode attention kernel. For A/B measurement and tests.
+    pub fn use_decode_attention(&self, which: llmcuda_cuda::kernels::inkling::DecodeAttention) {
+        self.dec.use_decode_attention(which);
+    }
+
     /// Bytes of weights resident on the device.
     pub fn weight_bytes(&self) -> usize {
         self.weight_bytes

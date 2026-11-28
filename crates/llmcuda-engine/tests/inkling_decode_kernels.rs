@@ -14,7 +14,8 @@ use std::sync::Arc;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
 use llmcuda_cuda::device::driver_available;
 use llmcuda_cuda::kernels::inkling::{
-    ControlWeights, DEC_ATTN_PARTS, DEC_ROW_POINTERS, InklingDecodeKernels, ProjOffsets,
+    ControlWeights, DEC_ATTN_PARTS, DEC_ROW_POINTERS, DecodeAttention, InklingDecodeKernels,
+    ProjOffsets,
 };
 use llmcuda_kernels::inkling as reference;
 use llmcuda_kernels::rng::Xorshift64Star;
@@ -78,201 +79,210 @@ fn decode_attention_matches_an_f64_oracle_past_the_window_and_the_chunk() {
     let kernels = InklingDecodeKernels::new(&ctx).expect("kernels load");
     let (heads, kv_heads, dim, n_rel) = (6usize, 2usize, 128usize, 16usize);
     let (qk_clip, rel_bound) = (22.627f32, 8.0f32);
-    let mut rng = Xorshift64Star::new(0xdeca77);
+    for mode in [DecodeAttention::Scalar, DecodeAttention::Mma] {
+        kernels.use_decode_attention(mode);
+        let mut rng = Xorshift64Star::new(0xdeca77);
 
-    // (positions of the rows, window, extent, log scale)
-    let cases: [AttentionCase; 7] = [
-        // Sliding: one row before the window fills, one a chunk deep, one
-        // past the window with four chunks to scan.
-        (&[5, 300, 1500], 1024, 1024, None, None),
-        // A window shorter than a chunk, cut mid-chunk.
-        (&[0, 255, 256, 700], 100, 100, None, None),
-        // Full attention with the position scale on (a floor small enough
-        // that tau > 1 here) and a bias table shorter than the reach.
-        (&[3, 64, 900], 0, 64, Some((0.1, 8.0)), None),
-        // One row, exactly one full chunk.
-        (&[255], 0, 1024, Some((0.1, 8192.0)), None),
-        // Full attention deeper than one chunk a block: 2,049, 2,304 and
-        // 5,000 positions are 9, 9 and 20 chunks over eight blocks, the
-        // first two with a one-position and a whole last chunk.
-        (&[2048, 2303, 4999], 0, 1024, Some((0.1, 512.0)), None),
-        // Ring caches: one row not yet round the ring, two that are, one of
-        // them with its window straddling the ring's end.
-        (&[700, 3000, 5000], 1024, 1024, None, Some(2048)),
-        (&[127, 128, 300], 100, 100, None, Some(128)),
-    ];
-    for (positions, window, extent, log, ring) in cases {
-        let rows = positions.len();
-        let o = ProjOffsets {
-            ldo: (2 * heads * dim + heads * n_rel + heads) as i32,
-            q: 0,
-            rel: (heads * dim) as i32,
-            sink: (heads * dim + heads * n_rel) as i32,
-            gate: (heads * dim + heads * n_rel + heads) as i32,
-            k: 0,
-            v: 0,
-            k_taps: -1,
-            v_taps: -1,
-        };
-        let ldo = o.ldo as usize;
-        let proj = rng.vec_f32(rows * ldo, -3.0, 3.0);
-        let q_clip = rng.vec_f32(heads * dim, 0.5, 1.5);
-        let rel_clip = rng.vec_f32(heads * n_rel, 0.5, 4.0);
-        let rel_bias = rng.vec_f32(extent * n_rel, -0.4, 0.4);
+        // (positions of the rows, window, extent, log scale)
+        let cases: [AttentionCase; 9] = [
+            // Sliding: one row before the window fills, one a chunk deep, one
+            // past the window with four chunks to scan.
+            (&[5, 300, 1500], 1024, 1024, None, None),
+            // A window shorter than a chunk, cut mid-chunk.
+            (&[0, 255, 256, 700], 100, 100, None, None),
+            // Full attention with the position scale on (a floor small enough
+            // that tau > 1 here) and a bias table shorter than the reach.
+            (&[3, 64, 900], 0, 64, Some((0.1, 8.0)), None),
+            // One row, exactly one full chunk.
+            (&[255], 0, 1024, Some((0.1, 8192.0)), None),
+            // Full attention deeper than one chunk a block: 2,049, 2,304 and
+            // 5,000 positions are 9, 9 and 20 chunks over eight blocks, the
+            // first two with a one-position and a whole last chunk.
+            (&[2048, 2303, 4999], 0, 1024, Some((0.1, 512.0)), None),
+            // Ring caches: one row not yet round the ring, two that are, one of
+            // them with its window straddling the ring's end.
+            (&[700, 3000, 5000], 1024, 1024, None, Some(2048)),
+            (&[127, 128, 300], 100, 100, None, Some(128)),
+            // Deep enough that the tensor-core path's spans are longer than
+            // their floor: 40,000 positions over 128 spans, beside a row with
+            // one key and a row a span and one key deep.
+            (&[39999, 0, 256], 0, 1024, Some((0.1, 8192.0)), None),
+            // A window that does not start on a multiple of eight keys.
+            (&[1027, 1030, 9], 1024, 1024, None, Some(4096)),
+        ];
+        for (positions, window, extent, log, ring) in cases {
+            let rows = positions.len();
+            let o = ProjOffsets {
+                ldo: (2 * heads * dim + heads * n_rel + heads) as i32,
+                q: 0,
+                rel: (heads * dim) as i32,
+                sink: (heads * dim + heads * n_rel) as i32,
+                gate: (heads * dim + heads * n_rel + heads) as i32,
+                k: 0,
+                v: 0,
+                k_taps: -1,
+                v_taps: -1,
+            };
+            let ldo = o.ldo as usize;
+            let proj = rng.vec_f32(rows * ldo, -3.0, 3.0);
+            let q_clip = rng.vec_f32(heads * dim, 0.5, 1.5);
+            let rel_clip = rng.vec_f32(heads * n_rel, 0.5, 4.0);
+            let rel_bias = rng.vec_f32(extent * n_rel, -0.4, 0.4);
 
-        // Each row its own caches, as long as its position needs.
-        let mut caches: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
-        let mut device_caches: Vec<(CudaSlice<u16>, CudaSlice<u16>)> = Vec::new();
-        let mut ptrs = vec![0u64; rows * DEC_ROW_POINTERS];
-        for (t, &p) in positions.iter().enumerate() {
-            let len = (p + 1) * kv_heads * dim;
-            let k = to_half(&rng.vec_f32(len, -2.0, 2.0));
-            let v = to_half(&rng.vec_f32(len, -1.0, 1.0));
-            // The device sees position j at row j % ring, the last `ring`
-            // positions only; the oracle keeps the plain layout.
-            let on_device = |cache: &[u16]| -> Vec<u16> {
-                let Some(ring) = ring else {
-                    return cache.to_vec();
+            // Each row its own caches, as long as its position needs.
+            let mut caches: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
+            let mut device_caches: Vec<(CudaSlice<u16>, CudaSlice<u16>)> = Vec::new();
+            let mut ptrs = vec![0u64; rows * DEC_ROW_POINTERS];
+            for (t, &p) in positions.iter().enumerate() {
+                let len = (p + 1) * kv_heads * dim;
+                let k = to_half(&rng.vec_f32(len, -2.0, 2.0));
+                let v = to_half(&rng.vec_f32(len, -1.0, 1.0));
+                // The device sees position j at row j % ring, the last `ring`
+                // positions only; the oracle keeps the plain layout.
+                let on_device = |cache: &[u16]| -> Vec<u16> {
+                    let Some(ring) = ring else {
+                        return cache.to_vec();
+                    };
+                    let row = kv_heads * dim;
+                    let mut out = vec![0u16; ring * row];
+                    for j in (p + 1).saturating_sub(ring)..=p {
+                        out[(j % ring) * row..][..row].copy_from_slice(&cache[j * row..][..row]);
+                    }
+                    out
                 };
-                let row = kv_heads * dim;
-                let mut out = vec![0u16; ring * row];
-                for j in (p + 1).saturating_sub(ring)..=p {
-                    out[(j % ring) * row..][..row].copy_from_slice(&cache[j * row..][..row]);
-                }
-                out
-            };
-            let (dk, dv) = (
-                stream.clone_htod(&on_device(&k)).unwrap(),
-                stream.clone_htod(&on_device(&v)).unwrap(),
-            );
-            ptrs[t * DEC_ROW_POINTERS] = dk.device_ptr(&stream).0;
-            ptrs[t * DEC_ROW_POINTERS + 1] = dv.device_ptr(&stream).0;
-            caches.push((k, v));
-            device_caches.push((dk, dv));
-        }
+                let (dk, dv) = (
+                    stream.clone_htod(&on_device(&k)).unwrap(),
+                    stream.clone_htod(&on_device(&v)).unwrap(),
+                );
+                ptrs[t * DEC_ROW_POINTERS] = dk.device_ptr(&stream).0;
+                ptrs[t * DEC_ROW_POINTERS + 1] = dv.device_ptr(&stream).0;
+                caches.push((k, v));
+                device_caches.push((dk, dv));
+            }
 
-        let f = |h: u16| f64::from(half::f16::from_bits(h).to_f32());
-        let scale = 1.0 / (dim as f64).sqrt();
-        let mut want = vec![0.0f64; rows * heads * dim];
-        for (t, &p) in positions.iter().enumerate() {
-            let row = &proj[t * ldo..][..ldo];
-            let tau = match log {
-                Some((alpha, floor)) => {
-                    1.0 + f64::from(alpha) * ((p + 1) as f64 / f64::from(floor)).max(1.0).ln()
-                }
-                None => 1.0,
-            };
-            let lo = if window > 0 && p + 1 > window {
-                p + 1 - window
-            } else {
-                0
-            };
-            let (k, v) = &caches[t];
-            for h in 0..heads {
-                let kvh = h / (heads / kv_heads);
-                let clipped = |x: &[f32], scales: &[f32], bound: f32| -> Vec<f64> {
-                    let v: Vec<f64> = x
-                        .iter()
-                        .zip(scales)
-                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+            let f = |h: u16| f64::from(half::f16::from_bits(h).to_f32());
+            let scale = 1.0 / (dim as f64).sqrt();
+            let mut want = vec![0.0f64; rows * heads * dim];
+            for (t, &p) in positions.iter().enumerate() {
+                let row = &proj[t * ldo..][..ldo];
+                let tau = match log {
+                    Some((alpha, floor)) => {
+                        1.0 + f64::from(alpha) * ((p + 1) as f64 / f64::from(floor)).max(1.0).ln()
+                    }
+                    None => 1.0,
+                };
+                let lo = if window > 0 && p + 1 > window {
+                    p + 1 - window
+                } else {
+                    0
+                };
+                let (k, v) = &caches[t];
+                for h in 0..heads {
+                    let kvh = h / (heads / kv_heads);
+                    let clipped = |x: &[f32], scales: &[f32], bound: f32| -> Vec<f64> {
+                        let v: Vec<f64> = x
+                            .iter()
+                            .zip(scales)
+                            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                            .collect();
+                        let norm = v.iter().map(|a| a * a).sum::<f64>().sqrt();
+                        let factor = (f64::from(bound) / (norm + 1e-6)).min(1.0) * tau;
+                        v.iter().map(|a| a * factor).collect()
+                    };
+                    let q = clipped(
+                        &row[o.q as usize + h * dim..][..dim],
+                        &q_clip[h * dim..][..dim],
+                        qk_clip,
+                    );
+                    let r = clipped(
+                        &row[o.rel as usize + h * n_rel..][..n_rel],
+                        &rel_clip[h * n_rel..][..n_rel],
+                        rel_bound,
+                    );
+                    let sink = f64::from(row[o.sink as usize + h]);
+                    let scores: Vec<f64> = (lo..=p)
+                        .map(|j| {
+                            let kr = &k[(j * kv_heads + kvh) * dim..][..dim];
+                            let dot: f64 = q.iter().zip(kr).map(|(a, b)| a * f(*b)).sum();
+                            let dist = p - j;
+                            let bias: f64 = if dist < extent {
+                                rel_bias[dist * n_rel..][..n_rel]
+                                    .iter()
+                                    .zip(&r)
+                                    .map(|(b, x)| f64::from(*b) * x)
+                                    .sum()
+                            } else {
+                                0.0
+                            };
+                            dot * scale + bias - sink
+                        })
                         .collect();
-                    let norm = v.iter().map(|a| a * a).sum::<f64>().sqrt();
-                    let factor = (f64::from(bound) / (norm + 1e-6)).min(1.0) * tau;
-                    v.iter().map(|a| a * factor).collect()
-                };
-                let q = clipped(
-                    &row[o.q as usize + h * dim..][..dim],
-                    &q_clip[h * dim..][..dim],
-                    qk_clip,
-                );
-                let r = clipped(
-                    &row[o.rel as usize + h * n_rel..][..n_rel],
-                    &rel_clip[h * n_rel..][..n_rel],
-                    rel_bound,
-                );
-                let sink = f64::from(row[o.sink as usize + h]);
-                let scores: Vec<f64> = (lo..=p)
-                    .map(|j| {
-                        let kr = &k[(j * kv_heads + kvh) * dim..][..dim];
-                        let dot: f64 = q.iter().zip(kr).map(|(a, b)| a * f(*b)).sum();
-                        let dist = p - j;
-                        let bias: f64 = if dist < extent {
-                            rel_bias[dist * n_rel..][..n_rel]
-                                .iter()
-                                .zip(&r)
-                                .map(|(b, x)| f64::from(*b) * x)
-                                .sum()
-                        } else {
-                            0.0
-                        };
-                        dot * scale + bias - sink
-                    })
-                    .collect();
-                let top = scores.iter().copied().fold(0.0f64, f64::max);
-                let denom = (-top).exp() + scores.iter().map(|s| (s - top).exp()).sum::<f64>();
-                let out = &mut want[(t * heads + h) * dim..][..dim];
-                for (j, s) in (lo..=p).zip(&scores) {
-                    let w = (s - top).exp() / denom;
-                    let vr = &v[(j * kv_heads + kvh) * dim..][..dim];
-                    for (acc, x) in out.iter_mut().zip(vr) {
-                        *acc += w * f(*x);
+                    let top = scores.iter().copied().fold(0.0f64, f64::max);
+                    let denom = (-top).exp() + scores.iter().map(|s| (s - top).exp()).sum::<f64>();
+                    let out = &mut want[(t * heads + h) * dim..][..dim];
+                    for (j, s) in (lo..=p).zip(&scores) {
+                        let w = (s - top).exp() / denom;
+                        let vr = &v[(j * kv_heads + kvh) * dim..][..dim];
+                        for (acc, x) in out.iter_mut().zip(vr) {
+                            *acc += w * f(*x);
+                        }
+                    }
+                    for (i, acc) in out.iter_mut().enumerate() {
+                        let g = f64::from(row[o.gate as usize + h * dim + i]);
+                        *acc /= 1.0 + (-g).exp();
                     }
                 }
-                for (i, acc) in out.iter_mut().enumerate() {
-                    let g = f64::from(row[o.gate as usize + h * dim + i]);
-                    *acc /= 1.0 + (-g).exp();
-                }
             }
-        }
 
-        let d_proj = stream.clone_htod(&proj).unwrap();
-        let d_ptrs = stream.clone_htod(&ptrs).unwrap();
-        let pos: Vec<i32> = positions.iter().map(|p| *p as i32).collect();
-        let d_pos = stream.clone_htod(&pos).unwrap();
-        let (d_q_clip, d_rel_clip, d_rel_bias) = (
-            stream.clone_htod(&q_clip).unwrap(),
-            stream.clone_htod(&rel_clip).unwrap(),
-            stream.clone_htod(&rel_bias).unwrap(),
-        );
-        let mut out = stream.alloc_zeros::<u16>(rows * heads * dim).unwrap();
-        let mut part = stream
-            .alloc_zeros::<f32>(rows * heads * DEC_ATTN_PARTS * (dim + 2))
-            .unwrap();
-        kernels
-            .attn(
-                &stream,
-                &d_proj,
-                &d_ptrs,
-                &d_pos,
-                &d_q_clip,
-                &d_rel_clip,
-                &d_rel_bias,
-                &mut part,
-                &mut out,
-                o,
-                heads,
-                kv_heads,
-                dim,
-                n_rel,
-                window,
-                extent,
-                qk_clip,
-                rel_bound,
-                log,
-                ring,
-                rows,
-            )
-            .unwrap();
-        let got = from_half(&stream.clone_dtoh(&out).unwrap());
-        drop(device_caches);
-        let (worst, one_minus_cos) = distance(&got, &want);
-        println!(
-            "decode attention positions {positions:?} window {window} extent {extent} log {log:?} ring {ring:?}: max_abs {worst:.3e} 1-cos {one_minus_cos:.3e}"
-        );
-        // The result is binary16 of a value within +-1: half an ulp is at
-        // most 2.4e-4, and the fp32 sums behind it add ~1e-5.
-        assert!(worst < 4e-4, "max-abs {worst}");
-        assert!(one_minus_cos < 2e-7, "1 - cosine {one_minus_cos}");
+            let d_proj = stream.clone_htod(&proj).unwrap();
+            let d_ptrs = stream.clone_htod(&ptrs).unwrap();
+            let pos: Vec<i32> = positions.iter().map(|p| *p as i32).collect();
+            let d_pos = stream.clone_htod(&pos).unwrap();
+            let (d_q_clip, d_rel_clip, d_rel_bias) = (
+                stream.clone_htod(&q_clip).unwrap(),
+                stream.clone_htod(&rel_clip).unwrap(),
+                stream.clone_htod(&rel_bias).unwrap(),
+            );
+            let mut out = stream.alloc_zeros::<u16>(rows * heads * dim).unwrap();
+            let mut part = stream
+                .alloc_zeros::<f32>(rows * heads * DEC_ATTN_PARTS * (dim + 2))
+                .unwrap();
+            kernels
+                .attn(
+                    &stream,
+                    &d_proj,
+                    &d_ptrs,
+                    &d_pos,
+                    &d_q_clip,
+                    &d_rel_clip,
+                    &d_rel_bias,
+                    &mut part,
+                    &mut out,
+                    o,
+                    heads,
+                    kv_heads,
+                    dim,
+                    n_rel,
+                    window,
+                    extent,
+                    qk_clip,
+                    rel_bound,
+                    log,
+                    ring,
+                    rows,
+                )
+                .unwrap();
+            let got = from_half(&stream.clone_dtoh(&out).unwrap());
+            drop(device_caches);
+            let (worst, one_minus_cos) = distance(&got, &want);
+            println!(
+                "decode attention {mode:?} positions {positions:?} window {window} extent {extent} log {log:?} ring {ring:?}: max_abs {worst:.3e} 1-cos {one_minus_cos:.3e}"
+            );
+            // The result is binary16 of a value within +-1: half an ulp is at
+            // most 2.4e-4, and the fp32 sums behind it add ~1e-5.
+            assert!(worst < 4e-4, "max-abs {worst}");
+            assert!(one_minus_cos < 2e-7, "1 - cosine {one_minus_cos}");
+        }
     }
 }
 

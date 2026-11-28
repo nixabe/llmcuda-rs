@@ -30,8 +30,8 @@
 //!
 //! That only works if the output still *looks* like a table, which is what
 //! `ToolFormat` is for: at `info` an event is written as its message and
-//! nothing else, so the rendering is byte-for-byte what `println!` produced
-//! before. `WARN` and `ERROR` keep a level tag, because a warning that looks
+//! nothing else, so the rendering is byte-for-byte what `println!` would
+//! produce. `WARN` and `ERROR` keep a level tag, because a warning that looks
 //! like ordinary output is a warning nobody reads. At `debug` and `trace` the
 //! format switches to level-plus-target, because at that point the reader
 //! wants provenance more than alignment.
@@ -214,8 +214,7 @@ pub fn init(level: LogLevel, explicit: bool) -> bool {
     let verbose = level != LogLevel::Info;
     let rust_log = std::env::var("RUST_LOG").ok();
 
-    // `LogLevel`'s Display is a valid filter directive, which
-    // `every_accepted_value_round_trips_through_display` keeps true.
+    // `LogLevel`'s Display is a valid filter directive.
     let filter = match (&rust_log, explicit) {
         (Some(directives), false) => EnvFilter::new(directives.clone()),
         // No RUST_LOG, or an explicit flag that overrides it — module docs.
@@ -451,7 +450,7 @@ mod tests {
 
     #[test]
     fn blank_separator_lines_stay_blank() {
-        // Roughly twenty call sites open with "\n" to put a blank line before
+        // Many call sites open with "\n" to put a blank line before
         // a section heading. Prefixing that empty line would print a bare
         // `DEBUG target:` with nothing after it.
         assert_eq!(

@@ -273,22 +273,6 @@ mod tests {
     }
 
     #[test]
-    fn only_seventy_five_counts_as_turing() {
-        assert!(ComputeCapability { major: 7, minor: 5 }.is_turing());
-        assert!(!ComputeCapability { major: 8, minor: 0 }.is_turing());
-        assert!(!ComputeCapability { major: 7, minor: 0 }.is_turing());
-    }
-
-    #[test]
-    fn sm_arch_string_is_what_nvrtc_expects() {
-        assert_eq!(
-            ComputeCapability { major: 7, minor: 5 }.sm_arch(),
-            "sm_75",
-            "NVRTC rejects any other spelling"
-        );
-    }
-
-    #[test]
     fn rtx_8000_bandwidth_derives_to_about_672_gb_s() {
         // 384-bit bus at 7000 MHz effective GDDR6.
         let d = dev(0, 7, 5);

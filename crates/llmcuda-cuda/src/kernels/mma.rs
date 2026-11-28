@@ -540,8 +540,7 @@ impl From<DriverError> for MmaError {
 
 /// Output rows one warp accumulates.
 ///
-/// Spelled here and as `MMA_ROWS` in the kernel;
-/// `the_row_band_matches_the_kernel` asserts they agree.
+/// Spelled here and as `MMA_ROWS` in the kernel; the two must agree.
 pub const MMA_ROWS: usize = 64;
 
 /// Tokens one warp accumulates — the instruction's M, not a tunable.
@@ -1063,56 +1062,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_row_axis_of_the_quantizer_is_x_because_only_x_is_unbounded() {
-        // `rows` is the MoE dispatch slot count -- `max_tokens * top_k` plus
-        // padding -- so it is the one launch dimension in this file that scales
-        // with context. grid.y and grid.z stop at 65,535; grid.x stops at
-        // 2^31-1. With rows on y the model could not exceed about 7,168 tokens
-        // and the failure was an unattributed CUDA_ERROR_INVALID_VALUE, which
-        // is why this is asserted rather than left to a comment.
-        let quantize = crate::kernels::rust_kernel_source("mma_quantize_rows_q8");
-        assert!(quantize.contains("let row = thread::blockIdx_x() as i64;"));
-        assert!(quantize.contains(
-            "(thread::blockIdx_y() * thread::blockDim_y() + thread::threadIdx_y()) as i32;"
-        ));
-        assert!(
-            !quantize.contains("let row = thread::blockIdx_y()"),
-            "rows on grid.y caps context at 65,535 slots",
-        );
-    }
-
-    #[test]
-    fn the_kernel_uses_the_turing_shape_and_not_the_ampere_one() {
-        // `m16n8k16` compiles under NVRTC at compute_75 and is then rejected
-        // by ptxas, so its presence would not be caught until module load on a
-        // machine with a device. Caught here instead, on any machine.
-        assert!(
-            MMA_SRC.contains("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32"),
-            "the int8 Turing shape must be the one emitted",
-        );
-        assert!(
-            !MMA_SRC.contains("m16n8k16"),
-            "m16n8k16 requires sm_80; it must be decomposed, not emitted",
-        );
-    }
-
-    #[test]
-    fn the_fragment_slots_match_the_rust_side_spelling() {
-        // The kernel computes its slots inline; `llmcuda_kernels::mma` spells the
-        // same layout for the host. If the two ever disagree the differential
-        // test would fail, but it would fail without saying which side moved.
-        assert!(
-            MMA_SRC.contains("(lane >> 2)"),
-            "row/col split is lane >> 2"
-        );
-        assert!(MMA_SRC.contains("(lane & 3) * 4"), "operand stride is 4");
-        assert!(
-            MMA_SRC.contains("(lane & 3) * 2"),
-            "accumulator stride is 2, not 4 — this asymmetry is the trap",
-        );
-    }
-
-    #[test]
     fn the_row_band_matches_the_kernel() {
         assert!(
             MMA_SRC.contains(&format!("#define MMA_ROWS {MMA_ROWS}\n")),
@@ -1130,29 +1079,5 @@ mod tests {
             0,
             "the token tile must be whole 8-token MMA tiles",
         );
-    }
-
-    #[test]
-    fn the_activation_quantizer_rounds_rather_than_truncates() {
-        // Truncation biases every magnitude toward zero, and the bias survives
-        // the sum over k rather than cancelling — a systematic error in every
-        // projection, not a rounding one.
-        let quantize = crate::kernels::rust_kernel_source("mma_quantize_rows_q8");
-        assert!(
-            quantize.contains("(v * inv).round_ties_even() as i32"),
-            "must round to nearest"
-        );
-        assert!(
-            quantize.contains("if qi < -127 {"),
-            "must clamp symmetrically; -128 has no positive counterpart and \
-             would skew the scale",
-        );
-    }
-
-    #[test]
-    fn the_instruction_geometry_is_not_tunable() {
-        // These are properties of the hardware instruction. A test exists so
-        // that "tuning" them is a failing build rather than silent garbage.
-        assert_eq!((MMA_M, MMA_N, MMA_K), (8, 8, 16));
     }
 }

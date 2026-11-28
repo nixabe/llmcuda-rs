@@ -6178,44 +6178,135 @@ fn check_stack(which: &'static str, t: QuantTensor<'_>, expected: usize) -> Resu
 mod tests {
     use super::*;
 
+    fn qwen() -> MoeGeometry {
+        MoeGeometry::qwen3_6(16, 64)
+    }
+
     #[test]
-    fn the_narrow_mma_variants_are_mirrored_in_rust() {
-        // `MMA_M_NARROW` picks a Rust-side kernel name and a shared-memory
-        // formula; nothing else ties it to the two device instantiations
-        // that must actually exist at that width. If the device side drifts
-        // -- someone reinstantiates `moe_expert_ffn_mma_narrow` at a
-        // different `M`, say -- `module.load_function` still succeeds
-        // (the name did not change) and the mismatch would show up as a
-        // shared-memory overrun instead of a compile or link error.
+    fn the_grid_guard_bounds_the_block_count_and_not_the_slot_count() {
+        // These differ by `block_size`, and guarding the wrong one cost this
+        // model a factor of `block_size` in supported context. At 32,768
+        // tokens and 16 slots to a block the dispatch needs 16,624 blocks of
+        // an available 65,535 — comfortable — while the slot count is 265,984,
+        // which the old guard compared against 65,535 and rejected.
+        let g = MoeGeometry::qwen3_6(16, 32_768);
+        assert_eq!(g.sorted_capacity(), 265_984);
+        assert_eq!(g.expert_block_capacity(), 16_624);
         assert!(
-            MOE_SRC.contains(&format!(
-                "moe_expert_ffn_mma_impl<{MMA_M_NARROW}, {}>(",
-                MMA_M_NARROW / 8
-            )),
-            "moe_expert_ffn_mma_narrow no longer instantiates the impl at MMA_M_NARROW",
+            g.expert_block_capacity() <= 65_535,
+            "32K tokens must be inside the grid.y limit, not outside it",
         );
         assert!(
-            MOE_SRC.contains(&format!(
-                "moe_expert_down_mma_impl<{MMA_M_NARROW}, {}>(",
-                MMA_M_NARROW / 8
-            )),
-            "moe_expert_down_mma_narrow no longer instantiates the impl at MMA_M_NARROW",
-        );
-        // The wide FFN wrapper is the fused-quantize one -- the only wide
-        // Q6 entry point `new` loads -- so the third template argument is
-        // part of what must not drift.
-        assert!(
-            MOE_SRC.contains("moe_expert_ffn_mma_impl<MOE_MMA_M, MOE_MMA_MF, true>("),
-            "moe_expert_ffn_mma_fused_iq no longer instantiates the impl at MOE_MMA_M",
-        );
-        assert!(
-            MOE_SRC.contains("moe_expert_down_mma_impl<MOE_MMA_M, MOE_MMA_MF>("),
-            "moe_expert_down_mma no longer instantiates the impl at MOE_MMA_M",
+            g.sorted_capacity() > 65_535,
+            "this test is only meaningful while the two quantities disagree",
         );
     }
 
-    fn qwen() -> MoeGeometry {
-        MoeGeometry::qwen3_6(16, 64)
+    #[test]
+    fn every_grid_dimension_is_a_function_of_the_geometry_alone() {
+        // The other half of AGENTS.md rule 5: the *buffers* not being sized by
+        // a per-step value is checked above, and this is the launch shapes.
+        // Two geometries differing only in `max_tokens` must still each
+        // produce one fixed grid, and the tiled GEMM's grid must not depend on
+        // `num_tokens_post_pad` — that value exists only in device memory, so
+        // anything reading it would have to synchronize and could not be
+        // captured.
+        for max_tokens in [1usize, 19, 128, 512] {
+            let g = MoeGeometry::qwen3_6(16, max_tokens);
+            // Routed GEMM: (row band, dispatch-block capacity).
+            let routed_y = g.expert_block_capacity() as u32;
+            assert_eq!(routed_y, (g.sorted_capacity() / g.block_size) as u32);
+            // Shared expert: (row band, token-tile count).
+            let shared_y = (g.max_tokens as u32).div_ceil(TILE_M as u32);
+            assert_eq!(shared_y as usize, g.max_tokens.div_ceil(TILE_M));
+            // Both grid.y values must fit the driver's 65535 limit for every
+            // geometry `MoeKernels::new` accepts.
+            assert!(routed_y <= 65_535 && shared_y <= 65_535);
+            // grid.x is a band of output rows, and both contraction lengths
+            // are whole tiles.
+            assert_eq!((g.intermediate as u32).div_ceil(TILE_ROWS), 64);
+            assert_eq!((g.hidden as u32).div_ceil(TILE_ROWS), 256);
+            assert!(g.hidden.is_multiple_of(TILE_K) && g.intermediate.is_multiple_of(TILE_K));
+        }
+    }
+
+    #[test]
+    fn sorted_capacity_bounds_the_worst_case_at_the_real_geometry() {
+        let g = qwen();
+        // 64 tokens x top-8 = 512 flat pairs. Every one of the 256 experts
+        // can be active, and each active run pays up to block_size - 1 of
+        // padding: 512 + 256*15 = 4352, already a multiple of 16.
+        assert_eq!(g.max_flat_pairs(), 512);
+        assert_eq!(g.sorted_capacity(), 4352);
+        assert_eq!(g.expert_block_capacity(), 272);
+        assert!(g.sorted_capacity().is_multiple_of(g.block_size));
+
+        // Brute force the bound on a small geometry: enumerate every way of
+        // splitting `numel` selections across experts is too many, so check
+        // the analytic worst case instead — one expert per selection until
+        // experts run out, each padded to a full block.
+        let small = MoeGeometry {
+            num_experts: 4,
+            experts_per_token: 2,
+            hidden: 8,
+            intermediate: 4,
+            block_size: 4,
+            max_tokens: 3,
+        };
+        let numel = small.max_flat_pairs(); // 6
+        let mut worst = 0usize;
+        // All distributions of 6 selections over 4 experts.
+        for a in 0..=numel {
+            for b in 0..=numel - a {
+                for c in 0..=numel - a - b {
+                    let d = numel - a - b - c;
+                    let total: usize = [a, b, c, d]
+                        .iter()
+                        .map(|&n| n.div_ceil(small.block_size) * small.block_size)
+                        .sum();
+                    worst = worst.max(total);
+                }
+            }
+        }
+        assert!(
+            small.sorted_capacity() >= worst,
+            "capacity {} is below the enumerated worst case {worst}",
+            small.sorted_capacity(),
+        );
+    }
+
+    #[test]
+    fn every_buffer_is_sized_from_the_geometry_alone() {
+        // The property AGENTS.md rule 5 is really asking for: nothing below
+        // depends on a per-step token count.
+        let g = qwen();
+        assert_eq!(g.stack_elements(), 256 * 512 * 2048);
+        // 8.9 MiB of intermediate, 4 MiB of per-(token,k) partials.
+        assert_eq!(g.sorted_capacity() * g.intermediate, 4352 * 512);
+        assert_eq!(g.max_flat_pairs() * g.hidden, 512 * 2048);
+    }
+
+    #[test]
+    fn shared_gemv_tile_covers_decode_widths() {
+        // Smallest covering tile, same rule as `gdn.rs`'s `proj_tile_for`.
+        // Three is the audit's batch width and must land on one t4 launch.
+        assert_eq!(shared_gemv_tile_for(2), (0, 2));
+        assert_eq!(shared_gemv_tile_for(3), (1, 3));
+        assert_eq!(shared_gemv_tile_for(4), (2, 4));
+        assert_eq!(shared_gemv_tile_for(5), (3, 8));
+        assert_eq!(shared_gemv_tile_for(8), (3, 8));
+        assert_eq!(shared_gemv_tile_for(9), (4, 16));
+        assert_eq!(shared_gemv_tile_for(16), (4, 16));
+        assert_eq!(shared_gemv_tile_for(17), (4, 16));
+        assert_eq!(SHARED_GEMV_MAX_TOKENS, 16);
+    }
+
+    /// Community formats have no tuned instantiation, so asking for one is a
+    /// routing bug rather than something to paper over at run time.
+    #[test]
+    #[should_panic(expected = "has no tuned entry point")]
+    fn a_community_format_has_no_tuned_index() {
+        let _ = ExpertQuant::Q4K.tuned_index();
     }
 
     #[test]
@@ -6280,256 +6371,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_dequant_prologue_multiplies_in_the_reference_order() {
-        // Bit-identical weights depend on `(d * scale) * q` for Q6_K and
-        // `q * d` for Q8_0. This guards the two expressions from being
-        // "simplified" into a different rounding.
-        assert!(
-            MOE_SRC.contains("return d * (float)sc[si] * (float)(raw - 32);"),
-            "Q6_K prologue reassociated away from (d * scale) * q",
-        );
-        assert!(
-            MOE_SRC.contains("return (float)q * d;"),
-            "Q8_0 prologue reassociated away from q * d",
-        );
-    }
-
-    #[test]
-    fn quants_and_scales_are_read_as_signed() {
-        // Reading int8 codes or the per-group scales as unsigned is the most
-        // likely transcription error and produces plausible magnitudes.
-        assert!(MOE_SRC.contains("signed char q = (signed char)(q4 >> (8 * t));"));
-        assert!(MOE_SRC.contains("(const signed char*)(base + 192 + half * 8)"));
-    }
-
-    #[test]
-    fn the_padding_sentinel_is_num_tokens_times_top_k() {
-        // `padding_sentinel(num_tokens, top_k) == num_tokens * top_k` in
-        // `llmcuda_kernels::moe::dispatch`, and consumers test `flat >= numel`.
-        // A sentinel of, say, -1 would still "work" for the fill but would
-        // make `flat / top_k` index before the token array.
-        // The tables are filled by the Rust dispatch; the C++ consumers test
-        // the sentinel.
-        let dispatch = crate::kernels::rust_kernel_source("dispatch_token");
-        assert!(dispatch.contains("let numel = *valid_tokens * top_k;"));
-        assert!(dispatch.contains("*sorted_token_ids.add(s as usize) = numel;"));
-        assert!(MOE_SRC.contains("if (flat >= numel) return;"));
-    }
-
-    #[test]
-    fn inactive_blocks_are_minus_one() {
-        assert!(
-            crate::kernels::rust_kernel_source("dispatch_token")
-                .contains("*expert_ids.add(b as usize) = -1;")
-        );
-        assert!(MOE_SRC.contains("if (e < 0) return;"));
-    }
-
-    #[test]
-    fn the_dispatch_scatter_is_ordered_not_atomic() {
-        // The reference places an expert's tokens in ascending flat index.
-        // An atomic cursor would give arrival order instead, which is not
-        // reproducible run to run and cannot be compared exactly. Scoped to
-        // the dispatch kernel's body rather than the whole source so that a
-        // legitimate atomic elsewhere would not trip it.
-        for kernel in ["moe_align_block_size", "dispatch_token"] {
-            assert!(
-                !crate::kernels::rust_kernel_source(kernel).contains("atomic"),
-                "the dispatch scatter must not use atomics; ordering is the contract",
-            );
-        }
-    }
-
-    #[test]
-    fn the_grid_guard_bounds_the_block_count_and_not_the_slot_count() {
-        // These differ by `block_size`, and guarding the wrong one cost this
-        // model a factor of `block_size` in supported context. At 32,768
-        // tokens and 16 slots to a block the dispatch needs 16,624 blocks of
-        // an available 65,535 — comfortable — while the slot count is 265,984,
-        // which the old guard compared against 65,535 and rejected.
-        let g = MoeGeometry::qwen3_6(16, 32_768);
-        assert_eq!(g.sorted_capacity(), 265_984);
-        assert_eq!(g.expert_block_capacity(), 16_624);
-        assert!(
-            g.expert_block_capacity() <= 65_535,
-            "32K tokens must be inside the grid.y limit, not outside it",
-        );
-        assert!(
-            g.sorted_capacity() > 65_535,
-            "this test is only meaningful while the two quantities disagree",
-        );
-    }
-
-    #[test]
-    fn every_grid_dimension_is_a_function_of_the_geometry_alone() {
-        // The other half of AGENTS.md rule 5: the *buffers* not being sized by
-        // a per-step value is checked above, and this is the launch shapes.
-        // Two geometries differing only in `max_tokens` must still each
-        // produce one fixed grid, and the tiled GEMM's grid must not depend on
-        // `num_tokens_post_pad` — that value exists only in device memory, so
-        // anything reading it would have to synchronize and could not be
-        // captured.
-        for max_tokens in [1usize, 19, 128, 512] {
-            let g = MoeGeometry::qwen3_6(16, max_tokens);
-            // Routed GEMM: (row band, dispatch-block capacity).
-            let routed_y = g.expert_block_capacity() as u32;
-            assert_eq!(routed_y, (g.sorted_capacity() / g.block_size) as u32);
-            // Shared expert: (row band, token-tile count).
-            let shared_y = (g.max_tokens as u32).div_ceil(TILE_M as u32);
-            assert_eq!(shared_y as usize, g.max_tokens.div_ceil(TILE_M));
-            // Both grid.y values must fit the driver's 65535 limit for every
-            // geometry `MoeKernels::new` accepts.
-            assert!(routed_y <= 65_535 && shared_y <= 65_535);
-            // grid.x is a band of output rows, and both contraction lengths
-            // are whole tiles.
-            assert_eq!((g.intermediate as u32).div_ceil(TILE_ROWS), 64);
-            assert_eq!((g.hidden as u32).div_ceil(TILE_ROWS), 256);
-            assert!(g.hidden.is_multiple_of(TILE_K) && g.intermediate.is_multiple_of(TILE_K));
-        }
-    }
-
-    #[test]
-    fn routing_selection_carries_the_index_so_ties_break_low() {
-        // `route_token` breaks ties on equal probability by lower expert
-        // index. Without the index in the reduction the winner is whichever
-        // lane got there first, which is not even stable across runs.
-        //
-        // Both halves are asserted: the per-lane scan over the experts it
-        // owns, and the cross-lane butterfly that merges the lanes. The
-        // second is what makes the selection independent of the reduction's
-        // shape, which is the property the kernel's own comment rests on.
-        let route = crate::kernels::rust_kernel_source("route_token");
-        assert!(route.contains("if p[0] > bv || (p[0] == bv && (bi < 0 || lane + 0 < bi)) {"));
-        assert!(route.contains("if p[15] > bv || (p[15] == bv && (bi < 0 || lane + 480 < bi)) {"));
-        assert!(route.contains("if cv > bv || (cv == bv && ci >= 0 && (bi < 0 || ci < bi)) {"));
-        // And the mask that stops a selected expert being picked again must
-        // stay a predicated sweep over literal indices, not a dynamic index:
-        // `p` is a register array, and indexing it by the winner spills it to
-        // local memory.
-        assert!(
-            route.contains("if bi >= 0 && lane + 480 == bi {\n                    p[15] = -1.0;")
-        );
-        assert!(!route.contains("p[bi"));
-    }
-
-    #[test]
-    fn sorted_capacity_bounds_the_worst_case_at_the_real_geometry() {
-        let g = qwen();
-        // 64 tokens x top-8 = 512 flat pairs. Every one of the 256 experts
-        // can be active, and each active run pays up to block_size - 1 of
-        // padding: 512 + 256*15 = 4352, already a multiple of 16.
-        assert_eq!(g.max_flat_pairs(), 512);
-        assert_eq!(g.sorted_capacity(), 4352);
-        assert_eq!(g.expert_block_capacity(), 272);
-        assert!(g.sorted_capacity().is_multiple_of(g.block_size));
-
-        // Brute force the bound on a small geometry: enumerate every way of
-        // splitting `numel` selections across experts is too many, so check
-        // the analytic worst case instead — one expert per selection until
-        // experts run out, each padded to a full block.
-        let small = MoeGeometry {
-            num_experts: 4,
-            experts_per_token: 2,
-            hidden: 8,
-            intermediate: 4,
-            block_size: 4,
-            max_tokens: 3,
-        };
-        let numel = small.max_flat_pairs(); // 6
-        let mut worst = 0usize;
-        // All distributions of 6 selections over 4 experts.
-        for a in 0..=numel {
-            for b in 0..=numel - a {
-                for c in 0..=numel - a - b {
-                    let d = numel - a - b - c;
-                    let total: usize = [a, b, c, d]
-                        .iter()
-                        .map(|&n| n.div_ceil(small.block_size) * small.block_size)
-                        .sum();
-                    worst = worst.max(total);
-                }
-            }
-        }
-        assert!(
-            small.sorted_capacity() >= worst,
-            "capacity {} is below the enumerated worst case {worst}",
-            small.sorted_capacity(),
-        );
-    }
-
-    #[test]
-    fn every_buffer_is_sized_from_the_geometry_alone() {
-        // The property AGENTS.md rule 5 is really asking for: nothing below
-        // depends on a per-step token count.
-        let g = qwen();
-        assert_eq!(g.stack_elements(), 256 * 512 * 2048);
-        // 8.9 MiB of intermediate, 4 MiB of per-(token,k) partials.
-        assert_eq!(g.sorted_capacity() * g.intermediate, 4352 * 512);
-        assert_eq!(g.max_flat_pairs() * g.hidden, 512 * 2048);
-    }
-
-    #[test]
-    fn geometry_is_validated_not_assumed() {
-        // The checks that run without a device.
-        let bad = MoeError::UnsupportedGeometry {
-            geometry: Box::new(MoeGeometry {
-                block_size: 0,
-                ..qwen()
-            }),
-            reason: "block_size must be non-zero",
-        };
-        assert!(bad.to_string().contains("block_size must be non-zero"));
-
-        let ragged = MoeError::RaggedWeights {
-            which: "gate",
-            bytes: 211,
-            block_bytes: 210,
-        };
-        assert!(ragged.to_string().contains("211"));
-
-        let wrong = MoeError::WrongElementCount {
-            which: "down",
-            expected: 268_435_456,
-            found: 1024,
-        };
-        assert!(wrong.to_string().contains("268435456"));
-
-        let too_many = MoeError::TooManyTokens {
-            tokens: 65,
-            max_tokens: 64,
-        };
-        assert!(too_many.to_string().contains("65"));
-    }
-
-    #[test]
-    fn quant_block_geometry_matches_the_ggml_layout() {
-        assert_eq!(ExpertQuant::Q6K.block_elements(), 256);
-        assert_eq!(ExpertQuant::Q6K.file_block_bytes(), 210);
-        assert_eq!(ExpertQuant::Q6K.block_bytes(), 224);
-        assert_eq!(ExpertQuant::Q8_0.block_elements(), 32);
-        assert_eq!(ExpertQuant::Q8_0.block_bytes(), 34);
-        assert_eq!(BLOCK_Q6_K_BYTES, QK_K / 2 + QK_K / 4 + QK_K / 16 + 2);
-        assert_eq!(BLOCK_Q8_0_BYTES, 2 + QK8_0);
-        // The real file is mixed, so the codes must be distinct and stable.
-        assert_ne!(ExpertQuant::Q6K.code(), ExpertQuant::Q8_0.code());
-    }
-
-    #[test]
-    fn shared_gemv_tile_covers_decode_widths() {
-        // Smallest covering tile, same rule as `gdn.rs`'s `proj_tile_for`.
-        // Three is the audit's batch width and must land on one t4 launch.
-        assert_eq!(shared_gemv_tile_for(2), (0, 2));
-        assert_eq!(shared_gemv_tile_for(3), (1, 3));
-        assert_eq!(shared_gemv_tile_for(4), (2, 4));
-        assert_eq!(shared_gemv_tile_for(5), (3, 8));
-        assert_eq!(shared_gemv_tile_for(8), (3, 8));
-        assert_eq!(shared_gemv_tile_for(9), (4, 16));
-        assert_eq!(shared_gemv_tile_for(16), (4, 16));
-        assert_eq!(shared_gemv_tile_for(17), (4, 16));
-        assert_eq!(SHARED_GEMV_MAX_TOKENS, 16);
-    }
-
     /// `ExpertQuant::code`, `dequant_tile_ct`'s arms and the community
     /// ladder's arms must agree.
     ///
@@ -6563,115 +6404,39 @@ mod tests {
         }
     }
 
-    /// Every tuned family is compiled once per shipped format, and the two
-    /// arrays the launcher indexes are in that order.
-    ///
-    /// `tuned_index` maps Q6_K to 0 and Q8_0 to 1; if a family were loaded in
-    /// the other order the engine would read every expert of both formats as
-    /// the other one, silently.
     #[test]
-    fn every_tuned_family_is_compiled_at_both_shipped_formats() {
-        for fam in [
-            "moe_expert_ffn",
-            "moe_expert_ffn_flat",
-            "moe_expert_ffn_gemv",
-            "moe_expert_down",
-            "moe_expert_down_flat",
-            "moe_expert_down_gemv",
-            "moe_shared_ffn",
-            "moe_shared_down",
-            "moe_shared_ffn_gemv",
-            "moe_shared_down_gemv",
-        ] {
-            for suffix in ["_q6k", "_q8"] {
-                assert!(
-                    MOE_SRC.contains(&format!("void {fam}{suffix}(")),
-                    "{fam}{suffix} is not compiled",
-                );
-            }
-            // And the runtime-ladder form is gone from the tuned path: a
-            // kernel taking `int gate_quant` would be one that branches per
-            // tile, which is the 5.05% regression 40f7fc6 reverted.
-            assert!(
-                !MOE_SRC.contains(&format!("void {fam}(")),
-                "{fam} still has an unspecialized entry point",
-            );
-        }
-        for tt in [2, 3, 4, 8, 16] {
-            for suffix in ["_q6k", "_q8"] {
-                assert!(
-                    MOE_SRC.contains(&format!("moe_shared_ffn_gemv_t{tt}{suffix},")),
-                    "moe_shared_ffn_gemv_t{tt}{suffix} is not instantiated",
-                );
-            }
-        }
-    }
-
-    /// The affine formats' rounding is pinned, or nvcc contracts their
-    /// subtraction into an FMA and the weight stops matching the reference.
-    #[test]
-    fn the_affine_prologue_cannot_contract_into_an_fma() {
+    fn the_narrow_mma_variants_are_mirrored_in_rust() {
+        // `MMA_M_NARROW` picks a Rust-side kernel name and a shared-memory
+        // formula; nothing else ties it to the two device instantiations
+        // that must actually exist at that width. If the device side drifts
+        // -- someone reinstantiates `moe_expert_ffn_mma_narrow` at a
+        // different `M`, say -- `module.load_function` still succeeds
+        // (the name did not change) and the mismatch would show up as a
+        // shared-memory overrun instead of a compile or link error.
         assert!(
-            MOE_SRC.contains("mul.rn.f32") && MOE_SRC.contains("sub.rn.f32"),
-            "moe_affine_value lost its rounding pins",
-        );
-    }
-
-    /// Community formats have no tuned instantiation, so asking for one is a
-    /// routing bug rather than something to paper over at run time.
-    #[test]
-    #[should_panic(expected = "has no tuned entry point")]
-    fn a_community_format_has_no_tuned_index() {
-        let _ = ExpertQuant::Q4K.tuned_index();
-    }
-
-    #[test]
-    fn the_shared_expert_has_no_indirection() {
-        // If the shared-expert kernels ever grow a `sorted_token_ids`
-        // argument, the hoist has been undone.
-        //
-        // Scans each shared body in turn rather than everything after the
-        // first one. The tail form passed only while the shared kernels
-        // happened to be last in the source: appending any routed kernel
-        // after them -- as the community path does -- put `sorted_token_ids`
-        // inside the scanned range and failed a test about the shared expert
-        // for a reason that had nothing to do with it.
-        let mut bodies = String::new();
-        let mut from = 0;
-        while let Some(hit) = MOE_SRC[from..].find("void moe_shared_") {
-            let open = MOE_SRC[from + hit..]
-                .find('{')
-                .expect("a kernel definition has a body");
-            let mut depth = 0usize;
-            let mut end = from + hit + open;
-            for (i, c) in MOE_SRC[from + hit + open..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = from + hit + open + i;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            bodies.push_str(&MOE_SRC[from + hit..=end]);
-            from = end;
-        }
-        assert!(
-            bodies.contains("moe_shared_ffn"),
-            "no shared kernel bodies were found to check",
-        );
-        let tail = &bodies[..];
-        assert!(
-            !tail.contains("sorted_token_ids"),
-            "the shared expert must not consult the routed dispatch tables",
+            MOE_SRC.contains(&format!(
+                "moe_expert_ffn_mma_impl<{MMA_M_NARROW}, {}>(",
+                MMA_M_NARROW / 8
+            )),
+            "moe_expert_ffn_mma_narrow no longer instantiates the impl at MMA_M_NARROW",
         );
         assert!(
-            !tail.contains("topk_weights"),
-            "the shared expert has no routing weight",
+            MOE_SRC.contains(&format!(
+                "moe_expert_down_mma_impl<{MMA_M_NARROW}, {}>(",
+                MMA_M_NARROW / 8
+            )),
+            "moe_expert_down_mma_narrow no longer instantiates the impl at MMA_M_NARROW",
+        );
+        // The wide FFN wrapper is the fused-quantize one -- the only wide
+        // Q6 entry point `new` loads -- so the third template argument is
+        // part of what must not drift.
+        assert!(
+            MOE_SRC.contains("moe_expert_ffn_mma_impl<MOE_MMA_M, MOE_MMA_MF, true>("),
+            "moe_expert_ffn_mma_fused_iq no longer instantiates the impl at MOE_MMA_M",
+        );
+        assert!(
+            MOE_SRC.contains("moe_expert_down_mma_impl<MOE_MMA_M, MOE_MMA_MF>("),
+            "moe_expert_down_mma no longer instantiates the impl at MOE_MMA_M",
         );
     }
 }

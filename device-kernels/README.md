@@ -88,10 +88,9 @@ CUDA_VISIBLE_DEVICES=0 cargo test --release -p llmcuda-engine \
   --test gdn_verify_differential --test attention_differential
 ```
 
-`llmcuda-cuda`'s unit tests read this source and the generated PTX: tap
-order, the rotary tail copy, the reduction's order, and that the convolution
-was compiled without an FMA. `layer_ops_differential` holds each kernel to
-its CPU reference. The Gated DeltaNet tests compare these kernels exactly
+`layer_ops_differential` holds each kernel to its CPU reference, with the
+spans that must be bit-identical (the rotary tail copy, the residual add)
+gated exactly. The Gated DeltaNet tests compare these kernels exactly
 with the fused CUDA C++ paths that share their arithmetic, which is what
 catches a port that is close but not identical.
 
@@ -108,8 +107,7 @@ catches a port that is close but not identical.
    (`bench_decode_batch`, `bench_forward`) from two prebuilt target
    directories. The port does not have to win; it has to not cost anything
    measurable.
-4. Switch the launch site, delete the CUDA C++, and move the tests that read
-   its source to this one.
+4. Switch the launch site and delete the CUDA C++.
 
 Things cuda-oxide does differently from NVRTC that have cost throughput
 here, each of which made a bit-identical port look like it had to stay C++:

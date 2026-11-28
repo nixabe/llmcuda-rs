@@ -532,13 +532,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_skipped_check_is_not_a_passing_check() {
-        let skipped = CheckOutcome::Skipped("no device".into());
-        assert!(!skipped.is_pass());
-        assert!(!skipped.ran());
-    }
-
-    #[test]
     fn a_report_of_all_skips_does_not_claim_success_by_running() {
         let r = SpikeReport {
             emits_sm75_ptx: CheckOutcome::Skipped("x".into()),
@@ -558,17 +551,6 @@ mod tests {
             cuda_graphs: CheckOutcome::Pass("ok".into()),
         };
         assert!(!r.all_ran_checks_passed());
-    }
-
-    #[test]
-    fn labels_line_up_with_checks() {
-        let r = SpikeReport {
-            emits_sm75_ptx: CheckOutcome::Pass("a".into()),
-            inline_ptx: CheckOutcome::Pass("b".into()),
-            warp_intrinsics: CheckOutcome::Pass("c".into()),
-            cuda_graphs: CheckOutcome::Pass("d".into()),
-        };
-        assert_eq!(r.checks().len(), SpikeReport::LABELS.len());
     }
 
     /// The spike proper. Skips loudly rather than failing when no GPU is

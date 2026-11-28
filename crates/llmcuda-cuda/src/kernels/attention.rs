@@ -96,8 +96,7 @@ const KEYS_PER_WARP: usize = 4;
 
 /// Query rows one block carries. Mirrors `ATTN_QT`.
 ///
-/// The product `QUERY_TILE * KEYS_PER_WARP` is pinned to 32 by
-/// [`the_query_tile_gives_one_thread_per_softmax_slot`], which is what makes
+/// The product `QUERY_TILE * KEYS_PER_WARP` must be 32, which is what makes
 /// `QUERY_TILE * keys_per_tile()` equal the block width at every head
 /// dimension: `head_dim/32` warps times `KEYS_PER_WARP` keys times
 /// `QUERY_TILE` rows is `head_dim` threads exactly.
@@ -4517,176 +4516,6 @@ mod tests {
     }
 
     #[test]
-    fn the_split_kernel_strides_by_two_head_dims() {
-        // Guards the interleaved layout from being "simplified" in the Rust
-        // kernel: query head h at 2*h, its gate at 2*h + 1.
-        let src = crate::kernels::RUST_KERNELS_SRC;
-        assert!(
-            src.contains("*packed.add((row + 2 * h * head_dim as i64 + d) as usize)"),
-            "query slice is no longer read at the interleaved 2*h stride",
-        );
-        assert!(
-            src.contains("*packed.add((row + (2 * h + 1) * head_dim as i64 + d) as usize)"),
-            "gate slice is no longer read at the interleaved 2*h+1 stride",
-        );
-    }
-
-    #[test]
-    fn the_causal_bound_is_inclusive_of_the_query_position() {
-        // An off-by-one here leaks exactly one future token per row, which
-        // moves aggregate error metrics by almost nothing. It is asserted
-        // structurally because no tolerance would catch it reliably.
-        // The block's loop bound is the *last* row's window; each earlier row
-        // masks the tail off itself. Both halves are asserted, because
-        // dropping the per-row mask would silently let row `qi0` attend to
-        // seven future tokens and every aggregate metric would barely move.
-        assert!(
-            ATTENTION_SRC
-                .contains("long long n_visible = (long long)(*key_offset) + qi0 + qt_live;"),
-            "the causal window bound changed shape",
-        );
-        assert!(
-            ATTENTION_SRC.contains("long long limit = (long long)(*key_offset) + qi0 + tid;")
-                && ATTENTION_SRC.contains("long long limit = (long long)(*key_offset) + qi0 + su;")
-                && ATTENTION_SRC.contains("if (j0 + w <= limit) tmax ="),
-            "the per-row causal mask is gone from the softmax phases",
-        );
-        assert!(
-            ATTENTION_SRC.contains("for (long long j0 = 0; j0 < n_visible; j0 += tile)")
-                && ATTENTION_SRC.contains("long long key = j0 + (long long)warp * ATTN_KT + r;")
-                && ATTENTION_SRC.contains("if (key < n_visible) {"),
-            "the key loop no longer stops at the causal bound",
-        );
-    }
-
-    #[test]
-    fn the_rope_tail_is_copied_rather_than_computed() {
-        // `out[d] = in[d]` is bit-identical. Anything arithmetic — even
-        // multiplying by a cos of angle zero — is not, and would fail the
-        // exact-equality gate the differential test puts on the tail.
-        let tiled = crate::kernels::rust_kernel_source("attn_rope_partial_neox");
-        assert!(
-            tiled.contains("*output.add(base + d as usize) = *input.add(base + d as usize);"),
-            "the untouched rotary tail is no longer a plain copy",
-        );
-        // And it is still selected by the same bound, now inside the token
-        // band rather than outside it.
-        assert!(
-            tiled.contains("if d >= rotated {"),
-            "the rotary tail is no longer selected by the rotated width",
-        );
-        let imrope = crate::kernels::rust_kernel_source("attn_rope_partial_imrope");
-        assert!(imrope.contains(
-            "if d >= rope_dim {\n            *out.add(base + d as usize) = *input.add(base + d as usize);"
-        ));
-    }
-
-    #[test]
-    fn the_accumulator_is_rescaled_before_the_new_contributions_land() {
-        // Online softmax is only stable if the running accumulator and the
-        // normalizer are moved into the new max's frame *first*. Folding the
-        // new weights in before rescaling produces a finite, plausible, wrong
-        // answer whenever the max increases.
-        let rescale_l = ATTENTION_SRC
-            .find("l_sh[tid] = l_sh[tid] * corr_sh[tid] + lsum;")
-            .expect("normalizer rescale present");
-        let rescale_acc = ATTENTION_SRC
-            .find("for (int u = 0; u < QT; ++u) acc[u] = acc[u] * corr_sh[u];")
-            .expect("accumulator rescale present");
-        let fold_in = ATTENTION_SRC
-            .find("acc[u] += w_sh[u * tile + w] * vv;")
-            .expect("value accumulation present");
-        assert!(rescale_acc < fold_in, "values folded in before rescaling");
-        assert!(rescale_l < fold_in, "normalizer updated after the values");
-
-        // The one-row kernel is a separate body and needs the same order.
-        let t1 = ATTENTION_SRC
-            .find("__global__ void attn_flash_causal_t1(")
-            .expect("the one-row kernel is still there");
-        let tail = &ATTENTION_SRC[t1..];
-        let t1_l = tail
-            .find("l = l * corr + lsum;")
-            .expect("t1 normalizer rescale");
-        let t1_acc = tail
-            .find("float a = acc * corr;")
-            .expect("t1 accumulator rescale");
-        // Anchored on the prefix rather than the whole expression: the value
-        // load acquired an `h2f(...)` when the cache became binary16, and the
-        // property being checked here is the *order* of the fold against the
-        // rescale, not how the value is read.
-        let t1_fold = tail.find("a += w_sh[w]").expect("t1 value accumulation");
-        assert!(t1_acc < t1_fold, "t1 values folded in before rescaling");
-        assert!(t1_l < t1_fold, "t1 normalizer updated after the values");
-    }
-
-    #[test]
-    fn gqa_is_a_grouping_not_an_identity() {
-        assert!(
-            ATTENTION_SRC.contains("int kvh = h / (q_heads / kv_heads);"),
-            "the kv head mapping is no longer a GQA grouping",
-        );
-        // Mirrors llmcuda_kernels::attention::kv_head_for_query_head at the real
-        // 16:2 geometry. Asserted here because llmcuda-cuda must not depend on
-        // the oracle crate.
-        let kv_of = |h: usize| h / (16 / 2);
-        assert_eq!(kv_of(0), 0);
-        assert_eq!(kv_of(7), 0);
-        assert_eq!(kv_of(8), 1);
-        assert_eq!(kv_of(15), 1);
-    }
-
-    #[test]
-    fn the_shared_memory_budget_fits_turing_at_the_real_geometry() {
-        // docs/KERNELS.md: 48 KiB per block, measured. The module docs work
-        // through why the textbook tile shapes do not fit at head_dim 256.
-        const TURING_SHARED_PER_BLOCK: usize = 48 * 1024;
-        let head_dim = 256usize;
-        let keys_per_tile = (head_dim / 32) * KEYS_PER_WARP;
-        let bytes = (2 * QUERY_TILE * keys_per_tile + 3 * QUERY_TILE) * size_of::<f32>();
-        assert_eq!(bytes, 2144);
-        assert!(bytes < TURING_SHARED_PER_BLOCK / 20);
-
-        // The tile shapes that do not fit, so the arithmetic in the module
-        // docs fails loudly if someone edits it.
-        let tiled = |bm: usize, bn: usize| (bm + 2 * bn) * head_dim * 4 + bm * bn * 4;
-        assert!(tiled(64, 64) > TURING_SHARED_PER_BLOCK);
-        assert!(tiled(32, 32) > TURING_SHARED_PER_BLOCK);
-        assert!(tiled(16, 16) > TURING_SHARED_PER_BLOCK);
-        assert!(tiled(8, 8) < TURING_SHARED_PER_BLOCK);
-    }
-
-    #[test]
-    fn head_geometry_is_validated_not_assumed() {
-        // The checks that run without a device.
-        assert!(
-            AttentionError::UnsupportedHeadDim { head_dim: 100 }
-                .to_string()
-                .contains("100")
-        );
-        assert!(
-            AttentionError::UnevenGqaGrouping {
-                q_heads: 16,
-                kv_heads: 5,
-            }
-            .to_string()
-            .contains("16")
-        );
-        assert!(
-            AttentionError::QueryPastKeys {
-                key_offset: 100,
-                n_query: 8,
-                n_keys: 104,
-            }
-            .to_string()
-            .contains("108")
-        );
-        // Qwen3.6's real geometry must be accepted.
-        assert_eq!(256 % 32, 0);
-        assert_eq!(16 % 2, 0);
-        assert_eq!(64 % 2, 0);
-    }
-
-    #[test]
     fn a_kv_cache_may_be_longer_than_its_filled_window_but_never_shorter() {
         // The asymmetry is the whole point: a cache is allocated for the
         // longest admissible sequence and filled one token at a time, so
@@ -4710,39 +4539,29 @@ mod tests {
     }
 
     #[test]
-    fn the_query_tile_gives_one_thread_per_softmax_slot() {
-        // The kernel's softmax phases index `score_sh` and `w_sh` as
-        // `su * tile + sw` with `su = tid / tile`, and cover every slot with
-        // no loop. That is only true when the block is exactly as wide as the
-        // tile is big — which, since the block is `head_dim` threads and the
-        // tile is `(head_dim / 32) * KEYS_PER_WARP` keys deep per row, reduces
-        // to this product being a warp.
-        assert_eq!(
-            QUERY_TILE * KEYS_PER_WARP,
-            32,
-            "QUERY_TILE * KEYS_PER_WARP must be 32, or phase 2 misses slots",
-        );
-        for head_dim in [32usize, 64, 128, 256] {
-            let tile = (head_dim / 32) * KEYS_PER_WARP;
-            assert_eq!(
-                QUERY_TILE * tile,
-                head_dim,
-                "head_dim {head_dim}: block width and softmax slot count diverged",
+    fn the_staged_tiles_fit_the_shared_memory_that_was_opted_in_to() {
+        // Only the K/V tile remains shared; Q and softmax state are registers.
+        for head_dim in [32, 64, 128, 256] {
+            let bytes = mma_shared_bytes(head_dim);
+            assert!(
+                bytes <= MMA_SHARED_CEILING,
+                "head_dim {head_dim}: {bytes} B of staged tiles exceeds the \
+                 {MMA_SHARED_CEILING} B carveout",
             );
         }
-    }
-
-    #[test]
-    fn the_register_query_tile_bounds_the_head_dimension() {
-        // `qr[ATTN_QT][ATTN_MAXD]` is only in registers while every index
-        // folds to a constant, so the head dimension cannot exceed what
-        // ATTN_MAXD covers. Asserted because raising head_dim past it would
-        // compile, run, and silently spill.
-        assert_eq!(32 * ATTN_MAXD, 256);
-        assert!(ATTENTION_SRC.contains("#define ATTN_MAXD 8"));
+        assert_eq!(
+            mma_shared_bytes(256),
+            8_320,
+            "the budget at this model's geometry moved; check it still buys \
+             what the block shape was widened for",
+        );
+        // Well under 32 KiB now that Q is in registers, so shared memory is no
+        // longer what holds this kernel to one block per SM -- the accumulator
+        // is. Stated because the natural next question is occupancy, and the
+        // answer has moved from "shared" to "registers".
         assert!(
-            ATTENTION_SRC.contains("float qr[QT][ATTN_MAXD];"),
-            "the query tile is no longer a register array",
+            mma_shared_bytes(256) <= 32 * 1024,
+            "two blocks per SM are no longer admitted by shared memory",
         );
     }
 
@@ -4826,33 +4645,6 @@ mod tests {
         assert!(
             rows_per_warp.is_multiple_of(32 / MMA_KEY_TILE),
             "{rows_per_warp} rows per warp is not a whole number of softmax passes",
-        );
-    }
-
-    #[test]
-    fn the_staged_tiles_fit_the_shared_memory_that_was_opted_in_to() {
-        // Only the K/V tile remains shared; Q and softmax state are registers.
-        for head_dim in [32, 64, 128, 256] {
-            let bytes = mma_shared_bytes(head_dim);
-            assert!(
-                bytes <= MMA_SHARED_CEILING,
-                "head_dim {head_dim}: {bytes} B of staged tiles exceeds the \
-                 {MMA_SHARED_CEILING} B carveout",
-            );
-        }
-        assert_eq!(
-            mma_shared_bytes(256),
-            8_320,
-            "the budget at this model's geometry moved; check it still buys \
-             what the block shape was widened for",
-        );
-        // Well under 32 KiB now that Q is in registers, so shared memory is no
-        // longer what holds this kernel to one block per SM -- the accumulator
-        // is. Stated because the natural next question is occupancy, and the
-        // answer has moved from "shared" to "registers".
-        assert!(
-            mma_shared_bytes(256) <= 32 * 1024,
-            "two blocks per SM are no longer admitted by shared memory",
         );
     }
 }

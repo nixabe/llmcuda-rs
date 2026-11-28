@@ -392,153 +392,50 @@ unsafe fn route_token(
         if tid < 32 {
             let lane = tid;
             let mut p = [0.0f32; 16];
-            p[0] = if lane + 0 < num_experts {
-                *probs.add((lane + 0) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[1] = if lane + 32 < num_experts {
-                *probs.add((lane + 32) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[2] = if lane + 64 < num_experts {
-                *probs.add((lane + 64) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[3] = if lane + 96 < num_experts {
-                *probs.add((lane + 96) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[4] = if lane + 128 < num_experts {
-                *probs.add((lane + 128) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[5] = if lane + 160 < num_experts {
-                *probs.add((lane + 160) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[6] = if lane + 192 < num_experts {
-                *probs.add((lane + 192) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[7] = if lane + 224 < num_experts {
-                *probs.add((lane + 224) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[8] = if lane + 256 < num_experts {
-                *probs.add((lane + 256) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[9] = if lane + 288 < num_experts {
-                *probs.add((lane + 288) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[10] = if lane + 320 < num_experts {
-                *probs.add((lane + 320) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[11] = if lane + 352 < num_experts {
-                *probs.add((lane + 352) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[12] = if lane + 384 < num_experts {
-                *probs.add((lane + 384) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[13] = if lane + 416 < num_experts {
-                *probs.add((lane + 416) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[14] = if lane + 448 < num_experts {
-                *probs.add((lane + 448) as usize) / sum_exp
-            } else {
-                -1.0
-            };
-            p[15] = if lane + 480 < num_experts {
-                *probs.add((lane + 480) as usize) / sum_exp
-            } else {
-                -1.0
-            };
+            macro_rules! each_slot {
+                ($m:ident) => {
+                    $m!(0);
+                    $m!(1);
+                    $m!(2);
+                    $m!(3);
+                    $m!(4);
+                    $m!(5);
+                    $m!(6);
+                    $m!(7);
+                    $m!(8);
+                    $m!(9);
+                    $m!(10);
+                    $m!(11);
+                    $m!(12);
+                    $m!(13);
+                    $m!(14);
+                    $m!(15);
+                };
+            }
+            macro_rules! load {
+                ($i:literal) => {
+                    p[$i] = if lane + 32 * $i < num_experts {
+                        *probs.add((lane + 32 * $i) as usize) / sum_exp
+                    } else {
+                        -1.0
+                    };
+                };
+            }
+            each_slot!(load);
             let mut j = 0;
             while j < top_k {
                 let (mut bv, mut bi) = (-1.0f32, -1i32);
-                if p[0] > bv || (p[0] == bv && (bi < 0 || lane + 0 < bi)) {
-                    bv = p[0];
-                    bi = lane + 0;
+                // A lane's experts ascend, so a tie only ever replaces the
+                // empty pick: the lower index is the one already held.
+                macro_rules! scan {
+                    ($i:literal) => {
+                        if p[$i] > bv || (p[$i] == bv && bi < 0) {
+                            bv = p[$i];
+                            bi = lane + 32 * $i;
+                        }
+                    };
                 }
-                if p[1] > bv || (p[1] == bv && (bi < 0 || lane + 32 < bi)) {
-                    bv = p[1];
-                    bi = lane + 32;
-                }
-                if p[2] > bv || (p[2] == bv && (bi < 0 || lane + 64 < bi)) {
-                    bv = p[2];
-                    bi = lane + 64;
-                }
-                if p[3] > bv || (p[3] == bv && (bi < 0 || lane + 96 < bi)) {
-                    bv = p[3];
-                    bi = lane + 96;
-                }
-                if p[4] > bv || (p[4] == bv && (bi < 0 || lane + 128 < bi)) {
-                    bv = p[4];
-                    bi = lane + 128;
-                }
-                if p[5] > bv || (p[5] == bv && (bi < 0 || lane + 160 < bi)) {
-                    bv = p[5];
-                    bi = lane + 160;
-                }
-                if p[6] > bv || (p[6] == bv && (bi < 0 || lane + 192 < bi)) {
-                    bv = p[6];
-                    bi = lane + 192;
-                }
-                if p[7] > bv || (p[7] == bv && (bi < 0 || lane + 224 < bi)) {
-                    bv = p[7];
-                    bi = lane + 224;
-                }
-                if p[8] > bv || (p[8] == bv && (bi < 0 || lane + 256 < bi)) {
-                    bv = p[8];
-                    bi = lane + 256;
-                }
-                if p[9] > bv || (p[9] == bv && (bi < 0 || lane + 288 < bi)) {
-                    bv = p[9];
-                    bi = lane + 288;
-                }
-                if p[10] > bv || (p[10] == bv && (bi < 0 || lane + 320 < bi)) {
-                    bv = p[10];
-                    bi = lane + 320;
-                }
-                if p[11] > bv || (p[11] == bv && (bi < 0 || lane + 352 < bi)) {
-                    bv = p[11];
-                    bi = lane + 352;
-                }
-                if p[12] > bv || (p[12] == bv && (bi < 0 || lane + 384 < bi)) {
-                    bv = p[12];
-                    bi = lane + 384;
-                }
-                if p[13] > bv || (p[13] == bv && (bi < 0 || lane + 416 < bi)) {
-                    bv = p[13];
-                    bi = lane + 416;
-                }
-                if p[14] > bv || (p[14] == bv && (bi < 0 || lane + 448 < bi)) {
-                    bv = p[14];
-                    bi = lane + 448;
-                }
-                if p[15] > bv || (p[15] == bv && (bi < 0 || lane + 480 < bi)) {
-                    bv = p[15];
-                    bi = lane + 480;
-                }
+                each_slot!(scan);
                 let mut off = 16;
                 while off > 0 {
                     let cv = warp::shuffle_xor_f32_sync(u32::MAX, bv, off);
@@ -549,54 +446,14 @@ unsafe fn route_token(
                     }
                     off >>= 1;
                 }
-                if bi >= 0 && lane + 0 == bi {
-                    p[0] = -1.0;
+                macro_rules! retire {
+                    ($i:literal) => {
+                        if lane + 32 * $i == bi {
+                            p[$i] = -1.0;
+                        }
+                    };
                 }
-                if bi >= 0 && lane + 32 == bi {
-                    p[1] = -1.0;
-                }
-                if bi >= 0 && lane + 64 == bi {
-                    p[2] = -1.0;
-                }
-                if bi >= 0 && lane + 96 == bi {
-                    p[3] = -1.0;
-                }
-                if bi >= 0 && lane + 128 == bi {
-                    p[4] = -1.0;
-                }
-                if bi >= 0 && lane + 160 == bi {
-                    p[5] = -1.0;
-                }
-                if bi >= 0 && lane + 192 == bi {
-                    p[6] = -1.0;
-                }
-                if bi >= 0 && lane + 224 == bi {
-                    p[7] = -1.0;
-                }
-                if bi >= 0 && lane + 256 == bi {
-                    p[8] = -1.0;
-                }
-                if bi >= 0 && lane + 288 == bi {
-                    p[9] = -1.0;
-                }
-                if bi >= 0 && lane + 320 == bi {
-                    p[10] = -1.0;
-                }
-                if bi >= 0 && lane + 352 == bi {
-                    p[11] = -1.0;
-                }
-                if bi >= 0 && lane + 384 == bi {
-                    p[12] = -1.0;
-                }
-                if bi >= 0 && lane + 416 == bi {
-                    p[13] = -1.0;
-                }
-                if bi >= 0 && lane + 448 == bi {
-                    p[14] = -1.0;
-                }
-                if bi >= 0 && lane + 480 == bi {
-                    p[15] = -1.0;
-                }
+                each_slot!(retire);
                 if lane == 0 {
                     *topk_ids.add((token as i64 * top_k as i64 + j as i64) as usize) = bi;
                     *rval.add(j as usize) = bv;

@@ -1729,3 +1729,54 @@ fn four_heads_a_kv_head_take_the_tensor_cores_and_match_the_reference() {
         );
     }
 }
+
+/// One query head a KV head has no group to share and no tensor-core block,
+/// so it takes `attn_flash_causal`, the one prefill kernel the real geometry
+/// never launches. Its values come from the same binary16 cache as its keys.
+#[test]
+fn one_query_head_a_kv_head_takes_the_scalar_kernel_and_matches_the_reference() {
+    let Some(ctx) = setup() else { return };
+    let (q_heads, kv_heads, head_dim) = (4usize, 4usize, 128usize);
+    let stream = ctx.default_stream();
+    let kernels =
+        AttentionKernels::new(&ctx, q_heads, kv_heads, head_dim).expect("kernels compile");
+    assert!(
+        !kernels.uses_tensor_cores(64),
+        "one query head a KV head must not take the tensor cores"
+    );
+
+    let mut rng = Xorshift64Star::new(0x5CA1_A12D);
+    // (cached keys, queries): a whole query tile, ragged ones, and a block
+    // that starts mid-sequence.
+    const CASES: [(usize, usize); 5] = [(0, 8), (0, 33), (0, 129), (0, 515), (300, 77)];
+    for (offset, n_query) in CASES {
+        let n_keys = offset + n_query;
+        let q_full: Vec<f32> = rng.vec_f32(n_keys * q_heads * head_dim, -1.0, 1.0);
+        let k = as_cached(&rng.vec_f32(n_keys * kv_heads * head_dim, -1.0, 1.0));
+        let v = as_cached(&rng.vec_f32(n_keys * kv_heads * head_dim, -1.0, 1.0));
+        let q_block = &q_full[offset * q_heads * head_dim..];
+        let device = run_device(
+            &stream, &kernels, q_block, &k, &v, n_query, n_keys, offset, q_heads, head_dim,
+        );
+
+        let mut worst_abs = 0.0f32;
+        for h in 0..q_heads {
+            let q_h = head_rows(&q_full, n_keys, q_heads, head_dim, h);
+            let k_h = head_rows(&k, n_keys, kv_heads, head_dim, h);
+            let v_h = head_rows(&v, n_keys, kv_heads, head_dim, h);
+            let full = causal_attention_streaming(&q_h, &k_h, &v_h);
+            let reference: Vec<f32> = full[offset..].iter().flatten().copied().collect();
+            let candidate: Vec<f32> = (0..n_query)
+                .flat_map(|t| {
+                    let base = (t * q_heads + h) * head_dim;
+                    device[base..base + head_dim].to_vec()
+                })
+                .collect();
+            worst_abs = worst_abs.max(compare(&candidate, &reference).max_abs_error);
+            assert_matches(&candidate, &reference, &GATE);
+        }
+        println!(
+            "cached {offset:4} + {n_query:4} queries x {q_heads} heads: max_abs={worst_abs:.3e}"
+        );
+    }
+}

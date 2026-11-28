@@ -541,8 +541,8 @@ __global__ void NAME(                                                           
         for (int u = 0; u < QT; ++u) acc[u] = acc[u] * corr_sh[u];              \
         for (int w = 0; w < tile; ++w) {                                        \
             if (j0 + w >= n_visible) break;                                     \
-            float vv =                                                          \
-                v[((j0 + w) * (long long)kv_heads + kvh) * (long long)head_dim + tid]; \
+            float vv = h2f(                                                     \
+                v[((j0 + w) * (long long)kv_heads + kvh) * (long long)head_dim + tid]); \
             _Pragma("unroll")                                                   \
             for (int u = 0; u < QT; ++u) acc[u] += w_sh[u * tile + w] * vv;     \
         }                                                                       \

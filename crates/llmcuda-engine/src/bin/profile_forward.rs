@@ -49,7 +49,7 @@ use cudarc::driver::CudaContext;
 use llmcuda_cuda::arena::memory_info;
 use llmcuda_cuda::device::{DeviceInfo, driver_available};
 use llmcuda_engine::block::moe::MoeBlock;
-use llmcuda_engine::forward::{Forward, Stage, arena_holds};
+use llmcuda_engine::forward::{Forward, Stage, arena_holds, moe_block_size};
 use llmcuda_engine::state::SequenceState;
 use llmcuda_engine::weights::DeviceWeights;
 use llmcuda_gguf::GgufFile;
@@ -70,9 +70,6 @@ const PEAK_TFLOP_S: f64 = 16.3;
 
 /// Discarded passes before timing, matching `bench_forward`.
 const WARMUP: usize = 2;
-
-/// Grouped-GEMM tile width, the same value `Forward` builds the MoE with.
-const MOE_BLOCK_SIZE: usize = 16;
 
 /// The buckets the report aggregates into.
 ///
@@ -640,7 +637,7 @@ fn main() {
         // replayable from a captured graph (AGENTS.md rule 5). Only the slots
         // holding a live `(token, expert)` pair do any work; the rest read two
         // integers and return. This is the fraction that matters.
-        let geometry = MoeBlock::geometry_for(&config, MOE_BLOCK_SIZE, n)
+        let geometry = MoeBlock::geometry_for(&config, moe_block_size(n), n)
             .expect("profile_forward targets the routed model");
         let capacity = geometry.sorted_capacity();
         info!(

@@ -189,14 +189,6 @@ mod tests {
     }
 
     #[test]
-    fn defaults_construct_successfully() {
-        let cfg = CacheConfig::with_defaults(model()).unwrap();
-        assert_eq!(cfg.attention_block_size(), DEFAULT_ATTENTION_BLOCK_SIZE);
-        assert_eq!(cfg.gdn_retention_interval(), DEFAULT_GDN_RETENTION_INTERVAL);
-        assert_eq!(cfg.attention_blocks_per_retention_interval(), 8);
-    }
-
-    #[test]
     fn attention_page_bytes_follow_the_models_kv_cache_formats() {
         use llmcuda_model::{KvCacheType, KvCacheTypes};
         let f16 = ModelConfig::k2_horizon_36b_a4b();

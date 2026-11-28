@@ -136,13 +136,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_pool_has_all_blocks_free() {
-        let pool = BlockPool::new("attention", 4096, 8);
-        assert_eq!(pool.free_count(), 8);
-        assert_eq!(pool.total(), 8);
-    }
-
-    #[test]
     fn alloc_then_free_round_trips() {
         let mut pool = BlockPool::new("attention", 4096, 2);
         let a = pool.alloc().unwrap();

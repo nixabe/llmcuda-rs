@@ -75,10 +75,10 @@ impl MessagesRequest {
     ///
     /// Anthropic spells the choice as an object, but a harness pointing an
     /// OpenAI-shaped client at this endpoint sends the bare string — the same
-    /// reason `min_p` is accepted here. Reading only an object's `type` meant
-    /// a string fell through to the absent arm and was silently taken as
-    /// `auto`: `"none"` offered the tools it asked this server not to offer,
-    /// and `"required"` was accepted as a guarantee nothing here keeps.
+    /// reason `min_p` is accepted here. Reading only an object's `type` would
+    /// take a string as `auto`: `"none"` would offer the tools it asked this
+    /// server not to offer, and `"required"` would be accepted as a guarantee
+    /// nothing here keeps.
     fn tools_offered(&self) -> Result<bool, ApiError> {
         let choice = match self.tool_choice.as_ref() {
             None => return Ok(true),
@@ -219,8 +219,8 @@ fn content_blocks(collected: &Collected, request_id: u64) -> Vec<Value> {
     // Only when it has something in it. An empty text block is not something
     // the real API emits, and a client that replays this message into its
     // next turn gets a 400 for it — text blocks must be non-empty on the way
-    // in. Cutting off mid-thought produced exactly that: a thinking block
-    // followed by an empty text block.
+    // in. Cutting off mid-thought is the case that would emit one: a
+    // thinking block followed by an empty text block.
     if !collected.text.is_empty() {
         content.push(json!({ "type": "text", "text": collected.text }));
     }
@@ -265,9 +265,8 @@ fn tool_use_id(request_id: u64, index: usize) -> String {
 /// chain exactly where an agentic loop needs it, across a tool call.
 ///
 /// One function rather than a copy at each of the three places a block
-/// closes: the copy on the tool-call path consumed `open` before testing it,
-/// so that path — a thinking block closed by a tool call, which is every
-/// reasoning turn that calls a tool — was the one case that never signed.
+/// closes, so the tool-call path — a thinking block closed by a tool call,
+/// which is every reasoning turn that calls a tool — signs like the others.
 fn close_block(open: Option<&str>, index: usize, request_id: u64) -> Vec<Value> {
     let Some(kind) = open else {
         return Vec::new();
@@ -562,11 +561,10 @@ mod tests {
 
     #[test]
     fn a_reply_cut_off_mid_thought_carries_no_empty_text_block() {
-        // The regression. Hitting max_tokens while still thinking used to
-        // emit a thinking block plus `{"type":"text","text":""}`. A client
-        // that replays that assistant turn is sending an empty text block
-        // back, which the API rejects — so the harness breaks on its *next*
-        // request, not this one.
+        // Hitting max_tokens while still thinking must not emit a thinking
+        // block plus `{"type":"text","text":""}`. A client that replays that
+        // assistant turn is sending an empty text block back, which the API
+        // rejects — so the harness breaks on its *next* request, not this one.
         let blocks = content_blocks(&collected("still thinking", "", vec![]), 7);
         assert_eq!(
             blocks.len(),
@@ -815,7 +813,7 @@ mod tests {
 
     #[test]
     fn an_image_in_an_assistant_turn_is_still_refused() {
-        // Widening this to tool results did not widen it to the model's own
+        // Images are accepted in tool results but not in the model's own
         // turns: the template has no vision markup there.
         let request = request(&format!(
             r#"{{"max_tokens":16,"messages":[
@@ -829,10 +827,9 @@ mod tests {
 
     #[test]
     fn a_bare_string_tool_choice_is_read_rather_than_ignored() {
-        // The regression. Only an object's `type` was read, so the string
-        // form an OpenAI-shaped client sends fell through to the absent arm
-        // and became `auto`: `"none"` offered the tools it asked this server
-        // to withhold, and `"required"` was answered 200 as a guarantee
+        // The string form an OpenAI-shaped client sends must not be taken as
+        // `auto`: `"none"` would offer the tools it asked this server to
+        // withhold, and `"required"` would be answered 200 as a guarantee
         // nothing here keeps.
         let auto = request(r#"{"max_tokens":1,"messages":[],"tool_choice":"auto"}"#);
         let none = request(r#"{"max_tokens":1,"messages":[],"tool_choice":"none"}"#);
@@ -847,13 +844,10 @@ mod tests {
 
     #[test]
     fn a_thinking_block_closed_by_a_tool_call_is_still_signed() {
-        // The regression, and the reason this is one function rather than a
-        // copy at each of the three places a block closes: the copy on the
-        // tool-call path had already consumed `open` when it tested it, so
-        // the signature was skipped on exactly the path that carries it —
-        // every reasoning turn that ends in a tool call. A client that keeps
-        // only signed thinking then replays the turn without it, and the
-        // model loses its chain across the tool boundary.
+        // Every reasoning turn that ends in a tool call closes its thinking
+        // block on the tool-call path. A client that keeps only signed
+        // thinking would replay that turn without it, and the model would
+        // lose its chain across the tool boundary.
         let events = close_block(Some("thinking"), 0, 7);
         assert_eq!(events.len(), 2, "sign, then stop: {events:?}");
         assert_eq!(events[0]["delta"]["type"], "signature_delta");

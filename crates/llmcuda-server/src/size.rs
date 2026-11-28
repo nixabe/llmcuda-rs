@@ -6,18 +6,18 @@
 //! a budget silently read as a thousandth of what was meant would show up as
 //! a mysterious cache miss rate rather than an error.
 
-/// Parse a byte size: a number, optionally followed by a binary unit.
-///
-/// `4096`, `512K`, `2M`, `8G`, `1T`, and the `KiB`/`MiB`/`GiB`/`TiB` and
-/// `KB`/`MB`/`GB` spellings of the same. All units are powers of 1024 —
-/// there is no decimal-megabyte reading here, since the quantity being sized
-/// is memory.
 /// `--cache-ram full` / `-1`: size the arena from the serving configuration
 /// rather than a byte budget, so every slot can keep a retention point at
 /// every interval across its whole context. llama.cpp spells the same idea
 /// `-cram -1` ("no limit"); the value is a sentinel, not a size.
 pub const FULL_COVERAGE: u64 = u64::MAX;
 
+/// Parse a byte size: a number, optionally followed by a binary unit.
+///
+/// `4096`, `512K`, `2M`, `8G`, `1T`, and the `KiB`/`MiB`/`GiB`/`TiB` and
+/// `KB`/`MB`/`GB` spellings of the same. All units are powers of 1024 —
+/// there is no decimal-megabyte reading here, since the quantity being sized
+/// is memory.
 pub fn parse_bytes(text: &str) -> Result<u64, String> {
     let text = text.trim();
     if text.is_empty() {
@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn an_unknown_unit_is_refused_rather_than_ignored() {
-        // Reading `8GG` as 8 bytes would be a thousand-fold error that shows
+        // Reading `8GG` as 8 bytes would be a billion-fold error that shows
         // up as a puzzling miss rate rather than a message.
         assert!(parse_bytes("8GG").is_err());
         assert!(parse_bytes("8 gigs").is_err());

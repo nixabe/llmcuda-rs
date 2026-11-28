@@ -3,9 +3,8 @@
 //! Both header spellings are accepted on every endpoint — OpenAI clients send
 //! `Authorization: Bearer <key>`, Anthropic clients send `x-api-key: <key>`,
 //! and a server that speaks both dialects should not make the caller care
-//! which one it guessed. With no key configured the server is open, which is
-//! how it behaved before this existed and how `llama-server` behaves without
-//! `--api-key`.
+//! which one it guessed. With no key configured the server is open, as
+//! `llama-server` is without `--api-key`.
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -16,7 +15,7 @@ use axum::response::Response;
 use super::AppState;
 use super::error::{ApiError, Dialect};
 
-/// Compare two keys without a length-dependent early exit.
+/// Compare two keys without an early exit at the first differing byte.
 ///
 /// The lengths themselves are not secret — a key that is the wrong length is
 /// the wrong key — but the position of the first differing byte is.

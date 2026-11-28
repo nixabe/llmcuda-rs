@@ -425,8 +425,7 @@ impl Generation {
             .insert(id, sender);
         // Announce the wait before blocking on the lock, so the driver loop
         // knows to stand aside rather than reacquire it the instant it
-        // finishes a step. Decremented as soon as the lock is held — the
-        // count is "handlers queueing", not "handlers submitting".
+        // finishes a step.
         state.submit_waiters.fetch_add(1, Ordering::AcqRel);
         let placement = state.engine.place_tokens(
             NewRequest {

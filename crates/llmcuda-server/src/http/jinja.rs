@@ -1,5 +1,5 @@
-//! Rendering the prompt with the model's own `tokenizer.chat_template`,
-//! behind `--jinja`.
+//! Rendering the prompt with the model's own `tokenizer.chat_template`, the
+//! default unless `--no-jinja` is given.
 //!
 //! # Why there is a choice at all
 //!
@@ -11,18 +11,18 @@
 //! different one, would be rendered by the wrong rules and look like a dumber
 //! model rather than a bug.
 //!
-//! `--jinja` removes the copy from the loop: the template in the file is
-//! evaluated, as llama.cpp does with its bundled `minja`. It costs a template
-//! evaluation per request and depends on the template being one this engine
-//! can run.
+//! Rendering the template removes the copy from the loop: the template in the
+//! file is evaluated, as llama.cpp does with its own `common/jinja`. It costs
+//! a template evaluation per request and depends on the template being one
+//! this engine can run.
 //!
 //! # The Python that Jinja does not have
 //!
 //! Hugging Face chat templates are written against Python's Jinja, and call
 //! Python's own string methods — `startswith`, `endswith`, `split`, `strip`.
 //! Jinja proper has none of those, so they are supplied here through
-//! minijinja's unknown-method hook. This is the same set llama.cpp's `minja`
-//! implements, and for the same reason.
+//! minijinja's unknown-method hook. llama.cpp's `common/jinja` implements
+//! them too, for the same reason.
 //!
 //! # What the template is given
 //!
@@ -81,8 +81,8 @@ impl ChatTemplate {
         let mut env = Environment::new();
         env.set_unknown_method_callback(python_method);
         // This is a model prompt, not HTML. Minijinja's built-in emits
-        // compact JSON and HTML escapes; llama.cpp's minja uses spaces after
-        // separators and preserves characters such as '<' in tool schemas.
+        // compact JSON and HTML escapes; llama.cpp's `common/jinja` uses spaces
+        // after separators and preserves characters such as '<' in tool schemas.
         env.add_filter("tojson", prompt_tojson);
         env.add_filter("string", prompt_string);
         // Templates call this to reject inputs they cannot render — a system
@@ -221,7 +221,7 @@ fn prompt_tojson(
     kwargs: Kwargs,
 ) -> Result<JinjaValue, Error> {
     let indent = indent.or(kwargs.get("indent")?);
-    // Python's json.dumps keywords, as llama.cpp's minja takes them.
+    // Python's json.dumps keywords, as llama.cpp's `common/jinja` takes them.
     let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
     let separators: Option<Vec<String>> = kwargs.get("separators")?;
     let _ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
@@ -808,8 +808,8 @@ mod tests {
     /// The hand-written ChatML and the model's own template, on the same
     /// conversation, byte for byte.
     ///
-    /// This is the gate the hand-renderer never had. It is a *copy* of the
-    /// template, and nothing else in this crate would notice it drifting —
+    /// The hand-renderer is a *copy* of the template, and nothing else in
+    /// this crate would notice it drifting —
     /// a re-quantized GGUF carrying an updated template would just make the
     /// model look worse. Here the two are compared directly.
     #[test]
@@ -928,8 +928,8 @@ mod tests {
     ///
     /// Every rule the hand-renderer implements is here, because with the
     /// template serving by default the rest of this crate's rendering tests
-    /// pin a path that is no longer the one requests take — this is what ties
-    /// the two together.
+    /// pin a path that is not the one requests take — this is what ties the
+    /// two together.
     fn fixtures() -> Vec<(&'static str, Conversation)> {
         let mut all = Vec::new();
 
@@ -1101,7 +1101,8 @@ mod tests {
     }
 
     /// Python scalar spelling is part of the prompt, even though generated
-    /// calls use JSON spelling. Both renderers must replay it like minja.
+    /// calls use JSON spelling. Both renderers must replay it like llama.cpp's
+    /// `common/jinja`.
     #[test]
     fn a_boolean_argument_replays_with_python_spelling() {
         let path = std::env::var_os("LLMCUDA_MODEL")

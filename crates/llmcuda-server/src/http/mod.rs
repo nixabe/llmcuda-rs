@@ -58,8 +58,7 @@ const THINK_CLOSE: &str = "</think>";
 /// The serving defaults a request may override.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// `None` leaves the server open, which is what it was before an API key
-    /// could be configured.
+    /// `None` leaves the server open.
     pub api_key: Option<String>,
     pub mcp_config: Option<std::path::PathBuf>,
     /// The model name reported by `/v1/models` and echoed in responses.
@@ -71,8 +70,7 @@ pub struct ServerConfig {
     pub default_reasoning: bool,
     /// What a request that does not set its own sampling fields samples
     /// with. Both dialects document temperature 1.0; a temperature of `0`
-    /// makes silent requests greedy, which is what this server always did
-    /// before it had a sampler.
+    /// makes silent requests greedy.
     pub sampling_defaults: SamplingDefaults,
     /// `Some` when `--mmproj` loaded a vision tower; `None` serves text
     /// only and refuses image parts with a 400 that names the flag.
@@ -83,9 +81,10 @@ pub struct ServerConfig {
     /// The model's own `tokenizer.chat_template`, when prompts are to be
     /// rendered with it. `None` hand-renders.
     pub chat_template: Option<String>,
-    /// Whether `--jinja` was asked for explicitly. On the default, a template
-    /// this engine cannot compile falls back to the hand-written ChatML with
-    /// a warning; asked for by name, it fails startup.
+    /// Whether the template is required: `--jinja` asked for explicitly, or a
+    /// model (K2, Inkling) whose chat format is its own template. Otherwise a
+    /// template this engine cannot compile falls back to the hand-written
+    /// ChatML with a warning; required, it fails startup.
     pub jinja_required: bool,
     /// The model is a decision model (`clef`): it serves `/v1/systemone`
     /// and nothing that generates text.
@@ -118,8 +117,9 @@ struct AppState {
     /// The token pieces a tool-call grammar is masked against, built once at
     /// startup and shared by every request that offers tools.
     grammar_vocab: Arc<llmcuda_grammar::Vocab>,
-    /// `Some` under `--jinja`: the model's own template, which renders every
-    /// prompt in place of `Conversation::render`.
+    /// `Some` unless `--no-jinja` was given or the file had no usable
+    /// template: the model's own template, which renders every prompt in
+    /// place of `Conversation::render`.
     chat_template: Option<Arc<jinja::ChatTemplate>>,
     /// Handlers currently blocked trying to take a worker lock to submit a
     /// request. A driver loop holds its worker's lock for a whole GPU step
@@ -269,13 +269,12 @@ async fn models(
 /// One of these runs per worker, on its own thread rather than a task
 /// because a step is a blocking, GPU-bound call.
 ///
-/// The three loops are deliberately not synchronized. The engine used to be
-/// stepped by a single thread that spawned all three workers and joined them
-/// every step, which made every card run at the speed of the slowest one in
-/// that step: a decode had to wait out whatever prefill chunk another card
-/// happened to be grinding through. Each loop now takes only its own
-/// worker's lock, so the cards interleave at whatever rate their own work
-/// allows. See `docs/BENCHMARKS.md`.
+/// The three loops are deliberately not synchronized: stepping all three
+/// workers in lockstep would make every card run at the speed of the slowest
+/// one, a decode waiting out whatever prefill chunk another card is grinding
+/// through. Each loop takes only its own worker's lock, so the cards
+/// interleave at whatever rate their own work allows. See
+/// `docs/BENCHMARKS.md`.
 fn worker_loop(state: AppState, worker: WorkerId) {
     loop {
         if state
@@ -528,8 +527,8 @@ pub async fn serve(
         decision_max_length: config.decision_max_length,
     };
     // One driver thread per worker. They share nothing but the client map
-    // and the engine's shared prefix cache, so a card that is prefilling no
-    // longer holds up a card that only has a decode token to emit.
+    // and the engine's shared prefix cache, so a card that is prefilling
+    // does not hold up a card that only has a decode token to emit.
     for index in 0..state.engine.worker_count() {
         let worker_state = state.clone();
         let worker = WorkerId(index as u32);

@@ -184,7 +184,8 @@ pub fn chat_template_from_gguf(path: &Path) -> Result<Option<String>, TokenizerE
     Ok(Some(prefix + source))
 }
 
-/// Load the GPT-2 byte-level BPE used by Qwen3.5/Qwen3.6 from a GGUF file.
+/// Load the GPT-2 byte-level BPE from a GGUF file, split by its
+/// `tokenizer.ggml.pre` (`qwen35`, `k2-horizon` or `inkling2`).
 pub fn from_gguf(path: &Path) -> Result<Tokenizer, TokenizerError> {
     let gguf = GgufFile::open(path)?;
     let tokens = gguf
@@ -311,8 +312,6 @@ mod tests {
         assert!(eog.contains(&250019));
     }
 
-    /// Token ids llama.cpp ae6a7ad2c produced for the same text (the
-    /// `api.tokens` of the capture `inkling_reference.rs` uses).
     /// An image's block is four tokens: the header, the content type, the
     /// placeholder the server expands, and the end. A placeholder that
     /// tokenized as text would leave the image out of the prompt silently.
@@ -341,6 +340,8 @@ mod tests {
         assert_eq!(ids.get_ids(), &[200000, 200005, 200054, 200010]);
     }
 
+    /// Token ids llama.cpp ae6a7ad2c produced for the same text (the
+    /// `api.tokens` of the capture `inkling_reference.rs` uses).
     #[test]
     fn inkling_tokenizer_matches_llama_cpp_on_the_capture_prompt() {
         let path = std::env::var_os("LLMCUDA_INKLING_MODEL").map_or_else(

@@ -17,8 +17,9 @@
 //!
 //! The parsing rules follow llama.cpp's parser for this format — which it
 //! selects by what the template contains rather than by the model's name, so
-//! Qwen3.6 takes it (`common/chat.cpp`,
-//! `common_chat_params_init_qwen3_coder`): a parameter
+//! Qwen3.6 takes it (`common/chat.cpp` selects
+//! `common_chat_params_init_qwen3_coder`, in
+//! `common/parsers/qwen3-coder.cpp`): a parameter
 //! whose schema type is `string` takes the raw text between its tags, any
 //! other parameter is parsed as JSON, and a call may open with a bare
 //! `<function=name>` — for a *known* name only — because the model
@@ -62,10 +63,10 @@ fn schema_is_string(schema: &Value) -> bool {
 /// serve.
 ///
 /// A hosted tool — `web_search`, `file_search`, `code_interpreter`, an `mcp`
-/// server, Anthropic's versioned `bash_*` and `text_editor_*` — is executed by
-/// the provider, and there is no provider here. Refusing the whole request
-/// over one was the wrong failure: a harness that offers `web_search`
-/// alongside six function tools lost all seven and got nothing served at all.
+/// server, Anthropic's `web_search_*` — is executed by the provider, and
+/// there is no provider here. Refusing the whole request over one is the
+/// wrong failure: a harness that offers `web_search` alongside six function
+/// tools would lose all seven.
 ///
 /// So they are dropped and the rest are served. The drop is reported rather
 /// than silent: the caller's own tools still work, and a `warn!` names what
@@ -387,7 +388,8 @@ impl ToolDefinition {
 /// The grammar that keeps the model inside the tools it was offered.
 ///
 /// llama.cpp attaches one to every request that carries `tools`
-/// (`tools/server/server-common.cpp`, `grammar_type = "tool_calls"`), and
+/// (`common/chat.cpp`, `common_chat_session::apply_sampling`,
+/// `COMMON_GRAMMAR_TYPE_TOOL_CALLS`), and
 /// this is the same decision: tools offered means output constrained. A tool
 /// whose wrapper does not name a function is skipped rather than failing the
 /// request — it could not be called anyway.
@@ -667,7 +669,7 @@ fn parse_call(
             .unwrap_or(&rest[..value_end]);
         rest = &rest[value_end + "</parameter>".len()..];
 
-        // Typing follows llama.cpp (`common/chat.cpp`,
+        // Typing follows llama.cpp (`common/parsers/qwen3-coder.cpp`,
         // `common_chat_params_init_qwen3_coder`): a schema that says
         // `string` takes the text verbatim; anything else is JSON, with the
         // raw text kept when it does not parse.

@@ -241,9 +241,9 @@ impl ResponsesRequest {
                         }
                         // The model's own prior thinking, handed back. This is
                         // how a reasoning conversation is continued, and
-                        // refusing it broke every agentic loop that replayed
-                        // what this server had just emitted. It is folded into
-                        // the assistant turn rather than dropped, because
+                        // refusing it would break every agentic loop that
+                        // replays what this server just emitted. It is folded
+                        // into the assistant turn rather than dropped, because
                         // `Conversation::render` replays the reasoning that
                         // came after the caller's last question — which is
                         // exactly a tool-calling loop's, and is the chain the
@@ -400,9 +400,7 @@ struct Envelope {
     /// Echoed back verbatim. `tools`, `tool_choice` and `parallel_tool_calls`
     /// are *required* members of the Responses object — the official SDK
     /// models them as non-optional, so a response without them fails
-    /// validation before a caller ever sees the output. They were missing,
-    /// which made this endpoint unusable from `openai-python` regardless of
-    /// what the model produced.
+    /// validation before a caller ever sees the output.
     tools: Value,
     tool_choice: Value,
     parallel_tool_calls: bool,
@@ -1063,9 +1061,9 @@ mod tests {
 
     #[test]
     fn a_reasoning_item_replayed_from_our_own_output_is_accepted() {
-        // The regression, in the exact shape this server emits: a harness
-        // continuing a reasoning conversation hands the previous `output`
-        // back as `input`. Refusing `reasoning` broke every such loop.
+        // In the exact shape this server emits: a harness continuing a
+        // reasoning conversation hands the previous `output` back as
+        // `input`. Refusing `reasoning` would break every such loop.
         let turns = turns_of(json!({
             "input": [
                 {"type": "message", "role": "user",
@@ -1143,9 +1141,9 @@ mod tests {
 
     #[test]
     fn a_hosted_tool_is_dropped_and_the_function_tools_beside_it_still_serve() {
-        // The regression. `web_search` is run by the provider, and there is
-        // no provider here — but refusing the request over it took the
-        // caller's own tools down too, so nothing served at all.
+        // `web_search` is run by the provider, and there is no provider here
+        // — but refusing the request over it would take the caller's own
+        // tools down too.
         let request: ResponsesRequest = serde_json::from_value(json!({
             "input": "hi",
             "tools": [
@@ -1270,8 +1268,8 @@ mod tests {
     #[test]
     fn a_namespace_group_is_flattened_into_its_member_tools() {
         // Harnesses group tools to keep a big surface from spending its whole
-        // budget on schemas. Rejecting the group outright took every tool in
-        // it with them.
+        // budget on schemas. Rejecting the group outright would take every
+        // tool in it with it.
         let request: ResponsesRequest = serde_json::from_value(json!({
             "input": "hi",
             "tools": [{
@@ -1353,9 +1351,9 @@ mod tests {
     /// The three fields the official SDK models as non-optional.
     #[test]
     fn the_response_object_carries_every_field_the_sdk_requires() {
-        // These were missing, and their absence is not a soft failure: the
-        // SDK validates the object before a caller sees any output, so every
-        // call through `openai-python` failed regardless of what was served.
+        // Their absence is not a soft failure: the SDK validates the object
+        // before a caller sees any output, so every call through
+        // `openai-python` would fail regardless of what was served.
         let envelope = Envelope {
             id: "resp_1".to_owned(),
             created: 0,

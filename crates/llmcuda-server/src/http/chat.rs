@@ -1,10 +1,10 @@
 //! Conversations, and the ChatML prompt Qwen3.6 expects.
 //!
-//! The GGUF carries a Jinja chat template. Rendering it would mean shipping a
-//! Jinja engine plus a compatibility layer for the Python string methods the
-//! template calls (`startswith`, `split`, `rstrip`), so this module writes the
-//! same markup directly and pins the result with tests instead. The parts of
-//! the template that are reproduced here are: the merged leading system
+//! The GGUF carries a Jinja chat template, which `super::jinja` renders by
+//! default. This module writes the same markup directly — what serves under
+//! `--no-jinja`, or when the file has no template this engine can use — and
+//! pins the result with tests. The parts of the template that are
+//! reproduced here are: the merged leading system
 //! message, the per-role turn markers, the rule that a reasoning span is
 //! replayed only for assistant turns after the last user query, and the
 //! generation prompt's open — or pre-closed — `<think>` block.
@@ -137,11 +137,12 @@ impl ImageSource {
 
 /// A content part.
 ///
-/// Anything else — an image, an audio clip, a file reference — parses as
-/// `Other` and is refused by name when the conversation is folded. Letting
-/// serde reject it instead would report only that no variant of an untagged
-/// enum matched, which tells the caller nothing about what this server cannot
-/// do.
+/// Anything else — an audio clip, a file reference, a provider's own block —
+/// parses as `Other`, and folding decides what it is: content this server
+/// cannot read is refused by name, a bare string or a `text` field is taken
+/// as text, and the rest is skipped. Letting serde reject it instead would
+/// report only that no variant of an untagged enum matched, which tells the
+/// caller nothing about what this server cannot do.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum Part {
@@ -191,10 +192,9 @@ impl ToolResult {
 /// Whether a JSON array is a list of typed content blocks rather than data a
 /// tool happened to return as an array.
 ///
-/// A Responses `function_call_output` is free-form JSON and has always been
-/// handed to the model as its JSON spelling; only an array that is content
-/// gets folded as content, so `[1, 2, 3]` still reaches the model as
-/// `[1,2,3]`.
+/// A Responses `function_call_output` is free-form JSON and is handed to the
+/// model as its JSON spelling; only an array that is content gets folded as
+/// content, so `[1, 2, 3]` reaches the model as `[1,2,3]`.
 pub(crate) fn is_content_blocks(values: &[Value]) -> bool {
     !values.is_empty()
         && values
@@ -208,10 +208,8 @@ pub(crate) fn is_content_blocks(values: &[Value]) -> bool {
 /// they fold through the same path: text joins, an image contributes its
 /// marker and its pixels, a part this server cannot read is refused by name,
 /// and a part some provider invented is skipped rather than failing the
-/// turn. That is a change of behaviour for the last two — this used to
-/// refuse every block that was not `text` — and it is the point: a tool that
-/// returns a screenshot is a normal agent shape, and the model's own
-/// template renders vision markup inside a `tool` turn.
+/// turn: a tool that returns a screenshot is a normal agent shape, and the
+/// model's own template renders vision markup inside a `tool` turn.
 fn fold_tool_result(content: Option<&Value>) -> Result<ToolResult, String> {
     let blocks = match content {
         None => return Ok(ToolResult::default()),
@@ -230,7 +228,6 @@ fn fold_tool_result(content: Option<&Value>) -> Result<ToolResult, String> {
 /// provider invents are overwhelmingly its own artifacts — a redacted or
 /// signed reasoning block, a trace of a search it ran — and refusing the
 /// request over one throws away a conversation this server could have served.
-/// Four rounds of exactly that failure are why the default is what it is.
 ///
 /// These are the exception, and the distinction is who the content belongs
 /// to. They carry the *caller's* material: a document, a file, audio. This
@@ -456,7 +453,8 @@ normal with your current knowledge and do not tell the user about function calls
 /// How a replayed call argument appears between its `<parameter>` tags.
 ///
 /// Strings verbatim, containers as JSON, scalars through Python's `str()`
-/// (`True`, `None`), as the model's template does under llama.cpp's minja.
+/// (`True`, `None`), as the model's template does under llama.cpp's
+/// `common/jinja`.
 fn parameter_value(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -622,8 +620,9 @@ pub(crate) fn image_misplaced() -> &'static str {
 ///
 /// `"auto"` and `"none"` cost nothing to honour. Forcing a call — `required`,
 /// `any`, or a named function — is a *guarantee* about the output, and
-/// nothing here constrains decoding to keep it; a request answered with prose
-/// where a call was guaranteed is a wrong answer, not an approximate one.
+/// nothing here makes the model start a call: the tool grammar only keeps
+/// one well-formed once it begins. A request answered with prose where a
+/// call was guaranteed is a wrong answer, not an approximate one.
 pub(crate) fn unsupported_tool_choice(dialect: Dialect, choice: &str) -> ApiError {
     ApiError::bad_request(
         dialect,
@@ -645,8 +644,7 @@ mod tests {
     #[test]
     fn a_refusal_part_renders_as_the_turn_s_text() {
         // `refusal` is a valid assistant content type, so a harness replaying
-        // an assistant turn that contained one was sending something this
-        // server refused outright.
+        // an assistant turn that contained one must not be refused.
         let folded = parts(serde_json::json!([{"type": "refusal", "refusal": "I can't help."}]))
             .fold()
             .expect("a refusal is content, not an error");
@@ -655,9 +653,8 @@ mod tests {
 
     #[test]
     fn an_unrecognized_part_is_skipped_rather_than_failing_the_turn() {
-        // The default that four rounds of harness breakage argued for. A part
-        // a provider invented is its own artifact; the text beside it is the
-        // conversation, and it must still serve.
+        // A part a provider invented is its own artifact; the text beside it
+        // is the conversation, and it must still serve.
         let folded = parts(serde_json::json!([
             {"type": "text", "text": "before"},
             {"type": "redacted_thinking", "data": "opaque"},
@@ -1054,9 +1051,9 @@ mod tests {
 
     #[test]
     fn a_tool_result_carrying_something_unreadable_is_still_refused() {
-        // The exception the module already draws, now reachable through a
-        // tool result: a document is the caller's own material, and folding
-        // it away would answer about something never seen.
+        // The exception the module draws holds inside a tool result too: a
+        // document is the caller's own material, and folding it away would
+        // answer about something never seen.
         let blocks: Vec<Value> =
             serde_json::from_str(r#"[{"type":"input_file","file_id":"f_1"}]"#).expect("parses");
         assert!(Content::fold_blocks(&blocks).is_err());

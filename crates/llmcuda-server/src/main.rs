@@ -62,12 +62,10 @@ enum SpecType {
     SpecDflash,
 }
 
-/// `--help` addendum for the flag clap never sees (see [`Args`] docs).
 /// Fraction of the host's *available* memory the prefix cache may claim when
 /// no `--cache-ram` is given: a quarter. The arena is page-locked, so it does
-/// not page out, and the weights still need the page cache — 63.86 GiB pinned
-/// on this host once squeezed a 32 GB model out of it and turned every
-/// restart into a cold read.
+/// not page out, and the weights still need the page cache — pinning too much
+/// squeezes the model file out of it and turns every restart into a cold read.
 const DEFAULT_CACHE_RAM_SHARE: u64 = 4;
 
 /// `MemAvailable` from `/proc/meminfo`, in bytes.
@@ -84,6 +82,7 @@ fn host_available_bytes() -> Option<u64> {
     })
 }
 
+/// `--help` addendum for the flag clap never sees (see [`Args`] docs).
 fn log_flag_help() -> String {
     format!("Logging:\n{}", llmcuda_log::FLAG_HELP)
 }
@@ -636,16 +635,10 @@ fn model_config_for(
             on_disk + on_disk * 6 / 100,
         ));
     }
-    // The file's own name, for `/v1/models`. `ModelConfig::name` is the name
-    // of the *architecture's* transcribed configuration, which is the right
-    // thing for a shape check and the wrong thing to serve: a second
-    // checkpoint of the same architecture would advertise itself as the
-    // first. See the `qwen35moe` note in docs/MODEL.md.
     let mtp_available = config.mtp_available(&file);
-    // Resident weights from the file's own tensor directory. This used to be
-    // one measured constant (Qwen3.6-35B-A3B's 29.6 GiB) for every non-K2
-    // file, which over-reserved a 9 GB Clef by 20 GiB and would under-reserve
-    // any file larger than that one.
+    // Resident weights from the file's own tensor directory: a single
+    // constant per architecture would over-reserve a small file and
+    // under-reserve a larger one.
     let schema = llmcuda_model::WeightSchema::new(&config);
     let directory = schema
         .resolve(&file)
@@ -657,6 +650,11 @@ fn model_config_for(
     } + decision_head_bytes(&file, &config);
     Ok((
         config,
+        // The file's own name, for `/v1/models`. `ModelConfig::name` is the
+        // name of the *architecture's* transcribed configuration, which is the
+        // right thing for a shape check and the wrong thing to serve: a second
+        // checkpoint of the same architecture would advertise itself as the
+        // first. See the `qwen35moe` note in docs/MODEL.md.
         file.get_str("general.name").map(str::to_owned),
         mtp_available,
         weights_bytes,
@@ -707,10 +705,10 @@ fn main() -> std::process::ExitCode {
     }
     // 1. Model configuration, chosen by what the file says it is.
     //
-    //    Read here rather than assumed, because the two architectures this
-    //    engine serves have the same tensor *names* for the mixer and would
-    //    otherwise fail deep in the weight resolver with a wall of shape
-    //    mismatches instead of one line naming the architecture.
+    //    Read here rather than assumed, because `qwen35moe` and `qwen35`
+    //    have the same tensor *names* for the mixer and would otherwise fail
+    //    deep in the weight resolver with a wall of shape mismatches instead
+    //    of one line naming the architecture.
     let (mut model, file_name, mtp_available, weights_bytes) = match model_config_for(&args.model) {
         Ok(m) => m,
         Err(e) => {
@@ -1080,8 +1078,8 @@ fn main() -> std::process::ExitCode {
     // everywhere in its context, and a worker needs that for every slot it
     // serves. Recurrent states are needed only where a request resumes — a
     // handful per sequence, whatever the depth — so they are counted apart
-    // (`SnapshotArenaSize`), and at 65.9 MiB against an interval's 40 that
-    // is most of what full coverage used to cost.
+    // (`SnapshotArenaSize`): at 65.9 MiB against an interval's 40, one per
+    // interval would be most of what full coverage costs.
     //
     // Below this the arena does not degrade gracefully: `reclaim_for` yields
     // rather than publish when slots are scarce, so a worker that cannot hold
@@ -1112,10 +1110,9 @@ fn main() -> std::process::ExitCode {
         Some(size::FULL_COVERAGE) => full_coverage,
         Some(budget) => for_budget(budget),
         // Default to full coverage, bounded by a share of what the host can
-        // spare. The old fixed 24 was chosen against the locked-memory limit
-        // and covers 16K per slot, which is under a single agent turn at this
-        // context; scaling with the configuration is what makes the shipped
-        // `-c 405504 -s 3` work rather than silently miss.
+        // spare. A fixed 24 covers only 16K per slot, which is under a single
+        // agent turn at this context; scaling with the configuration is what
+        // makes the shipped `-c 405504 -s 3` work rather than silently miss.
         None => {
             let floor = SnapshotArenaSize::dense(DEFAULT_SNAPSHOT_SLOTS_PER_WORKER);
             let affordable = host_available_bytes()

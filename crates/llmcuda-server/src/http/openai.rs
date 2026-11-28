@@ -307,8 +307,6 @@ pub(crate) async fn completions(
     let stream = async_stream::stream! {
         loop {
             match generation.next().await {
-                // No tool parser is attached to a raw completion, so a
-                // `ToolCall` chunk cannot arrive here.
                 Ok(Some(Chunk::ToolCall(_))) => unreachable!("completions attach no tool parser"),
                 Ok(Some(Chunk::Reasoning(text) | Chunk::Text(text))) => {
                     yield Ok::<_, std::convert::Infallible>(sse_json(&CompletionResponse {
@@ -842,10 +840,9 @@ mod tests {
 
     #[test]
     fn a_turn_that_only_called_tools_carries_a_null_content_not_a_missing_one() {
-        // The regression: one `Option` served both the streaming delta, where
-        // the field is absent, and the message, where OpenAI writes `null`.
-        // `skip_serializing_if` won, so a client that reads `content` as a
-        // required nullable field saw no key at all.
+        // The streaming delta omits the field, but the message writes `null`
+        // as OpenAI does: a client that reads `content` as a required
+        // nullable field must see the key.
         let message = ChatDelta {
             role: Some("assistant"),
             content: Some(None),

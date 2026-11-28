@@ -155,8 +155,7 @@ fn derived_parameter_count_agrees_with_the_file_section_by_section() {
     //
     // Both sides cover the text path only. The MTP block is a full extra
     // attention layer plus its own 256 experts — 0.84 B parameters — and
-    // including it on one side but not the other accounts for exactly the
-    // 2.4% gap an earlier hand-rolled comparison reported.
+    // including it on one side but not the other opens a 2.4% gap.
     let Some(file) = open() else { return };
     let config = ModelConfig::from_gguf(&file).expect("GGUF geometry");
     let schema = WeightSchema::new(&config);

@@ -149,9 +149,7 @@ pub struct WeightBytesPerParam {
 impl WeightBytesPerParam {
     /// Q6_K: 210 bytes per 256-element block. Block layout transcribed from
     /// `block_q6_K` in `ggml/src/ggml-common.h` (see `llmcuda-gguf`'s
-    /// `GgmlType::Q6K`, which this crate deliberately does not depend on —
-    /// see the module doc — so the constant is repeated here rather than
-    /// imported).
+    /// `GgmlType::Q6K`).
     pub const Q6_K: f64 = 210.0 / 256.0;
 
     /// Q8_0: 34 bytes per 32-element block.

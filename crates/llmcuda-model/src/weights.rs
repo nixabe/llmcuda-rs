@@ -308,16 +308,6 @@ impl fmt::Display for WeightError {
 
 impl std::error::Error for WeightError {}
 
-/// The GGUF `general.architecture` value the MoE schema is written against.
-///
-/// Retained as a named constant because several tests and the oracle capture
-/// refer to it directly; [`WeightSchema`] takes the architecture from the
-/// [`ModelConfig`] it was built for, so a dense schema checks for `qwen35`.
-pub const MOE_ARCHITECTURE: &str = "qwen35moe";
-
-/// The GGUF `general.architecture` value the dense schema is written against.
-pub const DENSE_ARCHITECTURE: &str = "qwen35";
-
 /// Every tensor the model needs, derived from a [`ModelConfig`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightSchema {
@@ -331,9 +321,9 @@ impl WeightSchema {
     /// embedding table, and the LM head.
     ///
     /// The MTP head is excluded. It is a complete extra attention block plus
-    /// its own MoE — 20 tensors and roughly 0.75 GiB — and the engine has no
-    /// speculative decode path yet, so loading it would waste VRAM the text
-    /// path needs. Use [`Self::with_mtp`] once milestone 09 lands.
+    /// its own MoE — 20 tensors and roughly 0.75 GiB — that only MTP drafting
+    /// reads, so loading it otherwise would waste VRAM the text path needs.
+    /// Use [`Self::with_mtp`] when serving MTP drafts.
     pub fn new(config: &ModelConfig) -> Self {
         Self::build(config, false)
     }

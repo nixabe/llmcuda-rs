@@ -71,7 +71,7 @@ impl InklingVisionConfig {
     /// The tower shipped in `mmproj-F16.gguf` for Inkling 2 Mini.
     ///
     /// Transcribed from that file's `clip.vision.*` metadata; the
-    /// `real_inkling_mmproj` test holds it to the file.
+    /// `real_inkling_mmproj_weights` test holds it to the file.
     pub const fn inkling2_mini() -> Self {
         Self {
             num_layers: 23,

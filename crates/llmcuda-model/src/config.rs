@@ -508,7 +508,7 @@ impl ModelConfig {
     /// The dense sibling: `unsloth/Qwen3.8-27B-GGUF`.
     ///
     /// Transcribed from the GGUF's own `qwen35.*` hyperparameters, which are
-    /// what `dump the file` reports and what `llama.cpp`'s `qwen35` loader
+    /// what `gguf-info` reports and what `llama.cpp`'s `qwen35` loader
     /// reads:
     ///
     /// ```text
@@ -785,14 +785,6 @@ impl ModelConfig {
             }
             None => self.gdn.state_bytes_per_layer() * self.num_gdn_layers() as u64,
         }
-    }
-
-    /// Parameters in one FFN unit's three matrices.
-    ///
-    /// A unit is one expert on the MoE model and the whole MLP on the dense
-    /// one; `gate`, `up` and `down` are each `hidden x intermediate`.
-    pub const fn params_per_ffn_unit(&self) -> u64 {
-        MoeConfig::MATS_PER_EXPERT as u64 * self.hidden_size as u64 * self.ffn.intermediate() as u64
     }
 
     /// Total parameters held in feed-forward weights across all layers.

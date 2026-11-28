@@ -59,7 +59,7 @@ if ".target sm_75\n" not in ptx or any(
         "vision_layer_norm", "hg_q8_to_half_w", "dec_lexical", "dec_question_fields",
         "dec_features", "fwd_embed_quant",
         "k2_rotary_append", "k2_rotary_append_kv8",
-        "mma_quantize_rows_q8", "mma_repack_q8_0", "mma_repack_q8_0_h",
+        "mma_quantize_rows_q8", "mma_repack_q8_0_h",
         "ink_embed", "ink_linear", "ink_mix", "ink_ctrl_pair", "ink_ctrl_apply",
         "ink_conv", "ink_clip", "ink_rms_groups", "ink_rel_table", "ink_attn",
         "ink_gather_half", "ink_situ_half", "ink_moe_combine", "ink_softcap",

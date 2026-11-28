@@ -1,7 +1,7 @@
 //! Support kernels for the half and int8 GEMMs: conversions to binary16,
 //! the split-K reduce, activation quantization and Q8_0 repacks.
 
-use crate::common::{f2h, load_half_le};
+use crate::common::f2h;
 use cuda_device::{kernel, ptx_asm, thread, warp};
 
 /// Sum the split-K partial products of a tensor-core GEMM, ascending
@@ -146,30 +146,6 @@ pub unsafe fn mma_quantize_rows_q8(x: *const f32, q: *mut i8, scales: *mut f32, 
         *q.add(base + lane) = qi as i8;
         if lane == 0 {
             *scales.add((row * blocks as i64 + block as i64) as usize) = d;
-        }
-    }
-}
-
-/// Split GGUF Q8_0 blocks (a binary16 scale and 32 int8 codes) into a
-/// contiguous code array and fp32 scales.
-///
-/// grid: ceil(n_blocks / blockDim.y). block: (32, warps).
-///
-/// # Safety
-/// src covers n_blocks * 34 bytes, q n_blocks * 32, scales n_blocks.
-#[kernel]
-pub unsafe fn mma_repack_q8_0(src: *const u8, q: *mut i8, scales: *mut f32, n_blocks: i64) {
-    let b =
-        thread::blockIdx_x() as i64 * thread::blockDim_y() as i64 + thread::threadIdx_y() as i64;
-    if b >= n_blocks {
-        return;
-    }
-    let lane = thread::threadIdx_x() as usize;
-    unsafe {
-        let blk = src.add((b * 34) as usize);
-        *q.add((b * 32) as usize + lane) = *blk.add(2 + lane) as i8;
-        if lane == 0 {
-            *scales.add(b as usize) = load_half_le(blk);
         }
     }
 }

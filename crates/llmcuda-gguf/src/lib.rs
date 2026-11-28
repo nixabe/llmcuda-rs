@@ -3,7 +3,7 @@
 //!
 //! This crate is the only place that understands the GGUF *byte layout*.
 //! Everything downstream — [`llmcuda_model`](../llmcuda_model/index.html)'s
-//! structural description of the model, and eventually the CUDA loader —
+//! structural description of the model, and the CUDA loader —
 //! reads tensors and metadata through [`GgufFile`] rather than re-parsing
 //! bytes, so a layout bug shows up in exactly one place.
 //!

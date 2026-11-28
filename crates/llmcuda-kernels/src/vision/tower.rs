@@ -335,8 +335,7 @@ mod tests {
 
     #[test]
     fn gelu_matches_known_values() {
-        // gelu(0)=0, gelu is odd-ish: gelu(x)+gelu(-x)=x·1... spot values
-        // against the published tanh approximation.
+        // Spot values against the published tanh approximation.
         assert_eq!(gelu(0.0), 0.0);
         assert!((gelu(1.0) - 0.841192).abs() < 1e-5);
         assert!((gelu(-1.0) + 0.158808).abs() < 1e-5);

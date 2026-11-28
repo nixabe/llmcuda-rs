@@ -540,8 +540,8 @@ pub fn quantize_q6_k(x: &[f32; QK_K]) -> BlockQ6K {
                     let shift = (lane as u32) * 2;
                     qh[qh_byte_index] |= (raw >> 4) << shift;
 
-                    // lane 0 and 1 pack into the low/high nibble of
-                    // ql[l], lanes 2 and 3 into ql[l + 32], matching the
+                    // lanes 0 and 2 pack into the low/high nibble of
+                    // ql[l], lanes 1 and 3 into ql[l + 32], matching the
                     // dequant read pattern (ql[l]&0xF / ql[l]>>4 for
                     // lanes 0/2, ql[l+32]&0xF / ql[l+32]>>4 for lanes 1/3).
                     let (ql_index, nibble_high) = match lane {

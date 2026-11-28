@@ -20,7 +20,7 @@
 //! port, and llama.cpp does not implement a chunked GDN prefill kernel at
 //! all (only the recurrent form). **The one thing this module is graded
 //! against is agreement with `recurrent::recurrent_forward` on the same
-//! input** — see `equivalence` tests below — which is the project's stated
+//! input** — see the tests below — which is the project's stated
 //! milestone gate (cosine within `1e-3`; `Tolerance::gdn_chunk_vs_recurrent`).
 //!
 //! Per-token recurrence (state `S`, `head_dim x head_dim`, `v`-major):
@@ -54,8 +54,7 @@
 //! `(I - A')^{-1}` for a differently-signed `A'`; that is an equivalent
 //! statement of the same system reached by defining the unknown as `-u_t`
 //! instead of `u_t`. This derivation was worked from first principles
-//! against the verified recurrence above — see the C=2 hand-expansion in
-//! git history / the derivation notes — and validated by the
+//! against the verified recurrence above and validated by the
 //! recurrent-vs-chunked equivalence tests rather than matched to a
 //! particular paper's sign convention.)
 //!
@@ -65,8 +64,8 @@
 //!
 //! # Why the unknown solved for is `lambda_t u_t`, not `u_t`
 //!
-//! That last block is the algebra, and it **was** what this module
-//! computed. It is unusable in fp32 at this model's decay rates: `1/lambda_t`
+//! That last block is the algebra. It is unusable in fp32 at this model's
+//! decay rates: `1/lambda_t`
 //! is unbounded below, and Qwen3.6's per-token log-decays reach **-91.578**,
 //! so `lambda_1` is already `1.691e-40` (already subnormal in fp32) and
 //! `v_1 / lambda_1` overflows fp32 at `|v| > 5.8e-2`, against activations of
@@ -76,9 +75,7 @@
 //! `tests::chunked_forward_stays_finite_at_this_models_real_decay_rates`,
 //! which carries those numbers as the regression it guards. The recurrent
 //! form is immune, because it decays the state one token at a time and never
-//! accumulates; the differential test in `llmcuda-engine` therefore had to
-//! *exclude* this reference as an oracle on exactly the inputs that matter
-//! most.
+//! accumulates.
 //!
 //! The fix is a change of unknown, not a clamp. Substitute `u'_t = lambda_t
 //! u_t` and multiply the `t`-th row of the system through by `lambda_t`:
@@ -122,10 +119,10 @@
 //! for.
 //!
 //! The device kernel `llmcuda_cuda::kernels::gdn_chunked` carries the same
-//! substitution (it reached it first, for the same measured reason) and
-//! differs only in solving the triangular system by forward substitution
-//! rather than by materialising `(I + A')^{-1}`; its module docs give the
-//! shared-memory and stability argument for that choice. This module keeps
+//! substitution and differs only in solving the triangular system by
+//! forward substitution rather than by materialising `(I + A')^{-1}`; its
+//! module docs give the shared-memory and stability argument for that
+//! choice. This module keeps
 //! the explicit inverse because it is graded on being a legible
 //! transcription of the derivation above.
 

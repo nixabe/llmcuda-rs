@@ -2,10 +2,8 @@
 //!
 //! Every one of Qwen3.6's 30 GDN layers carries an `ssm_conv1d.weight` of
 //! shape `[4, 8192]` (`qwen35moe.ssm.conv_kernel = 4`) and applies it to the
-//! fused q/k/v stream *before* the delta rule. This kernel was absent from
-//! `docs/KERNELS.md` until the weight schema made it visible; see
-//! `docs/MODEL.md`. It is not optional and it is not folded into the delta
-//! rule.
+//! fused q/k/v stream *before* the delta rule; see `docs/MODEL.md`. It is
+//! not optional and it is not folded into the delta rule.
 //!
 //! # Where these semantics come from
 //!

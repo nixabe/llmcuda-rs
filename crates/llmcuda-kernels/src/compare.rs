@@ -165,7 +165,7 @@ impl Tolerance {
 
     /// The project's stated gate for Gated DeltaNet recurrent-vs-chunked
     /// equivalence: cosine within `1e-3` over long sequences. See
-    /// `AGENTS.md` / the milestone plan. Kept separate from
+    /// milestone 01 in `docs/MILESTONES.md`. Kept separate from
     /// [`Self::tight_fp32`] so the two call sites can diverge later without
     /// one silently loosening the other.
     pub const fn gdn_chunk_vs_recurrent() -> Self {
@@ -179,10 +179,11 @@ impl Tolerance {
 
     /// A future GPU (fp16/bf16 accumulation) kernel checked against an fp32
     /// CPU reference. Loose enough to absorb reduced-precision arithmetic;
-    /// still tight enough to catch a wrong kernel outright. Not exercised by
-    /// this crate today — no GPU kernel exists yet — but declared here so
-    /// the threshold is decided once, in one place, before anyone is
-    /// tempted to invent a number under deadline pressure.
+    /// still tight enough to catch a wrong kernel outright. No differential
+    /// test gates on it today — the fp32-accumulating device kernels carry
+    /// tighter bounds of their own — but it is declared here so the
+    /// threshold is decided once, in one place, before anyone is tempted to
+    /// invent a number under deadline pressure.
     pub const fn reduced_precision_gpu() -> Self {
         Self {
             max_abs_error: 5e-2,
@@ -265,9 +266,8 @@ pub fn check(result: &ComparisonResult, tolerance: &Tolerance) -> ToleranceCheck
 
 /// Runs a reference implementation and a candidate implementation on the
 /// same input, compares them, and panics with an actionable message if they
-/// disagree beyond `tolerance`. This is the API a future GPU differential
-/// test calls: `assert_matches(reference_fn(x), candidate_fn(x),
-/// &Tolerance::reduced_precision_gpu())`.
+/// disagree beyond `tolerance`. This is the API the GPU differential tests
+/// call: `assert_matches(candidate_fn(x), reference_fn(x), &tolerance)`.
 pub fn assert_matches(candidate: &[f32], reference: &[f32], tolerance: &Tolerance) {
     let result = compare(candidate, reference);
     if let ToleranceCheck::Fail { reason, result } = check(&result, tolerance) {

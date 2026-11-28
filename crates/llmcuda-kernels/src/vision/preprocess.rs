@@ -594,8 +594,7 @@ mod tests {
     #[test]
     fn hf_preprocessing_of_an_aligned_in_range_image_is_the_llama_cpp_one() {
         // 512x384 is aligned and 192 tokens: neither pipeline resizes, so
-        // the two agree exactly — which is why such images served the same
-        // pixels before this path existed.
+        // the two agree exactly.
         let cfg = cfg();
         let rgb: Vec<u8> = (0..512 * 384 * 3).map(|i| (i * 31 % 253) as u8).collect();
         let hf = preprocess_hf(&cfg, &rgb, 512, 384, 1024).expect("in range");

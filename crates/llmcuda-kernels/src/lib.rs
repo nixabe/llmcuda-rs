@@ -35,8 +35,7 @@
 //!   bit-unpacking, plus a round-trip quantizer for testing.
 //! - [`compare`] — the differential-testing harness itself: metrics,
 //!   named tolerance presets with documented rationale, and
-//!   [`compare::assert_matches`], the API a future GPU differential test
-//!   calls.
+//!   [`compare::assert_matches`], the API the GPU differential tests call.
 //! - [`rng`] — a small dependency-free deterministic RNG for reproducible
 //!   test inputs.
 

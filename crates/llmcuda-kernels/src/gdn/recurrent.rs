@@ -73,11 +73,9 @@ pub fn zero_state(head_dim: usize) -> GdnState {
 /// `5fdfa6282`.
 ///
 /// It is not `x / max(sqrt(sum), eps)`, which is `ggml_l2_norm` and
-/// `torch.nn.functional.normalize`. This function had that form while
-/// llama.cpp's graph called `ggml_l2_norm` here, because llama.cpp was the
-/// oracle; llama.cpp was wrong about the reference and has since corrected
-/// it, and transformers made and corrected the same substitution
-/// (huggingface/transformers#40842).
+/// `torch.nn.functional.normalize`. llama.cpp's graph called `ggml_l2_norm`
+/// here before `5fdfa6282`, and transformers made and corrected the same
+/// substitution (huggingface/transformers#40842).
 ///
 /// The two forms are not interchangeable. The additive one scales every
 /// vector by `1 - eps/(2*sum)` to first order, which grows as the norm

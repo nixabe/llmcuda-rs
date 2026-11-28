@@ -66,15 +66,6 @@ pub const fn a_fragment_slot(lane: usize) -> (usize, usize) {
     (lane >> 2, (lane & 3) * 4)
 }
 
-/// Where lane `lane` holds its piece of an `m8n8k16` **B** fragment.
-///
-/// Returns `(column, first_contraction_index)`. B is the `.col` operand, so a
-/// lane owns one output column and four consecutive contraction elements —
-/// the mirror image of [`a_fragment_slot`].
-pub const fn b_fragment_slot(lane: usize) -> (usize, usize) {
-    (lane >> 2, (lane & 3) * 4)
-}
-
 /// Which two accumulator entries lane `lane` holds in an `m8n8k16` **C/D**
 /// fragment.
 ///

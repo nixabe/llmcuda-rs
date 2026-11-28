@@ -8,7 +8,8 @@
 //! *must* agree with [`naive_forward`], which recomputes the identical
 //! result by looping directly over each token's routed experts with no
 //! dispatch table involved — two structurally different code paths over
-//! the same math. See the `equivalence` test below.
+//! the same math. See `grouped_dispatch_path_matches_the_naive_per_token_loop`
+//! below.
 
 /// One expert's three matrices, row-major, `[out_dim x in_dim]` (matches
 /// `MoeConfig::MATS_PER_EXPERT` = gate, up, down in `llmcuda-model`).

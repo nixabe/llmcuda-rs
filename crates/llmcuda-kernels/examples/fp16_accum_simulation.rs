@@ -30,7 +30,7 @@
 //!
 //! Run: `cargo run --release -p llmcuda-kernels --example fp16_accum_simulation`
 //!
-//! ## Result, part 1 (2026-08-18): IID-random V holds, but that is not the
+//! ## Result, part 1: IID-random V holds, but that is not the
 //! ## regime that matters
 //!
 //! With Q, K, **and V** independently random, this simulation holds with
@@ -80,16 +80,13 @@
 //!
 //! ## Disposition
 //!
-//! Rejected. The device kernel change was reverted in full
-//! (`attn_flash_causal_mma` is byte-identical to its pre-this-investigation
-//! state; `git diff` on `attention.rs` after the revert is empty). The
+//! Rejected. The device kernel change was reverted in full. The
 //! register win was real and independently confirmed (252 -> 198
 //! registers, zero spill both before and after, via `nvcc -Xptxas -v` on
 //! the extracted `ATTENTION_SRC`) but is moot: a lever that funds a second
 //! lever by breaking the accuracy gate the second lever was supposed to
-//! stay inside of is not a lever. See "fp16 P V accumulation as a
-//! register lever: the register win was real, the accuracy gate was not"
-//! in docs/BENCHMARKS.md.
+//! stay inside of is not a lever. See the "fp16 `P V` accumulation" row
+//! under "Rejected on measurement" in docs/BENCHMARKS.md.
 
 use llmcuda_kernels::compare::compare;
 use llmcuda_kernels::f16::round_through_f16;

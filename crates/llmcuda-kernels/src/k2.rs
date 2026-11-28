@@ -62,16 +62,8 @@ pub fn attention_gate(x: &[f32], gate: &[f32]) -> Vec<f32> {
         })
         .collect()
 }
-/// Symmetric 16-bit activation quantization with an fp32 scale for each
-/// 32-element group. Two signed byte digits have an exact 256:1 scale ratio.
-pub fn quantize_activation(x: &[f32]) -> Vec<f32> {
-    quantize_activation_with_bits(x, 16)
-}
-/// Quantization reference for the explicit projection precision.
-pub fn quantize_activation_with_bits(x: &[f32], bits: usize) -> Vec<f32> {
-    quantize_activation_grouped(x, bits, 32)
-}
-/// Activation reference with explicit scale group.
+/// Activation reference with explicit scale group. At 16 bits, two signed
+/// byte digits have an exact 256:1 scale ratio.
 pub fn quantize_activation_grouped(x: &[f32], bits: usize, group: usize) -> Vec<f32> {
     assert!([8, 12, 16].contains(&bits));
     let limit = if bits == 8 {
@@ -119,62 +111,6 @@ pub fn quantize_activation_grouped(x: &[f32], bits: usize, group: usize) -> Vec<
     }
     out
 }
-/// Affine offset correction: sum of quantized values minus the publisher's
-/// ordered sum of the original values, per 32-element group.
-pub fn activation_sum_correction(x: &[f32]) -> Vec<f32> {
-    activation_sum_correction_with_bits(x, 16)
-}
-fn activation_sum_correction_with_bits(x: &[f32], bits: usize) -> Vec<f32> {
-    let q = quantize_activation_with_bits(x, bits);
-    x.as_chunks::<32>()
-        .0
-        .iter()
-        .zip(q.as_chunks::<32>().0.iter())
-        .map(|(x, q)| {
-            let mut tree = x.to_vec();
-            for off in [16, 8, 4, 2, 1] {
-                let prev = tree.clone();
-                for l in 0..32 {
-                    tree[l] = prev[l] + prev[l ^ off];
-                }
-            }
-            q.iter().sum::<f32>() - tree[0]
-        })
-        .collect()
-}
-/// Projection with explicit activation quantization and optional Q4 affine minima.
-#[allow(clippy::too_many_arguments)]
-pub fn quantized_project(
-    w: &[f32],
-    x: &[f32],
-    ids: Option<&[i32]>,
-    inner: usize,
-    rows: usize,
-    tokens: usize,
-    topk: usize,
-    flat_input: bool,
-    minima: Option<&[f32]>,
-) -> Vec<f32> {
-    quantized_project_with_bits(w, x, ids, inner, rows, tokens, topk, flat_input, minima, 16)
-}
-/// CPU projection reference for 8- or 16-bit activations.
-#[allow(clippy::too_many_arguments)]
-pub fn quantized_project_with_bits(
-    w: &[f32],
-    x: &[f32],
-    ids: Option<&[i32]>,
-    inner: usize,
-    rows: usize,
-    tokens: usize,
-    topk: usize,
-    flat_input: bool,
-    minima: Option<&[f32]>,
-    bits: usize,
-) -> Vec<f32> {
-    quantized_project_grouped(
-        w, x, ids, inner, rows, tokens, topk, flat_input, minima, bits, 32,
-    )
-}
 /// Projection reference with explicit activation scale group.
 #[allow(clippy::too_many_arguments)]
 pub fn quantized_project_grouped(
@@ -193,6 +129,8 @@ pub fn quantized_project_grouped(
     let quantized = quantize_activation_grouped(x, bits, group);
     let mut out = project(w, &quantized, ids, inner, rows, tokens, topk, flat_input);
     if let Some(minima) = minima {
+        // Affine offset correction: sum of quantized values minus the
+        // publisher's ordered sum of the original values, per 32-element group.
         let correction: Vec<f32> = x
             .as_chunks::<32>()
             .0

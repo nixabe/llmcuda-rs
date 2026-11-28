@@ -3,8 +3,8 @@
 //!
 //! Sized for Qwen3.6's Gated Attention layers: 16 query heads, 2 KV heads
 //! (GQA ratio 8, see `AttentionConfig::gqa_ratio` in `llmcuda-model`), head
-//! dimension 256. This is the oracle the eventual sm_75 flash-attention
-//! port (`fattn-tile.cu` / `fattn-vec.cuh` in llama.cpp) gets checked
+//! dimension 256. This is the oracle the sm_75 flash-attention kernel
+//! (`llmcuda_cuda::kernels::attention`) gets checked
 //! against, so the two forms here are kept algorithmically independent: the
 //! naive form materializes the full score matrix, the streaming form never
 //! does, and they must still agree.

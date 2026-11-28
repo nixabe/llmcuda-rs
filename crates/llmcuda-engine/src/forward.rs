@@ -195,8 +195,7 @@ const EMBED_THREADS: u32 = 256;
 /// wide tile pull clearly ahead (~6%). 1,152 is the boundary this returns
 /// -- the top of the measured wash rather than the middle of it, so a
 /// token count landing in the noisy band never picks the tile that
-/// measured behind. See "Two compiled widths instead of one" in
-/// docs/BENCHMARKS.md for the numbers.
+/// measured behind.
 pub fn moe_block_size(tokens: usize) -> usize {
     if tokens <= 1152 { 32 } else { 64 }
 }

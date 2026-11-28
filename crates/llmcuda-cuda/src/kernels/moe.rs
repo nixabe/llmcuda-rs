@@ -184,9 +184,8 @@ const MMA_M: usize = 64;
 /// tokens up, and a real loss at 512, where an average expert's traffic does
 /// not fill even the *narrow* tile and the occupancy cut buys nothing.
 /// [`MoeKernels::new`] picks between the two
-/// compiled kernels by `block_size`, at this constant as the boundary --
-/// see "Two compiled widths instead of one" in docs/BENCHMARKS.md for the
-/// crossover measurement.
+/// compiled kernels by `block_size`, at this constant as the boundary;
+/// `forward::moe_block_size` carries the crossover measurement.
 const MMA_M_NARROW: usize = 32;
 /// Token count below which the fp32 grouped GEMM is faster.
 ///
@@ -2326,8 +2325,7 @@ __global__ void moe_expert_down_gemv_q8(
 // `moe_block_size`) rather than by a device-side branch: the two differ in
 // `__launch_bounds__`'s occupancy target, which is a property of the
 // compiled function, not something a runtime branch inside one function
-// could vary per launch. See "Two compiled widths instead of one" in
-// docs/BENCHMARKS.md for why 512 tokens needed this back and 8,192 did not.
+// could vary per launch.
 __global__ void __launch_bounds__(MOE_MMA_WARPS * 32, 3)
 moe_expert_ffn_mma_narrow(
     const unsigned char* __restrict__ gate_q,

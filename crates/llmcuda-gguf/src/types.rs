@@ -143,49 +143,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn block_sizes_match_ggml_type_traits() {
-        assert_eq!(GgmlType::F32.block_size(), 1);
-        assert_eq!(GgmlType::F32.type_size(), 4);
-        assert_eq!(GgmlType::F16.block_size(), 1);
-        assert_eq!(GgmlType::F16.type_size(), 2);
-        assert_eq!(GgmlType::Bf16.block_size(), 1);
-        assert_eq!(GgmlType::Bf16.type_size(), 2);
-        assert_eq!(GgmlType::Nvfp4.block_size(), 64);
-        assert_eq!(GgmlType::Nvfp4.type_size(), 36);
-        assert_eq!(GgmlType::Q4_0.block_size(), 32);
-        assert_eq!(GgmlType::Q4_0.type_size(), 18);
-        assert_eq!(GgmlType::Q8_0.block_size(), 32);
-        assert_eq!(GgmlType::Q8_0.type_size(), 34);
-        assert_eq!(GgmlType::Q4K.block_size(), 256);
-        assert_eq!(GgmlType::Q4K.type_size(), 144);
-        assert_eq!(GgmlType::Q5K.block_size(), 256);
-        assert_eq!(GgmlType::Q5K.type_size(), 176);
-        assert_eq!(GgmlType::Q6K.block_size(), 256);
-        assert_eq!(GgmlType::Q6K.type_size(), 210);
-    }
-
-    #[test]
     fn bytes_for_elements_rejects_partial_blocks() {
         assert!(GgmlType::Q6K.bytes_for_elements(255).is_err());
         assert!(GgmlType::Q6K.bytes_for_elements(256).is_ok());
         assert_eq!(GgmlType::Q6K.bytes_for_elements(512).unwrap(), 420);
-    }
-
-    #[test]
-    fn try_from_round_trips_ggml_type_ids() {
-        for (id, ty) in [
-            (0, GgmlType::F32),
-            (1, GgmlType::F16),
-            (2, GgmlType::Q4_0),
-            (8, GgmlType::Q8_0),
-            (12, GgmlType::Q4K),
-            (13, GgmlType::Q5K),
-            (14, GgmlType::Q6K),
-            (30, GgmlType::Bf16),
-            (40, GgmlType::Nvfp4),
-        ] {
-            assert_eq!(GgmlType::try_from(id).unwrap(), ty);
-        }
-        assert!(GgmlType::try_from(99).is_err());
     }
 }

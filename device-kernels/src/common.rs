@@ -3,7 +3,7 @@
 
 use cuda_device::{DynamicSharedArray, device, ptx_asm, thread, warp};
 
-/// `block_reduce_sum` from the CUDA C++ layer ops, operation for operation:
+/// A block-wide sum:
 /// a shuffle-down tree per warp, then thread 0 adds the warp totals in
 /// ascending order. The order is the contract -- the fused Gated DeltaNet
 /// kernels reduce the same way and are compared bit for bit.
@@ -53,7 +53,6 @@ pub(crate) unsafe fn inverse_rms(x: *const f32, width: i32, eps: f32) -> f32 {
     unsafe {
         while j < width {
             let v = *x.add(base + j as usize);
-            // NVRTC contracts the baseline's partial += v * v.
             partial = v.mul_add(v, partial);
             j += thread::blockDim_x() as i32;
         }

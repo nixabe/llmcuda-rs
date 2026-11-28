@@ -51,9 +51,9 @@ pub unsafe fn k2_combine(p: *const f32, w: *const f32, out: *mut f32, rows: i32,
     }
 }
 
-/// `k2_combine` followed by the two adds it used to feed: `ffn = routed +
-/// shared`, then `out = x + ffn`, each rounded as the separate
-/// `tensor_add` launches did.
+/// `k2_combine` followed by the two adds it feeds: `ffn = routed +
+/// shared`, then `out = x + ffn`, each rounded as a separate
+/// `tensor_add` launch rounds it.
 ///
 /// # Safety
 /// As `k2_combine`; shared, x, ffn and out cover tokens * rows floats.
@@ -318,7 +318,6 @@ pub unsafe fn k2_norm(
         let mut j = tid as i32;
         while j < part {
             let v = *xb.add(j as usize);
-            // NVRTC contracts the original's acc += x * x.
             acc = v.mul_add(v, acc);
             j += step;
         }

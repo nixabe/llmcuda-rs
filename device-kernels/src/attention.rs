@@ -289,7 +289,7 @@ pub unsafe fn attn_flash_decode_combine_k2_batch(
 /// the absolute position the sequence has reached.
 ///
 /// This is a kernel rather than two device-to-device copies for one
-/// reason: the destination offset was computed on the host, and a CUDA
+/// reason: a copy's destination offset is computed on the host, and a CUDA
 /// graph records addresses, so a captured decode step would write the
 /// same position forever. Reading the position from device memory is what
 /// makes the step replayable (AGENTS.md rule 5). Both halves go in one

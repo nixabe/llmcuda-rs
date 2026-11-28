@@ -30,7 +30,7 @@ pub unsafe fn tensor_add(a: *const f32, b: *const f32, out: *mut f32, n: i64) {
     }
 }
 
-/// SwiGLU in the baseline operand order, using libdevice exp rather than
+/// SwiGLU in the reference operand order, using libdevice exp rather than
 /// an approximate exponential intrinsic.
 ///
 /// # Safety
@@ -198,7 +198,6 @@ pub unsafe fn rope_partial(
             let cos_a = angle.cos() as f32;
             let x0 = *x.add(base + j as usize);
             let x1 = *x.add(base + (j + half) as usize);
-            // Match NVRTC's contraction while sharing the angle and loads.
             *out.add(base + j as usize) = x0.mul_add(cos_a, -(x1 * sin_a));
             *out.add(base + (j + half) as usize) = x0.mul_add(sin_a, x1 * cos_a);
         }

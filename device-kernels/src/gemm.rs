@@ -174,18 +174,22 @@ pub unsafe fn mma_repack_q8_0(src: *const u8, q: *mut i8, scales: *mut f32, n_bl
     }
 }
 
-/// `mma_repack_q8_0` keeping the scales as binary16 bits.
+/// Split GGUF Q8_0 blocks (a binary16 scale and 32 int8 codes) into a
+/// contiguous code array and the scales, kept as binary16 bits.
 ///
 /// Which width the scales get is a bandwidth decision, not a numeric
-/// one. Q8_0 stores an fp16 scale per 32 quants, so the fp32 form widens
+/// one. Q8_0 stores an fp16 scale per 32 quants, so an fp32 scale widens
 /// a value with no more precision to give: 1.125 bytes an element
 /// against Q8_0's 1.0625, 5.9% more traffic. That is noise for a shared
 /// expert and 1.01 GiB of every decoded token for a 17,408-wide dense
 /// FFN. This form keeps the file's own bits, so it is neither a
 /// requantization nor a rounding.
 ///
+/// grid: ceil(n_blocks / blockDim.y). block: (32, warps).
+///
 /// # Safety
-/// As `mma_repack_q8_0`, scales covering n_blocks halves.
+/// src covers n_blocks * 34 bytes, q n_blocks * 32, scales n_blocks
+/// halves.
 #[kernel]
 pub unsafe fn mma_repack_q8_0_h(src: *const u8, q: *mut i8, scales: *mut u16, n_blocks: i64) {
     let b =

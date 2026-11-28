@@ -179,8 +179,7 @@ pub unsafe fn moe_block_gate_and_combine(
         let xs = normed.add(base);
         let mut s = 0.0f32;
         if tid < 256 {
-            // NVRTC contracts the original's s += w[j] * xs[j]. Eight
-            // steps an iteration, loads first, so they issue together.
+            // Eight steps an iteration, loads first, so they issue together.
             let mut j = tid;
             let (mut wp, mut xp) = (w.add(tid as usize), xs.add(tid as usize));
             while j + 1792 < hidden {

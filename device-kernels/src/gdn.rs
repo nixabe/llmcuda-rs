@@ -136,9 +136,8 @@ pub unsafe fn gdn_scan_decay(log_decay: *const f32, decay: *mut f32, n: i64) {
 /// `gdn_silu` and `gdn_split_qkv` in one launch: the activated row is
 /// written whole to `silu` and its three slices to q, k and v.
 ///
-/// The standalone pair wrote one buffer that the split immediately read.
-/// `v / (1 + exp(-v))` is the same expression in the same order, so the
-/// outputs are the same bits.
+/// `v / (1 + exp(-v))` is `gdn_silu`'s expression in the same order, so
+/// the outputs are the same bits as the standalone pair's.
 ///
 /// grid: (value_heads, tokens). block: head_dim.
 ///
@@ -528,8 +527,8 @@ unsafe fn strided_dot2(
 /// hidden row, the alpha and beta projections of the normalized row for
 /// one head, and that head's gates.
 ///
-/// Replaces two `gdn_proj_f32` launches and a `gdn_gates` launch and
-/// keeps their arithmetic: the norm reduces in four bands of eight warp
+/// It keeps the arithmetic of two `gdn_proj_f32` launches and a
+/// `gdn_gates` launch: the norm reduces in four bands of eight warp
 /// totals that thread 0 adds in ascending order, each projection is the
 /// warp contraction of `gdn_proj_f32`, and the gates are `gdn_gates`'
 /// expressions. Block 0 of each token also writes the normalized row.
@@ -781,9 +780,9 @@ unsafe fn store4(p: *mut f32, v: [f32; 4]) {
 /// different model.
 ///
 /// The kernel is bandwidth-bound: 2 MiB of state read and written per
-/// layer per sequence. Its first form gave each state row a block, one
-/// thread per key index, with two block-wide reductions on the hot path,
-/// and moved state at 44% of the card's streaming roofline. One warp per
+/// layer per sequence. A block per state row, one thread per key index,
+/// puts two block-wide reductions on the hot path and measured 44% of
+/// the card's streaming roofline. One warp per
 /// row is the structure that fits: a lane owns four adjacent columns of
 /// each 128-column chunk, read and written as one 16-byte vector, so a
 /// warp keeps 512 contiguous bytes in flight; both reductions are

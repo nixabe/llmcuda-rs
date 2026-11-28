@@ -209,7 +209,6 @@ pub unsafe fn dec_layer_norm(
         let mut c = tid;
         while c < cols {
             let d = *xr.add(c as usize) - mean;
-            // NVRTC contracts the original's v += d * d.
             v = d.mul_add(d, v);
             c += step;
         }
@@ -594,8 +593,8 @@ pub unsafe fn dec_features(
         while c < width {
             let cu = c as usize;
             let (a, b) = (*f.add(cu), *x.add(cu));
-            // The product is also stored, so NVRTC does not contract it
-            // into the running sum.
+            // The product is also stored, so it joins the running sum
+            // already rounded, not fused.
             let ab = a * b;
             ff = a.mul_add(a, ff);
             xx = b.mul_add(b, xx);

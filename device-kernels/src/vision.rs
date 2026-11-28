@@ -51,7 +51,6 @@ pub unsafe fn vision_gelu(x: *mut u16, n: i64) {
     }
     unsafe {
         let v = h2f(*x.add(i as usize));
-        // NVRTC contracts the original's 1 + 0.044715 * v * v.
         let inner = (0.797_884_56_f32 * v) * (0.044715_f32 * v).mul_add(v, 1.0);
         *x.add(i as usize) = f2h((0.5 * v) * (1.0 + inner.tanh()));
     }

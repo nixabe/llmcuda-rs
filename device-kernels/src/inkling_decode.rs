@@ -125,7 +125,7 @@ unsafe fn mix_row(
         // A warp a state: its sum of squares and its product with every
         // query in one walk of the row, reduced by shuffle. Taking each of
         // the up to forty sums as a pass of the block with a barrier of its
-        // own was most of this kernel's time.
+        // own would be most of this kernel's time.
         if warp_id < total {
             let src = if warp_id < states {
                 stack.add((warp_id as i64 * plane) as usize + base)
@@ -385,7 +385,7 @@ pub unsafe fn ink_dec_inputs(
 ///
 /// One block a gate row, so the megabytes of `down` are streamed by as many
 /// SMs as there are rows; a block a *sequence* row reading every gate row
-/// was held to one SM's share of the bus.
+/// is held to one SM's share of the bus.
 ///
 /// grid: (rank, rows * ctrls), 256 threads, dynamic shared memory for the
 /// reduction. Block y is `row * ctrls + controller`.
@@ -673,8 +673,8 @@ pub unsafe fn ink_dec_kv(
 /// Block z of a (head, row) takes the 256-position chunks z, z + Z, z + 2Z
 /// .. of the visible span, Z = gridDim.z, and one with no chunk writes the
 /// empty partial (lowest max, zero sums). A chunk is a serial chain of
-/// loads and barriers, so one block walking a 1,024-row window was four of
-/// them in a row on one SM while the rest of the card idled: 90 us a
+/// loads and barriers, so one block walking a 1,024-row window is four of
+/// them in a row on one SM while the rest of the card idles: 90 us a
 /// launch at three rows, and barely more than at one.
 ///
 /// grid: (heads, rows, Z), 256 threads.
@@ -792,7 +792,7 @@ pub unsafe fn ink_dec_attn(
             // Logits. Warp w takes the keys j = w mod 8 of the chunk, a
             // lane four channels of each: one 8-byte load a lane a key, the
             // lane's share of the bias beside it, and the warp's sum by
-            // shuffle. A thread a key walking all 128 channels read the
+            // shuffle. A thread a key walking all 128 channels reads the
             // query back from shared memory once a channel, and it is the
             // load pipeline this kernel waits on.
             let mut warp_max = LOWEST;
